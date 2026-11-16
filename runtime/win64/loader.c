@@ -89,6 +89,7 @@ static void *guest_main(void *arg){
     if(getenv("KH_SNAPSHOT")) write_snapshot(g,t,getenv("KH_SNAPSHOT"));
     /* Windows runs the TLS callbacks with DLL_PROCESS_ATTACH before the entry point */
     kh_run_tls_callbacks(g,1);
+    kh_mod_syscalls_init(g);
     if(selftest){ extern int kh_selftest(KCtx*); int f=kh_selftest(g); kh_exit_process(f?1:0); }
     u64 entry;
     if(!strcmp(entry_mode,"crt")) entry=GS_BASE+0x4393d0;            /* WinMainCRTStartup: security cookie, CRT init, __xi/__xc tables, WinMain */

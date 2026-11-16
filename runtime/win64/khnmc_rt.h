@@ -218,3 +218,6 @@ int kh_file_selftest(KCtx *g);
 void kh_phase_file(KCtx *g,const char *path);
 void kh_phase_present(KCtx *g,u64 present,u64 draws,u64 clears,u64 psos);
 void kh_input_attach(KCtx *g);
+
+void kh_mod_syscalls_init(KCtx *g);
+int kh_mod_syscalls_selftest(KCtx *g);
