@@ -18,6 +18,33 @@ static void do_call(KCtx *g,void (*imp)(KCtx*),u64 a0,u64 a1,u64 a2,u64 a3,u64 a
     u64 save=KH_RSP(g); u64 sp=(save-0x200)&~0xFull; wr64(g,sp+0x20,a4); wr64(g,sp+0x28,a5); sp-=8; wr64(g,sp,0x7ff7ffff0000ull); KH_RSP(g)=sp;
     KH_RCX(g)=a0; KH_RDX(g)=a1; KH_R8(g)=a2; KH_R9(g)=a3; imp(g); KH_RSP(g)=save; }
 
+extern void rt_imp_api_ms_win_crt_stdio_l1_1_0___sopen_dispatch(KCtx *g);
+extern void rt_imp_api_ms_win_crt_stdio_l1_1_0___lseeki64(KCtx *g);
+extern void rt_imp_api_ms_win_crt_stdio_l1_1_0___read(KCtx *g);
+static int io_selftest(KCtx *g){
+    int fails=0,checks=0; char path[]="/tmp/khnmc-io-XXXXXX";
+    int fd=mkstemp(path); if(fd<0) return 1;
+    const u64 offset=0x100000123ull;
+    if(pwrite(fd,"seek",4,offset)!=4){ close(fd); unlink(path); return 1; } close(fd);
+    u64 name=ga_strdup(path),out=ga_alloc(16,16),buf=ga_alloc(16,16);
+    for(int secure=0;secure<2;secure++){
+        wr32(g,out,-1);
+        do_call(g,rt_imp_api_ms_win_crt_stdio_l1_1_0___sopen_dispatch,name,0x8000,0x40,0,out,secure);
+        u64 result=KH_RAX(g); int opened=(s32)rd32(g,out);
+        CHECK(result==0&&opened>=0);
+        if(opened<0){ if((s64)result>0) close(result); continue; }
+        do_call(g,rt_imp_api_ms_win_crt_stdio_l1_1_0___lseeki64,opened,offset,SEEK_SET,0,0,0);
+        CHECK(KH_RAX(g)==offset);
+        do_call(g,rt_imp_api_ms_win_crt_stdio_l1_1_0___read,opened,buf,4,0,0,0);
+        CHECK(KH_RAX(g)==4&&!memcmp(hp(g,buf),"seek",4)); close(opened);
+    }
+    unlink(path); wr32(g,out,42);
+    do_call(g,rt_imp_api_ms_win_crt_stdio_l1_1_0___sopen_dispatch,name,0x8000,0x40,0,out,0);
+    CHECK(KH_RAX(g)==2&&(s32)rd32(g,out)==-1);
+    ga_free(name); ga_free(out); ga_free(buf);
+    fprintf(stderr,"kh: io selftest: %d checks, %d failures\n",checks,fails); return fails;
+}
+
 /* Exercise the actual guest vtables and Win64 stack arguments. */
 static u64 audio_call6(KCtx *g,u64 obj,int slot,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){
     u64 saved[5]={KH_RSP(g),KH_RCX(g),KH_RDX(g),KH_R8(g),KH_R9(g)};
@@ -183,5 +210,5 @@ int kh_selftest(KCtx *g){
     fprintf(stderr,"kh: selftest: %d checks, %d failures\n",checks,fails);
     if(getenv("KH_SELFTEST_FATAL")){ extern void rt_imp_gdi32__MoveToEx(KCtx*); do_call(g,rt_imp_gdi32__MoveToEx,1,2,3,4,0,0); }   /* demonstrates the loud failure of an unimplemented import */
     extern int kh_gfx_selftest(KCtx *);
-    return fails + audio_selftest(g) + kh_file_selftest(g) + kh_gfx_selftest(g);
+    return fails + io_selftest(g) + audio_selftest(g) + kh_file_selftest(g) + kh_gfx_selftest(g);
 }

@@ -333,6 +333,21 @@ int kh_winpath(const char *win,char *out,size_t cap){
     char t[2048]; size_t n=0;
     for(const char *p=win;*p&&n<sizeof t-1;p++) t[n++]=(*p=='\\')?'/':*p; t[n]=0;
     char *s=t; if(!strncmp(s,"//?/",4)) s+=4; if(isalpha((unsigned char)s[0])&&s[1]==':') s+=2;
+    const char *pkgroot=getenv("KHNMC_PKGDIR");
+    const char *image=NULL;
+    if(!strncasecmp(s,"/hd28/STEAM/Image/",18)) image=s+18;
+    else if(!strncasecmp(s,"/KH2/Image/",11)) image=s+11;
+    else if(!strncasecmp(s,"Image/",6)) image=s+6;
+    if(pkgroot&&*pkgroot&&image){
+        /* Only package basenames cross this mapping; never allow traversal. */
+        size_t len=strlen(image); char base[2048];
+        if(strchr(image,'/')||len<5||
+           (strcasecmp(image+len-4,".hed")&&strcasecmp(image+len-4,".pkg"))||
+           snprintf(base,sizeof base,"%s/Image",pkgroot)>=(int)sizeof base){
+            snprintf(out,cap,"/invalid-package-path"); return 0;
+        }
+        return kh_resolve_ci(base,image,out,cap);
+    }
     /* synthetic Windows layout: C:\KH2 = game dir (kh_root); C:\Users\khnmc\Documents = kh_docs */
     if(!strncasecmp(s,"/KH2",4)&&(s[4]=='/'||s[4]==0)) return kh_resolve_ci(kh_root,s+4,out,cap);
     if(!strncasecmp(s,"/Users/khnmc/Documents",22)) return kh_resolve_ci(kh_docs,s+22,out,cap);

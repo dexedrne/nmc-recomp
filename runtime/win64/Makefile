@@ -14,9 +14,9 @@ WRAP = -Wl,--wrap=f_11d070 -Wl,--wrap=f_11d0a0 -Wl,--wrap=f_124060 -Wl,--wrap=f_
 FILE_HOOKS = 106000 1063d0 106700 106790 106870
 all: khnmc
 # Weak definitions also allow same-shard relocations to bind to the runtime hooks.
-obj/libkh2loose.a: $(LIFTED)/lib/x86/libkh2lifted.a Makefile
+obj/libkh2loose.a: $(LIFTED)/lib/x86/libkh2lifted.a Makefile tools/alias_file_hooks.py
 	@mkdir -p obj
-	objcopy $(foreach rva,$(FILE_HOOKS),--weaken-symbol=f_$(rva)) $< $@
+	python3 tools/alias_file_hooks.py $< $@ $(FILE_HOOKS)
 obj/%.o: $(ROOT)/runtime/%.c $(wildcard $(ROOT)/runtime/*.h)
 	@mkdir -p obj && $(CC) $(CFLAGS) -c $< -o $@
 obj/khrt_cpu.o: $(ROOT)/lifter-rt/khrt_cpu.c
