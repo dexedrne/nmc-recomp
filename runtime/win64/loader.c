@@ -64,6 +64,7 @@ static int load_image(void){
 void kh_exit_process(int code){
     extern void kh_report_seams(FILE*);
     { u64 lb,ac; extern void ga_stats(u64*,u64*); ga_stats(&lb,&ac); fprintf(stderr,"kh: process exit(%d) after %llu import calls; init tables run: %d __xi + %d __xc entries; guest heap live %llu bytes in %llu allocations\n",code,(unsigned long long)kh_trace_count(),kh_cnt_init_xi,kh_cnt_init_xc,(unsigned long long)lb,(unsigned long long)ac); }
+    { extern void kh_mod_difficulty_dump(void); kh_mod_difficulty_dump(); }
     kh_report_seams(stderr); { extern void kh_dump_threads(FILE*); if(getenv("KH_DUMP_THREADS")) kh_dump_threads(stderr); } fflush(stderr); fflush(stdout); _exit(code);
 }
 
@@ -90,6 +91,7 @@ static void *guest_main(void *arg){
     /* Windows runs the TLS callbacks with DLL_PROCESS_ATTACH before the entry point */
     kh_run_tls_callbacks(g,1);
     kh_mod_syscalls_init(g);
+    { extern void kh_mod_difficulty_init(KCtx *); kh_mod_difficulty_init(g); }
     if(selftest){ extern int kh_selftest(KCtx*); int f=kh_selftest(g); kh_exit_process(f?1:0); }
     u64 entry;
     if(!strcmp(entry_mode,"crt")) entry=GS_BASE+0x4393d0;            /* WinMainCRTStartup: security cookie, CRT init, __xi/__xc tables, WinMain */

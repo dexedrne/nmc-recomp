@@ -25,7 +25,7 @@ PHASE(13da10,4)
 PHASE(13d260,5)
 PHASE(405440,6)
 PHASE(3f29e0,7)
-PHASE(3c12f0,8)
+void kh_phase_damage_entry(void){ entries[8]++; }
 PHASE(2b4590,9)
 void orig_f_4f94b0(KCtx *);
 void f_4f94b0(KCtx *g){

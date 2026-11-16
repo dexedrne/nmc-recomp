@@ -185,6 +185,7 @@ static void syscall_handler(KCtx *g){
     require_mem(g,args,8ull*((entries[idx].flags&0xffff)?(entries[idx].flags&0xffff):1));
     a=rd32(g,args); b=(entries[idx].flags&0xffff)>1?rd32(g,args+8):0;
     switch(idx){
+    case 1: { extern void kh_mod_add_exp(KCtx *,u64); kh_mod_add_exp(g,args); break; }
     case 3: /* 11760: both halves are sign extended before OR, including the low half. */
         p=((u64)(s64)(s32)a<<32)|(u64)(s64)(s32)b;
         wr32(g,args,encode(g,p)); break;
@@ -224,7 +225,7 @@ void kh_mod_syscalls_init(KCtx *g){
     }
     /* The two four-byte static edits are halves of this one pointer. No count field exists. */
     wr64(g,GS_BASE+0x7534a8,table);
-    fprintf(stderr,"kh: mod syscall table 3 installed: 114 descriptors at 0x%llx (12 implemented, 102 named fatals)\n",(unsigned long long)table);
+    fprintf(stderr,"kh: mod syscall table 3 installed: 114 descriptors at 0x%llx (13 implemented, 101 named fatals)\n",(unsigned long long)table);
 }
 
 extern void orig_f_1f9a80(KCtx *g);
