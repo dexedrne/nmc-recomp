@@ -1,0 +1,36 @@
+# NOTHING derived from the game, the ISO, the exe or the mod's data is ever committed.
+*.exe
+*.dll
+*.iso
+*.ISO
+*.xiso
+*.bin
+*.img
+*.idx
+*.pkg
+*.hed
+*.scd
+*.mdlx
+*.mset
+*.ard
+*.elf
+*.ipa
+*.ppa
+*.pnach
+*.7z
+*.rar
+*.zip
+# generated / lifted output and workspaces
+/build/
+/out/
+/lifted/
+/generated/
+/workspace/
+/scratch/
+/extract/
+/idx/
+/pc/
+/orig/
+/nmc/
+__pycache__/
+.venv/
