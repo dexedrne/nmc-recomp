@@ -13,7 +13,9 @@ static int C_factory,C_adapter,C_output,C_swap,C_dev,C_queue,C_alloc,C_list,C_re
 static u64 o_adapter,o_output;
 static _Atomic u64 res_ids=1, heap_ids=1;
 _Atomic u64 gfx_draws, gfx_clears, gfx_barriers, gfx_execs, gfx_presents, gfx_copies, gfx_psos, gfx_resources, gfx_buffers_bytes;
+void kh_gfx_report(FILE *f);
 static int log_gfx;
+static _Atomic u64 gfx_bundles, gfx_pso_binds;
 
 #define OBJ_EX 32
 static u64 new_obj(int c,u64 extra){ return kh_com_obj(c,extra); }
@@ -72,7 +74,10 @@ static int h_output(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return
     return 0; }
 static int h_swap(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)c;
     switch(s){
-    case 8: case 22: gfx_presents++; wr32(g,o+40,rd32(g,o+40)+1); SET_RAX(g,0); return 1;                 /* Present / Present1 */
+    case 8: case 22: gfx_presents++;
+        fprintf(stderr,"kh: gfx frame=%llu bundles=%llu pso-binds=%llu ",(unsigned long long)gfx_presents,(unsigned long long)gfx_bundles,(unsigned long long)gfx_pso_binds);
+        kh_gfx_report(stderr);
+        wr32(g,o+40,rd32(g,o+40)+1); SET_RAX(g,0); return 1;                 /* Present / Present1 */
     case 9: { u32 i=(u32)A1(g)%3; u64 b=rd64(g,o+56+8*i); if(!b){ u64 desc=ga_alloc(56,16); memset(hp(g,desc),0,56); wr32(g,desc,3); wr64(g,desc+16,rd32(g,o+32)); wr32(g,desc+24,rd32(g,o+36)); wr16(g,desc+28,1); wr16(g,desc+30,1); wr32(g,desc+32,0x57); wr32(g,desc+36,1);
             b=new_resource(g,desc,3); ga_free(desc); wr64(g,o+56+8*i,b); } out_obj(g,A3(g),b); SET_RAX(g,0); return 1; }   /* GetBuffer(idx, riid, **pp) */
     case 10: SET_RAX(g,0); return 1;                                                                        /* SetFullscreenState */
@@ -80,7 +85,7 @@ static int h_swap(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1
     case 13: wr32(g,o+32,(u32)A2(g)?(u32)A2(g):rd32(g,o+32)); wr32(g,o+36,(u32)A3(g)?(u32)A3(g):rd32(g,o+36)); SET_RAX(g,0); return 1;     /* ResizeBuffers(count,w,h,fmt,flags) */
     case 15: out_obj(g,A1(g),o_output); SET_RAX(g,0); return 1;                                             /* GetContainingOutput */
     case 18: { u64 d=A1(g); memset(hp(g,d),0,0x30); wr32(g,d,rd32(g,o+32)); wr32(g,d+4,rd32(g,o+36)); wr32(g,d+8,0x57); wr32(g,d+16,1); wr32(g,d+24,0x30); wr32(g,d+28,3); wr32(g,d+36,3); wr32(g,d+44,0x42); SET_RAX(g,0); return 1; }   /* GetDesc1 */
-    case 19: { u64 d=A1(g); memset(hp(g,d),0,0x20); wr32(g,d+0x14,1); SET_RAX(g,0); return 1; }            /* GetFullscreenDesc: Windowed=TRUE */
+    case 19: { u64 d=A1(g); memset(hp(g,d),0,20); wr32(g,d+16,1); SET_RAX(g,0); return 1; }            /* GetFullscreenDesc: Windowed=TRUE */
     case 31: SET_RAX(g,0); return 1;                                                                        /* SetMaximumFrameLatency */
     case 33: SET_RAX(g,rd64(g,o+48)); return 1;                                                             /* GetFrameLatencyWaitableObject (manual-reset, always signalled) */
     case 36: SET_RAX(g,rd32(g,o+40)%3); return 1;                                                           /* GetCurrentBackBufferIndex */
@@ -141,7 +146,11 @@ static int h_list(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1
     case 12: case 13: gfx_draws++; return 1;                                                                /* Draw(Indexed)Instanced */
     case 15: case 16: case 17: gfx_copies++; return 1;                                                      /* CopyBufferRegion / CopyTextureRegion / CopyResource */
     case 19: gfx_copies++; return 1;                                                                        /* ResolveSubresource */
-    case 20: case 21: case 22: case 23: case 24: case 25: return 1;                                         /* topology, viewports, scissors, blend factor, stencil ref, SetPipelineState */
+    case 27:
+        if(!A1(g)||kh_com_cls_of(g,A1(g))!=C_list) kh_fatal(g,"null d3d12: ExecuteBundle requires a command list");
+        gfx_bundles++; return 1; /* Bundle commands already update the null recorder when recorded. */
+    case 25: gfx_pso_binds++; return 1;
+    case 20: case 21: case 22: case 23: case 24: return 1;                                         /* topology, viewports, scissors, blend factor, stencil ref, SetPipelineState */
     case 26: gfx_barriers+=A1(g); return 1;                                                                 /* ResourceBarrier */
     case 28: case 30: case 32: case 38: case 43: case 44: case 46: return 1;                                /* SetDescriptorHeaps, root signature, tables, CBVs, IA buffers, OMSetRenderTargets */
     case 47: case 48: gfx_clears++; return 1;                                                               /* Clear DSV / RTV */
@@ -183,3 +192,18 @@ IMP(dxgi,CreateDXGIFactory1){ kh_cnt_gfx_calls++; u64 fct=kh_com_obj(C_factory,0
 IMP(d3d12,ord101){ kh_cnt_gfx_calls++; /* D3D12CreateDevice(adapter, featureLevel, riid, **ppDevice) */ u64 pp=A3(g); if(!o_device) o_device=kh_com_obj(C_dev,0); if(pp){ wr64(g,pp,o_device); } SET_RAX(g,0); }
 IMP(d3d12,D3D12SerializeRootSignature){ kh_cnt_gfx_calls++; u64 b=mk_blob(g,A0(g),0x40); wr64(g,A2(g),b); if(A3(g)) wr64(g,A3(g),0); SET_RAX(g,0); }
 IMP(d3dcompiler_47,D3DStripShader){ kh_cnt_gfx_calls++; u64 b=mk_blob(g,A0(g),A1(g)); wr64(g,A3(g),b); SET_RAX(g,0); }
+
+int kh_gfx_selftest(KCtx *g){
+    u64 list=new_obj(C_list,16), bundle=new_obj(C_list,16);
+    u64 before=gfx_bundles;
+    kh_call(g,rd64(g,rd64(g,list)+27*8),list,bundle,0,0);
+    int fail=gfx_bundles!=before+1;
+    gfx_bundles=before;
+    u64 swap=new_obj(C_swap,96), out=ga_alloc(48,16);
+    memset(hp(g,out),0xa5,48);
+    kh_call(g,rd64(g,rd64(g,swap)+19*8),swap,out,0,0);
+    fail+=rd32(g,out+16)!=1 || rd32(g,out+20)!=0xa5a5a5a5u || rd64(g,out+24)!=0xa5a5a5a5a5a5a5a5ull;
+    ga_free(out);
+    fprintf(stderr,"kh: gfx selftest: 2 checks, %d failures\n",fail);
+    return fail;
+}

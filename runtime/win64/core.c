@@ -313,7 +313,7 @@ int h_close(u64 h){
 /* ======================================================================================================================
  * Windows path mapping (case-insensitive under kh_root)
  * ==================================================================================================================== */
-static int resolve_ci(const char *base,const char *rel,char *out,size_t cap){
+int kh_resolve_ci(const char *base,const char *rel,char *out,size_t cap){
     snprintf(out,cap,"%s",base); size_t len=strlen(out);
     const char *p=rel; int ok=1;
     while(*p){
@@ -334,10 +334,10 @@ int kh_winpath(const char *win,char *out,size_t cap){
     for(const char *p=win;*p&&n<sizeof t-1;p++) t[n++]=(*p=='\\')?'/':*p; t[n]=0;
     char *s=t; if(!strncmp(s,"//?/",4)) s+=4; if(isalpha((unsigned char)s[0])&&s[1]==':') s+=2;
     /* synthetic Windows layout: C:\KH2 = game dir (kh_root); C:\Users\khnmc\Documents = kh_docs */
-    if(!strncasecmp(s,"/KH2",4)&&(s[4]=='/'||s[4]==0)) return resolve_ci(kh_root,s+4,out,cap);
-    if(!strncasecmp(s,"/Users/khnmc/Documents",22)) return resolve_ci(kh_docs,s+22,out,cap);
+    if(!strncasecmp(s,"/KH2",4)&&(s[4]=='/'||s[4]==0)) return kh_resolve_ci(kh_root,s+4,out,cap);
+    if(!strncasecmp(s,"/Users/khnmc/Documents",22)) return kh_resolve_ci(kh_docs,s+22,out,cap);
     if(s[0]=='/') { snprintf(out,cap,"%s",s); return 0; }                 /* other absolute: pass through (will not exist) */
-    return resolve_ci(kh_root,s,out,cap);                                 /* relative: the game dir is the working directory */
+    return kh_resolve_ci(kh_root,s,out,cap);                                 /* relative: the game dir is the working directory */
 }
 int kh_winpath_w(KCtx *g,u64 w,char *out,size_t cap){ char u[2048]; gw_to_utf8(g,w,u,sizeof u); return kh_winpath(u,out,cap); }
 

@@ -188,6 +188,7 @@ int  kh_vformat_w(KCtx *g, u16 *dst, size_t cap, const u16 *fmt, u64 valist, int
 void kh_seam_steam_init(void);                       /* platform_seam_store.c */
 void kh_seam_gfx_init(void);                         /* null_d3d12.c */
 void kh_seam_audio_init(void);                       /* null_audio.c */
+int kh_audio_cocreate(KCtx *g);
 void kh_seam_input_init(void);
 void kh_seam_window_init(void);
 void kh_seam_mf_init(void);
@@ -210,3 +211,6 @@ u64  kh_com_vtbl(int cls);
 #define COM_REFS(g,o) rd64(g,(o)+16)
 void kh_register_proc(const char *dll,const char *name,u64 addr);
 u64  kh_spawn_hostfn_thread(KCtx *g,const char *name,KhFn fn,u64 param);
+
+int kh_resolve_ci(const char *base,const char *rel,char *out,size_t cap);
+int kh_file_selftest(KCtx *g);

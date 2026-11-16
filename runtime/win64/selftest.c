@@ -8,6 +8,7 @@ extern void rt_imp_api_ms_win_crt_utility_l1_1_0__qsort(KCtx *g); extern void rt
 extern void rt_imp_api_ms_win_crt_stdio_l1_1_0____stdio_common_vsprintf(KCtx *g);
 extern void rt_imp_kernel32__EnterCriticalSection(KCtx *g); extern void rt_imp_kernel32__LeaveCriticalSection(KCtx *g); extern void rt_imp_kernel32__InitializeCriticalSection(KCtx *g);
 extern void rt_imp_kernel32__SwitchToFiber(KCtx *g);
+extern void rt_imp_ole32__CoCreateInstance(KCtx *g);
 static int fails, checks;
 #define CHECK(c) do{ checks++; if(!(c)){ fails++; fprintf(stderr,"selftest FAIL: %s (line %d)\n",#c,__LINE__); } }while(0)
 
@@ -16,6 +17,120 @@ static void cmp_u32(KCtx *g){ u32 a=rd32(g,KH_RCX(g)),b=rd32(g,KH_RDX(g)); SET_R
 static void do_call(KCtx *g,void (*imp)(KCtx*),u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){
     u64 save=KH_RSP(g); u64 sp=(save-0x200)&~0xFull; wr64(g,sp+0x20,a4); wr64(g,sp+0x28,a5); sp-=8; wr64(g,sp,0x7ff7ffff0000ull); KH_RSP(g)=sp;
     KH_RCX(g)=a0; KH_RDX(g)=a1; KH_R8(g)=a2; KH_R9(g)=a3; imp(g); KH_RSP(g)=save; }
+
+/* Exercise the actual guest vtables and Win64 stack arguments. */
+static u64 audio_call6(KCtx *g,u64 obj,int slot,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){
+    u64 saved[5]={KH_RSP(g),KH_RCX(g),KH_RDX(g),KH_R8(g),KH_R9(g)};
+    u64 sp=(saved[0]-0x200)&~15ull;
+    memset(hp(g,sp),0,0x80); wr64(g,sp+0x20,a4); wr64(g,sp+0x28,a5);
+    sp-=8; wr64(g,sp,0x7ff7ffff0000ull); KH_RSP(g)=sp;
+    KH_RCX(g)=obj; KH_RDX(g)=a1; KH_R8(g)=a2; KH_R9(g)=a3;
+    kh_dispatch(g,rd64(g,rd64(g,obj)+slot*8));
+    u64 result=KH_RAX(g);
+    KH_RSP(g)=saved[0]; KH_RCX(g)=saved[1]; KH_RDX(g)=saved[2]; KH_R8(g)=saved[3]; KH_R9(g)=saved[4];
+    return result;
+}
+static u64 audio_call(KCtx *g,u64 obj,int slot,u64 a1,u64 a2,u64 a3){
+    return audio_call6(g,obj,slot,a1,a2,a3,0,0);
+}
+static int audio_selftest(KCtx *g){
+    int fails=0,checks=0;
+    static const u8 mmcls[16]={0x95,0x03,0xde,0xbc,0x2f,0xe5,0x7c,0x46,0x8e,0x3d,0xc4,0x57,0x92,0x91,0x69,0x2e};
+    u64 clsid=ga_alloc(16,16),out=ga_calloc(1,96);
+    memcpy(hp(g,clsid),mmcls,16);
+    do_call(g,rt_imp_ole32__CoCreateInstance,clsid,0,1,GS_BASE+0x61be48,out,0);
+    CHECK(KH_RAX(g)==0 && rd64(g,out)!=0);
+    if(fails) goto done;
+    u64 enumerator=rd64(g,out);
+    if(getenv("KH_SELFTEST_AUDIO_FATAL")) audio_call(g,enumerator,3,0,1,out);
+    CHECK(audio_call(g,enumerator,4,0,0,0)==0x80004003u);
+    CHECK(audio_call(g,enumerator,4,0,0,out)==0 && rd64(g,out)!=0);
+    u64 device=rd64(g,out);
+    CHECK(audio_call(g,device,5,out,0,0)==0 && rd16(g,rd64(g,out))=='k');
+    ga_free(rd64(g,out));
+    CHECK(kh_call5(g,rd64(g,rd64(g,device)+24),device,GS_BASE+0x61be28,1,0,out)==0 && rd64(g,out)!=0);
+    u64 client=rd64(g,out);
+    CHECK(audio_call(g,client,8,out,0,0)==0 && rd64(g,out)!=0);
+    u64 fmt=rd64(g,out);
+    CHECK(rd16(g,fmt)==0xfffe && rd16(g,fmt+2)==2 && rd32(g,fmt+4)==48000);
+    CHECK(rd32(g,fmt+8)==384000 && rd16(g,fmt+12)==8 && rd16(g,fmt+14)==32 && rd16(g,fmt+16)==22);
+    CHECK(rd16(g,fmt+18)==32 && rd32(g,fmt+20)==3 && rd32(g,fmt+24)==3 && rd64(g,fmt+32)==0x719b3800aa000080ull);
+    CHECK(audio_call(g,client,4,out,0,0)==0 && rd32(g,out)==480);
+    CHECK(audio_call(g,client,3,0,0,0)==0);
+    extern void rt_imp_kernel32__LoadLibraryExW(KCtx*),rt_imp_kernel32__GetProcAddress(KCtx*);
+    do_call(g,rt_imp_kernel32__LoadLibraryExW,GS_BASE+0x61be58,0,0,0,0,0);
+    u64 module=KH_RAX(g);
+    const char *creators[]={"XAudio2CreateWithVersionInfo","XAudio2Create"};
+    for(int i=0;i<2;i++){
+        u64 name=ga_strdup(creators[i]);
+        do_call(g,rt_imp_kernel32__GetProcAddress,module,name,0,0,0,0);
+        u64 creator=KH_RAX(g); CHECK(creator!=0);
+        if(creator){ CHECK(kh_call(g,creator,out,0,0,0)==0 && rd64(g,out)!=0); audio_call(g,rd64(g,out),2,0,0,0); }
+        ga_free(name);
+    }
+    extern void rt_imp_xaudio2_9__ord1(KCtx*);
+    do_call(g,rt_imp_xaudio2_9__ord1,out,0,0,0,0,0);
+    u64 engine=rd64(g,out);
+    CHECK(KH_RAX(g)==0 && engine!=0);
+    for(int slot=5;slot<=7;slot++){
+        CHECK(audio_call(g,engine,slot,out,slot==5?fmt:2,slot==5?0:48000)==0 && rd64(g,out)!=0);
+        u64 voice=rd64(g,out);
+        memset(hp(g,out),0xff,96);
+        audio_call(g,voice,0,out,0,0);
+        CHECK(rd32(g,out+8)==2 && rd32(g,out+12)==48000);
+        if(slot==5){ audio_call(g,voice,25,out,0,0); CHECK(rd64(g,out)==0 && rd32(g,out+8)==0 && rd64(g,out+16)==0); }
+        if(slot==7) CHECK(audio_call(g,voice,19,out,0,0)==0 && rd32(g,out)==3);
+        /* Retained parameters must survive caller buffer changes. */
+        wr32(g,out,0x3f000000); wr32(g,out+4,0x3e800000);
+        CHECK(audio_call(g,voice,14,2,out,0)==0);
+        memset(hp(g,out),0,8); audio_call(g,voice,15,2,out,0);
+        CHECK(rd32(g,out)==0x3f000000 && rd32(g,out+4)==0x3e800000);
+        CHECK(audio_call(g,voice,14,3,out,0)==0x88960001u);
+        u64 chain=ga_calloc(1,32), effect=ga_calloc(1,16);
+        wr32(g,chain,1); wr64(g,chain+4,effect); wr32(g,effect+8,1); wr32(g,effect+12,2);
+        CHECK(audio_call(g,voice,2,chain,0,0)==0);
+        wr32(g,out,0x12345678); CHECK(kh_call5(g,rd64(g,rd64(g,voice)+6*8),voice,0,out,4,0xdeadbeef00000000ull)==0);
+        wr32(g,out,0); CHECK(audio_call(g,voice,7,0,out,4)==0 && rd32(g,out)==0x12345678);
+        audio_call(g,voice,5,0,out,0); CHECK(rd32(g,out)==1);
+        CHECK(audio_call(g,voice,4,0,0,0)==0); audio_call(g,voice,5,0,out,0); CHECK(rd32(g,out)==0);
+        CHECK(audio_call(g,voice,3,0,0,0)==0); audio_call(g,voice,5,0,out,0); CHECK(rd32(g,out)==1);
+        CHECK(audio_call(g,voice,7,1,out,4)==0x88960001u);
+        CHECK(audio_call(g,voice,7,0,out,8)==0x88960001u);
+        CHECK(audio_call(g,voice,2,0,0,0)==0);
+        wr32(g,out,0x3f000000); wr32(g,out+4,0); wr32(g,out+8,0); wr32(g,out+12,0x3e800000);
+        CHECK(audio_call6(g,voice,16,voice,2,2,out,0)==0);
+        memset(hp(g,out),0xff,16);
+        CHECK(audio_call6(g,voice,17,voice,2,2,out,0)==0);
+        CHECK(rd32(g,out)==0x3f000000 && rd32(g,out+4)==0 && rd32(g,out+8)==0 && rd32(g,out+12)==0x3e800000);
+        CHECK(audio_call6(g,voice,17,voice,2,3,out,0)==0x88960001u);
+        *(u32*)&KH_XMM(g,1)=0x3e800000; audio_call(g,voice,12,0,0,0);
+        audio_call(g,voice,13,out,0,0); CHECK(rd32(g,out)==0x3e800000);
+        extern void rt_imp_xaudio2_9__ord3(KCtx*);
+        do_call(g,rt_imp_xaudio2_9__ord3,out,0,0,0,0,0);
+        u64 meter=rd64(g,out); wr64(g,effect,meter); wr32(g,effect+8,1);
+        CHECK(audio_call(g,voice,2,chain,0,0)==0);
+        wr64(g,out,out+32); wr64(g,out+8,out+48); wr32(g,out+16,2);
+        memset(hp(g,out+32),0xa5,32);
+        CHECK(audio_call(g,voice,7,0,out,20)==0);
+        CHECK(rd64(g,out)==out+32 && rd64(g,out+8)==out+48 && rd32(g,out+16)==2);
+        CHECK(rd64(g,out+32)==0 && rd64(g,out+48)==0 && rd64(g,out+40)==0xa5a5a5a5a5a5a5a5ull && rd64(g,out+56)==0xa5a5a5a5a5a5a5a5ull);
+        wr32(g,out+16,3); CHECK(audio_call(g,voice,7,0,out,20)==0x88960001u);
+        audio_call(g,meter,2,0,0,0);
+        ga_free(chain); ga_free(effect);
+        audio_call(g,voice,18,0,0,0);
+    }
+    memset(hp(g,out),0xa5,96); audio_call(g,engine,11,out,0,0);
+    CHECK(rd64(g,out)==0 && rd64(g,out+56)==0 && rd64(g,out+64)==0xa5a5a5a5a5a5a5a5ull);
+    audio_call(g,client,2,0,0,0); audio_call(g,device,2,0,0,0); audio_call(g,enumerator,2,0,0,0); audio_call(g,engine,2,0,0,0);
+    extern void rt_imp_ole32__CoTaskMemFree(KCtx*);
+    do_call(g,rt_imp_ole32__CoTaskMemFree,fmt,0,0,0,0,0);
+    do_call(g,rt_imp_ole32__CoCreateInstance,clsid,0,1,clsid,out,0);
+    CHECK(KH_RAX(g)==0x80004002u && rd64(g,out)==0);
+    ga_free(clsid); ga_free(out);
+done:
+    fprintf(stderr,"kh: audio selftest: %d checks, %d failures\n",checks,fails);
+    return fails;
+}
 
 /* ---- fibers ---- */
 static u64 main_fiber, fibA, fibB; static _Atomic int step; static int order[16]; static int nord;
@@ -67,5 +182,6 @@ int kh_selftest(KCtx *g){
     float c; u32 cu=rd32(g,GS_BASE+0x717480); memcpy(&c,&cu,4); float x1=2.5f; memcpy(&KH_XMM(g,1),&x1,4); do_call(g,rt_hook_fiber_yield_150080,task,0,0,0,0,0); float r; u32 ru=rd32(g,P+0x20); memcpy(&r,&ru,4); CHECK(r==2.5f-c);
     fprintf(stderr,"kh: selftest: %d checks, %d failures\n",checks,fails);
     if(getenv("KH_SELFTEST_FATAL")){ extern void rt_imp_gdi32__MoveToEx(KCtx*); do_call(g,rt_imp_gdi32__MoveToEx,1,2,3,4,0,0); }   /* demonstrates the loud failure of an unimplemented import */
-    return fails;
+    extern int kh_gfx_selftest(KCtx *);
+    return fails + audio_selftest(g) + kh_file_selftest(g) + kh_gfx_selftest(g);
 }
