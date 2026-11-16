@@ -1,0 +1,7 @@
+# Inclusive present ranges; gaps are released. A every 90 frames until title handoff.
+# Initial Settings defaults to No: select Yes before confirming at frame 270.
+90 92 A
+180 182 A
+240 242 DPAD_UP+DPAD_LEFT
+270 272 A
+# Stop pressing after the confirmed Initial Settings sequence; title loads ~frame 400.

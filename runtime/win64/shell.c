@@ -37,6 +37,7 @@ void f_579bf0(KCtx *g){                                  /* ManageRun(app) */
     if(getenv("KH_STATE_DUMP")) state_dump(g,getenv("KH_STATE_DUMP"));
     kh_warn("shell: ManageRun(app=0x%llx) -> native shell: DXInput.init, GXDevice.init",(unsigned long long)app);
     kh_call(g,GS_BASE+0x1335a0,HWND_MAIN,0,0,0);          /* BaseSimpleForm.OnLoad */
+    kh_input_attach(g);
     kh_warn("shell: DXInput.init returned; calling GXDevice.init (0x11d070)");
     kh_call(g,GS_BASE+0x11d070,HWND_MAIN,app,0,0);        /* BaseSimpleForm.OnShown */
     kh_warn("shell: GXDevice.init returned; parking until ExitApplication");

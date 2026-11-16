@@ -46,10 +46,10 @@ static int io_selftest(KCtx *g){
 }
 
 /* Exercise the actual guest vtables and Win64 stack arguments. */
-static u64 audio_call6(KCtx *g,u64 obj,int slot,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){
+static u64 audio_call8(KCtx *g,u64 obj,int slot,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5,u64 a6,u64 a7){
     u64 saved[5]={KH_RSP(g),KH_RCX(g),KH_RDX(g),KH_R8(g),KH_R9(g)};
     u64 sp=(saved[0]-0x200)&~15ull;
-    memset(hp(g,sp),0,0x80); wr64(g,sp+0x20,a4); wr64(g,sp+0x28,a5);
+    memset(hp(g,sp),0,0x80); wr64(g,sp+0x20,a4); wr64(g,sp+0x28,a5); wr64(g,sp+0x30,a6); wr64(g,sp+0x38,a7);
     sp-=8; wr64(g,sp,0x7ff7ffff0000ull); KH_RSP(g)=sp;
     KH_RCX(g)=obj; KH_RDX(g)=a1; KH_R8(g)=a2; KH_R9(g)=a3;
     kh_dispatch(g,rd64(g,rd64(g,obj)+slot*8));
@@ -57,6 +57,7 @@ static u64 audio_call6(KCtx *g,u64 obj,int slot,u64 a1,u64 a2,u64 a3,u64 a4,u64 
     KH_RSP(g)=saved[0]; KH_RCX(g)=saved[1]; KH_RDX(g)=saved[2]; KH_R8(g)=saved[3]; KH_R9(g)=saved[4];
     return result;
 }
+static u64 audio_call6(KCtx *g,u64 obj,int slot,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5){ return audio_call8(g,obj,slot,a1,a2,a3,a4,a5,0,0); }
 static u64 audio_call(KCtx *g,u64 obj,int slot,u64 a1,u64 a2,u64 a3){
     return audio_call6(g,obj,slot,a1,a2,a3,0,0);
 }
@@ -115,6 +116,12 @@ static int audio_selftest(KCtx *g){
         CHECK(audio_call(g,voice,14,3,out,0)==0x88960001u);
         u64 chain=ga_calloc(1,32), effect=ga_calloc(1,16);
         wr32(g,chain,1); wr64(g,chain+4,effect); wr32(g,effect+8,1); wr32(g,effect+12,2);
+        if(slot==5){
+            CHECK(audio_call8(g,engine,5,out,fmt,0,0,0,0,chain)==0);
+            u64 created=rd64(g,out); wr32(g,out,0);
+            CHECK(audio_call(g,created,5,0,out,0)==0 && rd32(g,out)==1);
+            audio_call(g,created,18,0,0,0);
+        }
         CHECK(audio_call(g,voice,2,chain,0,0)==0);
         wr32(g,out,0x12345678); CHECK(kh_call5(g,rd64(g,rd64(g,voice)+6*8),voice,0,out,4,0xdeadbeef00000000ull)==0);
         wr32(g,out,0); CHECK(audio_call(g,voice,7,0,out,4)==0 && rd32(g,out)==0x12345678);
@@ -170,7 +177,45 @@ static void migrate_proc(KCtx *g){          /* runs on a second thread: converts
 }
 static void sleep_ms(int ms){ usleep((useconds_t)ms*1000); }
 
+static void input_selftest(KCtx *g){
+    extern void kh_input_load(KCtx *,const char *);
+    extern u32 kh_input_state(KCtx *,u32,u64,u64);
+    char path[]="/tmp/khnmc-input-XXXXXX"; int fd=mkstemp(path); CHECK(fd>=0);
+    FILE *f=fdopen(fd,"w"); CHECK(f!=NULL);
+    fputs("10 12 A+START+LT+RT -32768 32767\n20 20 B+X+Y+BACK+LB+RB+DPAD_UP+DPAD_DOWN+DPAD_LEFT+DPAD_RIGHT+LSTICK+RSTICK\n30 31 - 1 -1\n",f); fclose(f);
+    u64 out=ga_alloc(32,16); memset(hp(g,out),0xa5,32);
+    kh_input_load(g,NULL); CHECK(kh_input_state(g,0,out,10)==1167 && rd32(g,out)==0xa5a5a5a5);
+    kh_input_load(g,path); unlink(path);
+    CHECK(kh_input_state(g,1,out,10)==1167);
+    CHECK(kh_input_state(g,0,out,9)==0 && rd32(g,out)>0 && rd64(g,out+4)==0);
+    u32 packet=rd32(g,out);
+    CHECK(kh_input_state(g,0,out,10)==0 && rd32(g,out)==packet+1);
+    CHECK(rd16(g,out+4)==0x1010 && rd8(g,out+6)==255 && rd8(g,out+7)==255);
+    CHECK(rd16(g,out+8)==0x8000 && rd16(g,out+10)==0x7fff && rd32(g,out+12)==0 && rd32(g,out+16)==0xa5a5a5a5);
+    extern void rt_imp_xinput1_4__ord2(KCtx *),rt_imp_xinput1_4__ord100(KCtx *),rt_imp_xinput1_4__XInputGetState(KCtx *),rt_imp_xinput1_4__XInputGetStateEx(KCtx *);
+    void (*getters[])(KCtx *)={rt_imp_xinput1_4__ord2,rt_imp_xinput1_4__ord100,rt_imp_xinput1_4__XInputGetState,rt_imp_xinput1_4__XInputGetStateEx};
+    for(int i=0;i<4;i++){ do_call(g,getters[i],0,out,0,0,0,0); CHECK(KH_RAX(g)==0 && rd64(g,out+4)==0); }
+    kh_input_state(g,0,out,10);
+    packet=rd32(g,out); kh_input_state(g,0,out,12); CHECK(rd32(g,out)==packet);
+    kh_input_state(g,0,out,13); CHECK(rd32(g,out)==packet+1 && rd64(g,out+4)==0 && rd32(g,out+12)==0);
+    kh_input_state(g,0,out,20); CHECK(rd16(g,out+4)==0xe3ef);
+    kh_input_state(g,0,out,30); CHECK(rd32(g,out+4)==0 && rd16(g,out+8)==1 && rd16(g,out+10)==0xffff);
+    kh_input_state(g,0,out,3001); CHECK(rd64(g,out+4)==0);
+    extern void kh_input_attach(KCtx *);
+    kh_call(g,GS_BASE+0x1335a0,0xab0001,0,0,0);
+    kh_input_attach(g);
+    CHECK(rd32(g,GS_BASE+0x8bb2a8+0x10)==0 && rd64(g,GS_BASE+0x8bb2a8+0xb8)!=0);
+    extern _Atomic u64 gfx_presents; u64 saved_present=gfx_presents; gfx_presents=10;
+    u64 data=ga_calloc(1,128);
+    kh_call(g,GS_BASE+0x134d10,GS_BASE+0x8bb2a8,data,0,0);
+    CHECK(rd64(g,GS_BASE+0x8bb2a8+0x18)==0x4308);
+    CHECK(rd16(g,data)==0x4308);
+    gfx_presents=saved_present; ga_free(data);
+    kh_input_load(g,getenv("KHNMC_INPUT_SCRIPT")); ga_free(out);
+}
+
 int kh_selftest(KCtx *g){
+    input_selftest(g);
     /* allocator */
     u64 p[64]; for(int i=0;i<64;i++){ p[i]=ga_alloc((u64)(i*37+1),(i%5==0)?64:16); CHECK(p[i]&&!(p[i]&15)); if(i%5==0) CHECK(!(p[i]&63)); memset(hp(g,p[i]),0xA5,(size_t)(i*37+1)); }
     for(int i=0;i<64;i+=2) ga_free(p[i]); u64 q=ga_calloc(10,10); CHECK(q&&rd64(g,q)==0&&rd64(g,q+88)==0); q=ga_realloc(q,5000); CHECK(q&&ga_usable(q)>=5000);

@@ -214,3 +214,7 @@ u64  kh_spawn_hostfn_thread(KCtx *g,const char *name,KhFn fn,u64 param);
 
 int kh_resolve_ci(const char *base,const char *rel,char *out,size_t cap);
 int kh_file_selftest(KCtx *g);
+
+void kh_phase_file(KCtx *g,const char *path);
+void kh_phase_present(KCtx *g,u64 present,u64 draws,u64 clears,u64 psos);
+void kh_input_attach(KCtx *g);

@@ -75,6 +75,7 @@ static int h_output(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return
 static int h_swap(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)c;
     switch(s){
     case 8: case 22: gfx_presents++;
+        kh_phase_present(g,gfx_presents,gfx_draws,gfx_clears,gfx_pso_binds);
         fprintf(stderr,"kh: gfx frame=%llu bundles=%llu pso-binds=%llu ",(unsigned long long)gfx_presents,(unsigned long long)gfx_bundles,(unsigned long long)gfx_pso_binds);
         kh_gfx_report(stderr);
         wr32(g,o+40,rd32(g,o+40)+1); SET_RAX(g,0); return 1;                 /* Present / Present1 */

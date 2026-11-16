@@ -33,6 +33,7 @@ static int package_fallback(const char *path){
     return 1;
 }
 static void file_log(KCtx *g,const char *path,const char *source,int size){
+    kh_phase_file(g,path);
     const char *log=getenv("KHNMC_FILELOG"); FILE *lf=fopen(log?log:"filelog.txt","a");
     if(!lf) kh_fatal(g,"cannot append file log %s",log?log:"filelog.txt");
     int failed=fprintf(lf,"%s %s %d %s\n",source?"HIT":"MISS",source?source:"NONE",size,path)<0;

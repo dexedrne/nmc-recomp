@@ -1,0 +1,61 @@
+/* Entry probes selected from the corrected name DB and platform/MOVIES.md.
+ * Archive aliases keep same-shard relocations and function-table entries on these hooks. */
+#include "khnmc_rt.h"
+static pthread_mutex_t phase_lock=PTHREAD_MUTEX_INITIALIZER;
+static char **seen;
+static size_t nseen,reported;
+static _Atomic u64 entries[11];
+static const char *names[]={"1505a0:GAME_MODE.start","5111d0:InitialSetting.ctor","5122e0:InitialSetting.vfn1","511300:InitialSetting.dtor","13da10:movie.open","13d260:movie.prepare","405440:EVENT.MapEvent","3f29e0:FIELD_COMMAND.execute","3c12f0:BATTLE.calc_damage","2b4590:title.Layout.task","4f94b0:SettingMenu.vfn1"};
+#define PHASE(RVA,I) void orig_f_##RVA(KCtx *); void f_##RVA(KCtx *g){ entries[I]++; orig_f_##RVA(g); }
+PHASE(1505a0,0)
+PHASE(5111d0,1)
+void orig_f_5122e0(KCtx *);
+static _Atomic int initial_state=-1,initial_choice=-1;
+void f_5122e0(KCtx *g){
+    entries[2]++;
+    initial_state=rd32(g,A0(g)+0x48); initial_choice=rd16(g,A0(g)+0x2ce);
+    static int previous=-1;
+    if(previous!=initial_state){ extern _Atomic u64 gfx_presents;
+        fprintf(stderr,"kh: InitialSetting frame=%llu state=%d choice=%d\n",(unsigned long long)gfx_presents,(int)initial_state,(int)initial_choice); previous=initial_state;
+    }
+    orig_f_5122e0(g);
+}
+PHASE(511300,3)
+PHASE(13da10,4)
+PHASE(13d260,5)
+PHASE(405440,6)
+PHASE(3f29e0,7)
+PHASE(3c12f0,8)
+PHASE(2b4590,9)
+void orig_f_4f94b0(KCtx *);
+void f_4f94b0(KCtx *g){
+    entries[10]++;
+    static int previous=-1; int state=rd32(g,A0(g)+0x774);
+    if(previous!=state){ extern _Atomic u64 gfx_presents;
+        fprintf(stderr,"kh: SettingMenu frame=%llu state=%d\n",(unsigned long long)gfx_presents,state); previous=state;
+    }
+    orig_f_4f94b0(g);
+}
+void kh_phase_file(KCtx *g,const char *path){
+    pthread_mutex_lock(&phase_lock);
+    for(size_t i=0;i<nseen;i++) if(!strcmp(seen[i],path)){ pthread_mutex_unlock(&phase_lock); return; }
+    char **next=realloc(seen,(nseen+1)*sizeof *seen);
+    if(!next) kh_fatal(g,"phase log: file list allocation failed"); seen=next;
+    seen[nseen]=strdup(path); if(!seen[nseen]) kh_fatal(g,"phase log: path allocation failed"); nseen++;
+    pthread_mutex_unlock(&phase_lock);
+}
+void kh_phase_present(KCtx *g,u64 present,u64 draws,u64 clears,u64 psos){
+    if(present%60) return;
+    static u64 prev_draws,prev_clears,prev_psos;
+    const char *path=getenv("KHNMC_PHASELOG"); if(!path) path="phase.log";
+    pthread_mutex_lock(&phase_lock);
+    FILE *f=fopen(path,"a"); if(!f) kh_fatal(g,"phase log: cannot append %s",path);
+    fprintf(f,"present=%llu draws=%llu clears=%llu pso-binds=%llu files=[",(unsigned long long)present,(unsigned long long)(draws-prev_draws),(unsigned long long)(clears-prev_clears),(unsigned long long)(psos-prev_psos));
+    for(size_t i=reported;i<nseen;i++) fprintf(f,"%s%s",i==reported?"":" | ",seen[i]);
+    reported=nseen; fprintf(f,"] initial-state=%d choice=%d entries=[",(int)initial_state,(int)initial_choice);
+    for(int i=0;i<11;i++) fprintf(f,"%s%s=%llu",i?" ":"",names[i],(unsigned long long)atomic_exchange(&entries[i],0));
+    int failed=fprintf(f,"]\n")<0 || ferror(f);
+    if(fclose(f)||failed) kh_fatal(g,"phase log: write failed %s",path);
+    prev_draws=draws; prev_clears=clears; prev_psos=psos;
+    pthread_mutex_unlock(&phase_lock);
+}

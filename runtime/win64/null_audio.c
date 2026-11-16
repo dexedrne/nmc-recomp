@@ -84,7 +84,7 @@ static int h_xa2(KCtx *g,u64 o,int s,const char *c){
         state->flags=s==5?(u32)A3(g):(u32)A4(g);
         for(u32 i=0;i<rd32(g,v+32);i++) state->channels[i]=0x3f800000;
         wr64(g,v+48,(uintptr_t)state);
-        if(!effect_chain(g,state,ARG(g,s==5?8:s==6?7:6))) kh_fatal(g,"null audio: invalid creation effect chain");
+        if(!effect_chain(g,state,ARG(g,s==7?6:7))) kh_fatal(g,"null audio: invalid creation effect chain");
         wr64(g,A1(g),v); break;
     }
     case 11: memset(hp(g,A1(g)),0,64); return 1; /* XAUDIO2_PERFORMANCE_DATA is 64 bytes. */
