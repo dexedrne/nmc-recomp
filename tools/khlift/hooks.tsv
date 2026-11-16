@@ -1,0 +1,4 @@
+# rva	symbol	reason     (functions NOT lifted: the call sites call the named runtime hook instead; guest ABI void f(KCtx*))
+# 0x150060 / 0x150080: fiber yield leaves (no .pdata) per scratch/s3-eh-fibers; the runtime implements them as stack switches
+0x150060	rt_hook_fiber_yield_150060	fiber yield leaf, 278 call sites (S3 verification)
+0x150080	rt_hook_fiber_yield_150080	fiber yield leaf, 14 call sites (S3 verification)
