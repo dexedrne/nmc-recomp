@@ -1,0 +1,236 @@
+"""Leaf (no-.pdata) function discovery to a fixpoint: strong refs -> recursive descent -> gap-scan of orphan code.
+Writes gapfn.pkl"""
+import pickle, bisect, collections, re, json
+import struct
+import cfgscan as C, x64scan as S
+exec(open('u2_eh.py').read().split("if __name__=='__main__':")[0])
+CD=pickle.load(open('cand.pkl','rb')); cand={k:set(v) for k,v in CD['cand'].items()}
+img=S.img
+for m in json.load(open('/home/user/projects/kh2-nmc-analysis/scratch/S7-name-db/clr_methods.json')):
+    if m['kind']=='native' and S.in_exec(m['rva']): cand.setdefault(m['rva'],set()).add('clr-native')
+pd=sorted((r['b'],r['e']) for r in out); pds=[a for a,b in pd]
+pdbegins=frozenset(pds)
+EX=sorted((a,b) for _,a,b in P.exec_secs)
+NEP=[(a,b) for n,a,b in P.exec_secs if n=='.nep'][0]
+gaps=[]
+for ea,eb in EX:
+    p=ea
+    k=bisect.bisect_left(pds,ea)
+    for a,b in pd[k:]:
+        if a>=eb: break
+        if a>p: gaps.append((p,a))
+        p=max(p,b)
+    if p<eb: gaps.append((p,eb))
+gstarts=[a for a,b in gaps]
+def gap_of(x):
+    k=bisect.bisect_right(gstarts,x)-1
+    return gaps[k] if k>=0 and gaps[k][0]<=x<gaps[k][1] else None
+STRONG={'call','tailjmp','vtable','reloc-ptr','init-xc','init-xi','export','entry','tls-callback','eh-cleanup','eh-catch','eh-seh-filter','eh-seh-finally','clr-native'}
+WEAK={'rip-ref','jcc-out'}
+stops=set(pdbegins)
+tags=collections.defaultdict(set)    # gap function start -> discovery tags
+weak={}
+for t,tg in cand.items():
+    if t in pdbegins: continue
+    g=gap_of(t)
+    if g is None: continue
+    s=tg&STRONG
+    if s: tags[t]|=tg-{'jumptable'}; stops.add(t)
+    elif tg&WEAK: weak[t]=set(tg)
+# ---------------- .nep: 16-byte stub units with signature (jmp+8; ud2; jmp [a]; jmp [b])
+NEPSIG=re.compile(rb'@KHINPUT(slash,pc/kh2fm.exe,5732352,6,8c6b6bfa1d58d182a6a4d17a700dad0910b4c93407ecc0fb4421cb8061b19169)@....\xff\x25....',re.S)
+nep_units={}
+for u in range(NEP[0],NEP[1]-15,16):
+    if NEPSIG.fullmatch(img[u:u+16]): nep_units[u]=(u,u+16)
+print('nep 16B stub units',len(nep_units))
+for u in nep_units:
+    if u not in tags: tags[u]={'nep-unit'}; stops.add(u)
+    else: tags[u].add('nep-unit')
+# ---------------- CLR IL method bodies live inside .text (mixed-mode image): exact extents from the method headers
+il_ranges=[]
+def il_extent(rva):
+    b=img[rva]
+    if b&3==2: return rva+1+(b>>2)
+    if b&3==3:
+        flags=struct.unpack_from('<H',img,rva)[0]; hs=(flags>>12)*4
+        cs=struct.unpack_from('<I',img,rva+4)[0]
+        end=rva+hs+cs
+        if flags&8:
+            end=(end+3)&~3
+            while True:
+                kind=img[end]
+                if kind&0x40: sz=img[end+1]|(img[end+2]<<8)|(img[end+3]<<16)
+                else: sz=img[end+1]
+                end+=sz
+                if not kind&0x80: break
+        return end
+    return None
+for m in json.load(open('/home/user/projects/kh2-nmc-analysis/scratch/S7-name-db/clr_methods.json')):
+    if m['kind']=='il' and S.in_exec(m['rva']):
+        e=il_extent(m['rva'])
+        if e: il_ranges.append((m['rva'],e,m['type'],m['name']))
+il_ranges.sort()
+print('IL bodies in exec sections',len(il_ranges),'bytes',sum(e-a for a,e,_,_ in il_ranges))
+fn={}; owner={}
+def run_fn(t):
+    g=gap_of(t)
+    lo,hi=g
+    r=C.analyze2([t],lambda x:t<=x<hi and not ilmask[x],stops,frozenset([t]),fstart=lambda x:x!=t and x%16==0 and img[x-1]==0xcc)
+    ins=r['insn']; r['start']=t
+    dat=[]
+    for jt in r['jtabs']:
+        dat.append((jt['table'],jt['table']+4*jt['n'],'jumptable'))
+        bt=jt['byte_table']
+        if bt[0] is not None and bt[1]: dat.append((bt[0],bt[0]+bt[1],'jt-bytes'))
+    r['data']=[d for d in dat if lo<=d[0] and d[1]<=hi]
+    if t in nep_units:   # unit covers the unreached ud2 + first jmp slot
+        for a in range(t,t+16):
+            pass
+        r['nep_unit']=True
+    return r
+covmask=bytearray(EX[-1][1]+16)
+ilmask=bytearray(EX[-1][1]+16)
+for a_,e_,_,_ in il_ranges:
+    for k_ in range(a_,e_): ilmask[k_]=1
+def install(t,r):
+    old=fn.get(t)
+    if old:
+        for a in old['insn']:
+            if owner.get(a)==t: del owner[a]
+    fn[t]=r
+    for a,s_ in r['insn'].items():
+        owner.setdefault(a,t)
+        for k in range(a,a+s_): covmask[k]=1
+    for da,db,_ in r['data']:
+        for k in range(da,db): covmask[k]=1
+def targets_of(r):
+    for s,t in r['calls']: yield t,'call'
+    for s,t,c in r['jmp_out']: yield t,('jcc-out' if (c and not (t%16==0 and img[t-1]==0xcc)) else ('tailjmp' if not c else 'tailjmp-cond'))
+    for s,t,m in r['rip_code']: yield t,'rip-ref'
+def absorb(r):
+    new=[]
+    for tt,tag in targets_of(r):
+        if not S.in_exec(tt) or tt in pdbegins: continue
+        if gap_of(tt) is None: continue
+        if tag in('call','tailjmp','tailjmp-cond'):
+            if tt not in tags: new.append(tt); stops.add(tt)
+            tags[tt].add('tailjmp' if tag.startswith('tailjmp') else tag)
+        else: weak.setdefault(tt,set()).add(tag)
+    return new
+def fixpoint(pending):
+    pending=list(pending)
+    while True:
+        while pending:
+            t=pending.pop()
+            if t in fn: continue
+            r=run_fn(t); install(t,r); pending+=absorb(r)
+        # conflicts: a strong start that lies on an instruction of another function -> re-analyse the owner
+        redo=set()
+        for s in list(tags):
+            o=owner.get(s)
+            if o is not None and o!=s: redo.add(o)
+            if s in fn: continue
+        # also starts that sit inside another function's instruction bytes (misaligned) are ignored here
+        for s in tags:
+            if s not in fn: pending.append(s)
+        if not redo and not pending: break
+        for o in redo:
+            r=run_fn(o); install(o,r); pending+=absorb(r)
+        if not redo and not pending: break
+    return
+fixpoint(sorted(tags))
+print('after strong refs: functions',len(fn),'strong',len(tags))
+# ---------------- orphan gap-scan
+def uncovered_subchunks():
+    cov=bytearray(EX[-1][1]+16)
+    for f,r in fn.items():
+        for a,s in r['insn'].items():
+            for k in range(a,a+s): cov[k]=1
+        for da,db,_ in r['data']:
+            for k in range(da,db): cov[k]=1
+    for u,(a,b) in nep_units.items():
+        for k in range(a,b): cov[k]=1
+    for a,b,_,_ in il_ranges:
+        for k in range(a,b): cov[k]=1
+    subs=[]
+    for a,b in gaps:
+        p=a
+        while p<b:
+            if cov[p]: p+=1; continue
+            q=p
+            while q<b and not cov[q]: q+=1
+            subs.append((p,q))
+            p=q
+    return subs,cov
+def is_nopseq(d):
+    n=0
+    for i in S.md.disasm(d,0):
+        if i.mnemonic not in('nop','xchg','int3'): return False
+        n+=i.size
+    return n==len(d)
+orph_rej=[]
+rounds=0
+rejected=set()
+def skip_nops(a,b):
+    """advance over leading multi-byte NOP padding"""
+    p=a
+    while p<b:
+        i=S.decode_one(p)
+        if i is None or p+i.size>b: break
+        if i.mnemonic=='nop' or (i.mnemonic=='xchg' and i.size==2 and i.op_str.replace(' ','').split(',')[0]==i.op_str.replace(' ','').split(',')[-1]):
+            p+=i.size
+        else: break
+    return p
+while True:
+    rounds+=1
+    subs,cov=uncovered_subchunks()
+    added=0
+    for a0,b in subs:
+        cur=a0
+        while cur<b:
+            while True:
+                while cur<b and (img[cur]==0xcc or covmask[cur]): cur+=1
+                a=skip_nops(cur,b)
+                if a==cur or a>=b: break
+                cur=a
+            if a>=b: break
+            if a in fn or a in rejected:
+                # already known start inside leftover: skip past it
+                cur=a+1 if a in rejected else max(x+s_ for x,s_ in fn[a]['insn'].items()); 
+                if a in rejected: break
+                continue
+            lo,hi=gap_of(a)
+            r=C.analyze2([a],lambda x,a=a:a<=x<hi and not ilmask[x],stops,frozenset([a]),fstart=lambda x,a=a:x!=a and x%16==0 and img[x-1]==0xcc)
+            ins=r['insn']
+            if not ins: rejected.add(a); orph_rej.append((a,'nodecode')); break
+            last=max(ins); li=S.decode_one(last)
+            term=li.mnemonic in('ret','jmp','ud2','int3') or bool(r['fall_stop'] or r['fall_out'])
+            if not term: rejected.add(a); orph_rej.append((a,'noterm')); break
+            tags[a].add('gap-scan'); stops.add(a)
+            r=run_fn(a); install(a,r); added+=1
+            fixpoint(absorb(r))
+            end=max(x+s_ for x,s_ in fn[a]['insn'].items())
+            cur=max(end,cur+1)
+    print('orphan round',rounds,'added',added)
+    if not added: break
+# weak refs: accept those that are not claimed by any function and sit at an uncovered byte
+accepted_weak=[];rejected_weak=[]
+for t,tg in sorted(weak.items()):
+    if t in fn: tags[t]|=tg; continue
+    if t in owner: rejected_weak.append((t,'interior-of',owner[t],sorted(tg))); continue
+    rejected_weak.append((t,'not-code-start',None,sorted(tg)))
+# ---------------- final bookkeeping
+subs,cov=uncovered_subchunks()
+left=[]
+for a0,b in subs:
+    cur=a0
+    while cur<b:
+        while cur<b and (img[cur]==0xcc or covmask[cur]): cur+=1
+        c2=skip_nops(cur,b)
+        if c2>cur: cur=c2; continue
+        if cur<b:
+            q=cur
+            while q<b and img[q]!=0xcc: q+=1
+            left.append((cur,q)); cur=q
+print('functions',len(fn),'leftover non-padding chunks',len(left),'bytes',sum(b-a for a,b in left),'orphan rejections',collections.Counter(r for a,r in orph_rej))
+pickle.dump(dict(fn=fn,tags={k:set(v) for k,v in tags.items()},weak=weak,gaps=gaps,EX=EX,nep_units=nep_units,il_ranges=il_ranges,left=left,orph_rej=orph_rej,rejected_weak=rejected_weak,stops=stops),open('gapfn.pkl','wb'))

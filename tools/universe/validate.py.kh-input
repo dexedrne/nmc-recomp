@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""Independent re-check of functions.json / functions.tsv / ranges.tsv / coverage.json against the exe.
+Usage: python3 validate.py [path-to-kh2fm.exe]    (needs pefile + capstone; read-only; never executes code from the exe)
+Exit status 0 = all checks pass."""
+import sys, os, json, struct, hashlib, bisect, collections, csv
+import pefile
+from capstone import Cs, CS_ARCH_X86, CS_MODE_64, CS_OP_IMM, CS_OP_MEM
+HERE=os.path.dirname(os.path.abspath(__file__))
+EXE=sys.argv[1] if len(sys.argv)>1 else '/home/user/projects/kh2-nmc-analysis/pc/kh2fm.exe'
+raw=open(EXE,'rb').read()
+sha=hashlib.sha256(raw).hexdigest()
+pe=pefile.PE(data=raw); img=bytes(pe.get_memory_mapped_image()); BASE=pe.OPTIONAL_HEADER.ImageBase
+fails=[]; notes=[]
+def check(name,ok,detail=''):
+    print(('PASS ' if ok else 'FAIL ')+name+((' -- '+str(detail)) if detail!='' else ''))
+    if not ok: fails.append(name)
+check('exe sha256 starts 9002b2de6a1f91a7',sha.startswith('9002b2de6a1f91a7'),sha[:16])
+J=json.load(open(os.path.join(HERE,'functions.json')))
+F=J['functions']
+check('json exe hash matches',J['exe_sha256']==sha)
+check('ids unique and sorted by start',[f['id'] for f in F]==sorted(set(f['id'] for f in F)) and all(F[i]['start_rva']<F[i+1]['start_rva'] for i in range(len(F)-1)),len(F))
+EX=[(s.Name.rstrip(b'\0').decode(),s.VirtualAddress,s.VirtualAddress+s.Misc_VirtualSize) for s in pe.sections if s.Characteristics&0x20000000]
+inexec=lambda a,b: any(x<=a and b<=y for _,x,y in EX)
+# ---- 1. .pdata: re-parse, merge chains, compare
+d=pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]; n=d.Size//12
+ent=[struct.unpack_from('<III',img,d.VirtualAddress+12*i) for i in range(n)]
+byb={e[0]:e for e in ent}; ends=[e[0] for e in ent]
+def uinfo(u):
+    fl=img[u]>>3; nc=img[u+2]; tail=u+4+((nc+1)&~1)*2
+    return fl,(struct.unpack_from('<III',img,tail) if fl&4 else None)
+def entry_idx(a):
+    i=bisect.bisect_right(ends,a)-1
+    return i if i>=0 and ent[i][0]<=a<ent[i][1] else None
+par={}
+for i,(b,e,u) in enumerate(ent):
+    fl,ch=uinfo(u&~1)
+    if ch: par[i]=entry_idx(ch[0])
+def root(i):
+    k=0
+    while i in par and k<10000: i=par[i]; k+=1
+    return i
+check('pdata sorted/non-overlapping',all(ent[i][1]<=ent[i+1][0] for i in range(n-1)),n)
+groups=collections.defaultdict(list)
+for i in range(n): groups[root(i)].append(i)
+check('chain parents all resolve',all(v is not None for v in par.values()),len(par))
+pd_funcs={f['start_rva']:f for f in F if f['has_pdata']}
+check('number of merged pdata functions equals roots',len(groups)==len(pd_funcs),(n,len(par),len(groups)))
+ok=True; bad=None
+for r,idxs in groups.items():
+    rb=ent[r][0]; f=pd_funcs.get(rb)
+    exp=sorted((ent[i][0],ent[i][1]) for i in idxs)
+    if f is None or sorted(map(tuple,f['ranges']))!=exp or f['n_pdata_entries']!=len(idxs) or f['size']!=sum(b-a for a,b in exp) or tuple(f['ranges'][0])!=(rb,ent[r][1]):
+        ok=False; bad=hex(rb); break
+check('every pdata function has ALL merged ranges, exact total size, primary range first',ok,bad or '')
+check('functions with fragments = 3315',sum(1 for f in pd_funcs.values() if len(f['ranges'])>1)==3315)
+def merged(rs):
+    o=[]
+    for a,b in sorted(rs):
+        if o and a<=o[-1][1]: o[-1][1]=max(o[-1][1],b)
+        else: o.append([a,b])
+    return o
+check('extents field = merge of ranges; every function is ONE contiguous extent',all(f['extents']==merged(f['ranges']) and len(f['extents'])==1 and f['extents'][0][1]-f['extents'][0][0]==f['size'] for f in F),sum(1 for f in F if len(f['extents'])>1))
+# ---- 2. ranges
+rs=sorted((a,b,f['id']) for f in F for a,b in f['ranges'])
+ov=[(rs[i],rs[i+1]) for i in range(len(rs)-1) if rs[i][1]>rs[i+1][0]]
+check('no range overlaps anywhere (%d ranges)'%len(rs),not ov,ov[:2])
+check('all ranges inside executable sections',all(inexec(a,b) for a,b,_ in rs))
+check('all functions: start in primary range, size=sum(ranges)',all(f['ranges'][0][0]<=f['start_rva']<f['ranges'][0][1] and f['size']==sum(b-a for a,b in f['ranges']) for f in F))
+leaf=[f for f in F if not f['has_pdata']]
+pdr=sorted((a,b) for f in F if f['has_pdata'] for a,b in f['ranges']); pst=[a for a,b in pdr]
+def in_pd(a,b):
+    k=bisect.bisect_right(pst,a)-1
+    if k>=0 and pdr[k][1]>a: return True
+    return k+1<len(pdr) and pdr[k+1][0]<b
+check('no leaf function range touches a .pdata range',not any(in_pd(a,b) for f in leaf for a,b in f['ranges']))
+# ---- 3. coverage
+cov=json.load(open(os.path.join(HERE,'coverage.json')))
+gaps=list(csv.DictReader(open(os.path.join(HERE,'gaps.tsv')),delimiter='\t'))
+tot=sum(y-x for _,x,y in EX)
+fb=sum(b-a for a,b,_ in rs); gb=sum(int(g['size']) for g in gaps)
+check('coverage: function bytes + classified non-function bytes = all executable bytes',fb+gb==tot==cov['total_exec_bytes'],(fb,gb,tot))
+check('coverage: zero unknown bytes',all(g['class']!='unknown' for g in gaps))
+check('coverage.json function_bytes matches',cov['function_bytes']==fb)
+# gaps do not overlap functions
+gr=sorted((int(g['start_rva'],16),int(g['end_rva'],16)) for g in gaps)
+allr=sorted([(a,b) for a,b,_ in rs]+gr)
+check('gap rows and function ranges tile the executable sections without overlap',all(allr[i][1]<=allr[i+1][0] for i in range(len(allr)-1)))
+# padding gaps really are padding
+md=Cs(CS_ARCH_X86,CS_MODE_64); md.detail=True
+def padding_ok(a,b,cls):
+    d=img[a:b]
+    if cls=='padding-int3': return all(x==0xcc for x in d)
+    if cls=='padding-nop':
+        p=a
+        while p<b:
+            ins=next(md.disasm(img[p:b],p,1),None)
+            if ins is None or ins.mnemonic not in('nop','int3'): return False
+            p+=ins.size
+        return True
+    if cls=='il-align-pad': return all(x==0 for x in d) and len(d)<=3
+    return True
+check('padding gap rows contain only padding bytes',all(padding_ok(int(g['start_rva'],16),int(g['end_rva'],16),g['class']) for g in gaps))
+# IL bodies: header check
+ilok=True
+for g in gaps:
+    if g['class']=='clr-il-body':
+        a=int(g['start_rva'],16); b=img[a]
+        if b&3 not in (2,3): ilok=False
+check('CLR IL body gap rows start with a valid IL method header',ilok,sum(1 for g in gaps if g['class']=='clr-il-body'))
+# ---- 4. linear re-decode: every direct call/jmp target leaving a function is a function start
+starts={f['start_rva'] for f in F}
+fr=[a for f in F for a,b,k in [(x['begin'],x['end'],x['role']) for x in f['fragments']]]
+allstart=starts|set(fr)
+rstarts=[a for a,b,_ in rs]
+def own(f,t): return any(a<=t<b for a,b in f['ranges'])
+bad=[]; nedge=0; nundec=0
+for f in F:
+    data=sorted((a,b) for a,b,k in f['data_in_code'])
+    for a,b in f['ranges']:
+        p=a
+        while p<b:
+            hit=[y for x,y in data if x<=p<y]
+            if hit: p=hit[0]; continue
+            ins=next(md.disasm(img[p:min(b,p+15)],p,1),None)
+            if ins is None: nundec+=1; p+=1; continue
+            if ins.mnemonic in('call','jmp') or ins.mnemonic.startswith('j'):
+                o=ins.operands[0]
+                if o.type==CS_OP_IMM:
+                    t=o.imm; nedge+=1
+                    if not own(f,t) and t not in allstart: bad.append((f['id'],hex(p),hex(t),ins.mnemonic))
+            p+=ins.size
+check('independent linear decode: every direct call/jmp target is a function start (or inside the same function)',len(bad)<=0,{'edges':nedge,'bad':len(bad),'undecodable_bytes':nundec,'examples':bad[:4]})
+# recorded edges equal fresh edges? (sets of recorded targets are all starts)
+rec_bad=[(f['id'],hex(t)) for f in F for t in f['calls']+f['tail_targets'] if t not in allstart]
+check('recorded calls/tail_targets all resolve to function starts',not rec_bad,rec_bad[:3])
+# ---- 5. relocations / vtables / init tables resolve to starts
+va,sz=pe.OPTIONAL_HEADER.DATA_DIRECTORY[5].VirtualAddress,pe.OPTIONAL_HEADER.DATA_DIRECTORY[5].Size
+sites=[]; p=va
+while p<va+sz:
+    page,bsz=struct.unpack_from('<II',img,p)
+    if bsz<8: break
+    for k in range((bsz-8)//2):
+        w=struct.unpack_from('<H',img,p+8+2*k)[0]
+        if w>>12==10: sites.append(page+(w&0xfff))
+    p+=bsz
+nonstart=[];nptr=0
+for s in sites:
+    t=struct.unpack_from('<Q',img,s)[0]-BASE
+    if any(x<=t<y for _,x,y in EX):
+        nptr+=1
+        if t not in starts: nonstart.append((hex(s),hex(t)))
+check('every base-relocated code pointer (%d) targets a function start'%nptr,not nonstart,nonstart[:3])
+relset=set(sites); rdata=[(s.VirtualAddress,s.VirtualAddress+s.Misc_VirtualSize) for s in pe.sections if s.Name.rstrip(b'\0')==b'.rdata'][0]
+cols={}
+for r in range(rdata[0],rdata[1]-24,4):
+    if struct.unpack_from('<I',img,r)[0]!=1: continue
+    off,cd,td,ch,ob=struct.unpack_from('<IIIII',img,r+4)
+    if ob==r and 0<td<len(img)-32 and img[td+16:td+20] in(b'.?AV',b'.?AU'): cols[BASE+r]=r
+nvt=0;slots=set()
+for s in sites:
+    if struct.unpack_from('<Q',img,s)[0] in cols:
+        nvt+=1; q=s+8
+        while q in relset:
+            t=struct.unpack_from('<Q',img,q)[0]-BASE
+            if not any(x<=t<y for _,x,y in EX): break
+            slots.add(t); q+=8
+check('RTTI vtables = 1066 and unique virtual targets = 5990',nvt==1066 and len(slots)==5990,(nvt,len(slots)))
+vflag={f['start_rva'] for f in F if f['is_virtual_target']}
+check('every virtual target is a function and is flagged is_virtual_target',slots==vflag and slots<=starts)
+# ---- 6. EH funclets
+FH3=None
+iat={}
+for e in pe.DIRECTORY_ENTRY_IMPORT:
+    for i in e.imports: iat[i.address-BASE]=(i.name or b'').decode()
+def handler_name(h):
+    if img[h:h+2]==b'\xff\x25': return iat.get(h+6+struct.unpack_from('<i',img,h+2)[0])
+    if img[h:h+15]==bytes.fromhex('@KHINPUT(hex,pc/kh2fm.exe,4427208,15,ce9059388674802a0c080a3e51713289840caa38034c6f62097eae62589523ae)@'): return '__GSHandlerCheck'
+    if img[h:h+11]==bytes.fromhex('@KHINPUT(hex,pc/kh2fm.exe,939312,11,7a30da41c47c80cb128b264262f15db099d4c041e2cafe1b60ee45179802c4f3)@'): return '__GSHandlerCheck_EH'
+fun=set()
+for i,(b,e,u) in enumerate(ent):
+    u&=~1; fl=img[u]>>3
+    if fl&4 or not fl&3: continue
+    nc=img[u+2]; tail=u+4+((nc+1)&~1)*2; h=struct.unpack_from('<I',img,tail)[0]; nm=handler_name(h)
+    if nm in('__CxxFrameHandler3','__GSHandlerCheck_EH'):
+        fi=struct.unpack_from('<I',img,tail+4)[0]
+        if struct.unpack_from('<I',img,fi)[0]!=0x19930522: continue
+        ms,um,nt,tm=struct.unpack_from('<iIII',img,fi+4)[0],struct.unpack_from('<I',img,fi+8)[0],struct.unpack_from('<I',img,fi+12)[0],struct.unpack_from('<I',img,fi+16)[0]
+        for k in range(ms):
+            act=struct.unpack_from('<iI',img,um+8*k)[1]
+            if act: fun.add(act)
+        for k in range(nt):
+            lo,hi,chi,nc2,ha=struct.unpack_from('<iiiII',img,tm+20*k)
+            for c in range(nc2):
+                doh=struct.unpack_from('<IiiII',img,ha+20*c)[3]
+                if doh: fun.add(doh)
+    elif nm=='__C_specific_handler':
+        cnt=struct.unpack_from('<I',img,tail+4)[0]
+        for k in range(cnt):
+            hn=struct.unpack_from('<I',img,tail+8+16*k+8)[0]
+            if hn>1: fun.add(hn)
+fset={f['start_rva'] for f in F if f['kind']=='funclet'}
+check('funclet set equals the set of addresses named by UnwindMap actions / catch handlers / SEH scope handlers',fun==fset,(len(fun),len(fset)))
+# ---- 7. kind sanity
+bad=[]
+for f in F:
+    k=f['kind']; a=f['start_rva']
+    if k=='root' and not f['has_pdata']: bad.append(f['id'])
+    if k=='import-stub':
+        if not((f['size']==6 and img[a:a+2]==b'\xff\x25') or (f['size']==7 and img[a:a+3]==b'\x48\xff\x25')): bad.append(f['id'])
+    if k in('thunk','trampoline','import-stub','leaf-no-pdata') and f['has_pdata']: bad.append(f['id'])
+check('kind sanity (root has pdata; import-stub is a 6/7-byte jmp [mem]; others no pdata)',not bad,bad[:3])
+check('exports (222) and entry point are function starts',all(a in starts for a in [e.address for e in pe.DIRECTORY_ENTRY_EXPORT.symbols])and pe.OPTIONAL_HEADER.AddressOfEntryPoint in starts)
+# ---- 8. TSV agrees with JSON
+rows=list(csv.DictReader(open(os.path.join(HERE,'functions.tsv')),delimiter='\t'))
+check('functions.tsv row count and ids match functions.json',len(rows)==len(F) and all(r['id']==f['id'] and int(r['start_rva'],16)==f['start_rva'] and int(r['size'])==f['size'] for r,f in zip(rows,F)))
+rr=list(csv.DictReader(open(os.path.join(HERE,'ranges.tsv')),delimiter='\t'))
+check('ranges.tsv row count equals total ranges',len(rr)==len(rs),len(rr))
+print()
+print('functions',len(F),'kinds',dict(collections.Counter(f['kind'] for f in F)))
+print('RESULT','ALL CHECKS PASSED' if not fails else 'FAILED: '+', '.join(fails))
+sys.exit(1 if fails else 0)

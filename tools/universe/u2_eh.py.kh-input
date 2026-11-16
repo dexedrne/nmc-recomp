@@ -1,0 +1,99 @@
+"""Step 1b: C++ EH (FH3) and SEH tables -> funclet references. Imports u1 parse."""
+import struct, collections, json, bisect
+exec(open('u1_pdata.py').read().split("cc=collections.Counter()")[0])
+def u32(r): return struct.unpack_from('<I',img,r)[0]
+def i32(r): return struct.unpack_from('<i',img,r)[0]
+def idstub(rva):
+    """resolve a jmp [rip+x] stub -> import name via pefile"""
+    return None
+iat={}
+for e in P.pe.DIRECTORY_ENTRY_IMPORT:
+    for i in e.imports: iat[i.address-P.base]=(e.dll.decode(),(i.name.decode() if i.name else 'ord%d'%i.ordinal))
+def stub_import(rva):
+    if img[rva:rva+2]==b'\xff\x25':
+        t=rva+6+i32(rva+2); return iat.get(t)
+    return None
+# classify handler routines
+HANDLERS={}
+for r in out:
+    h=r['handler']
+    if h is not None and h not in HANDLERS:
+        s=stub_import(h)
+        HANDLERS[h]=s[1] if s else None
+# GS handlers are CRT static code: identify by signature (checked against bytes)
+GS_SIG=bytes.fromhex('@KHINPUT(hex,pc/kh2fm.exe,4427208,15,ce9059388674802a0c080a3e51713289840caa38034c6f62097eae62589523ae)@')
+GSEH_SIG=bytes.fromhex('@KHINPUT(hex,pc/kh2fm.exe,1616080,24,cc031e2d23653701fd494f0f266667ed8a57fd8cfc98623d7947385393615ccf)@')
+for h in HANDLERS:
+    if HANDLERS[h] is None:
+        if img[h:h+len(GS_SIG)]==GS_SIG: HANDLERS[h]='__GSHandlerCheck'
+        elif img[h:h+len(GSEH_SIG)]==GSEH_SIG: HANDLERS[h]='__GSHandlerCheck_EH'
+        else: HANDLERS[h]='unknown'
+def entry_idx(a):
+    i=bisect.bisect_right(starts,a)-1
+    return i if i>=0 and out[i]['b']<=a<out[i]['e'] else None
+def root_of(i):
+    seen=0
+    while out[i]['chain'] and seen<1000:
+        j=out[i].get('parent_idx')
+        if j is None: break
+        i=j; seen+=1
+    return i
+for i,r in enumerate(out):
+    if r['chain']:
+        r['parent_idx']=entry_idx(r['chain'][0])
+for i,r in enumerate(out):
+    r['root_idx']=root_of(i)
+# ---- EH tables
+refs=collections.defaultdict(list)   # funclet rva -> [(kind, owner root rva)]
+funcinfo_bad=[]
+funcinfos={}
+seh_tables={}
+def parse_funcinfo(fi, owner):
+    magic=u32(fi)
+    if magic not in (0x19930520,0x19930521,0x19930522): funcinfo_bad.append((owner,fi,magic)); return
+    maxState=u32(fi+4); um=u32(fi+8); nTry=u32(fi+12); tm=u32(fi+16)
+    acts=[]
+    for k in range(maxState):
+        to,act=struct.unpack_from('<iI',img,um+8*k)
+        acts.append((to,act))
+        if act: refs[act].append(('cleanup',owner))
+    catches=[]
+    for k in range(nTry):
+        lo,hi,chi,nc,ha=struct.unpack_from('<iiiII',img,tm+20*k)
+        for c in range(nc):
+            adj,dt,dco,doh,dfr=struct.unpack_from('<IiiII',img,ha+20*c)
+            catches.append(doh)
+            if doh: refs[doh].append(('catch',owner))
+    funcinfos[owner]=dict(fi=fi,magic=hex(magic),maxState=maxState,nTry=nTry,acts=acts,catches=catches)
+for i,r in enumerate(out):
+    h=r['handler']
+    if h is None: continue
+    t=HANDLERS[h]; owner=out[r['root_idx']]['b']
+    hd=r['hdata']
+    if t=='__CxxFrameHandler3': parse_funcinfo(u32(hd),r['b'])
+    elif t=='__GSHandlerCheck_EH': parse_funcinfo(u32(hd),r['b'])
+    elif t=='__C_specific_handler':
+        cnt=u32(hd); tab=[]
+        for k in range(cnt):
+            bg,en,hn,jt=struct.unpack_from('<IIII',img,hd+4+16*k)
+            tab.append((bg,en,hn,jt))
+            if hn>1: refs[hn].append(('seh-filter' if jt else 'seh-finally',r['b']))
+        seh_tables[r['b']]=tab
+if __name__=='__main__':
+    print('handlers',{hex(k):v for k,v in HANDLERS.items()})
+    print('funcinfo parsed',len(funcinfos),'bad',len(funcinfo_bad))
+    print('distinct funclet refs',len(refs),'refs total',sum(len(v) for v in refs.values()))
+    c=collections.Counter()
+    for a,rr in refs.items():
+        i=entry_idx(a)
+        if i is None: c['not_in_pdata']+=1; continue
+        e=out[i]
+        c['entry_begin' if e['b']==a else 'entry_mid']+=1
+        if e['b']==a: c['chained' if e['chain'] else 'root']+=1
+    print(c)
+    kinds=collections.Counter(k for rr in refs.values() for k,_ in rr); print(kinds)
+    # how many referenced funclets are begins of non-chained entries
+    fl=set(a for a in refs if entry_idx(a) is not None and out[entry_idx(a)]['b']==a and not out[entry_idx(a)]['chain'])
+    print('funclet roots',len(fl))
+    mid=[a for a in refs if entry_idx(a) is not None and out[entry_idx(a)]['b']!=a][:10]; print([hex(x) for x in mid])
+    nip=[a for a in refs if entry_idx(a) is None][:10]; print([hex(x) for x in nip])
