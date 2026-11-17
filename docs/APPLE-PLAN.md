@@ -65,3 +65,10 @@ Task 12 (static edits) merge, task 17 (heap/id table + KH2Moose heap sizes), tas
   windows, mute before any simulator run, never touch the "iPhone Duo" simulator or the physical phone, no retry loops, windowless
   launchd job for anything needing the login session; signing/installing on the phone stays owner-gated. Task 26: compile the runtime and
   the lifted C for iOS there (2 jobs at most: 8 GB RAM), then boot the selftest inside an iOS Simulator of our own.
+
+## App icon (owner's choice, 2026-11-17)
+The icon is a clean 1024x1024 redraw of the mod's own emblem (the red-outlined kneeling silhouette with two keyblades, from the
+mod's `icon.png`), chosen by the owner from three candidates. It is derived from the mod's art, so it is NOT committed: it lives at
+`~/Documents/khnmc/app-icon/AppIcon-1024.png` (opaque RGB, as iOS requires). The app shell step adds it at build time as a
+single-size `AppIcon` set in an asset catalog (one 1024x1024 image; Xcode derives the other sizes).
+
