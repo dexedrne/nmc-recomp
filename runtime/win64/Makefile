@@ -12,6 +12,8 @@
 #   make XLATE=2                  -> obj-x2-objcopy/, ./khnmc-x2-objcopy   (Linux: isolates bias bugs from Darwin bugs)
 #   make XLATE=2 HOOKMODE=rename  -> obj-x2-rename/,  ./khnmc-x2-rename    (Linux: the Darwin hook mechanism under the GNU linker)
 #   make  (on Darwin)             -> XLATE=2 HOOKMODE=rename by default, obj/, ./khnmc, clang, no vkd3d backend (tools/darwin_build.sh)
+#   make GFX_VKD3D=1 (on Darwin)  -> the same build WITH the wrapped graphics bridge (KHNMC_GFX=vkd3dw KHNMC_GFX_DRIVER=system):
+#                                    vkd3d's four STATIC libraries and MoltenVK, see "Task 21b" below.  Off unless asked for.
 # SHARDS_DIR = where the lifted shard_*.c are read from (default $(LIFTED)/shards; never written).
 #
 # Task 26:
@@ -67,7 +69,8 @@ XLATE ?= 2
 HOOKMODE ?= rename
 OL ?= obj
 BIN ?= khnmc$(IOSSFX)
-GFX_VKD3D = 0
+# the vkd3d backend is OFF on Darwin unless `make GFX_VKD3D=1` asks for it (Task 21b, block below); IOS_PATHS=1 keeps it off
+GFX_VKD3D ?= 0
 LDEXPORT =
 GEN_PREBUILT ?= 1
 else
@@ -90,7 +93,7 @@ endif
 O ?= $(OL)$(IOSSFX)
 # vkd3d graphics in a bias build (XLATE != 0): only the WRAPPED bridge (KHNMC_GFX=vkd3dw, runtime/gfx_wrap.c) exists there.  The trampoline
 # bridge (KHNMC_GFX=vkd3d) hands guest pointers to vkd3d as host pointers and is compiled only for x86-64 identity builds: in every other
-# build it is the named fatal gfx-vkd3d-needs-identity.  Darwin has no vkd3d yet (GFX_VKD3D = 0 above).
+# build it is the named fatal gfx-vkd3d-needs-identity.  Darwin: only with `make GFX_VKD3D=1` (static vkd3d over MoltenVK, Task 21b).
 ifeq ($(filter $(HOOKMODE),objcopy rename),)
 $(error HOOKMODE must be objcopy or rename)
 endif
@@ -195,8 +198,40 @@ else
 GFX_VKD3D ?= 0
 endif
 ifeq ($(GFX_VKD3D),1)
+ifeq ($(UNAME_S),Darwin)
+# ---- Task 21b: the wrapped bridge on arm64 macOS (vkd3d over MoltenVK, i.e. Vulkan on Metal) ------------------------------------------
+# `make GFX_VKD3D=1` on Darwin.  vkd3d 2.1 is linked STATICALLY from the four libraries tools/apple/vkd3d-build/build_khnmc.sh makes
+# (no autotools on that host); its headers come from the same source tree, the Vulkan headers from VKHEADERS_DIR.  (The SPIR-V headers
+# next to them are needed to BUILD vkd3d only, not for these two objects.)  Differences from the Linux block below:
+#   * -DKH_GFX_VKD3D_STATIC=1: the static libraries already define the D3D12 interface GUIDs, so gfx_vkd3d.c does not (INITGUID there
+#     would be duplicate symbols);
+#   * no rpath and no -l: the archives are named by path and are prerequisites of the link;
+#   * the Vulkan library is MoltenVK's dylib, compiled in as an ABSOLUTE path (-DKH_GFX_VULKAN_LIB; KHNMC_GFX_VULKAN_LIB overrides it
+#     at run time).  Never through DYLD_LIBRARY_PATH: the system strips that from protected launchers such as nice;
+#   * only the wrapped bridge exists there (bias addresses, arm64: no Windows-ABI trampoline), and the runtime picks no driver on its
+#     own: KHNMC_GFX=vkd3dw KHNMC_GFX_DRIVER=system selects the Metal device.
+# A missing piece is an error here, by name, not a build without graphics.
+GFX_APPLE_DIR ?= $(HOME)/khnmc-work/gfxprobe
+VKD3D_SRC ?= $(GFX_APPLE_DIR)/vkd3d-2.1
+VKD3D_LIBDIR ?= $(VKD3D_SRC)/build-mac
+VKHEADERS_DIR ?= $(GFX_APPLE_DIR)/vkheaders
+MOLTENVK_LIB ?= $(GFX_APPLE_DIR)/moltenvk/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib
+VKD3D_STATIC = $(VKD3D_LIBDIR)/libvkd3d-utils.a $(VKD3D_LIBDIR)/libvkd3d.a $(VKD3D_LIBDIR)/libvkd3d-shader.a $(VKD3D_LIBDIR)/libvkd3d-common.a
+GFX_NEED = $(VKD3D_STATIC) $(VKD3D_SRC)/include/vkd3d_d3d12.h $(VKD3D_SRC)/include/vkd3d.h $(VKHEADERS_DIR)/vulkan/vulkan.h $(MOLTENVK_LIB)
+GFX_MISSING = $(filter-out $(wildcard $(GFX_NEED)),$(GFX_NEED))
+ifneq ($(strip $(GFX_MISSING)),)
+$(error GFX_VKD3D=1 on Darwin: missing $(GFX_MISSING) (VKD3D_SRC, VKD3D_LIBDIR, VKHEADERS_DIR, MOLTENVK_LIB; see tools/apple/vkd3d-build/README.md in the repo))
+endif
+ifeq ($(filter /%,$(MOLTENVK_LIB)),)
+$(error MOLTENVK_LIB must be an absolute path (got $(MOLTENVK_LIB)): the runtime loads exactly that file)
+endif
+$(O)/gfx_vkd3d.o $(O)/gfx_wrap.o: CFLAGS += -DKH_GFX_VKD3D=1 -DKH_GFX_VKD3D_STATIC=1 -DWIDL_C_INLINE_WRAPPERS -I$(VKD3D_SRC)/include -I$(VKHEADERS_DIR) '-DKH_GFX_VULKAN_LIB="$(MOLTENVK_LIB)"'
+GFX_LDFLAGS = $(VKD3D_STATIC)
+$(BIN): $(VKD3D_STATIC)
+else
 $(O)/gfx_vkd3d.o $(O)/gfx_wrap.o: CFLAGS += -DKH_GFX_VKD3D=1 -DWIDL_C_INLINE_WRAPPERS -I$(VKD3D_PREFIX)/include/vkd3d -I$(VKHEADERS_PREFIX)/include
 GFX_LDFLAGS = -L$(VKD3D_PREFIX)/lib -lvkd3d-utils -lvkd3d -ldl -Wl,--disable-new-dtags -Wl,-rpath,$(VKD3D_PREFIX)/lib
+endif
 endif
 $(O)/.gfx-vkd3d-$(GFX_VKD3D):
 	@mkdir -p $(O) && rm -f $(O)/.gfx-vkd3d-* && touch $@

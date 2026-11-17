@@ -5,7 +5,10 @@
 #                                               ~/$KHNMC_MAC_DIR/route-data and pc/kh2fm.exe to ~/$KHNMC_MAC_DIR/pc (rsync,
 #                                               checksummed).  Files that an earlier task left in ~/khnmc-work/route-data are
 #                                               reused by local copy when identical (--copy-dest); that directory is only read
-#   tools/darwin_route.sh selftest [TAG]        ./khnmc --selftest there; output fetched to $RUN/mac-selftest-<TAG>.out
+#   tools/darwin_route.sh selftest [TAG] [VAR=VALUE ...]
+#                                               ./khnmc --selftest there; output fetched to $RUN/mac-selftest-<TAG>.out.  Extra
+#                                               VAR=VALUE words are added to its environment (task 21b: KHNMC_GFX=vkd3dw
+#                                               KHNMC_GFX_DRIVER=system VKD3D_DEBUG=warn for the graphics selftest on the Metal device)
 #   tools/darwin_route.sh run TAG [route_one.py options, e.g. --difficulty 2 --env KH_IMPORT_COUNTS=1]
 #                                               ONE route (tools/route_one.py: the environment of route_batch.sh, niced, watchdog,
 #                                               refused below the memory threshold); run.out / phase.log / files.log / summary.*
@@ -17,6 +20,9 @@
 #   tools/darwin_route.sh wavsum TAG [NAME]     size, format and sha256 of run/<TAG>/<NAME> (default audio.wav) there: the whole
 #                                               file and the sample data alone (tools/wav_compare.py sum)
 #   tools/darwin_route.sh fetch TAG NAME        copy run/<TAG>/<NAME> to $RUN/mac-<TAG>/<NAME>
+#   tools/darwin_route.sh frames TAG [PRESENT ...]   task 21b: copy run/<TAG>/frames/index.tsv and the frame dumps of the listed
+#                                               presents (frame-NNNNNN.ppm, written by KHNMC_GFX_DUMP=@OUT@/frames) to
+#                                               $RUN/mac-<TAG>/frames/; without a present only the index.  Nothing is deleted there
 #   tools/darwin_route.sh probe [TOUCH_MIB]     build and run the device probe's measuring part there as a plain macOS program
 #                                               (tools/ios/probe/probe_host.c + probe_core.c; TOUCH_MIB default 64, at most 256
 #                                               on this shared machine): a test of the PROGRAM on arm64 Darwin, not an answer
@@ -55,7 +61,7 @@ route(){ # $1 = TAG, $2 = binary there, $3 = extra route_one option or "", rest 
   local args="" a; for a in "$@"; do case "$a" in *\'*) echo "darwin_route: an option with a single quote cannot be passed" >&2; exit 2;; esac; args="$args '$a'"; done
   "${SSH[@]}" "$MAC" "cd ~/$RDIR && python3 tools/route_one.py --bin $BIN --exe pc/kh2fm.exe --data route-data/data --pkgdir route-data/pkgdir --out run/$TAG --label $TAG --nice $NICE --min-free-pct $MINFREE $EXTRA $args"; local rc=$?
   mkdir -p "$RUN/mac-$TAG"
-  rsync -a -z -e "ssh -o BatchMode=yes" --include 'run.out' --include 'launch.out' --include 'phase.log' --include 'files.log' --include 'exit' --include 'env' --include 'summary.tsv' --include 'summary.json' --exclude '*' "$MAC:$RDIR/run/$TAG/" "$RUN/mac-$TAG/" || exit 1
+  rsync -a -z -e "ssh -o BatchMode=yes" --include 'run.out' --include 'launch.out' --include 'phase.log' --include 'files.log' --include 'exit' --include 'env' --include 'summary.tsv' --include 'summary.json' --include 'hash.tsv' --exclude '*' "$MAC:$RDIR/run/$TAG/" "$RUN/mac-$TAG/" || exit 1
   "${SSH[@]}" "$MAC" "rm -rf ~/$RDIR/run/$TAG/root ~/$RDIR/run/$TAG/docs ~/$RDIR/run/$TAG/home" || echo "darwin_route: NOTE: the run's state directories could not be removed on the Mac mini (run/$TAG/root, docs, home)" >&2
   return $rc
 }
@@ -77,9 +83,14 @@ sync)
   echo "darwin_route: $n files, content hash list ${L:0:16} equal on both sides"
   ;;
 selftest)
-  TAG=${1:-run}; tagok "$TAG"; busy && exit 3
+  TAG=${1:-run}; tagok "$TAG"; [ $# -gt 0 ] && shift
+  # extra environment for the selftest: VAR=VALUE words of a plain character set (they are pasted into the remote command line).
+  # TMPDIR goes to run/tmp as well: tmpfile() of the selftests' fatal cases follows it, so nothing is written outside the build directory
+  XENV=""; for kv in "$@"; do case "$kv" in [A-Za-z_]*=*) ;; *) echo "darwin_route: selftest takes VAR=VALUE words after the TAG (got '$kv')" >&2; exit 2;; esac
+    case "$kv" in *[!A-Za-z0-9_=./:@%+,-]*) echo "darwin_route: '$kv': only letters, digits and _ = . / : @ % + , - can be passed" >&2; exit 2;; esac; XENV="$XENV $kv"; done
+  busy && exit 3
   mkdir -p "$RUN"; push_tools
-  "${SSH[@]}" "$MAC" "cd ~/$RDIR && mkdir -p run/tmp && $GATE && rm -rf run/docs-selftest run/tmp/khnmc-route-* && (KH_EXE=\$PWD/pc/kh2fm.exe KH_DOCS=\$PWD/run/docs-selftest KH_TMPDIR=\$PWD/run/tmp nice -n $NICE ./khnmc --selftest > run/selftest-$TAG.out 2>&1; echo \"selftest exit=\$?\" | tee -a run/selftest-$TAG.out; echo \"darwin_route: left in run/tmp: \$(ls -A run/tmp | tr '\\n' ' ')\")" || exit 1
+  "${SSH[@]}" "$MAC" "cd ~/$RDIR && mkdir -p run/tmp && $GATE && rm -rf run/docs-selftest run/tmp/khnmc-route-* && (KH_EXE=\$PWD/pc/kh2fm.exe KH_DOCS=\$PWD/run/docs-selftest KH_TMPDIR=\$PWD/run/tmp TMPDIR=\$PWD/run/tmp$XENV nice -n $NICE ./khnmc --selftest > run/selftest-$TAG.out 2>&1; echo \"selftest exit=\$?\" | tee -a run/selftest-$TAG.out; echo \"darwin_route: left in run/tmp: \$(ls -A run/tmp | tr '\\n' ' ')\")" || exit 1
   scp -q -o BatchMode=yes "$MAC:$RDIR/run/selftest-$TAG.out" "$RUN/mac-selftest-$TAG.out" || exit 1
   grep -a "SKIPPED\|FAIL\|transcript\|guest space\|selftest exit" "$RUN/mac-selftest-$TAG.out" | cut -c1-220
   grep -aq "^selftest exit=0" "$RUN/mac-selftest-$TAG.out"
@@ -110,6 +121,16 @@ wavsum)
 fetch)
   TAG=${1:-}; tagok "$TAG"; NAME=${2:-}; case "$NAME" in ''|*[!A-Za-z0-9._-]*) echo "darwin_route: fetch TAG NAME" >&2; exit 2;; esac
   mkdir -p "$RUN/mac-$TAG"; rsync -a -z -e "ssh -o BatchMode=yes" "$MAC:$RDIR/run/$TAG/$NAME" "$RUN/mac-$TAG/$NAME"
+  ;;
+frames)
+  TAG=${1:-}; tagok "$TAG"; shift
+  mkdir -p "$RUN/mac-$TAG/frames"
+  rsync -a -z -e "ssh -o BatchMode=yes" "$MAC:$RDIR/run/$TAG/frames/index.tsv" "$RUN/mac-$TAG/frames/index.tsv" || { echo "darwin_route: run/$TAG/frames/index.tsv cannot be copied (no dump was written?)" >&2; exit 1; }
+  for n in "$@"; do case "$n" in ''|*[!0-9]*) echo "darwin_route: frames TAG PRESENT...: '$n' is not a present number" >&2; exit 2;; esac
+    f=$(printf 'frame-%06d.ppm' "$((10#$n))")
+    rsync -a -z -e "ssh -o BatchMode=yes" "$MAC:$RDIR/run/$TAG/frames/$f" "$RUN/mac-$TAG/frames/$f" || { echo "darwin_route: $f of run $TAG cannot be copied" >&2; exit 1; }
+  done
+  echo "darwin_route: frames of $TAG here: $(ls "$RUN/mac-$TAG/frames" | grep -c '\.ppm$') dumps, index $(($(wc -l < "$RUN/mac-$TAG/frames/index.tsv")-1)) lines"
   ;;
 probe)
   TOUCH=${1:-64}; case "$TOUCH" in ''|*[!0-9]*) echo "darwin_route: probe TOUCH_MIB" >&2; exit 2;; esac

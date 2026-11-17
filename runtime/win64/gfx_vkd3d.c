@@ -18,6 +18,11 @@
  *    is Linux's (the manifest path); in a build for another OS the default is the named fatal gfx-driver-no-cpu-driver and the system's
  *    Vulkan (macOS: MoltenVK) needs KHNMC_GFX_DRIVER=system.  The Vulkan library (libvulkan.so.1; macOS: libvulkan.1.dylib, else
  *    libMoltenVK.dylib, vkd3d's own order) is loaded by the runtime and handed to vkd3d, so vkd3d and the device check use the same one.
+ *        KHNMC_GFX_VULKAN_LIB=<absolute path>   load exactly this library instead of searching by name (TASK21b: MoltenVK's dylib on
+ *                                       macOS, where the system strips DYLD_LIBRARY_PATH from protected launchers such as nice).  A
+ *                                       build may carry a default (-DKH_GFX_VULKAN_LIB="<absolute path>", Makefile MOLTENVK_LIB on
+ *                                       Darwin); the variable wins.  A named library that cannot be loaded is a named fatal: there is
+ *                                       no fall-back to the search by name.
  *  - The vkd3d instance is created by us (vkd3d_create_instance), not by vkd3d-utils' D3D12CreateDevice, for two reasons that are on our
  *    side of the boundary: fence completion events must signal OUR kernel32 event handles (pfn_signal_event), and the game's wide strings
  *    (SetName) are 16-bit (wchar_size 2; vkd3d-utils would say 4 on Linux).
@@ -44,7 +49,13 @@
 #define _GNU_SOURCE
 #ifdef KH_GFX_VKD3D
 #define COBJMACROS
+/* The D3D12 interface GUIDs (IID_ID3D12Device ...).  vkd3d's SHARED libraries do not export them, so this file defines them (INITGUID)
+ * for the whole program.  vkd3d's STATIC libraries (KH_GFX_VKD3D_STATIC: the Darwin build, Makefile) define every one of them in their
+ * own objects, which are part of the link: there the definitions here would be duplicate symbols, so the libraries' are used.  An IID
+ * that such a library lacked would be an undefined symbol at link time, never a zero GUID at run time. */
+#ifndef KH_GFX_VKD3D_STATIC
 #define INITGUID
+#endif
 #ifndef WIDL_C_INLINE_WRAPPERS
 #define WIDL_C_INLINE_WRAPPERS
 #endif
@@ -71,7 +82,8 @@ void kh_gfx_vkd3d_init(void){
 }
 void kh_gfx_wrap_init(void){
     kh_fatal(NULL,"gfx-vkd3d-not-built: KHNMC_GFX=vkd3dw was requested but the vkd3d backend is not compiled into this binary. "
-                  "Rebuild with GFX_VKD3D=1 (the Makefile enables it on Linux when $(VKD3D_PREFIX)/lib/libvkd3d.so exists)");
+                  "Rebuild with GFX_VKD3D=1 (the Makefile enables it on Linux when $(VKD3D_PREFIX)/lib/libvkd3d.so exists; on macOS it is off unless "
+                  "`make GFX_VKD3D=1` is given, which links vkd3d's static libraries from $(VKD3D_LIBDIR))");
 }
 void kh_vkd3d_create_device(KCtx *g){ NOT_BUILT("D3D12CreateDevice"); }
 void kh_vkd3d_serialize_rootsig(KCtx *g){ NOT_BUILT("D3D12SerializeRootSignature"); }
@@ -227,14 +239,26 @@ static const char *const vk_lib_names[]={"libvulkan.1.dylib","libMoltenVK.dylib"
 #else
 static const char *const vk_lib_names[]={"libvulkan.so.1"};
 #endif
-static PFN_vkGetInstanceProcAddr vk_gipa; static const char *vk_lib_name;
+static PFN_vkGetInstanceProcAddr vk_gipa; static const char *vk_lib_name, *vk_lib_from="";
 /* caller holds vm */
 static HRESULT instance_get(void){
     if(vk_inst) return S_OK;
     if(!vk_gipa){ char why[512]; why[0]=0; void *lib=NULL;
+        /* a library named outright (KHNMC_GFX_VULKAN_LIB, else the build's KH_GFX_VULKAN_LIB) is THE library: an absolute path, and no
+         * search by name when it cannot be loaded */
+        const char *named=getenv("KHNMC_GFX_VULKAN_LIB"), *from="from KHNMC_GFX_VULKAN_LIB; ";
+        if(named&&!*named) named=NULL;
+#ifdef KH_GFX_VULKAN_LIB
+        if(!named){ named=KH_GFX_VULKAN_LIB; from="the build's KH_GFX_VULKAN_LIB; "; }
+#endif
+        if(named){
+            if(named[0]!='/') kh_fatal(NULL,"gfx-vulkan-lib-path: the Vulkan library was named as '%s' (%s): it must be an absolute path (a bare name would be searched like any other library)",named,from);
+            lib=dlopen(named,RTLD_NOW|RTLD_LOCAL);
+            if(!lib){ const char *e=dlerror(); kh_fatal(NULL,"gfx-vulkan-loader: the Vulkan library %s (%s) cannot be loaded: %s",named,from,e?e:"no reason given"); }
+            vk_lib_name=named; vk_lib_from=from; }
         for(size_t i=0;!lib&&i<sizeof vk_lib_names/sizeof*vk_lib_names;i++){ lib=dlopen(vk_lib_names[i],RTLD_NOW|RTLD_LOCAL);
             if(lib) vk_lib_name=vk_lib_names[i]; else { const char *e=dlerror(); size_t l=strlen(why); snprintf(why+l,sizeof why-l,"%s%s",l?"; ":"",e?e:vk_lib_names[i]); } }
-        if(!lib) kh_fatal(NULL,"gfx-vulkan-loader: no Vulkan library of this OS can be loaded (%s)",why);
+        if(!lib) kh_fatal(NULL,"gfx-vulkan-loader: no Vulkan library of this OS can be loaded (%s). KHNMC_GFX_VULKAN_LIB=<absolute path> names one outright",why);
         vk_gipa=(PFN_vkGetInstanceProcAddr)dlsym(lib,"vkGetInstanceProcAddr");
         if(!vk_gipa) kh_fatal(NULL,"gfx-vulkan-loader: %s has no vkGetInstanceProcAddr",vk_lib_name); }
     struct vkd3d_application_info app; memset(&app,0,sizeof app); app.type=VKD3D_STRUCTURE_TYPE_APPLICATION_INFO; app.application_name="khnmc"; app.api_version=VKD3D_API_VERSION_2_1;
@@ -248,7 +272,7 @@ static HRESULT instance_get(void){
     PFN_vkEnumeratePhysicalDevices enum_pd=(PFN_vkEnumeratePhysicalDevices)vk_gipa(vi,"vkEnumeratePhysicalDevices");
     PFN_vkGetPhysicalDeviceProperties props=(PFN_vkGetPhysicalDeviceProperties)vk_gipa(vi,"vkGetPhysicalDeviceProperties");
     if(!enum_pd||!props) kh_fatal(NULL,"gfx-vulkan-loader: %s gives no vkEnumeratePhysicalDevices / vkGetPhysicalDeviceProperties for the instance",vk_lib_name);
-    fprintf(stderr,"kh: gfx vkd3d: Vulkan library %s (handed to vkd3d as its vkGetInstanceProcAddr)\n",vk_lib_name);
+    fprintf(stderr,"kh: gfx vkd3d: Vulkan library %s (%shanded to vkd3d as its vkGetInstanceProcAddr)\n",vk_lib_name,vk_lib_from);
     VkPhysicalDevice pd[16]; uint32_t n=16; VkResult vr=enum_pd(vi,&n,pd);
     if((vr!=VK_SUCCESS&&vr!=VK_INCOMPLETE)||!n) kh_fatal(NULL,"gfx-vulkan-devices: vkEnumeratePhysicalDevices result %d, %u device(s)",(int)vr,n);
     for(uint32_t i=0;i<n;i++){ VkPhysicalDeviceProperties p; memset(&p,0,sizeof p); props(pd[i],&p);
@@ -481,6 +505,9 @@ static int ov_execute_bundle(KCtx *g){ kh_gfxc_bundle_replay(g,(ID3D12GraphicsCo
 typedef struct { u32 dim, fmt, samples, flags, w, h, mips; u64 n; } ResKind;
 typedef struct { u64 before, after, n; u32 bf, af, bw, bh, aw, ah, bfl, afl; } AliasPair;
 static ResKind res_kinds[48]; static int n_res_kinds; static AliasPair alias_pairs[16]; static int n_alias_pairs; static pthread_mutex_t cm=PTHREAD_MUTEX_INITIALIZER;
+/* TASK21b: the plain sampled textures by DXGI format (which block-compressed formats does the game upload? a device without BC support
+ * would need them decoded on the CPU) */
+static struct { u32 fmt; u64 n; } tex_fmts[24]; static int n_tex_fmts; static u64 c_tex_fmt_more;
 static _Atomic u64 c_res_total, c_res_buffers, c_res_sampled, c_bar_transition, c_bar_aliasing, c_bar_uav, c_resolves, c_msaa_resources;
 void kh_gfxc_census_resource(const D3D12_RESOURCE_DESC *d){
     if(!d) return; D3D12_RESOURCE_DESC c; memcpy(&c,d,sizeof c);                  /* the caller's pointer may be guest memory: no alignment assumed */
@@ -488,12 +515,50 @@ void kh_gfxc_census_resource(const D3D12_RESOURCE_DESC *d){
     atomic_fetch_add(&c_res_total,1);
     if(dim==1){ atomic_fetch_add(&c_res_buffers,1); return; }
     if(samples>1) atomic_fetch_add(&c_msaa_resources,1);
-    if(!(flags&3)&&samples<=1){ atomic_fetch_add(&c_res_sampled,1); return; }
+    if(!(flags&3)&&samples<=1){ atomic_fetch_add(&c_res_sampled,1);
+        pthread_mutex_lock(&cm); int j; for(j=0;j<n_tex_fmts;j++) if(tex_fmts[j].fmt==fmt) break;
+        if(j==n_tex_fmts&&n_tex_fmts<24){ tex_fmts[j].fmt=fmt; tex_fmts[j].n=0; n_tex_fmts++; }
+        if(j<24) tex_fmts[j].n++; else c_tex_fmt_more++; pthread_mutex_unlock(&cm); return; }
     pthread_mutex_lock(&cm); int i; for(i=0;i<n_res_kinds;i++){ ResKind *k=&res_kinds[i]; if(k->dim==dim&&k->fmt==fmt&&k->samples==samples&&k->flags==flags&&k->w==w&&k->h==h&&k->mips==mips) break; }
     if(i==n_res_kinds&&n_res_kinds<48){ res_kinds[i]=(ResKind){dim,fmt,samples,flags,w,h,mips,0}; n_res_kinds++; }
     if(i<48) res_kinds[i].n++; pthread_mutex_unlock(&cm);
 }
 void kh_gfxc_census_resolve(void){ atomic_fetch_add(&c_resolves,1); }
+/* TASK21b: what the game's pipeline states and depth-stencil views ask of the rasterizer.  These are the questions a Vulkan-on-Metal
+ * device raises (MoltenVK has no VK_EXT_depth_clip_enable, no geometry shaders, no stream output, and vkd3d maps D24_UNORM_S8_UINT to
+ * D32_SFLOAT_S8_UINT where the 24-bit format is missing): is depth clipping ever turned OFF, which depth formats and sample counts are
+ * asked for, which shader stages.  Counted by the wrapped bridge at CreateGraphicsPipelineState / CreateDepthStencilView. */
+typedef struct { u32 dsv, rtv0, nrt, samples, depth, stencil, clip; u64 n; } PsoKind;
+typedef struct { u32 view, res, samples; u64 n; } DsvKind;
+static PsoKind pso_kinds[48]; static int n_pso_kinds; static DsvKind dsv_kinds[16]; static int n_dsv_kinds;
+static _Atomic u64 c_pso, c_pso_noclip, c_pso_wire, c_pso_gs, c_pso_tess, c_pso_so, c_pso_cons, c_pso_bias, c_pso_a2c, c_pso_msen, c_pso_aaline, c_pso_forced, c_pso_more, c_dsv, c_dsv_more;
+void kh_gfxc_census_pso(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *d){
+    if(!d) return; const D3D12_RASTERIZER_DESC *r=&d->RasterizerState;
+    atomic_fetch_add(&c_pso,1);
+    if(!r->DepthClipEnable) atomic_fetch_add(&c_pso_noclip,1);
+    if(r->FillMode==D3D12_FILL_MODE_WIREFRAME) atomic_fetch_add(&c_pso_wire,1);
+    if(d->GS.pShaderBytecode&&d->GS.BytecodeLength) atomic_fetch_add(&c_pso_gs,1);
+    if((d->HS.pShaderBytecode&&d->HS.BytecodeLength)||(d->DS.pShaderBytecode&&d->DS.BytecodeLength)) atomic_fetch_add(&c_pso_tess,1);
+    if(d->StreamOutput.NumEntries) atomic_fetch_add(&c_pso_so,1);
+    if(r->ConservativeRaster) atomic_fetch_add(&c_pso_cons,1);
+    if(r->DepthBias||r->SlopeScaledDepthBias!=0.0f) atomic_fetch_add(&c_pso_bias,1);
+    if(d->BlendState.AlphaToCoverageEnable) atomic_fetch_add(&c_pso_a2c,1);
+    if(r->MultisampleEnable) atomic_fetch_add(&c_pso_msen,1);
+    if(r->AntialiasedLineEnable) atomic_fetch_add(&c_pso_aaline,1);
+    if(r->ForcedSampleCount) atomic_fetch_add(&c_pso_forced,1);
+    PsoKind k={(u32)d->DSVFormat,d->NumRenderTargets?(u32)d->RTVFormats[0]:0,d->NumRenderTargets,d->SampleDesc.Count,d->DepthStencilState.DepthEnable!=0,d->DepthStencilState.StencilEnable!=0,r->DepthClipEnable!=0,0};
+    pthread_mutex_lock(&cm); int i; for(i=0;i<n_pso_kinds;i++){ PsoKind *q=&pso_kinds[i]; if(q->dsv==k.dsv&&q->rtv0==k.rtv0&&q->nrt==k.nrt&&q->samples==k.samples&&q->depth==k.depth&&q->stencil==k.stencil&&q->clip==k.clip) break; }
+    if(i==n_pso_kinds&&n_pso_kinds<48){ pso_kinds[i]=k; n_pso_kinds++; }
+    if(i<48) pso_kinds[i].n++; else atomic_fetch_add(&c_pso_more,1); pthread_mutex_unlock(&cm);
+}
+/* view_format: the DSV desc's format, 0 = no desc or DXGI_FORMAT_UNKNOWN (the resource's own format is used) */
+void kh_gfxc_census_dsv(ID3D12Resource *res,u32 view_format){
+    atomic_fetch_add(&c_dsv,1); u32 rf=0, samples=0;
+    if(res){ D3D12_RESOURCE_DESC d=ID3D12Resource_GetDesc(res); rf=d.Format; samples=d.SampleDesc.Count; }
+    pthread_mutex_lock(&cm); int i; for(i=0;i<n_dsv_kinds;i++) if(dsv_kinds[i].view==view_format&&dsv_kinds[i].res==rf&&dsv_kinds[i].samples==samples) break;
+    if(i==n_dsv_kinds&&n_dsv_kinds<16){ dsv_kinds[i]=(DsvKind){view_format,rf,samples,0}; n_dsv_kinds++; }
+    if(i<16) dsv_kinds[i].n++; else atomic_fetch_add(&c_dsv_more,1); pthread_mutex_unlock(&cm);
+}
 /* barriers of one ResourceBarrier call, with REAL resource pointers (calls with more than 64 barriers are not counted: the game batches 8) */
 void kh_gfxc_census_barriers(const D3D12_RESOURCE_BARRIER *b,u32 n){
     if(!b||n>64) return;
@@ -519,8 +584,18 @@ static void census_report(FILE *f){
     fprintf(f,"kh: gfx vkd3d census: resources created=%llu (buffers=%llu, sampled single-sample textures=%llu, multisampled=%llu); barriers: transition=%llu aliasing=%llu uav=%llu; ResolveSubresource calls=%llu\n",
             P(c_res_total),P(c_res_buffers),P(c_res_sampled),P(c_msaa_resources),P(c_bar_transition),P(c_bar_aliasing),P(c_bar_uav),P(c_resolves));
     pthread_mutex_lock(&cm);
+    if(n_tex_fmts){ fprintf(f,"kh: gfx vkd3d census: sampled single-sample textures by DXGI format (fmt71 / 74 / 77 = BC1 / BC2 / BC3, fmt28 / 87 = R8G8B8A8 / B8G8R8A8):");
+        for(int i=0;i<n_tex_fmts;i++) fprintf(f," [fmt%u = %llu]",tex_fmts[i].fmt,P(tex_fmts[i].n)); if(c_tex_fmt_more) fprintf(f," [+%llu in formats beyond the table]",P(c_tex_fmt_more)); fputc('\n',f); }
     if(n_res_kinds){ fprintf(f,"kh: gfx vkd3d census: render-target / depth-stencil / multisampled textures (dimension format WxH mips samples flags = count):");
         for(int i=0;i<n_res_kinds;i++){ ResKind *k=&res_kinds[i]; fprintf(f," [%uD fmt%u %ux%u m%u s%u fl0x%x = %llu]",k->dim-1,k->fmt,k->w,k->h,k->mips,k->samples,k->flags,P(k->n)); } fputc('\n',f); }
+    if(c_pso){ fprintf(f,"kh: gfx vkd3d census: pipeline states=%llu: DepthClipEnable=FALSE in %llu, wireframe %llu, geometry shader %llu, hull/domain shader %llu, stream output %llu, conservative raster %llu, depth bias %llu, alpha-to-coverage %llu, MultisampleEnable %llu, AntialiasedLineEnable %llu, ForcedSampleCount %llu\n",
+                P(c_pso),P(c_pso_noclip),P(c_pso_wire),P(c_pso_gs),P(c_pso_tess),P(c_pso_so),P(c_pso_cons),P(c_pso_bias),P(c_pso_a2c),P(c_pso_msen),P(c_pso_aaline),P(c_pso_forced));
+        fprintf(f,"kh: gfx vkd3d census: pipeline states by (DSV format, RTV0 format x targets, samples, depth test, stencil test, depth clip = count):");
+        for(int i=0;i<n_pso_kinds;i++){ PsoKind *k=&pso_kinds[i]; fprintf(f," [dsv fmt%u rtv fmt%u x%u s%u depth %u stencil %u clip %u = %llu]",k->dsv,k->rtv0,k->nrt,k->samples,k->depth,k->stencil,k->clip,P(k->n)); }
+        if(c_pso_more) fprintf(f," [+%llu in kinds beyond the table]",P(c_pso_more)); fputc('\n',f); }
+    if(c_dsv){ fprintf(f,"kh: gfx vkd3d census: depth-stencil views=%llu (view format on resource format, samples = count; view fmt0 = the resource's):",P(c_dsv));
+        for(int i=0;i<n_dsv_kinds;i++){ DsvKind *k=&dsv_kinds[i]; fprintf(f," [fmt%u on fmt%u s%u = %llu]",k->view,k->res,k->samples,P(k->n)); }
+        if(c_dsv_more) fprintf(f," [+%llu beyond the table]",P(c_dsv_more)); fputc('\n',f); }
     for(int i=0;i<n_alias_pairs;i++){ AliasPair *p=&alias_pairs[i]; fprintf(f,"kh: gfx vkd3d census: aliasing barrier pair %d: before=%llx (fmt%u %ux%u fl0x%x) after=%llx (fmt%u %ux%u fl0x%x) x%llu\n",i,P(p->before),p->bf,p->bw,p->bh,p->bfl,P(p->after),p->af,p->aw,p->ah,p->afl,P(p->n)); }
     pthread_mutex_unlock(&cm);
 }
@@ -901,7 +976,8 @@ int kh_gfx_vkd3d_selftest(KCtx *g){
     u64 m=ga_calloc(1,2048), dev=0,q=0,fct=0,sc=0,rt=0,heap=0,al=0,cl=0,fence=0,blob=0,rs=0,rt1=0,vb=0,pso=0,rs0=0,blob0=0,ba=0,bl=0,rt2=0,rsT=0,blobT=0,psoT=0,srvh=0,samph=0;
     ID3DBlob *vsb=NULL,*psb=NULL,*errb=NULL,*ptb=NULL;
     char save_dir[sizeof dump_dir]; memcpy(save_dir,dump_dir,sizeof dump_dir); u64 save_every=dump_every, save_presents=gfx_presents, save_dumps=dumps_written;
-    char tmp[]="/tmp/khnmc-vkd3d-selftest-XXXXXX"; if(!mkdtemp(tmp)){ fprintf(stderr,"vkd3d selftest FAIL: mkdtemp\n"); return 1; }
+    char tmp[900]; kh_tmp_path(tmp,sizeof tmp,"khnmc-vkd3d-selftest-XXXXXX");      /* $KH_TMPDIR, else /tmp (host_env.c) */
+    if(!mkdtemp(tmp)){ fprintf(stderr,"vkd3d selftest FAIL: mkdtemp(%s): %s\n",tmp,strerror(errno)); return 1; }
     /* D3D12CreateDevice: probe form (ppDevice NULL -> S_FALSE), then a real device; its methods are native addresses */
     T((u32)GI(rt_imp_d3d12__ord101,0,0xb000,GP(&IID_ID3D12Device),0)==1);
     T((u32)GI(rt_imp_d3d12__ord101,0,0xb000,GP(&IID_ID3D12Device),m)==0); dev=rd64(g,m); T(dev!=0);

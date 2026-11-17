@@ -50,7 +50,7 @@ u64 kh_input_game_frames(void);
  * calls this probe first. */
 void kh_phase_field_cmd_entry(void){ entries[7]++;
     if(atomic_fetch_add(&field_cmds_total,1)==0){ extern _Atomic u64 gfx_presents;
-        fprintf(stderr,"kh: phase: first FIELD_COMMAND.execute at present %llu, game frame %llu, virtual vblank %llu\n",(unsigned long long)gfx_presents,(unsigned long long)kh_input_game_frames(),(unsigned long long)(kh_vclock_on?kh_vclock_vblanks():0)); } }
+        fprintf(stderr,"kh: phase: first FIELD_COMMAND.execute at present %llu, game frame %llu, virtual vblank %llu, host-ns=%llu\n",(unsigned long long)gfx_presents,(unsigned long long)kh_input_game_frames(),(unsigned long long)(kh_vclock_on?kh_vclock_vblanks():0),(unsigned long long)kh_host_ns()); } }
 /* BATTLE.calc_damage: one line per call with every clock, so that a hit can be found in the picture stream and in the sound */
 /* Task 27: the hits counted here (only while something is on screen) and the game frame of the last one feed the route conditions
  * `battle` and `hits N` (runtime/route_state.c). */
@@ -61,8 +61,10 @@ void kh_phase_test_set_damage(u64 hits,u64 last_frame){ atomic_store(&damage_hit
 void kh_phase_damage_entry(void){ entries[8]++; extern _Atomic u64 gfx_presents;
     if(!gfx_presents) return;                                       /* not while nothing is on screen (selftests) */
     u64 k=atomic_fetch_add(&damage_hits,1)+1; atomic_store(&damage_last_frame,kh_input_game_frames());
-    fprintf(stderr,"kh: event damage #%llu present=%llu game-frame=%llu vblank=%llu virtual-ns=%llu\n",(unsigned long long)k,(unsigned long long)gfx_presents,(unsigned long long)kh_input_game_frames(),
-            (unsigned long long)(kh_vclock_on?kh_vclock_vblanks():0),(unsigned long long)(kh_vclock_on?kh_vclock_now_ns():0)); }
+    /* host-ns (TASK21b): the host's monotonic clock, so that presents and game frames per second between two events can be read from
+     * the log on the host clock too, where the two virtual-clock fields are 0 */
+    fprintf(stderr,"kh: event damage #%llu present=%llu game-frame=%llu vblank=%llu virtual-ns=%llu host-ns=%llu\n",(unsigned long long)k,(unsigned long long)gfx_presents,(unsigned long long)kh_input_game_frames(),
+            (unsigned long long)(kh_vclock_on?kh_vclock_vblanks():0),(unsigned long long)(kh_vclock_on?kh_vclock_now_ns():0),(unsigned long long)kh_host_ns()); }
 void kh_phase_title_entry(void){ entries[9]++; atomic_fetch_add(&title_depth,1); } /* f_2b4590 itself lives in moose.c (Task 23: KH2Moose fast_title picks the patched or the vanilla body) */
 void kh_phase_title_exit(void){ atomic_fetch_sub(&title_depth,1); }                  /* ... and calls this when the title task returns */
 /* Task 27: the New Game menu task (title mode 1; the exe calls it once, from the title task at 0x2b493f): difficulty, the second

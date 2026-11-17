@@ -7,7 +7,7 @@
  *   gfx_wrap.c    the WRAPPED bridge KHNMC_GFX=vkd3dw: every D3D12 object the game sees is a guest-side COM object that holds the real
  *                 interface pointer; every method decodes the guest arguments, translates guest pointers and calls vkd3d's C API.
  *                 Correct in every address mode (identity, bias); no assembly and no ABI of its own (the compiler calls vkd3d with the ABI
- *                 vkd3d's headers declare).  Run so far on Linux x86-64 only.  The shared start-up depends on the OS, not the CPU: the CPU
+ *                 vkd3d's headers declare).  Runs on Linux x86-64 and, since TASK21b, on arm64 macOS (static vkd3d over MoltenVK).  The shared start-up depends on the OS, not the CPU: the CPU
  *                 driver policy (lavapipe manifest) exists on Linux only, elsewhere KHNMC_GFX_DRIVER=system must be given; the Vulkan
  *                 library is chosen per OS (macOS: libvulkan.1.dylib, else libMoltenVK.dylib) and handed to vkd3d.
  *
@@ -53,6 +53,8 @@ void kh_gfxc_rootsig_learn(KCtx *g,u64 rs,const void *blob,size_t size);        
 void kh_gfxc_census_resource(const D3D12_RESOURCE_DESC *d);                          /* a resource was created */
 void kh_gfxc_census_barriers(const D3D12_RESOURCE_BARRIER *b,u32 n);                 /* barriers with REAL resource pointers */
 void kh_gfxc_census_resolve(void);
+void kh_gfxc_census_pso(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *d);                /* a pipeline state was created (host copy of the desc) */
+void kh_gfxc_census_dsv(ID3D12Resource *res,u32 view_format);                        /* a depth-stencil view was created (0 = the resource's format) */
 
 /* ---- bundles: our recorder objects (guest COM objects in both bridges), replayed on a real direct command list ----------------- */
 u64  kh_gfxc_bundle_allocator_new(KCtx *g);                                          /* CreateCommandAllocator(BUNDLE) */

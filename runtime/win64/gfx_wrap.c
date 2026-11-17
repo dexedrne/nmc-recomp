@@ -279,7 +279,11 @@ static u64 host_to_guest(KCtx *g,const void *p,const char *what){
     return a;
 }
 /* a creation result: the game gets the guest object of the new real object (or NULL with the failing HRESULT) */
-static void w_out(KCtx *g,u64 pp,HRESULT hr,void *out,int kind){ if(pp) wr64(g,pp,SUCCEEDED(hr)&&out?w_get(g,out,kind,1):0); SET_RAX(g,(u32)hr); }
+static _Atomic u64 n_create_failed;
+static void w_out(KCtx *g,u64 pp,HRESULT hr,void *out,int kind){
+    /* a refused creation is the game's to handle, but never a silent one (TASK21b: what another Vulkan implementation rejects must be in the log) */
+    if(FAILED(hr)){ atomic_fetch_add(&n_create_failed,1); fprintf(stderr,"kh: gfx wrap: a creation call for a %s FAILED with hr=0x%08x (vkd3d refused it; the game gets the HRESULT and a null object)\n",wk[kind].iface,(unsigned)hr); }
+    if(pp) wr64(g,pp,SUCCEEDED(hr)&&out?w_get(g,out,kind,1):0); SET_RAX(g,(u32)hr); }
 static D3D12_CPU_DESCRIPTOR_HANDLE cpuh(u64 v){ D3D12_CPU_DESCRIPTOR_HANDLE h; h.ptr=(SIZE_T)v; return h; }
 static D3D12_GPU_DESCRIPTOR_HANDLE gpuh(u64 v){ D3D12_GPU_DESCRIPTOR_HANDLE h; h.ptr=v; return h; }
 #define RES(a,what) ((ID3D12Resource*)kh_wrap_real(g,(a),WK_RESOURCE,what))
@@ -325,8 +329,13 @@ static int w_dev(KCtx *g,ID3D12Device *d,int s){
         if(type==D3D12_COMMAND_LIST_TYPE_BUNDLE){ if(!pp) kh_fatal(g,"gfx-bundle: CreateCommandAllocator(BUNDLE) without a result pointer"); wr64(g,pp,kh_gfxc_bundle_allocator_new(g)); SET_RAX(g,0); return 1; }
         HRESULT hr=ID3D12Device_CreateCommandAllocator(d,(D3D12_COMMAND_LIST_TYPE)type,iidp(g,A2(g),"CreateCommandAllocator"),pp?&out:NULL); w_out(g,pp,hr,out,WK_ALLOCATOR); return 1; }
     case 10: { WX x; wx_init(&x,g); u64 pp=A3(g); void *out=NULL;                /* CreateGraphicsPipelineState(desc, riid, **pp) */
-        HRESULT hr=ID3D12Device_CreateGraphicsPipelineState(d,x_pso(&x,A1(g)),iidp(g,A2(g),"CreateGraphicsPipelineState"),pp?&out:NULL); wx_done(&x);
-        atomic_fetch_add(&gfx_psos,1); w_out(g,pp,hr,out,WK_PSO); return 1; }
+        const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pd=x_pso(&x,A1(g));
+        HRESULT hr=ID3D12Device_CreateGraphicsPipelineState(d,pd,iidp(g,A2(g),"CreateGraphicsPipelineState"),pp?&out:NULL);
+        if(SUCCEEDED(hr)) kh_gfxc_census_pso(pd);
+        else if(pd) fprintf(stderr,"kh: gfx wrap: CreateGraphicsPipelineState FAILED hr=0x%08x: DSV fmt%u, RTV0 fmt%u x%u, samples %u, DepthClipEnable %d, fill %u, cull %u, topology type %u, VS %llu / PS %llu / GS %llu / HS %llu / DS %llu bytes, %u input elements\n",
+                        (unsigned)hr,(unsigned)pd->DSVFormat,(unsigned)pd->RTVFormats[0],pd->NumRenderTargets,pd->SampleDesc.Count,(int)pd->RasterizerState.DepthClipEnable,(unsigned)pd->RasterizerState.FillMode,(unsigned)pd->RasterizerState.CullMode,
+                        (unsigned)pd->PrimitiveTopologyType,P(pd->VS.BytecodeLength),P(pd->PS.BytecodeLength),P(pd->GS.BytecodeLength),P(pd->HS.BytecodeLength),P(pd->DS.BytecodeLength),pd->InputLayout.NumElements);
+        wx_done(&x); atomic_fetch_add(&gfx_psos,1); w_out(g,pp,hr,out,WK_PSO); return 1; }
     case 12: { u32 type=(u32)A2(g); u64 al=A3(g), pso=ARG(g,4), riid=ARG(g,5), pp=ARG(g,6); void *out=NULL;   /* CreateCommandList(node, type, allocator, pso, riid, **pp) */
         if(type==D3D12_COMMAND_LIST_TYPE_BUNDLE){ if(!pp) kh_fatal(g,"gfx-bundle: CreateCommandList(BUNDLE) without a result pointer"); wr64(g,pp,kh_gfxc_bundle_new(g,al,pso)); SET_RAX(g,0); return 1; }
         HRESULT hr=ID3D12Device_CreateCommandList(d,(UINT)A1(g),(D3D12_COMMAND_LIST_TYPE)type,(ID3D12CommandAllocator*)kh_wrap_real(g,al,WK_ALLOCATOR,"CreateCommandList: allocator"),
@@ -352,7 +361,8 @@ static int w_dev(KCtx *g,ID3D12Device *d,int s){
     case 18: { D3D12_SHADER_RESOURCE_VIEW_DESC vd; ID3D12Device_CreateShaderResourceView(d,RES(A1(g),"CreateShaderResourceView"),CP(vd,A2(g)),cpuh(A3(g))); return 1; }
     case 19: { D3D12_UNORDERED_ACCESS_VIEW_DESC vd; ID3D12Device_CreateUnorderedAccessView(d,RES(A1(g),"CreateUnorderedAccessView"),RES(A2(g),"CreateUnorderedAccessView: counter"),CP(vd,A3(g)),cpuh(ARG(g,4))); return 1; }
     case 20: { D3D12_RENDER_TARGET_VIEW_DESC vd; ID3D12Device_CreateRenderTargetView(d,RES(A1(g),"CreateRenderTargetView"),CP(vd,A2(g)),cpuh(A3(g))); return 1; }
-    case 21: { D3D12_DEPTH_STENCIL_VIEW_DESC vd; ID3D12Device_CreateDepthStencilView(d,RES(A1(g),"CreateDepthStencilView"),CP(vd,A2(g)),cpuh(A3(g))); return 1; }
+    case 21: { D3D12_DEPTH_STENCIL_VIEW_DESC vd; ID3D12Resource *res=RES(A1(g),"CreateDepthStencilView"); const D3D12_DEPTH_STENCIL_VIEW_DESC *pv=CP(vd,A2(g));
+        ID3D12Device_CreateDepthStencilView(d,res,pv,cpuh(A3(g))); kh_gfxc_census_dsv(res,pv?(u32)pv->Format:0); return 1; }
     case 22: { D3D12_SAMPLER_DESC sd; ID3D12Device_CreateSampler(d,CP(sd,A1(g)),cpuh(A2(g))); return 1; }
     case 23: { u32 nd=(u32)A1(g), ns=(u32)ARG(g,4); WX x; wx_init(&x,g); x_count(&x,nd,65536,"CopyDescriptors destination ranges"); x_count(&x,ns,65536,"CopyDescriptors source ranges");
         /* CopyDescriptors(nDst, dstStarts, dstSizes, nSrc, srcStarts, srcSizes, type): handles and sizes are plain values */
@@ -553,7 +563,7 @@ void kh_wrap_serialize_rootsig(KCtx *g){
 /* ---- report ------------------------------------------------------------------------------------------------------------------------- */
 void kh_wrap_report(FILE *f){
     u64 total=0; for(int k=0;k<WK_N;k++) for(int s=0;s<MAXSLOT;s++) total+=wcalls[k][s];
-    fprintf(f,"kh: gfx wrap: wrapped calls=%llu, calls through the Windows-ABI trampoline=%llu, Map calls=%llu; guest objects made / gone (live):",P(total),P(kh_native_calls),P(n_maps));
+    fprintf(f,"kh: gfx wrap: wrapped calls=%llu, calls through the Windows-ABI trampoline=%llu, Map calls=%llu, creation calls refused by vkd3d=%llu; guest objects made / gone (live):",P(total),P(kh_native_calls),P(n_maps),P(n_create_failed));
     for(int k=0;k<WK_N;k++) if(n_made[k]) fprintf(f," %s %llu/%llu (%llu)",wk[k].iface+(strncmp(wk[k].iface,"ID3D12",6)?0:6),P(n_made[k]),P(n_dead[k]),P(n_made[k]-n_dead[k]));
     fputc('\n',f);
     for(int k=0;k<WK_N;k++){ u64 t=0; for(int s=0;s<MAXSLOT;s++) t+=wcalls[k][s]; if(!t) continue;

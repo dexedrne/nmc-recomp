@@ -8,6 +8,8 @@
 #        KHNMC_MAC_NICE (default 10), KHNMC_MAC_MIN_FREE (default 30: no step starts below this `memory_pressure` reading),
 #        KHNMC_MAC_STOP_FREE (default MIN_FREE: between two groups of shards the build waits when the reading is below this),
 #        KHNMC_MAC_CHUNK (default 20: shards compiled between two readings)
+#   Task 21b: MAKE_ARGS="GFX_VKD3D=1" builds the wrapped graphics bridge in (static vkd3d + MoltenVK from ~/khnmc-work/gfxprobe on the
+#        Mac, see the Makefile's Darwin block; that directory is only read).  The input scripts (input/) are synced too.
 #
 # What it does, in order:
 #   1. syncs Makefile, runtime/, lifter-rt/, tools/, lifted/gen/ and the four generated mod sources of gen/ (mod_static_lifted.c,
@@ -39,13 +41,14 @@ case "$JOBS" in ''|*[!0-9]*) echo "darwin_build: JOBS must be a number" >&2; exi
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20)
 RS=(rsync -a --delete -e "ssh -o BatchMode=yes -o ConnectTimeout=20")
 cd "$HERE"
-for f in Makefile runtime lifter-rt tools lifted/gen lifted/shards gen/mod_static_lifted.c gen/mod_static_table.h gen/mod_neverland_table.h gen/mod_moose_table.h; do [ -e "$f" ] || { echo "darwin_build: missing $f in $HERE" >&2; exit 2; }; done
+for f in Makefile runtime lifter-rt tools input lifted/gen lifted/shards gen/mod_static_lifted.c gen/mod_static_table.h gen/mod_neverland_table.h gen/mod_moose_table.h; do [ -e "$f" ] || { echo "darwin_build: missing $f in $HERE" >&2; exit 2; }; done
 
 "${SSH[@]}" "$MAC" "mkdir -p ~/$RDIR/lifted/gen ~/$RDIR/gen"
 "${RS[@]}" Makefile "$MAC:$RDIR/Makefile"
 "${RS[@]}" runtime/ "$MAC:$RDIR/runtime/"
 "${RS[@]}" lifter-rt/ "$MAC:$RDIR/lifter-rt/"
 "${RS[@]}" --exclude '__pycache__' tools/ "$MAC:$RDIR/tools/"
+"${RS[@]}" input/ "$MAC:$RDIR/input/"
 "${RS[@]}" lifted/gen/ "$MAC:$RDIR/lifted/gen/"
 rsync -a -z -e "ssh -o BatchMode=yes -o ConnectTimeout=20" gen/mod_static_lifted.c gen/mod_static_table.h gen/mod_neverland_table.h gen/mod_moose_table.h "$MAC:$RDIR/gen/"
 GL=$(sha256sum gen/mod_static_lifted.c gen/mod_static_table.h gen/mod_neverland_table.h gen/mod_moose_table.h | cut -d' ' -f1 | tr '\n' ' ')

@@ -1,0 +1,24 @@
+# Task 21b: a PRIVATE copy of input/field-battle-d18.txt for ONE host (the Mac mini, vkd3d over MoltenVK: first FIELD_COMMAND at game frame 1397, field commands every frame from about 1496), cut after the press at script frame 1350.
+# Purpose: a field WITHOUT input, so that a picture depends only on the time since the field came up and the same game moment
+# can be found in a run of another renderer by content (tools/l21b_compare.py align).  input/field-idle-i21.txt (cut after 2430)
+# no longer does that on the merged build: with KH2Moose's fast_title the field is up long before 2430 (Mac: 1397),
+# so its presses every 90 game frames land in the field and Roxas attacks at an offset that differs from host to host.
+# The cut is per host because the field comes up at another game frame on each (load times); a frame-numbered script cannot
+# follow that.  The state-driven route language (task 27) makes these two files unnecessary once it is merged.
+@hold 165 until initial-state 3
+@clock game-frames
+180 182 A
+240 242 DPAD_UP+DPAD_LEFT
+270 272 A
+360 362 A
+450 452 A
+540 542 A
+630 632 A
+720 722 A
+810 812 A
+900 902 A
+990 992 A
+1080 1082 A
+1170 1172 A
+1260 1262 A
+1350 1352 A
