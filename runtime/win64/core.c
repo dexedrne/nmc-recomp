@@ -2,6 +2,7 @@
  * handle table, guest-to-host calls, time, Windows path mapping.  Replaces the lifter's khrt_dispatch.c (see README, ABI notes). */
 #include "khnmc_rt.h"
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <sys/stat.h>
 #include <signal.h>
 #include <time.h>
@@ -274,7 +275,11 @@ u64 ga_realloc(u64 p,u64 n){
     BHdr *h=(BHdr*)XLG(p-HDR); int src=h->src;
     u64 old=ga_usable(p);
     if(n<=old){
-        if(h->magic==MAGIC_LIVE){ pthread_mutex_lock(&gm); Zone *z=&zones[h->zone]; win_acct(p,h->size,src,0); z->live-=h->size; h->size=n; win_acct(p,n,src,1); z->live+=n; pthread_mutex_unlock(&gm); }   /* keep the block, shrink its logical size */
+        if(h->magic==MAGIC_LIVE){ pthread_mutex_lock(&gm); Zone *z=&zones[h->zone]; u64 was=h->size; win_acct(p,was,src,0); z->live-=was; h->size=n; win_acct(p,n,src,1); z->live+=n;   /* keep the block, shrink its logical size */
+            /* A page-run block's run length is stored nowhere: free derives it from h->size.  So the pages the smaller size no longer
+             * covers go back NOW; left to free they would be in no list and in no counter for the rest of the run (review 2026-11-17). */
+            if(h->cls==CLS_BIG){ u64 r0=rup(HDR+was,4096), r1=rup(HDR+n,4096); if(r1<r0) run_free(z,p-HDR+r1,r0-r1); }
+            pthread_mutex_unlock(&gm); }
         return p; }
     u64 q=ga_alloc_src(n,16,src); if(!q) return 0; memcpy((void*)XLG(q),(void*)XLG(p),old<n?old:n); ga_free(p); return q;
 }
@@ -371,6 +376,7 @@ void ga_window_sources(u64 base,char *out,size_t cap){
 /* What is at a guest address?  For reports and fatals only: a heap block is found by scanning back for its header (a big block's
  * header sits on a page boundary, a small block's at most 256 KiB below), so block contents that imitate a header can mislead it. */
 int kh_describe_stack(u64 a,char *out,size_t cap);     /* threads.c */
+_Atomic unsigned long long ga_describe_walked;      /* pages the big-block walk of ga_describe has read (selftest: 0 for a small block) */
 int ga_describe(u64 a,char *out,size_t cap){
     if(a<0x10000){ snprintf(out,cap,"not a pointer (small integer %llu)",(unsigned long long)a); return 0; }
     if(a<GS_BASE||a>=arena_hi){ const char *hn=kh_host_fn_name(a); if(hn) snprintf(out,cap,"runtime host function '%s' (synthetic address)",hn); else snprintf(out,cap,"outside guest space"); return 0; }
@@ -394,16 +400,23 @@ int ga_describe(u64 a,char *out,size_t cap){
     #define POOL_WIN(q) ({ u64 _w=((q)-GS_BASE)>>GA_WIN_SHIFT; _w<nwin && win_live[_w*GA_NSRC+GA_SRC_POOL]==GA_WIN; })
     if(POOL_WIN(a)){ snprintf(out,cap,"%s: enlarged pool of the mod (header-less page run), window 0x%llx +0x%llx",z->name,(unsigned long long)(a&~(GA_WIN-1)),(unsigned long long)(a&(GA_WIN-1))); return 1; }
     int got=diag_lock(), found=0;
-    for(u64 q=a&~0xfffull, n=0; q>=z->lo && n<(1ull<<18) && !found; q-=4096, n++){              /* big blocks: up to 1 GiB back */
-        if(POOL_WIN(q)) break;
-        BHdr *h=(BHdr*)XLG(q); if(h->magic==MAGIC_LIVE&&h->cls==CLS_BIG&&h->src<GA_NSRC&&a<q+HDR+h->size){
-            snprintf(out,cap,"%s: %s block 0x%llx (%llu bytes) +0x%llx",z->name,src_names[h->src],(unsigned long long)(q+HDR),(unsigned long long)h->size,(unsigned long long)(a-q-HDR)); found=1; }
-        if(q<z->lo+4096) break; }
+    /* Small blocks FIRST (at most 256 KiB back).  The page walk for big blocks reads one header per 4 KiB for up to 1 GiB and has
+     * no early exit; it used to run first, for every pointer, also on the registration path of the object-id table (idtable.c
+     * note_new), where every first pointer of a window is a small block: on a host without a shared zero page (Darwin) each
+     * untouched page it read became resident, with the allocator lock held (review 2026-11-17).  Now it runs only when no small
+     * block owns the address.  A big block's own header is not a small-block header (cls CLS_BIG gives span 0), so the order
+     * cannot change an answer. */
     for(u64 q=(a&~15ull), n=0; q>=z->lo+HDR && n<=(BIG_LIMIT+2*HDR)/16 && !found; q-=16, n++){   /* small blocks */
         BHdr *h=(BHdr*)XLG(q-HDR); if(h->src>=GA_NSRC) continue;
         u64 span=(h->cls>=1&&h->cls<NCLS)?cls_size(h->cls):(h->cls==0?rup(h->size,16):0); if(!span||a>=q+span) continue;
         if(h->magic==MAGIC_LIVE){ snprintf(out,cap,"%s: %s block 0x%llx (%llu bytes) +0x%llx",z->name,src_names[h->src],(unsigned long long)q,(unsigned long long)h->size,(unsigned long long)(a-q)); found=1; }
         else if(h->magic==MAGIC_FREE){ snprintf(out,cap,"%s: FREED %s block 0x%llx (class of %llu bytes) +0x%llx",z->name,src_names[h->src],(unsigned long long)q,(unsigned long long)span,(unsigned long long)(a-q)); found=1; } }
+    for(u64 q=a&~0xfffull, n=0; q>=z->lo && n<(1ull<<18) && !found; q-=4096, n++){              /* big blocks: up to 1 GiB back */
+        if(POOL_WIN(q)) break;
+        atomic_fetch_add(&ga_describe_walked,1);
+        BHdr *h=(BHdr*)XLG(q); if(h->magic==MAGIC_LIVE&&h->cls==CLS_BIG&&h->src<GA_NSRC&&a<q+HDR+h->size){
+            snprintf(out,cap,"%s: %s block 0x%llx (%llu bytes) +0x%llx",z->name,src_names[h->src],(unsigned long long)(q+HDR),(unsigned long long)h->size,(unsigned long long)(a-q-HDR)); found=1; }
+        if(q<z->lo+4096) break; }
     diag_unlock(got);
     if(!found) snprintf(out,cap,"%s: no block header found below it (a free page run, a header-less page run, or released memory)",z->name);
     return 1;
@@ -466,6 +479,51 @@ int kh_ga_selftest(KCtx *g){
     u64 r5=TRUN(3u<<20); GCHECK(r5==r1 && t->bump==bump1 && t->runfree==0); TRUNFREE(r5,3u<<20);
     { u64 hw=0; int ok=1; for(int i=0;i<2000;i++){ u64 n=4096ull*(u64)(1+(i%30)*10); u64 p=TRUN(n), q=TALLOC(1+(u64)(i%50)*97); if(!p||!q){ ok=0; break; } if(i==100) hw=t->bump; TRUNFREE(p,n); pthread_mutex_lock(&gm); free_locked(q); pthread_mutex_unlock(&gm); }
       GCHECK(ok && hw && t->bump==hw); }                                                           /* steady churn does not move the high-water mark */
+    /* realloc that SHRINKS a page-run block: the pages the smaller size no longer covers go back at once (zeroed, mergeable), the
+     * kept part keeps its bytes, and the later free returns the rest: afterwards the free run is whole again, nothing is lost */
+    { GCHECK(t->runs && t->runs->lo==r1 && t->runs->size==(3u<<20) && !t->runs->next && t->runfree==(3u<<20));
+      u64 big=TALLOC(2u<<20), run0=rup(HDR+(2u<<20),4096), run1=rup(HDR+300000,4096); GCHECK(big==r1+HDR && t->runfree==(3u<<20)-run0);
+      memset((void*)XLG(big),0x55,2u<<20);
+      u64 live0=t->live, same=ga_realloc(big,300000);
+      GCHECK(same==big && ga_usable(big)==300000 && t->live==live0-(2u<<20)+300000);
+      GCHECK(t->runfree==(3u<<20)-run1 && t->runs && t->runs->lo==r1+run1 && !t->runs->next);          /* the surplus merged with the free rest */
+      GCHECK(*(u8*)XLG(big+299999)==0x55 && *(u8*)XLG(r1+run1)==0 && *(u8*)XLG(r1+run0-1)==0);            /* kept bytes kept, returned pages read as zero */
+      GCHECK(ga_realloc(big,300000)==big && t->runfree==(3u<<20)-run1);                                  /* same size again: nothing moves */
+      GCHECK(ga_realloc(big,1000)==big && ga_usable(big)==1000 && t->runfree==(3u<<20)-4096);            /* below the big limit: still a run, of one page */
+      pthread_mutex_lock(&gm); free_locked(big); pthread_mutex_unlock(&gm);
+      GCHECK(t->runs && t->runs->lo==r1 && t->runs->size==(3u<<20) && !t->runs->next && t->runfree==(3u<<20)); }
+    /* ga_describe: a small block is found without the page walk (which reads one header per 4 KiB, up to 1 GiB back); an address deep
+     * inside a big block still gets its block, by the walk */
+    { u64 sm=ga_alloc_src(300,16,GA_SRC_CRT), bg=ga_alloc_src(1u<<20,16,GA_SRC_CRT); char d[200]; GCHECK(sm&&bg);
+      unsigned long long w0=atomic_load(&ga_describe_walked); d[0]=0; ga_describe(sm+17,d,sizeof d);
+      GCHECK(strstr(d,"block")&&strstr(d,"(300 bytes) +0x11")&&!strstr(d,"FREED") && atomic_load(&ga_describe_walked)==w0);
+      d[0]=0; ga_describe(bg+600000,d,sizeof d);
+      GCHECK(strstr(d,"(1048576 bytes) +0x927c0") && atomic_load(&ga_describe_walked)>w0);
+      ga_free(sm); ga_free(bg); }
+    /* the guest range below the image: a read there ends in the fault report, in bias mode because the low guard reserves it */
+    {
+#if KH_XLATE_MODE!=0
+      const char *lge=getenv("KHNMC_LOW_GUARD"); int off=lge&&!strcmp(lge,"off");
+      GCHECK(off ? gs_low_guard==0 : gs_low_guard==GS_BASE);
+      if(gs_low_guard){ u64 pg=kh_host_page(); u64 at[3]={0,0x80000000ull,GS_BASE-pg}; int mapped=0;
+          for(int i=0;i<3;i++){ unsigned char vec=0; if(mincore((void*)XLG(at[i]),pg,(void*)&vec)==0) mapped++; }
+          GCHECK(mapped==3 && (uintptr_t)XLG(0)==gs_bias && gs_bias+GS_BASE==gs_host_base); }                 /* reserved by us, from guest 0 up to the image */
+      const u64 probe[3]={0x10,0x80000010ull,GS_BASE-8}; const int nprobe=3; const char *want="reserved without access by the low guard";
+#else
+      const u64 probe[1]={0x10}; const int nprobe=1; const char *want="identity mode";
+#endif
+      if(!kh_fork_ok()) kh_selftest_not_run("arena","a read below the image must end in the fault report",2*nprobe);
+      else for(int i=0;i<nprobe;i++){
+          FILE *log=kh_tmpfile(); GCHECK(log!=NULL); if(!log) break;
+          fflush(stderr); pid_t child=kh_fork();
+          if(!child){ if(dup2(fileno(log),STDERR_FILENO)<0) _exit(98); volatile u8 v=*(volatile u8*)XLG(probe[i]); (void)v; _exit(99); }
+          int status=0; char out[1200]; out[0]=0;
+          if(child>0&&waitpid(child,&status,0)==child){ rewind(log); size_t n=fread(out,1,sizeof out-1,log); out[n]=0; }
+          fclose(log);
+          char line[96]; snprintf(line,sizeof line,"kh: the address is guest 0x%llx, BELOW the image",(unsigned long long)probe[i]);
+          GCHECK(child>0 && WIFEXITED(status) && WEXITSTATUS(status)==4);
+          GCHECK(strstr(out,line) && strstr(out,want)); }
+    }
     /* exhaustion: the zone is 64 MiB.  A request that cannot fit is reported (in production: a named fatal) and yields 0; nothing is damaged and the zone keeps working */
     u64 hole=TRUN(3u<<20); GCHECK(hole==r1 && !t->runs);                                             /* no free run is left: what follows comes from the top */
     ex_rec.calls=0; u64 left=t->hi-rup(t->bump,4096);
@@ -702,6 +760,8 @@ static void on_sig(int sig,siginfo_t *si,void *uc){
     if(sig==SIGSEGV||sig==SIGBUS){                       /* which guest address that is (bias mode: host = guest + bias), and what lies there */
         u64 ga=(u64)(fa-gs_bias); char d[256]; d[0]=0; int in=fa>=gs_host_base&&fa-gs_host_base<gs_size; if(in) ga_describe(ga,d,sizeof d);
         if(in) fprintf(stderr,"kh: the address is guest 0x%llx (%s)%s\n",(unsigned long long)ga,d,GA_OK(ga)?"":": not committed guest memory");
+        else if(fa>=gs_bias&&fa<gs_host_base) fprintf(stderr,"kh: the address is guest 0x%llx, BELOW the image (%s): a null guest pointer plus an offset, an undecoded 32-bit object id, or another small wild value\n",
+                                 (unsigned long long)ga,gs_bias?(gs_low_guard?"reserved without access by the low guard":"NOT reserved: this fault came from the host's own layout"):"identity mode");
         else if(gs_bias) fprintf(stderr,"kh: the address is outside guest space (host 0x%llx..0x%llx, bias 0x%llx); as a guest address it would be 0x%llx: a host pointer used as a guest pointer, or a guest pointer used without the bias\n",
                                  (unsigned long long)gs_host_base,(unsigned long long)(gs_host_base+gs_size),(unsigned long long)gs_bias,(unsigned long long)ga);
     }

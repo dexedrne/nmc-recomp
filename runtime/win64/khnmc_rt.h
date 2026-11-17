@@ -20,6 +20,7 @@
 extern uintptr_t gs_host_base;                     /* host address of guest address GS_BASE */
 extern u64 gs_size;                                /* bytes of guest space (image + arena) */
 extern uintptr_t gs_bias;                          /* host - guest (0 in identity mode) */
+extern u64 gs_low_guard;                           /* bias mode: guest 0..gs_low_guard below the image is reserved without access (0: no guard) */
 int  ga_ok(u64 a);                                 /* a is in the image or in a COMMITTED part of the guest arena (readable and writable) */
 #define GA_OK(a) ga_ok((u64)(a))
 

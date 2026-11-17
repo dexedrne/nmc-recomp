@@ -26,6 +26,7 @@ static char exe_path[1024]="/home/user/projects/kh2-nmc-analysis/pc/kh2fm.exe";
 #endif
 static const char *entry_mode="crt";
 static u64 guest_space_size=0x300000000ull;   /* 12 GiB reserve, lazily committed */
+u64 gs_low_guard=0;                           /* bias mode: bytes of guest space below GS_BASE that are reserved without access (GS_BASE, or 0 = no guard) */
 static int exit_code_main=-1; static int selftest; static int hd_check; static const char *hd_check_report;
 
 #define RD16(p) (*(const u16*)(p))
@@ -48,14 +49,27 @@ static int load_image(void){
     gs_bias=0;
     if(mprotect(m,image_hi-GS_BASE,PROT_READ|PROT_WRITE|PROT_EXEC)){ perror("kh: commit image"); return -1; }
 #else
-    void *m=mmap(0,guest_space_size,PROT_NONE,flags,-1,0);
+    /* Bias mode.  The guest range BELOW the image (guest 0 .. GS_BASE: a null pointer plus an offset, an undecoded 32-bit object id,
+     * any small wild value) must fault, as it does on the PC and in the identity build.  Without a reservation of its own it is
+     * whatever the host has at bias + address (on macOS: often a system library): lifted code then reads garbage or writes into
+     * the host and no report is made (review 2026-11-17: the Linux identity runs had reported real faults at guest 0x4, 0x8, 0x30,
+     * 0x4c, 0x458).  So the reservation starts at guest 0: GS_BASE (5 GiB) more of address space, never committed.
+     * KHNMC_LOW_GUARD=off, or a host that will not give that much, falls back to the old layout, and says so loudly. */
+    const char *lge=getenv("KHNMC_LOW_GUARD"); void *lowm=MAP_FAILED, *m; int lg_off=lge&&!strcmp(lge,"off");
+    if(lge&&*lge&&!lg_off&&strcmp(lge,"on")){ fprintf(stderr,"kh: KHNMC_LOW_GUARD=%s (on or off)\n",lge); return -1; }
+    if(!lg_off) lowm=mmap(0,GS_BASE+guest_space_size,PROT_NONE,flags,-1,0);
+    if(lowm!=MAP_FAILED){ m=(u8*)lowm+GS_BASE; gs_low_guard=GS_BASE; }
+    else { m=mmap(0,guest_space_size,PROT_NONE,flags,-1,0); gs_low_guard=0; }
     if(m==MAP_FAILED){ perror("mmap guest space"); return -1; } gs_bias=(uintptr_t)m-GS_BASE;
+    if(!gs_low_guard) fprintf(stderr,"kh: guest space: WARNING: NO LOW GUARD (%s): guest addresses below 0x%llx are NOT reserved; a null or low wild guest pointer may read or write host memory at bias + address without a fault\n",
+                              lg_off?"KHNMC_LOW_GUARD=off":"the host refused the larger reservation",(unsigned long long)GS_BASE);
     if(mprotect(m,image_hi-GS_BASE,PROT_READ|PROT_WRITE)){ perror("kh: commit image"); return -1; }
 #endif
     gs_host_base=(uintptr_t)m; gs_size=guest_space_size;
 #if KH_XLATE_MODE!=0
-    fprintf(stderr,"kh: guest space: bias mode, guest 0x%llx..0x%llx is host 0x%llx..0x%llx (bias 0x%llx), host page %lu bytes\n",(unsigned long long)GS_BASE,(unsigned long long)(GS_BASE+guest_space_size),
-            (unsigned long long)gs_host_base,(unsigned long long)(gs_host_base+guest_space_size),(unsigned long long)gs_bias,(unsigned long)sysconf(_SC_PAGESIZE));
+    fprintf(stderr,"kh: guest space: bias mode, guest 0x%llx..0x%llx is host 0x%llx..0x%llx (bias 0x%llx), host page %lu bytes; low guard: %s\n",(unsigned long long)GS_BASE,(unsigned long long)(GS_BASE+guest_space_size),
+            (unsigned long long)gs_host_base,(unsigned long long)(gs_host_base+guest_space_size),(unsigned long long)gs_bias,(unsigned long)sysconf(_SC_PAGESIZE),
+            gs_low_guard?"guest 0x0 up to the image is reserved without access":"NONE");
 #endif
 #ifdef MADV_DONTDUMP
     madvise(m,guest_space_size,MADV_DONTDUMP);
