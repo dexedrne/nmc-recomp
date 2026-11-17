@@ -110,6 +110,13 @@ const KhRouteCondInfo kh_route_cond_info[KR_NCOND]={
     [KR_ITEM_USES]     ={"item-uses",1,1,1000,"N items applied by the mod's item handler since the step started"},
     [KR_ITEM_DRAIN]    ={"item-drain",0,0,0,"an item applied since the step started lowered the target's HP or MP"},
     [KR_ITEM_HEAL]     ={"item-heal",0,0,0,"an item applied since the step started raised the target's HP or MP"},
+    [KR_DOOR]          ={"door",1,0,255,"the current place's door (entrance) is N"},
+    [KR_MAP_PROGRAM]   ={"map-program",1,0,65535,"the area's map program is N"},
+    [KR_BTL_PROGRAM]   ={"btl-program",1,0,65535,"the area's btl program is N"},
+    [KR_EVT_PROGRAM]   ={"evt-program",1,0,65535,"the area's evt program is N"},
+    [KR_PAUSE_MENU]    ={"pause-menu",0,0,0,"the pause screen (system menu 50) takes input"},
+    [KR_PAUSE_ID]      ={"pause-id",1,0,65535,"the pause screen's cursor is on the row with id N (6 continue, 5 skip the event)"},
+    [KR_PAUSE_HAS]     ={"pause-has",1,0,65535,"the pause screen has a row with id N"},
 };
 int kh_route_cond_lookup(const char *name){ for(int i=0;i<KR_NCOND;i++) if(!strcmp(name,kh_route_cond_info[i].name)) return i; return -1; }
 
@@ -158,6 +165,8 @@ static void windows(KCtx *g,int *total,int *waiting){
     }
 }
 static int message(KCtx *g){ int t,wt; windows(g,&t,&wt); return wt>0; }
+/* task 30, for the trace line: state and mode of the first window of the list (mode 1 = confirm, 2 = a choice) */
+static void first_window(KCtx *g,int *st,int *mode){ u64 w=rd64(g,WIN_HEAD); *st=*mode=-1; if(readable(w,0x5c8)){ *st=(s32)rd32(g,w+0xa0); *mode=(s32)rd32(g,w+0x260); } }
 static int field(KCtx *g){ return fc_frame>0 && rd8(g,NOW_WORLD)!=0xff && !message(g); }
 static int battle(u64 n){ u64 h=kh_phase_damage_hits(), last=kh_phase_damage_last_frame(); return h>0 && n>=last && n-last<=KR_BATTLE_RECENT; }
 
@@ -219,7 +228,37 @@ int kh_route_command_menu(KCtx *g,KhCommandMenu *o){
     return o->depth;
 }
 int kh_route_world(KCtx *g){ u8 w=rd8(g,NOW_WORLD); return w==0xff?-1:w; }
+/* Task 30: the programs of the area scripts that run now.  0x152be0 (called with a place record: world, room, door, then map / btl /
+ * evt program words, 0xffff = keep) writes the current place: [0x140717008] world, +1 room, +2 door (the entrance whose spawn
+ * points the player takes), +4 map program, +6 btl program, +8 evt program; the defaults come from the save, three words per room
+ * at 0x1409a98c0 + 6 * (world * 64 + room).  A program is the id of one program of the area's `map` / `btl` / `evt` script
+ * (ard/us/<map>.ard): which spawn files it loads, which mission it starts, which event plays and which program comes after. */
+int kh_route_programs(KCtx *g,int *door,int *map,int *btl,int *evt){
+    if(rd8(g,NOW_WORLD)==0xff) return 0;
+    if(door) *door=rd8(g,NOW_WORLD+2); if(map) *map=rd16(g,NOW_WORLD+4); if(btl) *btl=rd16(g,NOW_WORLD+6); if(evt) *evt=rd16(g,NOW_WORLD+8);
+    return 1;
+}
 int kh_route_area(KCtx *g){ u8 a=rd8(g,NOW_WORLD+1); return rd8(g,NOW_WORLD)==0xff||a==0xff?-1:a; }
+/* Task 30: the pause screen.  START (0x1572b0) opens system menu 50 (table 0x1405ba170, type 8: 0x2e4c20 / 0x1595b0 -> 0x2e4950)
+ * while a mission record exists, and every event of the story sets one (tt01's events: `mission` flickers on): its rows are then
+ * id 6 (continue) and id 5 (skip the event; traced: run-P30/explore3b, A on it ends event 100 of tt01 within 5 game frames and the
+ * area goes on to the next program; id 6 closes the menu and the event plays on, explore3a2).  The menu's code (0x31d0b0 /
+ * 0x31d200 and 0x31e8xx) keeps a pointer to its cursor word at [0x140bef528] and to its row-id list (u16, 0xffff = no row) at
+ * [0x140bef538]; MENU::isRunning [0x1409006b0] and the menu id [0x140900724] = 50 say that it is the one running.  The list is
+ * filled two frames after the menu opens (all 0xffff before): no row = not taking input yet.  DPAD_DOWN moves the cursor to the
+ * next row (traced). */
+#define PAUSE_CURP (GS_BASE+0xbef528ull)
+#define PAUSE_IDS  (GS_BASE+0xbef538ull)
+#define MENU_ID    (GS_BASE+0x900724ull)
+int kh_route_pause_menu(KCtx *g,KhPauseMenu *o){
+    memset(o,0,sizeof *o); o->cursor=-1;
+    if(!rd8(g,MENU_RUN) || (s32)rd32(g,MENU_ID)!=50) return 0;
+    u64 cp=rd64(g,PAUSE_CURP), ip=rd64(g,PAUSE_IDS); if(!readable(cp,2) || !readable(ip,24)) return 0;
+    while(o->rows<12){ u16 v=rd16(g,ip+2*(u64)o->rows); if(v==0xffff) break; o->id[o->rows++]=v; }
+    if(!o->rows) return 0;
+    int c=rd16(g,cp); o->cursor=c<o->rows?c:-1;
+    return 1;
+}
 #define MISSIONS (GS_BASE+0x2a114a0ull)    /* six mission records of 0x40 bytes; 0x3ad500 returns the highest whose first word is not 0 */
 u64 kh_route_mission(KCtx *g){ for(int i=5;i>=0;i--){ u64 r=MISSIONS+0x40ull*(u64)i; if(rd16(g,r)) return r; } return 0; }
 /* The object list: head [0x142a171c8], next = the object id at +0xa90 (0x3bfb70 walks it).  [obj+0] is the id of the object's
@@ -253,9 +292,11 @@ int kh_route_cursor(KCtx *g,int kind){
     if(kind==KR_TITLE_CHOICE) return title_menu(g)?(int)(s32)rd32(g,T_CURSOR):-1;
     if(kind==KR_NEWGAME_CHOICE) return newgame_choice(g);
     if(kind==KR_COMMAND_ROW || kind==KR_COMMAND_ID){ KhCommandMenu m; return kh_route_command_menu(g,&m)?m.cursor:-1; }
+    if(kind==KR_PAUSE_ID){ KhPauseMenu p; return kh_route_pause_menu(g,&p)?p.cursor:-1; }
     return -1;
 }
 int kh_route_cursor_target(KCtx *g,int kind,int arg){
+    if(kind==KR_PAUSE_ID){ KhPauseMenu p; if(!kh_route_pause_menu(g,&p)) return -1; for(int i=0;i<p.rows;i++) if(p.id[i]==arg) return i; return -1; }
     if(kind!=KR_COMMAND_ID) return arg;
     KhCommandMenu m; if(!kh_route_command_menu(g,&m)) return -1;
     for(int i=0;i<m.rows;i++) if(m.cmd[i]==arg) return i;
@@ -292,6 +333,12 @@ int kh_route_cond_eval(KCtx *g,int kind,int arg,u64 n,const KhRouteBase *b){
     case KR_ENEMIES_AT_MOST:{ int e=kh_route_enemies(g,0,0,NULL,NULL,NULL); return e>=0 && e<=arg; }
     case KR_ITEM_USES:      return kh_mod_item_obs(NULL)-b->items>=(u64)arg;
     case KR_ITEM_DRAIN: case KR_ITEM_HEAL: return item_cond(kind,b);
+    case KR_DOOR: case KR_MAP_PROGRAM: case KR_BTL_PROGRAM: case KR_EVT_PROGRAM: {
+        int d,m,bt,e; if(!kh_route_programs(g,&d,&m,&bt,&e)) return 0;
+        return (kind==KR_DOOR?d:kind==KR_MAP_PROGRAM?m:kind==KR_BTL_PROGRAM?bt:e)==arg; }
+    case KR_PAUSE_MENU: { KhPauseMenu p; return kh_route_pause_menu(g,&p); }
+    case KR_PAUSE_ID:   { KhPauseMenu p; return kh_route_pause_menu(g,&p) && p.cursor>=0 && p.id[p.cursor]==arg; }
+    case KR_PAUSE_HAS:  { KhPauseMenu p; if(!kh_route_pause_menu(g,&p)) return 0; for(int i=0;i<p.rows;i++) if(p.id[i]==arg) return 1; return 0; }
     }
     kh_fatal(g,"route-condition-unknown: condition kind %d",kind);
 }
@@ -299,10 +346,10 @@ void kh_route_state_summary(KCtx *g,u64 n,char *out,size_t cap){
     int t,wt; windows(g,&t,&wt); u64 hits=kh_phase_damage_hits(); char last[24]="-";
     if(hits) snprintf(last,sizeof last,"%llu",(unsigned long long)kh_phase_damage_last_frame());
     size_t o=(size_t)snprintf(out,cap,"initial-state=%d%s title=%s mode=%d menu=%s cursor=%d screen=%d newgame=%s page=%d choice=%d game-level=%d world=%02x room=%02x "
-             "field-cmds-this-frame=%llu field=%d windows=%d waiting=%d menu-open=%d",
+             "door=%d map-program=%#x btl-program=%#x evt-program=%#x field-cmds-this-frame=%llu field=%d windows=%d waiting=%d menu-open=%d",
              kh_phase_initial_state(),kh_phase_initial_alive()?"":"(gone)",kh_phase_title_alive()?"running":"not-running",(int)(s32)rd32(g,T_MODE),
              rd64(g,T_MENU)?"up":"none",(int)(s32)rd32(g,T_CURSOR),title_screen(g),kh_phase_newgame_alive()?"running":"not-running",newgame_page(g),newgame_choice(g),
-             (int)(s32)rd32(g,GAME_LEVEL),rd8(g,NOW_WORLD),rd8(g,NOW_WORLD+1),(unsigned long long)fc_frame,field(g),t,wt,rd8(g,MENU_RUN));
+             (int)(s32)rd32(g,GAME_LEVEL),rd8(g,NOW_WORLD),rd8(g,NOW_WORLD+1),rd8(g,NOW_WORLD+2),rd16(g,NOW_WORLD+4),rd16(g,NOW_WORLD+6),rd16(g,NOW_WORLD+8),(unsigned long long)fc_frame,field(g),t,wt,rd8(g,MENU_RUN));
     if(o>=cap) return;
     KhPlayerSheet ps; KhCommandMenu cm;
     if(kh_route_player_sheet(g,&ps)) o+=(size_t)snprintf(out+o,cap-o," player=char%d hp=%d/%d mp=%d/%d",(int)ps.chr,(int)ps.hp,(int)ps.hp_max,(int)ps.mp,(int)ps.mp_max);
@@ -314,6 +361,8 @@ void kh_route_state_summary(KCtx *g,u64 n,char *out,size_t cap){
     if(o>=cap) return;
     o+=(size_t)snprintf(out+o,cap-o," mission=%s enemies=%d",kh_route_mission(g)?"yes":"no",kh_route_enemies(g,0,0,NULL,NULL,NULL));
     if(o>=cap) return;
+    if(t){ int ws,wm; first_window(g,&ws,&wm); o+=(size_t)snprintf(out+o,cap-o," window0=state%d/mode%d",ws,wm); if(o>=cap) return; }
+    { KhPauseMenu pm; if(kh_route_pause_menu(g,&pm)){ o+=(size_t)snprintf(out+o,cap-o," pause-menu=row%d ids=",pm.cursor); for(int i=0;i<pm.rows && o<cap;i++) o+=(size_t)snprintf(out+o,cap-o,"%s%u",i?",":"",(unsigned)pm.id[i]); if(o>=cap) return; } }
     snprintf(out+o,cap-o," hits=%llu last-hit-frame=%s battle=%d items=%llu",(unsigned long long)hits,last,battle(n),(unsigned long long)kh_mod_item_obs(NULL));
 }
 
@@ -334,10 +383,12 @@ void kh_route_map_report(KCtx *g,FILE *f,const char *what){
     int most=0, used=kh_idtable_slots(&most); u64 lo=0,bump=0,live=0,flo=0,fbump=0,flive=0;
     ga_zone_get(0,&lo,NULL,&bump,NULL,&live); ga_zone_get(1,&flo,NULL,&fbump,NULL,&flive);
     long now,peak; rss_mib(&now,&peak); u64 tc=0,te=0,tr=0; kh_threads_counts(&tc,&te,&tr);
-    fprintf(f,"kh: map report (%s): game frame %llu, world %02x area %02x; id table %d of 64 slots (most ever %d); id zone high-water %llu MiB, in use %llu MiB; "
+    int door=-1,mp=-1,bp=-1,ep=-1; kh_route_programs(g,&door,&mp,&bp,&ep);
+    fprintf(f,"kh: map report (%s): game frame %llu, world %02x area %02x (door %d, programs map %#x btl %#x evt %#x); id table %d of 64 slots (most ever %d); id zone high-water %llu MiB, in use %llu MiB; "
               "far zone high-water %llu MiB, in use %llu MiB; RSS %ld MiB (peak %ld MiB); files opened %zu (distinct paths); threads created %llu, ended %llu (stacks released %llu)\n",
-            what,(unsigned long long)kh_input_game_frames(),rd8(g,NOW_WORLD),rd8(g,NOW_WORLD+1),used,most,(unsigned long long)((bump-lo)>>20),(unsigned long long)(live>>20),
+            what,(unsigned long long)kh_input_game_frames(),rd8(g,NOW_WORLD),rd8(g,NOW_WORLD+1),door,mp,bp,ep,used,most,(unsigned long long)((bump-lo)>>20),(unsigned long long)(live>>20),
             (unsigned long long)((fbump-flo)>>20),(unsigned long long)(flive>>20),now,peak,kh_phase_files_seen(),(unsigned long long)tc,(unsigned long long)te,(unsigned long long)tr);
+    { extern void kh_gfx_mem_report(FILE*); kh_gfx_mem_report(f); }          /* task 30: the null device's live resources and buffer data */
     const char *e=getenv("KHNMC_IDTABLE_REPORT"); if(e&&*e&&*e!='0') kh_idtable_report_now(f,what);
 }
 
@@ -389,12 +440,69 @@ static void trace_objs(KCtx *g,u64 n){                     /* KHNMC_ROUTE_TRACE=
         u32 id=rd32(g,o+0xa90); if(!id) break; o=rd64(g,ID_TABLE+8ull*((id&0x7fffffffu)>>25))|(id&0x1ffffffu); k++; }
     fprintf(stderr,"%s (%d objects)\n",buf,k+1);
 }
+/* KHNMC_TRACE_PLACE=1 (task 30, diagnostic): who places and turns objects when a map comes up.  Every call of YS::OBJ::set_pos
+ * (0x3b64d0; 0x3b6510 is the same plus a flag) and of the two rotation setters (0x3b6420 takes a vector: with the object's flag
+ * [+0x9b8] bit 3 it is stored as is and [+0x68c] = its y, else it is a DIRECTION and the facing becomes atan2(x, z); 0x3b6560 takes
+ * the facing angle itself) during the 600 game frames after each map change, with the object, its class record's vtable, the
+ * value and the caller (return address).  Read-only: the hooks pass every call through unchanged. */
+static int place_trace=-1; static u64 place_until;
+static void place_log(KCtx *g,const char *fn){
+    if(place_trace<0){ const char *e=getenv("KHNMC_TRACE_PLACE"); place_trace=e&&*e=='1'; }
+    if(!place_trace) return;
+    u64 n=kh_input_game_frames(); if(n>place_until) return;
+    u64 obj=KH_RCX(g), ra=rd64(g,KH_RSP(g)); u32 cid=readable(obj,4)?rd32(g,obj):0; u64 cls=cid&0x80000000u?decode_id(g,cid):0; u64 vt=readable(cls,8)?rd64(g,cls):0;
+    char v[96]="-"; float f[4]={0};
+    if(fn[4]=='p'||!strcmp(fn,"set_rot_vec")){ u64 a=KH_RDX(g); if(readable(a,16)){ for(int i=0;i<4;i++) f[i]=rdf(g,a+4*(u64)i); snprintf(v,sizeof v,"(%.2f, %.2f, %.2f, %.2f)",f[0],f[1],f[2],f[3]); } }
+    else { u32 x; memcpy(&x,&KH_XMM(g,1),4); memcpy(&f[0],&x,4); snprintf(v,sizeof v,"yaw %.3f",f[0]); }
+    fprintf(stderr,"kh: place game-frame=%llu %s obj=%llx class-vtable=%llx%s flag9b8=%x value %s caller rva %llx; pos before (%.1f, %.1f, %.1f) facing %.3f\n",(unsigned long long)n,fn,(unsigned long long)obj,
+            (unsigned long long)(vt?vt-GS_BASE:0),obj==rd64(g,FC_PLAYER)?" (the field player)":"",readable(obj,0x9c0)?rd32(g,obj+0x9b8):0,v,(unsigned long long)(ra-GS_BASE),
+            readable(obj,0x690)?rdf(g,obj+0x670):0,readable(obj,0x690)?rdf(g,obj+0x674):0,readable(obj,0x690)?rdf(g,obj+0x678):0,readable(obj,0x690)?rdf(g,obj+0x68c):0);
+}
+/* the object initializer 0x3b3200(obj, id, objentry, flags, &pos, yaw) and its two wrappers 0x3da940 / 0x419230(obj, objentry, flags,
+ * &pos, yaw): every object of the field starts there with the position and facing its creator hands over */
+static void init_log(KCtx *g,const char *fn,u64 posp,float yaw,u32 id){
+    if(place_trace<0){ const char *e=getenv("KHNMC_TRACE_PLACE"); place_trace=e&&*e=='1'; }
+    if(!place_trace || kh_input_game_frames()>place_until) return;
+    u64 rsp=KH_RSP(g), ra=rd64(g,rsp); float p[3]={0};
+    if(readable(posp,12)) for(int i=0;i<3;i++) p[i]=rdf(g,posp+4*(u64)i);
+    fprintf(stderr,"kh: place game-frame=%llu %s obj=%llx id=%#x pos (%.1f, %.1f, %.1f) yaw %.3f caller rva %llx\n",(unsigned long long)kh_input_game_frames(),fn,(unsigned long long)KH_RCX(g),id,p[0],p[1],p[2],yaw,(unsigned long long)(ra-GS_BASE));
+}
+static float stack_f(KCtx *g,u64 off){ u32 v=rd32(g,KH_RSP(g)+off); float f; memcpy(&f,&v,4); return f; }
+void orig_f_3b3200(KCtx *); void f_3b3200(KCtx *g){ init_log(g,"obj_init",rd64(g,KH_RSP(g)+0x28),stack_f(g,0x30),(u32)KH_RDX(g)); orig_f_3b3200(g); }
+void orig_f_3da940(KCtx *); void f_3da940(KCtx *g){ u64 e=KH_RDX(g); init_log(g,"obj_init_3da940",KH_R9(g),stack_f(g,0x28),readable(e,4)?rd32(g,e):0); orig_f_3da940(g); }
+void orig_f_419230(KCtx *); void f_419230(KCtx *g){ u64 e=KH_RDX(g); init_log(g,"obj_init_419230",KH_R9(g),stack_f(g,0x28),readable(e,4)?rd32(g,e):0); orig_f_419230(g); }
+void orig_f_3b64d0(KCtx *); void f_3b64d0(KCtx *g){ place_log(g,"set_pos"); orig_f_3b64d0(g); }
+void orig_f_3b6510(KCtx *); void f_3b6510(KCtx *g){ place_log(g,"set_pos2"); orig_f_3b6510(g); }
+void orig_f_3b6420(KCtx *); void f_3b6420(KCtx *g){ place_log(g,"set_rot_vec"); orig_f_3b6420(g); }
+void orig_f_3b6560(KCtx *); void f_3b6560(KCtx *g){ place_log(g,"set_rot_yaw"); orig_f_3b6560(g); }
+/* KHNMC_TRACE_MENU=1 (task 30, diagnostic): while a system menu runs (MENU::isRunning), every dword that changed since the last game
+ * frame in the menu globals (0x140742000..0x140745000, 0x140900600..0x140900800, 0x140bee000..0x140bf0000) and in the two blocks
+ * the camp menu's init 0x304ea0 stores at 0x140beec28 (0x90 bytes) and 0x140beecc8 (0x11f0 bytes).  How the camp menu's cursor and
+ * rows were found.  Read-only. */
+typedef struct { u64 ptr_at, base, size; u32 *prev; u64 seen; } MenuRegion;
+static MenuRegion menu_regions[]={{0,GS_BASE+0x742000ull,0x3000,0,0},{0,GS_BASE+0x900600ull,0x200,0,0},{0,GS_BASE+0xbee000ull,0x2000,0,0},
+                                  {GS_BASE+0xbeec28ull,0,0x90,0,0},{GS_BASE+0xbeecc8ull,0,0x11f0,0,0}};
+static int menu_trace=-1;
+static void trace_menu(KCtx *g,u64 n){
+    if(menu_trace<0){ const char *e=getenv("KHNMC_TRACE_MENU"); menu_trace=e&&*e=='1'; }
+    if(!menu_trace) return;
+    int run=rd8(g,MENU_RUN)!=0;
+    for(size_t r=0;r<sizeof menu_regions/sizeof *menu_regions;r++){ MenuRegion *m=&menu_regions[r];
+        u64 b=m->ptr_at?rd64(g,m->ptr_at):m->base; if(!readable(b,m->size)){ m->seen=0; continue; }
+        if(!m->prev) m->prev=calloc(m->size/4,4);
+        if(m->seen!=b || !run){ memcpy(m->prev,(void*)XL(g,b),m->size); m->seen=b; continue; }     /* a new block, or no menu: just remember */
+        int k=0; char line[1600]; size_t o=(size_t)snprintf(line,sizeof line,"kh: menu diff game-frame=%llu region %zu:",(unsigned long long)n,r);
+        for(u64 i=0;i<m->size/4;i++){ u32 v=rd32(g,b+4*i); if(v!=m->prev[i]){ if(k<40 && o<sizeof line-60) o+=(size_t)snprintf(line+o,sizeof line-o," %llx:%x->%x",(unsigned long long)(b+4*i),m->prev[i],v); k++; m->prev[i]=v; } }
+        if(k) fprintf(stderr,"%s%s (%d changed)\n",line,k>40?" ...":"",k);
+    }
+}
 void kh_route_state_tick(KCtx *g,u64 n){
+    trace_menu(g,n);
     u64 fc=kh_phase_field_cmds(); fc_frame=fc-fc_prev; fc_prev=fc;
     { int w=kh_route_world(g), a=kh_route_area(g), m=w>=0&&a>=0?(w<<8|a):-1;
       if(m>=0 && m!=map_prev){ char what[64]; if(map_prev<0) snprintf(what,sizeof what,"map %02x:%02x entered",w,a);
           else snprintf(what,sizeof what,"map %02x:%02x -> %02x:%02x",map_prev>>8,map_prev&0xff,w,a);
-          kh_route_map_report(g,stderr,what); map_prev=m; } }
+          kh_route_map_report(g,stderr,what); map_prev=m; place_until=n+600; } }
     if(trace<0){ const char *e=getenv("KHNMC_ROUTE_TRACE"); trace=e&&!strcmp(e,"1")?1:e&&!strcmp(e,"2")?2:0; }
     if(!trace) return;
     if(trace==2){ trace2(g,n); trace_objs(g,n); trace_carry(g); }

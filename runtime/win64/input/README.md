@@ -136,3 +136,52 @@ multiplier, so a route's numbers can be checked against the formula. Every map c
 with the id table's slots, the arena zones' high-water marks, RSS, files opened and threads (with `KHNMC_IDTABLE_REPORT=1` the
 whole id table follows). `KHNMC_ROUTE_TRACE=2` adds the player's sheet, position, facing and the camera yaw every 8 game frames
 and the object list with the running mission every 64: what the coordinates in a route come from.
+
+## Route scripts, task 30: fighting until something happens, the place's programs
+
+```
+@fight until COND [radius R] [every P] [hold H] [stall N] [timeout N]
+                                               fight until COND holds: every game frame the left stick walks the player to
+                                               the nearest enemy (camera-relative, as @goto enemy); within R (default 150) of it
+                                               he stands and presses A for H of every P game frames (default 3 of 20, counted
+                                               from the step's start); with no enemy in the object list he stands still and
+                                               presses nothing (A near an NPC would talk), and waiting for the next wave is not
+                                               a stall.  Walking toward an enemy without getting 10 map units closer for N game
+                                               frames (default 600) is the named fatal `route-goto-stalled` (a distance 50 above
+                                               the closest one, after a knock-back, starts a new approach); `until` not holding
+                                               within the time-out is `route-wait-timeout` (with the enemies seen at the last
+                                               look and the attacks pressed).  `until` is required.
+```
+
+| condition | true when (runtime/route_state.c has the details) |
+|---|---|
+| `door N` | the current place's door (the entrance whose spawn points the player takes) is N: [0x14071700a] |
+| `map-program N`, `btl-program N`, `evt-program N` | the program of the area's `map` / `btl` / `evt` script that runs now: words [0x14071700c] / [0x14071700e] / [0x140717010] (0x152be0 writes the place: world, room, door, the three programs; their defaults are the save's three words per room at 0x1409a98c0 + 6 * (world * 64 + room)). A program decides the spawn files, the mission and the event; an event names the program that follows it |
+
+```
+@skip until COND [every P] [hold H] [timeout N]
+                                               skip the story's events through the game's own pause screen until COND: while
+                                               no pause screen is up, START for H of every P game frames (default 2 of 30);
+                                               when it is up (`pause-menu`), DPAD to the row with id 5 ("skip") and A.  A pause
+                                               screen without that row (a mission's pause has no rows) is the named fatal
+                                               `route-skip-no-skip-row` with the rows it has.  Typical: `@skip until field`
+@talk until COND [every P] [hold H] [stable S] [timeout N]
+                                               answer field message windows: A for H of every P frames (default 2 of 20), only
+                                               while a message waits; the step ends when COND has held S game frames in a row
+                                               (default 30), so the one-frame gaps between pages and the pauses between two
+                                               windows of one scene do not end it.  Typical: `@talk until field stable 120`
+```
+
+| condition | true when |
+|---|---|
+| `pause-menu` | the pause screen (system menu 50: MENU::isRunning, menu id [0x140900724] = 50) takes input: its row list ([[0x140bef538]], u16 ids, 0xffff = none) has a row. START opens it instead of the camp menu while a mission record exists; the story's events set one, and then its rows are 6 (continue) and 5 (skip the event) |
+| `pause-id N` | the pause screen's cursor ([[0x140bef528]]) is on the row with id N; `@select pause-id N` moves it there (DPAD_DOWN = next row) |
+| `pause-has N` | the pause screen has a row with id N |
+
+A condition's number may be written in hex with `0x` (`@wait btl-program 0x1301`), as the program ids appear in the area data
+(`ard/us/<map>.ard`, entries `map` / `btl` / `evt`). The map report and the `KHNMC_ROUTE_TRACE` state line print door and programs (the state line also the pause screen's rows and the
+first message window's state and mode).
+`KHNMC_TRACE_PLACE=1` (diagnostic) prints every object initialisation (0x3b3200 and its wrappers 0x3da940 / 0x419230: object
+id, position, facing) and every set_pos / set-rotation call during the 600 game frames after a map change; `KHNMC_TRACE_MENU=1`
+(diagnostic) prints every dword of the menu globals and of the camp menu's two blocks that changed during a game frame while a
+system menu runs. Both only read.

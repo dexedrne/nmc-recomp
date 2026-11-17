@@ -13,6 +13,9 @@ static int C_factory,C_adapter,C_output,C_swap,C_dev,C_queue,C_alloc,C_list,C_re
 static u64 o_adapter,o_output;
 static _Atomic u64 res_ids=1, heap_ids=1;
 _Atomic u64 gfx_draws, gfx_clears, gfx_barriers, gfx_execs, gfx_presents, gfx_copies, gfx_psos, gfx_resources, gfx_buffers_bytes;
+/* task 30: a resource is destroyed at its last Release, as Direct3D destroys it: its buffer data (far zone) and the object itself
+ * (id zone) go back to the arena.  gfx_resources / gfx_buffers_bytes stay what they were (created so far); these count what went. */
+static _Atomic u64 gfx_res_freed, gfx_buffers_freed_bytes, gfx_buffers_freed;
 static long vblank_ns=16666667;            /* the null backend's frame sleep; KHNMC_NULL_VBLANK_NS=n (1,000,000..500,000,000) overrides it (task 27: 120 ms frames) */
 void kh_gfx_report(FILE *f);
 void kh_gfx_tex_report(FILE *f);
@@ -108,7 +111,8 @@ static int h_swap(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1
         wr32(g,o+40,rd32(g,o+40)+1); SET_RAX(g,0); return 1;                 /* Present / Present1 */
     case 9: if(kh_gfx_vkd3d_on){ kh_vkd3d_swap_getbuffer(g,o); return 1; }
             { u32 i=(u32)A1(g)%3; u64 b=rd64(g,o+56+8*i); if(!b){ u64 desc=ga_alloc(56,16); memset(hp(g,desc),0,56); wr32(g,desc,3); wr64(g,desc+16,rd32(g,o+32)); wr32(g,desc+24,rd32(g,o+36)); wr16(g,desc+28,1); wr16(g,desc+30,1); wr32(g,desc+32,0x57); wr32(g,desc+36,1);
-            b=new_resource(g,desc,3); ga_free(desc); wr64(g,o+56+8*i,b); } out_obj(g,A3(g),b); SET_RAX(g,0); return 1; }   /* GetBuffer(idx, riid, **pp) */
+            b=new_resource(g,desc,3); ga_free(desc); wr64(g,o+56+8*i,b); }             /* the swap chain's own reference (count 1) */
+            kh_com_ref_add(g,b); out_obj(g,A3(g),b); SET_RAX(g,0); return 1; }        /* GetBuffer(idx, riid, **pp): the caller gets a new reference (AddRef, as DXGI does) and releases it */
     case 10: SET_RAX(g,0); return 1;                                                                        /* SetFullscreenState */
     case 12: { u64 d=A1(g); memset(hp(g,d),0,0x48); wr32(g,d,rd32(g,o+32)); wr32(g,d+4,rd32(g,o+36)); wr32(g,d+0x10,0x57); wr32(g,d+0x1c,1); wr32(g,d+0x24,0x30); wr32(g,d+0x28,3); wr32(g,d+0x38,1); wr32(g,d+0x3c,3); wr32(g,d+0x40,0x42); SET_RAX(g,0); return 1; } /* GetDesc */
     case 13: if(kh_gfx_vkd3d_on){ u32 nw=(u32)A2(g)?(u32)A2(g):rd32(g,o+32), nh=(u32)A3(g)?(u32)A3(g):rd32(g,o+36); kh_vkd3d_swap_resize(g,o,nw,nh);
@@ -221,8 +225,21 @@ static int h_list(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1
     case 47: case 48: gfx_clears++; return 1;                                                               /* Clear DSV / RTV */
     case 53: case 54: return 1;                                                                             /* EndQuery / ResolveQueryData */
     default: return 0; } }
+/* Release of a resource (task 30).  The null device keeps no reference of its own to a resource (views, barriers, copies and
+ * command lists only read it during the call; ExecuteCommandLists runs nothing), the swap chain holds one per back buffer
+ * (GetBuffer), so the last Release is the end of the resource as on Windows: its buffer data and the object are freed.  The
+ * vtable pointer and class word are cleared first: a use after the last Release faults (or is the named fatal "is not a
+ * resource" of CopyTextureRegion) instead of working by accident on memory that another resource may already hold. */
+static void res_release(KCtx *g,u64 o){
+    int last=0; u64 r=kh_com_ref_drop(g,o,&last); SET_RAX(g,r);
+    if(!last) return;
+    u64 d=rd64(g,o+R_DATA), n=rd64(g,o+R_SIZE);
+    if(d){ wr64(g,o+R_DATA,0); ga_free(d); gfx_buffers_freed++; gfx_buffers_freed_bytes+=n; }
+    gfx_res_freed++; wr64(g,o,0); wr64(g,o+8,0); ga_free(o);
+}
 static int h_res(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)c;
     switch(s){
+    case 2: res_release(g,o); return 1;                                                                     /* Release */
     case 8: { u64 d=rd64(g,o+R_DATA); if(A3(g)) wr64(g,A3(g),d); SET_RAX(g,d?0:E_FAIL_); return 1; }       /* Map(sub, range, **ppData) */
     case 9: return 1;                                                                                       /* Unmap */
     case 10: { u64 out=A1(g); memcpy(hp(g,out),hp(g,o+R_DESC),56); SET_RAX(g,out); return 1; }              /* GetDesc (hidden return pointer in rdx) */
@@ -260,6 +277,16 @@ void kh_seam_gfx_init(void){
 }
 void kh_gfx_report(FILE *f){ fprintf(f,"kh: gfx: draws=%llu clears=%llu barriers=%llu execs=%llu presents=%llu copies=%llu psos=%llu resources=%llu upload/buffer bytes=%llu\n",(unsigned long long)gfx_draws,(unsigned long long)gfx_clears,(unsigned long long)gfx_barriers,(unsigned long long)gfx_execs,(unsigned long long)gfx_presents,(unsigned long long)gfx_copies,(unsigned long long)gfx_psos,(unsigned long long)gfx_resources,(unsigned long long)gfx_buffers_bytes); }
 
+/* task 30: what the null device holds now (exit report and every map report): resources created / destroyed at their last Release,
+ * buffer data allocated / freed.  Nothing for the vkd3d backends: their resources are vkd3d's. */
+void kh_gfx_mem_report(FILE *f){
+    if(kh_gfx_vkd3d_on) return;
+    u64 rc=gfx_resources, rf=gfx_res_freed, bb=gfx_buffers_bytes, bf=gfx_buffers_freed_bytes;
+    fprintf(f,"kh: gfx memory: resources created %llu, destroyed at their last Release %llu, live %llu; buffer data %llu MiB allocated, %llu MiB freed (%llu buffers), live %llu MiB\n",
+            (unsigned long long)rc,(unsigned long long)rf,(unsigned long long)(rc-rf),(unsigned long long)(bb>>20),(unsigned long long)(bf>>20),(unsigned long long)gfx_buffers_freed,(unsigned long long)((bb-bf)>>20));
+}
+void kh_gfx_res_counts(u64 *created,u64 *destroyed,u64 *bytes,u64 *freed_bytes){ if(created) *created=gfx_resources; if(destroyed) *destroyed=gfx_res_freed; if(bytes) *bytes=gfx_buffers_bytes; if(freed_bytes) *freed_bytes=gfx_buffers_freed_bytes; }
+
 void kh_gfx_tex_report(FILE *f){
     if(kh_gfx_vkd3d_on){ kh_gfx_vkd3d_report(f); return; }                    /* vkd3d owns the textures: no recorder statistics, the backend line instead */
     u64 tr=0,trb=0,tu=0,tub=0; for(int i=0;i<128;i++){ tr+=tx_res[i]; trb+=tx_res_bytes[i]; tu+=tx_up[i]; tub+=tx_up_bytes[i]; }
@@ -277,6 +304,67 @@ IMP(d3d12,ord101){ kh_cnt_gfx_calls++; /* D3D12CreateDevice(adapter, featureLeve
 IMP(d3d12,D3D12SerializeRootSignature){ kh_cnt_gfx_calls++; if(kh_gfx_vkd3d_on){ kh_vkd3d_serialize_rootsig(g); return; } u64 b=mk_blob(g,A0(g),0x40); wr64(g,A2(g),b); if(A3(g)) wr64(g,A3(g),0); SET_RAX(g,0); }
 IMP(d3dcompiler_47,D3DStripShader){ kh_cnt_gfx_calls++; u64 b=mk_blob(g,A0(g),A1(g)); wr64(g,A3(g),b); SET_RAX(g,0); }
 
+/* ---- task 30 selftest: a resource is destroyed at its last Release ------------------------------------------------------------ */
+static u64 st_call8(KCtx *g,u64 obj,int slot,u64 a1,u64 a2,u64 a3,u64 a4,u64 a5,u64 a6,u64 a7){   /* this + 7 arguments through the guest ABI */
+    u64 saved[5]={KH_RSP(g),KH_RCX(g),KH_RDX(g),KH_R8(g),KH_R9(g)};
+    u64 sp=(saved[0]-0x200)&~15ull; memset(hp(g,sp),0,0x80); wr64(g,sp+0x20,a4); wr64(g,sp+0x28,a5); wr64(g,sp+0x30,a6); wr64(g,sp+0x38,a7);
+    sp-=8; wr64(g,sp,0x7ff7ffff0000ull); KH_RSP(g)=sp; KH_RCX(g)=obj; KH_RDX(g)=a1; KH_R8(g)=a2; KH_R9(g)=a3;
+    kh_dispatch(g,rd64(g,rd64(g,obj)+8ull*(u64)slot)); u64 r=KH_RAX(g);
+    KH_RSP(g)=saved[0]; KH_RCX(g)=saved[1]; KH_RDX(g)=saved[2]; KH_R8(g)=saved[3]; KH_R9(g)=saved[4]; return r;
+}
+static u64 far_live(void){ extern int ga_zone_get(int,u64*,u64*,u64*,u64*,u64*); u64 l=0; ga_zone_get(1,NULL,NULL,NULL,NULL,&l); return l; }
+static int block_freed(KCtx *g,u64 p){ return rd32(g,p-16+4)==0xF4EEF4EEu; }      /* the arena's block header (core.c BHdr): magic MAGIC_FREE once ga_free took it */
+typedef struct { KCtx *g; u64 obj; int rounds; _Atomic int lasts; } RefRace;
+static void *ref_race(void *p){ RefRace *r=(RefRace*)p; for(int i=0;i<r->rounds;i++) kh_com_ref_add(r->g,r->obj);
+    for(int i=0;i<r->rounds;i++){ int last=0; kh_com_ref_drop(r->g,r->obj,&last); if(last) r->lasts++; } return NULL; }
+static int release_selftest(KCtx *g){
+    int checks=0, fails=0;
+#define RCHECK(c) do{ checks++; if(!(c)){ fails++; fprintf(stderr,"kh: gfx release selftest FAIL line %d: %s\n",__LINE__,#c); } }while(0)
+    /* the reference count itself: 8 host threads x 20,000 AddRef + Release on one object end at the count they started from, and no
+     * Release of theirs is the last one (the object's own reference stays) */
+    { int ck=kh_com_class("selftest:refcount",3,0,NULL); u64 o=kh_com_obj(ck,16); RefRace rr={g,o,20000,0}; pthread_t t[8];
+      for(int i=0;i<8;i++) pthread_create(&t[i],NULL,ref_race,&rr); for(int i=0;i<8;i++) pthread_join(t[i],NULL);
+      RCHECK(rd64(g,o+16)==1 && rr.lasts==0);
+      int last=0; RCHECK(kh_com_ref_drop(g,o,&last)==0 && last==1); last=5; RCHECK(kh_com_ref_drop(g,o,&last)==0 && last==0 && rd64(g,o+16)==0);   /* 1 -> 0 is the last; 0 stays 0 and is not "last" again */
+      ga_free(o); }
+    if(kh_gfx_vkd3d_on){ fprintf(stderr,"kh: gfx release selftest: %d checks, %d failures (the null device's resources are not used with KHNMC_GFX=vkd3d*: those checks not run)\n",checks,fails); return fails; }
+    u64 dev=kh_com_obj(C_dev,0), m=ga_alloc(0x200,16); memset(hp(g,m),0,0x200);
+    u64 desc=m, pp=m+0x40, heap=m+0x80;
+    u64 r0=gfx_resources, f0=gfx_res_freed, b0=gfx_buffers_bytes, fb0=gfx_buffers_freed_bytes;
+    static const u64 sizes[2]={3u<<20 /* a page run */, 1000 /* a size-class block */};
+    for(int k=0;k<2;k++){
+        u64 w=sizes[k]; memset(hp(g,desc),0,56); wr32(g,desc,1); wr64(g,desc+16,w); wr32(g,desc+24,1); wr16(g,desc+28,1); wr16(g,desc+30,1); wr32(g,desc+36,1);
+        u64 fl=far_live(); wr64(g,pp,0);
+        RCHECK(st_call8(g,dev,27,heap,0,desc,0,0,0,pp)==0);                          /* CreateCommittedResource(heap, flags, desc, state, clear, riid, **pp) */
+        u64 r=rd64(g,pp), vt=r?rd64(g,r):0; RCHECK(r && kh_com_cls_of(g,r)==C_res && rd64(g,r+16)==1);
+        u64 d=r?rd64(g,r+R_DATA):0; RCHECK(d && rd64(g,r+R_SIZE)==w && far_live()>=fl+w && gfx_resources==r0+(u64)k+1);
+        if(!r||!d) break;
+        wr64(g,pp,0); RCHECK(st_call8(g,r,8,0,0,pp,0,0,0,0)==0 && rd64(g,pp)==d);       /* Map: the data pointer */
+        wr8(g,d+w-1,0x5a);
+        RCHECK(st_call8(g,r,1,0,0,0,0,0,0,0)==2);                                      /* AddRef */
+        RCHECK(st_call8(g,r,2,0,0,0,0,0,0,0)==1 && rd64(g,r)==vt && rd64(g,r+R_DATA)==d && rd8(g,d+w-1)==0x5a && gfx_res_freed==f0+(u64)k);   /* Release: still referenced, nothing freed */
+        RCHECK(st_call8(g,r,2,0,0,0,0,0,0,0)==0);                                      /* the last Release */
+        RCHECK(rd64(g,r)!=vt && gfx_res_freed==f0+(u64)k+1 && gfx_buffers_freed_bytes==fb0+(k?sizes[0]:0)+w);   /* destroyed: vtable gone, counted */
+        RCHECK(far_live()==fl && block_freed(g,r));                                  /* buffer data and object back in the arena */
+        RCHECK(gfx_resources==r0+(u64)k+1 && gfx_buffers_bytes==b0+(k?sizes[0]:0)+w); /* created-so-far counters unchanged by the release */
+    }
+    /* a texture (no buffer data) is destroyed too; QueryInterface counts as a reference */
+    { memset(hp(g,desc),0,56); wr32(g,desc,3); wr64(g,desc+16,64); wr32(g,desc+24,64); wr16(g,desc+28,1); wr16(g,desc+30,1); wr32(g,desc+32,71); wr32(g,desc+36,1);
+      u64 fl=far_live(); wr64(g,pp,0); RCHECK(st_call8(g,dev,29,heap,0,desc,0,0,0,pp)==0);   /* CreatePlacedResource */
+      u64 r=rd64(g,pp); RCHECK(r && !rd64(g,r+R_DATA) && far_live()==fl);
+      if(r){ u64 q=m+0x100; wr64(g,q,0); RCHECK(st_call8(g,r,0,0,q,0,0,0,0,0)==0 && rd64(g,q)==r && rd64(g,r+16)==2);
+             RCHECK(st_call8(g,r,2,0,0,0,0,0,0,0)==1 && kh_com_cls_of(g,r)==C_res); RCHECK(st_call8(g,r,2,0,0,0,0,0,0,0)==0 && block_freed(g,r)); } }
+    /* the swap chain keeps its back buffers: GetBuffer hands out a NEW reference, the caller's Release does not destroy the buffer */
+    { u64 sc=new_obj(C_swap,96); wr32(g,sc+32,64); wr32(g,sc+36,32); u64 f1=gfx_res_freed;
+      wr64(g,pp,0); RCHECK(st_call8(g,sc,9,1,0,pp,0,0,0,0)==0); u64 b=rd64(g,pp); RCHECK(b && rd64(g,sc+56+8)==b && rd64(g,b+16)==2);
+      if(b){ u64 vt=rd64(g,b); RCHECK(st_call8(g,b,2,0,0,0,0,0,0,0)==1 && rd64(g,b)==vt && gfx_res_freed==f1);
+             wr64(g,pp,0); RCHECK(st_call8(g,sc,9,1,0,pp,0,0,0,0)==0 && rd64(g,pp)==b && rd64(g,b+16)==2);    /* the same buffer again, alive */
+             RCHECK(st_call8(g,b,2,0,0,0,0,0,0,0)==1 && kh_com_cls_of(g,b)==C_res); } }
+    ga_free(m); ga_free(dev);
+    fprintf(stderr,"kh: gfx release selftest: %d checks, %d failures\n",checks,fails);
+#undef RCHECK
+    return fails;
+}
 int kh_gfx_selftest(KCtx *g){
     u64 list=new_obj(C_list,16), bundle=new_obj(C_list,16);
     u64 before=gfx_bundles;
@@ -289,6 +377,7 @@ int kh_gfx_selftest(KCtx *g){
     fail+=rd32(g,out+16)!=1 || rd32(g,out+20)!=0xa5a5a5a5u || rd64(g,out+24)!=0xa5a5a5a5a5a5a5a5ull;
     ga_free(out);
     fprintf(stderr,"kh: gfx selftest: 2 checks, %d failures\n",fail);
+    fail+=release_selftest(g);                                                /* task 30: resources destroyed at their last Release */
     fail+=kh_wrap_selftest_pure(g);                                           /* the wrapped bridge's translation layer: needs no device, runs with every backend */
     if(kh_gfx_vkd3d_on) fail+=kh_gfx_vkd3d_selftest(g);                       /* KHNMC_GFX=vkd3d / vkd3dw ./khnmc --selftest: device, clear, present, image dump */
     return fail;

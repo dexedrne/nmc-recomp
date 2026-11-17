@@ -13,6 +13,15 @@ static int log_com=-1;
 static struct { short c, s; } rmap[65536];
 static _Atomic u64 com_freed;
 u64 kh_com_freed(void){ return com_freed; }
+/* The reference count at obj+16, changed atomically as Direct3D / XAudio2 do (task 30: objects that are freed at their last Release
+ * must not lose a decrement to two threads releasing at once).  ref_drop never goes below 0 and says whether THIS call took the
+ * count from 1 to 0 (*last), which is the one call that may destroy the object. */
+u64 kh_com_ref_add(KCtx *g,u64 obj){ return __atomic_add_fetch((u64*)hp(g,obj+16),1,__ATOMIC_ACQ_REL); }
+u64 kh_com_ref_drop(KCtx *g,u64 obj,int *last){
+    u64 *p=(u64*)hp(g,obj+16), r=__atomic_load_n(p,__ATOMIC_ACQUIRE);
+    while(r && !__atomic_compare_exchange_n(p,&r,r-1,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) ;
+    if(last) *last=(r==1); return r?r-1:0;
+}
 static void com_thunk(KCtx *g){
     u64 d=(g->aux[0]-KH_HOSTFN_BASE)>>4; int c=rmap[d].c,s=rmap[d].s; Cls *k=&cls[c]; u64 obj=KH_RCX(g);
     if(log_com<0){ const char *e=getenv("KH_LOG_COM"); log_com=e&&*e=="1"[0]; }
@@ -20,10 +29,10 @@ static void com_thunk(KCtx *g){
     k->cnt[s]++; switch(k->group){ case 1: kh_cnt_steam_calls++; break; case 2: kh_cnt_audio_calls++; break; case 3: kh_cnt_input_calls++; break; case 4: kh_cnt_mf_calls++; break; default: kh_cnt_gfx_calls++; }
     if(k->h && k->h(g,obj,s,k->name)){ KH_RET(g); return; }
     if(!k->noiunk && (s==0||s==1||s==2)){                                    /* IUnknown defaults: QueryInterface (returns the same object), AddRef, Release */
-        if(s==0){ if(KH_R8(g)){ wr64(g,KH_R8(g),obj); wr64(g,obj+16,rd64(g,obj+16)+1); } SET_RAX(g,0); }
-        else if(s==1){ u64 r=rd64(g,obj+16)+1; wr64(g,obj+16,r); SET_RAX(g,r); }
-        else { u64 r=rd64(g,obj+16); if(r) r--; wr64(g,obj+16,r); SET_RAX(g,r);
-               if(!r&&k->free0){ wr64(g,obj,0); wr64(g,obj+8,0); ga_free(obj); atomic_fetch_add(&com_freed,1); } }      /* the vtable pointer is cleared first: a use after the last Release faults instead of working by accident */
+        if(s==0){ if(KH_R8(g)){ wr64(g,KH_R8(g),obj); kh_com_ref_add(g,obj); } SET_RAX(g,0); }
+        else if(s==1){ SET_RAX(g,kh_com_ref_add(g,obj)); }
+        else { int last=0; u64 r=kh_com_ref_drop(g,obj,&last); SET_RAX(g,r);
+               if(last&&k->free0){ wr64(g,obj,0); wr64(g,obj+8,0); ga_free(obj); atomic_fetch_add(&com_freed,1); } }      /* the vtable pointer is cleared first: a use after the last Release faults instead of working by accident */
         KH_RET(g); return;
     }
     if(k->strict) kh_fatal(g,"unimplemented COM method %s slot %d (vtbl+0x%x) called (this=%llx)",k->name,s,s*8,(unsigned long long)obj);

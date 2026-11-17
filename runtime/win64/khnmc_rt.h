@@ -279,6 +279,8 @@ typedef int (*KhComHandler)(KCtx *g,u64 obj,int slot,const char *cls);
 int  kh_com_class(const char *name,int nslots,int flags,KhComHandler h);   /* returns class id */
 void kh_com_dump(FILE *f);
 u64  kh_com_obj(int cls,u64 extra_bytes);                                      /* returns guest address of a new object (refcount 1) */
+u64  kh_com_ref_add(KCtx *g,u64 obj);                                           /* atomic AddRef of obj+16, returns the new count */
+u64  kh_com_ref_drop(KCtx *g,u64 obj,int *last);                                /* atomic Release (never below 0); *last = this call took it from 1 to 0 */
 int  kh_com_cls_of(KCtx *g,u64 obj);
 u64  kh_com_vtbl(int cls);
 #define COM_REFS(g,o) rd64(g,(o)+16)

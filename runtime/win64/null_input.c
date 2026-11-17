@@ -82,12 +82,12 @@ u64 kh_input_game_frames(void){ return atomic_load(&game_frames); }
  * frame after the last relative press, a frame with nothing pressed: two steps' presses are always separated by at least one
  * released frame, so the game sees every press as a new one.  A step without relative lines hands over in the same tick. */
 typedef struct { int kind, arg, neg; } Cond;
-enum { ST_WAIT, ST_PRESS, ST_SELECT, ST_EXPECT, ST_GOTO };
-static const char *st_name[]={"@wait","@press","@select","@expect","@goto"};
+enum { ST_WAIT, ST_PRESS, ST_SELECT, ST_EXPECT, ST_GOTO, ST_FIGHT, ST_SKIP, ST_TALK };
+static const char *st_name[]={"@wait","@press","@select","@expect","@goto","@fight","@skip","@talk"};
 typedef struct { u64 a,b; ScriptPad pad; } RelRange;
 typedef struct { int type; Cond c; ScriptPad pad; u64 every, hold, timeout; unsigned line; char text[160]; RelRange *rel; size_t nrel; u64 maxb;
                  u64 started, met, waited;
-                 float gx, gz, radius; u64 stall; int has_until, to_enemy; } Step;   /* @goto: target (or the nearest enemy), radius, frames without progress, `until` in c */
+                 float gx, gz, radius; u64 stall; int has_until, to_enemy; u64 stable; } Step;   /* @talk: frames `until` must hold in a row */   /* @goto: target (or the nearest enemy), radius, frames without progress, `until` in c */
 static Step *steps; static size_t nsteps;
 static char route_path[512];
 #define ARG_DIFFICULTY (-2)                /* a condition argument `difficulty`: the route's difficulty (@difficulty N or KHNMC_ROUTE_DIFFICULTY) */
@@ -104,7 +104,17 @@ static int (*yaw_fn)(KCtx *,float *)=kh_route_camera_yaw;
 static int (*enemy_fn)(KCtx *,float,float,float *,float *,float *)=kh_route_enemies;
 /* @goto (task 29): progress bookkeeping of the running step and the stick it computed for the next frame */
 #define GOTO_PROGRESS 10.0f                                   /* the distance must shrink by this much (map units) to count as progress */
+#define FIGHT_SETBACK 50.0f                                   /* @fight: a distance this much above the closest one starts a new approach (task 30: a knock-back
+                                                                 made the first version time a walk of 1,000 units against a closest distance of 166 seen before it) */
 static float goto_best, goto_d, goto_x, goto_z, goto_cam, goto_tx, goto_tz; static u64 goto_best_at; static int goto_seen, goto_have_cam; static s16 goto_lx, goto_ly;
+/* @fight (task 30): A pressed for the next frame, enemies seen at the last tick (-1 = no map), A presses made (new presses) */
+static int fight_a, fight_enemies; static u64 fight_presses;
+/* @skip (task 30): the button pressed for the next frame, frames it stays pressed, released frames before the next press, and counts */
+#define SKIP_ROW 5                                            /* the pause screen's "skip the event" row id (row 6 continues) */
+static u16 skip_btn; static int skip_hold, skip_gap; static u64 skip_starts, skip_skips, skip_moves;
+/* @talk (task 30): `until` held this many frames in a row; A presses made while a message waited */
+static u64 talk_run, talk_presses; static int talk_msg;
+static int (*pause_fn)(KCtx *,KhPauseMenu *)=kh_route_pause_menu;
 static int route_exit_at_end;                             /* KHNMC_ROUTE_END=exit: the run ends (exit 0, with the reports) when the route is done */
 u64 kh_phase_damage_hits(void);
 static int cond_true(KCtx *g,const Cond *c,u64 n){ int v=cond_fn(g,c->kind,c->arg,n,&step_base)!=0; return c->neg?!v:v; }
@@ -129,9 +139,9 @@ static void route_tick(KCtx *g,u64 n){
         }
         Step *s=&steps[cur_step];
         if(step_phase==0){ step_phase=1; step_t0=n; kh_route_base_now(n,&step_base); s->started=n; sel_from=sel_until=-1;
-                           goto_best=1e30f; goto_best_at=n; goto_seen=0; goto_lx=goto_ly=0; }
+                           goto_best=1e30f; goto_best_at=n; goto_seen=0; goto_lx=goto_ly=0; fight_a=0; fight_enemies=0; fight_presses=0; skip_btn=0; skip_hold=skip_gap=0; skip_starts=skip_skips=skip_moves=0; talk_run=talk_presses=0; talk_msg=0; }
         if(step_phase==1){
-            int ok=s->type==ST_GOTO?0:cond_true(g,&s->c,n);          /* @goto reads its optional `until` itself */
+            int ok=s->type==ST_GOTO||s->type==ST_FIGHT||s->type==ST_SKIP||s->type==ST_TALK?0:cond_true(g,&s->c,n);   /* @goto / @fight / @skip / @talk read their `until` themselves */
             if(s->type==ST_EXPECT){ if(!ok) route_fatal_state(g,n,"route-expect-failed",s,"the game is not in this state"); step_met(s,n,n-1); }
             else if(s->type==ST_WAIT){ if(ok) step_met(s,n,n-1); }
             else if(s->type==ST_PRESS){
@@ -156,6 +166,46 @@ static void route_tick(KCtx *g,u64 n){
                     else snprintf(what,sizeof what,"the player's position could not be read for %llu game frames (no field player)",(unsigned long long)s->stall);
                     route_fatal_state(g,n,"route-goto-stalled",s,what);
                 }
+            } else if(s->type==ST_TALK){                       /* answer message windows with A until COND has held `stable` frames in a row */
+                int pressed_last=skip_btn!=0; Cond msg={KR_MESSAGE,-1,0};
+                talk_run=cond_true(g,&s->c,n)?talk_run+1:0; talk_msg=cond_true(g,&msg,n);
+                if(talk_run>=s->stable){ skip_btn=0; step_met(s,n,pressed_last?n:n-1); }
+                else if(skip_hold>0) skip_hold--;
+                else if(skip_gap>0){ skip_btn=0; skip_gap--; }
+                else if(talk_msg){ skip_btn=0x1000; talk_presses++; skip_hold=(int)s->hold-1; skip_gap=(int)(s->every-s->hold); }   /* A: the next page / the answer */
+                else skip_btn=0;
+            } else if(s->type==ST_SKIP){                       /* skip events through the pause screen until COND */
+                int pressed_last=skip_btn!=0;
+                if(cond_true(g,&s->c,n)){ skip_btn=0; step_met(s,n,pressed_last?n:n-1); }
+                else if(skip_hold>0) skip_hold--;                                  /* the current press goes on */
+                else if(skip_gap>0){ skip_btn=0; skip_gap--; }                       /* released frames before the next press */
+                else { KhPauseMenu pm;
+                    if(pause_fn(g,&pm)){ int want=-1; for(int i=0;i<pm.rows;i++) if(pm.id[i]==SKIP_ROW) want=i;
+                        if(want<0){ char what[300]; size_t o=(size_t)snprintf(what,sizeof what,"the pause screen is up without a row to skip an event (id %d); its rows:",SKIP_ROW);
+                            for(int i=0;i<pm.rows && o<sizeof what-8;i++) o+=(size_t)snprintf(what+o,sizeof what-o," %u",(unsigned)pm.id[i]);
+                            route_fatal_state(g,n,"route-skip-no-skip-row",s,what); }
+                        if(pm.cursor==want){ skip_btn=0x1000; skip_skips++; skip_gap=s->every; }          /* A on "skip" */
+                        else { skip_btn=pm.cursor>=0&&pm.cursor<want?0x2:0x1; skip_moves++; skip_gap=4; }   /* DPAD_DOWN / DPAD_UP one row */
+                    } else { skip_btn=0x10; skip_starts++; skip_gap=s->every; }                      /* START: open the pause screen */
+                    skip_hold=(int)s->hold-1; }
+            } else if(s->type==ST_FIGHT){                      /* walk to the nearest enemy, attack it within the radius, until COND */
+                int pressed_last=goto_lx||goto_ly||fight_a, was_a=fight_a; float x,y,z,h,cy;
+                goto_lx=goto_ly=0; fight_a=0;
+                if(cond_true(g,&s->c,n)) step_met(s,n,pressed_last?n:n-1);
+                else if(pos_fn(g,&x,&y,&z,&h)){
+                    float ex=0,ez=0,ed=0; int ne=enemy_fn(g,x,z,&ex,&ez,&ed); goto_seen=1; goto_x=x; goto_z=z; fight_enemies=ne;
+                    if(ne<=0){ goto_best=1e30f; goto_best_at=n; }                 /* nothing to fight: stand still, no A (it would talk to whoever stands near) */
+                    else { float d=hypotf(x-ex,z-ez); goto_tx=ex; goto_tz=ez; goto_d=d;
+                        if(d<=s->radius){ goto_best=1e30f; goto_best_at=n;           /* in reach: attack, as @press A every P hold H */
+                            if((n-step_t0)%s->every<s->hold){ fight_a=1; if(!was_a) fight_presses++; } }
+                        else { if(d+GOTO_PROGRESS<=goto_best || d>goto_best+FIGHT_SETBACK){ goto_best=d; goto_best_at=n; }   /* knocked back, or the enemy moved off: a new approach */
+                            if((goto_have_cam=yaw_fn(g,&cy))){ goto_cam=cy; kh_route_goto_stick(x,z,ex,ez,cy,d<2.0f*s->radius?0.6f:1.0f,&goto_lx,&goto_ly); } } }
+                } else { goto_best=1e30f; goto_best_at=n; }                       /* no field player (a map change, a menu): wait, the time-out still runs */
+                if(step_phase==1 && n-goto_best_at>=s->stall){
+                    char what[400]; snprintf(what,sizeof what,"no progress toward the nearest enemy (%.0f, %.0f) for %llu game frames: the player is at (%.0f, %.0f), %.0f away; the closest was %.0f at game frame %llu; %d enemies; camera yaw %s%.3f",
+                                             goto_tx,goto_tz,(unsigned long long)s->stall,goto_x,goto_z,goto_d,goto_best,(unsigned long long)goto_best_at,fight_enemies,goto_have_cam?"":"(unreadable) ",goto_cam);
+                    route_fatal_state(g,n,"route-goto-stalled",s,what);
+                }
             } else {                                           /* ST_SELECT: move the cursor one row at a time until it is on the row */
                 int pressing=sel_from>=0 && (long long)n-1<sel_until;
                 int v=cursor_fn(g,s->c.kind), want=target_fn(g,s->c.kind,s->c.arg);
@@ -169,12 +219,20 @@ static void route_tick(KCtx *g,u64 n){
             if(step_phase==1){
                 if(n-s->started>=s->timeout){
                     char what[400];
-                    if(s->type==ST_SELECT && s->c.kind==KR_COMMAND_ID) snprintf(what,sizeof what,"the command menu's cursor did not reach a row of command %d within %llu game frames; "
+                    if(s->type==ST_SELECT && s->c.kind==KR_PAUSE_ID) snprintf(what,sizeof what,"the pause screen's cursor did not reach the row with id %d within %llu game frames; "
+                                                     "that row is %d (-1 = no such row or the screen is not up), the cursor is on row %d",s->c.arg,(unsigned long long)s->timeout,target_fn(g,s->c.kind,s->c.arg),cursor_fn(g,s->c.kind));
+                    else if(s->type==ST_SELECT && s->c.kind==KR_COMMAND_ID) snprintf(what,sizeof what,"the command menu's cursor did not reach a row of command %d within %llu game frames; "
                                                      "that row is %d (-1 = the top list has no such row), the cursor is on row %d (-1 = not up)",s->c.arg,(unsigned long long)s->timeout,target_fn(g,s->c.kind,s->c.arg),cursor_fn(g,s->c.kind));
                     else if(s->type==ST_SELECT) snprintf(what,sizeof what,"the cursor (%s) did not reach row %d within %llu game frames; it is on row %d (-1 = not up)",
                                                      kh_route_cond_info[s->c.kind].name,s->c.arg,(unsigned long long)s->timeout,cursor_fn(g,s->c.kind));
                     else if(s->type==ST_GOTO) snprintf(what,sizeof what,"the player did not get within %.0f of %s(%.0f, %.0f) within %llu game frames%s; %s at (%.0f, %.0f), %.0f away",
                                                      s->radius,s->to_enemy?"the nearest enemy ":"",s->to_enemy?goto_tx:s->gx,s->to_enemy?goto_tz:s->gz,(unsigned long long)s->timeout,s->has_until?" and `until` did not hold":"",goto_seen?"last seen":"never seen",goto_x,goto_z,goto_d);
+                    else if(s->type==ST_TALK) snprintf(what,sizeof what,"the end of the dialogue (%s%s for %llu game frames in a row) did not come within %llu game frames; A pressed %llu times; a message %s now",
+                                                     s->c.neg?"NOT: ":"",kh_route_cond_info[s->c.kind].what,(unsigned long long)s->stable,(unsigned long long)s->timeout,(unsigned long long)talk_presses,talk_msg?"waits":"does not wait");
+                    else if(s->type==ST_SKIP) snprintf(what,sizeof what,"the end of the events (%s%s) did not come within %llu game frames; START pressed %llu times, \"skip\" chosen %llu times, cursor moved %llu times",
+                                                     s->c.neg?"NOT: ":"",kh_route_cond_info[s->c.kind].what,(unsigned long long)s->timeout,(unsigned long long)skip_starts,(unsigned long long)skip_skips,(unsigned long long)skip_moves);
+                    else if(s->type==ST_FIGHT) snprintf(what,sizeof what,"the fight's end (%s%s) did not come within %llu game frames; %d enemies at the last look%s, %llu attacks pressed; the player %s at (%.0f, %.0f)",
+                                                     s->c.neg?"NOT: ":"",kh_route_cond_info[s->c.kind].what,(unsigned long long)s->timeout,fight_enemies,fight_enemies>0?"":" (none to walk to)",(unsigned long long)fight_presses,goto_seen?"last seen":"never seen",goto_x,goto_z);
                     else snprintf(what,sizeof what,"%s%s never came within %llu game frames",s->c.neg?"NOT: ":"",kh_route_cond_info[s->c.kind].what,(unsigned long long)s->timeout);
                     route_fatal_state(g,n,"route-wait-timeout",s,what);
                 }
@@ -192,13 +250,15 @@ static void route_tick(KCtx *g,u64 n){
         else if(step_phase==1 && s->type==ST_PRESS && n>=step_t0 && (n-step_t0)%s->every<s->hold) pad=s->pad;
         else if(step_phase==1 && s->type==ST_SELECT && sel_from>=0 && (long long)n>=sel_from && (long long)n<sel_until) pad.buttons=sel_dir?0x2:0x1;
         else if(step_phase==1 && s->type==ST_GOTO){ pad.lx=goto_lx; pad.ly=goto_ly; }
+        else if(step_phase==1 && s->type==ST_FIGHT){ pad.lx=goto_lx; pad.ly=goto_ly; if(fight_a) pad.buttons=0x1000; }      /* A (bit 12) */
+        else if(step_phase==1 && (s->type==ST_SKIP||s->type==ST_TALK)) pad.buttons=skip_btn;
     }
     pthread_mutex_lock(&input_lock); route_pad=pad; pthread_mutex_unlock(&input_lock);
 }
 static void route_report(FILE *f){
     size_t done=0; for(size_t i=0;i<nsteps;i++) if(steps[i].met) done++;
     fprintf(f,"kh: route report: %zu of %zu steps done%s; difficulty %d%s; met at game frame:",done,nsteps,route_done?"":" -- ROUTE INCOMPLETE",route_difficulty,route_difficulty_from);
-    for(size_t i=0;i<nsteps;i++) if(steps[i].met) fprintf(f," L%u:%s=%llu",steps[i].line,steps[i].type==ST_SELECT?"select":steps[i].type==ST_GOTO?"goto":kh_route_cond_info[steps[i].c.kind].name,(unsigned long long)steps[i].met);
+    for(size_t i=0;i<nsteps;i++) if(steps[i].met) fprintf(f," L%u:%s=%llu",steps[i].line,steps[i].type==ST_SELECT?"select":steps[i].type==ST_GOTO?"goto":steps[i].type==ST_FIGHT?"fight":steps[i].type==ST_SKIP?"skip":steps[i].type==ST_TALK?"talk":kh_route_cond_info[steps[i].c.kind].name,(unsigned long long)steps[i].met);
     if(!route_done && cur_step<nsteps) fprintf(f,"; waiting at line %u `%s` since game frame %llu",steps[cur_step].line,steps[cur_step].text,(unsigned long long)steps[cur_step].started);
     fputc('\n',f);
 }
@@ -235,6 +295,8 @@ static int parse_cond(char **words,int n,int *i,Cond *c,const char **why){
         if(*i>=n){ *why="this condition takes a number"; return 0; }
         if(!strcmp(words[*i],"difficulty") && ci->hi>=3 && ci->lo==0) c->arg=ARG_DIFFICULTY;
         else if(number(words[*i],ci->lo,ci->hi,&v)) c->arg=(int)v;
+        else if(words[*i][0]=='0' && words[*i][1]=='x' && words[*i][2]){ char *e; errno=0; v=strtoll(words[*i]+2,&e,16);       /* task 30: 0x1301 (program ids are hex in the area data) */
+            if(errno || *e || v<ci->lo || v>ci->hi){ *why="the condition's number is out of range"; return 0; } c->arg=(int)v; }
         else { *why="the condition's number is out of range"; return 0; }
         (*i)++;
     }
@@ -269,7 +331,7 @@ void kh_input_load(KCtx *g,const char *path){
         if(!strcmp(words[0],"@clock")){ if(n!=2||strcmp(words[1],"game-frames")||clock_game) goto invalid; clock_game=1; if(!first_frame_line) first_frame_line=lineno; continue; }
         if(!strcmp(words[0],"@timeout")){ long long v; if(n!=2||!number(words[1],1,100000000,&v)){ why="@timeout takes a number of game frames"; goto invalid; } timeout_default=(u64)v; continue; }
         if(!strcmp(words[0],"@difficulty")){ long long v; if(n!=2||!number(words[1],0,3,&v)||route_difficulty>=0){ why="@difficulty takes 0..3, once"; goto invalid; } route_difficulty=(int)v; route_difficulty_from=" (@difficulty)"; continue; }
-        if(!strcmp(words[0],"@wait")||!strcmp(words[0],"@expect")||!strcmp(words[0],"@press")||!strcmp(words[0],"@select")||!strcmp(words[0],"@goto")){
+        if(!strcmp(words[0],"@wait")||!strcmp(words[0],"@expect")||!strcmp(words[0],"@press")||!strcmp(words[0],"@select")||!strcmp(words[0],"@goto")||!strcmp(words[0],"@fight")||!strcmp(words[0],"@skip")||!strcmp(words[0],"@talk")){
             Step st; memset(&st,0,sizeof st); st.line=lineno; st.timeout=timeout_default; st.every=8; st.hold=2; st.radius=100.0f; st.stall=240; st.c.kind=-1;
             snprintf(st.text,sizeof st.text,"%s",t0);
             int i=1;
@@ -298,14 +360,43 @@ void kh_input_load(KCtx *g,const char *path){
                     else { why="unknown option for @goto (radius, until, stall, timeout)"; goto invalid; }
                     i+=2;
                 }
+            } else if(!strcmp(words[0],"@talk")){                 /* @talk until COND [every P] [hold H] [stable S] [timeout N] (task 30) */
+                st.type=ST_TALK; st.every=20; st.hold=2; st.stable=30;
+                if(n<3 || strcmp(words[1],"until")){ why="@talk until COND [every P] [hold H] [stable S] [timeout N]"; goto invalid; }
+                i=2; if(!parse_cond(words,n,&i,&st.c,&why)) goto invalid; st.has_until=1;
+                while(i<n){ long long w; if(i+1>=n || !number(words[i+1],1,100000000,&w)){ why="@talk: every, hold, stable and timeout take a number"; goto invalid; }
+                    if(!strcmp(words[i],"every")) st.every=(u64)w; else if(!strcmp(words[i],"hold")) st.hold=(u64)w; else if(!strcmp(words[i],"stable")) st.stable=(u64)w; else if(!strcmp(words[i],"timeout")) st.timeout=(u64)w;
+                    else { why="unknown option for @talk (every, hold, stable, timeout)"; goto invalid; }
+                    i+=2; }
+                if(st.hold>=st.every){ why="@talk: hold must be shorter than every (a press needs a release before the next)"; goto invalid; }
+            } else if(!strcmp(words[0],"@skip")){                 /* @skip until COND [every P] [hold H] [timeout N] (task 30) */
+                st.type=ST_SKIP; st.every=30; st.hold=2;
+                if(n<3 || strcmp(words[1],"until")){ why="@skip until COND [every P] [hold H] [timeout N]"; goto invalid; }
+                i=2; if(!parse_cond(words,n,&i,&st.c,&why)) goto invalid; st.has_until=1;
+                while(i<n){ long long w; if(i+1>=n || !number(words[i+1],1,100000000,&w)){ why="@skip: every, hold and timeout take a number"; goto invalid; }
+                    if(!strcmp(words[i],"every")) st.every=(u64)w; else if(!strcmp(words[i],"hold")) st.hold=(u64)w; else if(!strcmp(words[i],"timeout")) st.timeout=(u64)w;
+                    else { why="unknown option for @skip (every, hold, timeout)"; goto invalid; }
+                    i+=2; }
+            } else if(!strcmp(words[0],"@fight")){                /* @fight until COND [radius R] [every P] [hold H] [stall N] [timeout N] (task 30) */
+                st.type=ST_FIGHT; st.radius=150.0f; st.every=20; st.hold=3; st.stall=600;
+                while(i<n){
+                    if(!strcmp(words[i],"until")){ if(st.has_until){ why="@fight: one `until` only"; goto invalid; } i++; if(!parse_cond(words,n,&i,&st.c,&why)) goto invalid; st.has_until=1; continue; }
+                    long long w; if(i+1>=n || !number(words[i+1],1,100000000,&w)){ why="@fight: radius, every, hold, stall and timeout take a number"; goto invalid; }
+                    if(!strcmp(words[i],"radius")) st.radius=(float)w; else if(!strcmp(words[i],"every")) st.every=(u64)w; else if(!strcmp(words[i],"hold")) st.hold=(u64)w;
+                    else if(!strcmp(words[i],"stall")) st.stall=(u64)w; else if(!strcmp(words[i],"timeout")) st.timeout=(u64)w;
+                    else { why="unknown option for @fight (until, radius, every, hold, stall, timeout)"; goto invalid; }
+                    i+=2;
+                }
+                if(!st.has_until){ why="@fight needs `until COND` (what ends the fight: e.g. until not mission, until enemies-at-most 0)"; goto invalid; }
+                if(st.hold>=st.every){ why="@fight: hold must be shorter than every (a press needs a release before the next)"; goto invalid; }
             } else {
                 st.type=ST_SELECT; st.hold=2;
                 if(n<3){ why="@select title-choice|newgame-choice N (or command-row N, command-id N)"; goto invalid; }
                 if(!parse_cond(words,n,&i,&st.c,&why)) goto invalid;
-                if(st.c.neg || (st.c.kind!=KR_TITLE_CHOICE && st.c.kind!=KR_NEWGAME_CHOICE && st.c.kind!=KR_COMMAND_ROW && st.c.kind!=KR_COMMAND_ID)){
-                    why="@select moves title-choice or newgame-choice (or the field command menu: command-row, command-id)"; goto invalid; }
+                if(st.c.neg || (st.c.kind!=KR_TITLE_CHOICE && st.c.kind!=KR_NEWGAME_CHOICE && st.c.kind!=KR_COMMAND_ROW && st.c.kind!=KR_COMMAND_ID && st.c.kind!=KR_PAUSE_ID)){
+                    why="@select moves title-choice or newgame-choice (or the field command menu: command-row, command-id; the pause screen: pause-id)"; goto invalid; }
             }
-            while(st.type!=ST_GOTO && i<n){                /* options: every P, hold H (@press), timeout T (every step but @expect) */
+            while(st.type!=ST_GOTO && st.type!=ST_FIGHT && st.type!=ST_SKIP && st.type!=ST_TALK && i<n){                /* options: every P, hold H (@press), timeout T (every step but @expect) */
                 long long v; if(i+1>=n || !number(words[i+1],1,100000000,&v)){ why="an option takes a number"; goto invalid; }
                 if(!strcmp(words[i],"timeout") && st.type!=ST_EXPECT) st.timeout=(u64)v;
                 else if(!strcmp(words[i],"every") && st.type==ST_PRESS) st.every=(u64)v;
@@ -321,7 +412,7 @@ void kh_input_load(KCtx *g,const char *path){
         if(words[0][0]=='@'){ why="unknown directive"; goto invalid; }
         if(words[0][0]=='+'){                              /* relative press of the last step */
             long long a,b,x=0,y=0;
-            if(!nsteps){ why="a relative line (+A +B) needs a step (@wait, @press, @select, @expect, @goto) before it"; goto invalid; }
+            if(!nsteps){ why="a relative line (+A +B) needs a step (@wait, @press, @select, @expect, @goto, @fight, @skip, @talk) before it"; goto invalid; }
             if((n!=3 && n!=5) || words[1][0]!='+' || !number(words[0]+1,1,100000000,&a) || !number(words[1]+1,a,100000000,&b)){ why="+A +B BUTTONS [lx ly] with 1 <= A <= B"; goto invalid; }
             if(n==5 && (!number(words[3],-32768,32767,&x)||!number(words[4],-32768,32767,&y))) goto invalid;
             ScriptPad pad={.lx=(s16)x,.ly=(s16)y}; if(!parse_buttons(words[2],&pad)) goto invalid;
@@ -845,5 +936,189 @@ int kh_input_route29_selftest(KCtx *g){
     kh_input_load(g,getenv("KHNMC_INPUT_SCRIPT"));
     fprintf(stderr,"kh: input route N29 selftest: %d checks, %d failures\n",checks,fails);
 #undef NCHECK
+    return fails;
+}
+
+/* ---- task 30: selftest of @fight and of the programs reader ------------------------------------------------------------------------
+ * Part 1 drives route_tick with the task 29 stand-ins (a simulated player who walks 10 units per frame along camera yaw + the stick's
+ * angle, one enemy standing still); Part 2 runs the real programs reader on a synthetic place block. */
+static int t30_pcur(KCtx *g,int kind){ (void)g; return kind==KR_PAUSE_ID?t29_cursor:-1; }
+static int t30_ptgt(KCtx *g,int kind,int arg){ (void)g; if(kind!=KR_PAUSE_ID) return arg; for(int i=0;i<t29_nrows;i++) if(t29_rows[i]==arg) return i; return -1; }
+/* @skip's stand-in game: a chain of t30_events events; START (new press) opens the pause screen (rows t30_rows, cursor 0) when an
+ * event plays, DPAD moves its cursor, A closes it: on the skip row (id 5) the event ends, on another row it plays on.  The area
+ * condition `area 7` comes when the last event ended. */
+static int t30_events, t30_up, t30_nrows, t30_both, t30_start_in_menu, t30_a_on_continue; static u16 t30_rows[4]={6,5}, t30_prev;
+static int t30_pause(KCtx *g,KhPauseMenu *o){ (void)g; memset(o,0,sizeof *o); o->cursor=-1; if(!t30_up) return 0; o->rows=t30_nrows; for(int i=0;i<t30_nrows;i++) o->id[i]=t30_rows[i]; o->cursor=t29_cursor; return 1; }
+static void t30_skip_run(KCtx *g,u64 n0,u64 n1){
+    for(u64 n=n0;n<=n1;n++){ route_tick(g,n); u16 b=route_pad.buttons, e=b&~t30_prev; t30_prev=b;
+        if(b&&(b&(b-1))) t30_both++;
+        if((e&0x10)){ if(t30_up) t30_start_in_menu++; else if(t30_events>0){ t30_up=1; t29_cursor=0; } }
+        else if(t30_up && (e&3)){ t29_cursor+=(e&2)?1:-1; if(t29_cursor<0) t29_cursor=0; if(t29_cursor>=t30_nrows) t29_cursor=t30_nrows-1; }
+        else if(t30_up && (e&0x1000)){ t30_up=0; if(t30_rows[t29_cursor]==5) t30_events--; else t30_a_on_continue++; }
+        t_val[KR_AREA]=t30_events==0?7:0; } }
+/* @talk's stand-in: a dialogue of t30_pages pages; a message waits t30_open frames after the step starts and again 2 frames after
+ * every new A press, until the last page is answered; `not message` is the end condition */
+static int t30_pages, t30_wait_at, t30_a_without_msg; static u16 t30_tprev;
+static void t30_talk_run(KCtx *g,u64 n0,u64 n1){
+    for(u64 n=n0;n<=n1;n++){ route_tick(g,n); u16 b=route_pad.buttons, e=b&~t30_tprev; t30_tprev=b;
+        if(e&0x1000){ if(!t_val[KR_MESSAGE]) t30_a_without_msg++; else { t_val[KR_MESSAGE]=0; if(--t30_pages>0) t30_wait_at=(int)n+3; else t30_wait_at=-1; } }
+        if(t30_wait_at>=0 && (int)n>=t30_wait_at && t30_pages>0){ t_val[KR_MESSAGE]=1; t30_wait_at=-1; } } }
+static u64 t30_talk_ticks; static void t30_talk_body(void){ kh_input_load(t_g,t_child_path); t30_talk_run(t_g,1,t30_talk_ticks); _exit(0); }
+static u64 t30_skip_ticks; static void t30_skip_body(void){ kh_input_load(t_g,t_child_path); t30_skip_run(t_g,1,t30_skip_ticks); _exit(0); }
+static u64 t30_ticks; static void t30_body(void){ kh_input_load(t_g,t_child_path); t29_run(t_g,1,t30_ticks,t29_ex,t29_ez); _exit(0); }
+/* walk toward the enemy, get knocked back to the start at tick 30, walk again: a new approach, not a stall */
+static void t30_knock_body(void){ kh_input_load(t_g,t_child_path); t29_run(t_g,1,30,t29_ex,t29_ez); t29_x=0; t29_z=0; t29_run(t_g,31,90,t29_ex,t29_ez);
+    _exit(hypotf(t29_x-t29_ex,t29_z-t29_ez)<=100.0f ? 0 : 7); }
+int kh_input_route30_selftest(KCtx *g){
+    int checks=0,fails=0; t_g=g;
+#define PCHECK(c) do{ checks++; if(!(c)){ fails++; fprintf(stderr,"input route P30 selftest FAIL: %s (line %d)\n",#c,__LINE__); } }while(0)
+    int (*sv_cond)(KCtx *,int,int,u64,const KhRouteBase *)=cond_fn; int (*sv_cur)(KCtx *,int)=cursor_fn; int (*sv_tgt)(KCtx *,int,int)=target_fn;
+    int (*sv_pos)(KCtx *,float *,float *,float *,float *)=pos_fn; int (*sv_yaw)(KCtx *,float *)=yaw_fn; int (*sv_en)(KCtx *,float,float,float *,float *,float *)=enemy_fn;
+    char *sv_env=getenv("KHNMC_ROUTE_DIFFICULTY"); char sv_envv[16]=""; if(sv_env) snprintf(sv_envv,sizeof sv_envv,"%s",sv_env); unsetenv("KHNMC_ROUTE_DIFFICULTY");
+    cond_fn=t_cond; cursor_fn=t29_cur; target_fn=t29_target; pos_fn=t29_pos; yaw_fn=t29_yaw; enemy_fn=t29_enemy;
+    memset(t_val,0,sizeof t_val); t29_step=0; t29_frozen=0; t29_pos_ok=t29_cam_ok=1;
+    /* 1. parse: defaults, options, a relative press after it */
+    PCHECK(t_load(g,"@fight until not mission\n") && nsteps==1 && steps[0].type==ST_FIGHT && steps[0].has_until && steps[0].c.kind==KR_MISSION && steps[0].c.neg &&
+           steps[0].radius==150.0f && steps[0].every==20 && steps[0].hold==3 && steps[0].stall==600 && steps[0].timeout==3600);
+    PCHECK(t_load(g,"@fight until enemies-at-most 0 radius 80 every 10 hold 2 stall 300 timeout 5000\n+1 +2 B\n") && nsteps==1 && steps[0].c.kind==KR_ENEMIES_AT_MOST && steps[0].c.arg==0 &&
+           !steps[0].c.neg && steps[0].radius==80.0f && steps[0].every==10 && steps[0].hold==2 && steps[0].stall==300 && steps[0].timeout==5000 && steps[0].nrel==1);
+    /* the place conditions: numbers in decimal or 0x hex (the area data's program ids are written in hex) */
+    PCHECK(t_load(g,"@wait pause-menu\n@expect pause-id 5\n@wait pause-has 6\n") && nsteps==3 && steps[0].c.kind==KR_PAUSE_MENU && steps[1].c.kind==KR_PAUSE_ID && steps[1].c.arg==5 && steps[2].c.kind==KR_PAUSE_HAS);
+    PCHECK(t_load(g,"@wait btl-program 0x1301\n@wait map-program 4864\n@wait evt-program 0x41\n@expect door 52\n") && nsteps==4 && steps[0].c.kind==KR_BTL_PROGRAM && steps[0].c.arg==0x1301 &&
+           steps[1].c.kind==KR_MAP_PROGRAM && steps[1].c.arg==0x1300 && steps[2].c.kind==KR_EVT_PROGRAM && steps[2].c.arg==0x41 && steps[3].c.kind==KR_DOOR && steps[3].c.arg==52);
+    /* 2. walk to the enemy (every stick frame on the bearing), stop within the radius, attack there (A for `hold` of every `every`
+     *    frames, never together with the stick), and when `until` holds: one released frame, then the step's relative press */
+    { t29_x=0; t29_z=0; t29_cam=0.4f; t29_enemies=1; t29_ex=0; t29_ez=400; t29_maxdev=0;
+      PCHECK(t_load(g,"@fight until area 7 radius 100 every 20 hold 3 stall 100\n+1 +1 B\n"));
+      u16 bt[300]; s16 sx[300]; int both=0, edges=0, longest=0, run=0, stick_in_reach=0, a_far=0;
+      for(u64 n=1;n<=200;n++){ float d=hypotf(t29_x-t29_ex,t29_z-t29_ez);                      /* where he stands when the tick decides the pad */
+          t29_run(g,n,n,t29_ex,t29_ez); bt[n-1]=route_pad.buttons; sx[n-1]=(s16)(route_pad.lx|route_pad.ly);
+          if(bt[n-1]&&sx[n-1]) both++;
+          if(bt[n-1]==0x1000){ if(n==1||bt[n-2]!=0x1000) edges++; run++; if(run>longest) longest=run; } else run=0;
+          if(sx[n-1] && d<=100.0f) stick_in_reach++;
+          if(bt[n-1] && d>100.0f) a_far++; }
+      float d=hypotf(t29_x-t29_ex,t29_z-t29_ez);
+      PCHECK(!steps[0].met && d<=100.0f && d>=100.0f-10.0f && t29_maxdev<0.001f);          /* walked on the bearing and stopped at the edge of reach */
+      PCHECK(both==0 && stick_in_reach==0 && a_far==0 && longest==3 && edges>=6 && edges<=9 && (u64)edges==fight_presses);   /* attacks only in reach */
+      int last_pressed=bt[199]||sx[199];
+      t_val[KR_AREA]=7; t29_run(g,201,201,0,0); PCHECK(steps[0].met==201 && route_pad.lx==0 && route_pad.ly==0 && route_pad.buttons==(last_pressed?0:0x2000));   /* +1 B: the next frame, or one later after a pressed frame */
+      t29_run(g,202,202,0,0); PCHECK(route_pad.buttons==(last_pressed?0x2000:0));
+      t_val[KR_AREA]=0; }
+    /* the attack pattern counts from the step's start: met while A was held -> the anchor keeps a released frame before the B press */
+    { t29_x=0; t29_z=0; t29_cam=0; t29_enemies=1; t29_ex=0; t29_ez=50;
+      PCHECK(t_load(g,"@fight until area 7 radius 100 every 20 hold 3\n+1 +1 B\n"));
+      t29_run(g,1,1,0,50); PCHECK(route_pad.buttons==0x1000);                                /* tick 1 computes counter 1: (1-1)%20 = 0 < 3: A */
+      t_val[KR_AREA]=7; t29_run(g,2,2,0,50); PCHECK(steps[0].met==2 && route_pad.buttons==0);   /* the frame after a pressed one is released */
+      t29_run(g,3,3,0,50); PCHECK(route_pad.buttons==0x2000); t_val[KR_AREA]=0; }
+    /* no enemy: he stands (no stick, no A), and waiting for the next wave is not a stall */
+    { t29_x=0; t29_z=0; t29_enemies=0; PCHECK(t_load(g,"@fight until area 7 stall 30\n"));
+      int any=0; for(u64 n=1;n<=20;n++){ t29_run(g,n,n,0,0); if(route_pad.buttons||route_pad.lx||route_pad.ly) any++; }
+      PCHECK(any==0 && !steps[0].met && t29_x==0 && t29_z==0); }
+    /* the pause screen: @select pause-id moves its cursor by DPAD to the row with that id (5 = skip the event), then A */
+    { cursor_fn=t30_pcur; target_fn=t30_ptgt; t29_rows[0]=6; t29_rows[1]=5; t29_nrows=2; t29_cursor=0; t29_step=1;
+      PCHECK(t_load(g,"@select pause-id 5 timeout 100\n+1 +2 A\n") && nsteps==1 && steps[0].type==ST_SELECT && steps[0].c.kind==KR_PAUSE_ID && steps[0].c.arg==5);
+      u16 bp[60]; for(u64 n=1;n<=40;n++){ t29_run(g,n,n,0,0); bp[n-1]=route_pad.buttons; }
+      int downs=0,ups=0,a=0; for(int i=0;i<40;i++){ if((bp[i]&2)&&(i==0||!(bp[i-1]&2))) downs++; if((bp[i]&1)&&(i==0||!(bp[i-1]&1))) ups++; if(bp[i]==0x1000) a++; }
+      PCHECK(t29_cursor==1 && downs==1 && ups==0 && a==2 && route_done);
+      t29_cursor=1; PCHECK(t_load(g,"@select pause-id 6 timeout 100\n")); t29_run(g,1,40,0,0); PCHECK(t29_cursor==0 && steps[0].met>0);
+      t29_step=0; cursor_fn=t29_cur; target_fn=t29_target; }
+    /* @skip: three events skipped through the pause screen: START opens it, DPAD_DOWN to the skip row, A; never two buttons at once,
+     * no START while the screen is up, never A on "continue"; then `until` holds and a released frame comes before the next press */
+    { int (*sv_pause)(KCtx *,KhPauseMenu *)=pause_fn; pause_fn=t30_pause; t30_events=3; t30_up=0; t30_nrows=2; t30_rows[0]=6; t30_rows[1]=5; t30_both=t30_start_in_menu=t30_a_on_continue=0; t30_prev=0; t_val[KR_AREA]=0;
+      PCHECK(t_load(g,"@skip until area 7 timeout 1000\n+1 +1 B\n") && nsteps==1 && steps[0].type==ST_SKIP && steps[0].c.kind==KR_AREA && steps[0].c.arg==7 && steps[0].every==30 && steps[0].hold==2);
+      u64 n=1; for(;n<=400 && !steps[0].met;n++) t30_skip_run(g,n,n);
+      PCHECK(steps[0].met>0 && t30_events==0 && skip_starts==3 && skip_skips==3 && skip_moves==3 && t30_both==0 && t30_start_in_menu==0 && t30_a_on_continue==0);
+      u16 last=t30_prev; t30_skip_run(g,n,n); PCHECK(route_pad.buttons==(last?0:0x2000)); t30_skip_run(g,n+1,n+1); PCHECK(route_pad.buttons==(last?0x2000:0));
+      /* the same with an odd period (decisions on both parities of the frame counter) */
+      t30_events=2; t30_up=0; t29_cursor=0; t30_both=t30_start_in_menu=t30_a_on_continue=0; t30_prev=0; t_val[KR_AREA]=0;
+      PCHECK(t_load(g,"@skip until area 7 every 9 hold 2 timeout 1000\n")); for(n=1;n<=300 && !steps[0].met;n++) t30_skip_run(g,n,n);
+      PCHECK(steps[0].met>0 && skip_starts==2 && skip_skips==2 && t30_start_in_menu==0 && t30_a_on_continue==0 && t30_both==0);
+      PCHECK(t_load(g,"@skip until area 7 every 10 hold 3 timeout 50\n") && steps[0].every==10 && steps[0].hold==3 && steps[0].timeout==50);
+      t_val[KR_AREA]=7; t30_skip_run(g,1,1); PCHECK(steps[0].met==1 && route_pad.buttons==0); t_val[KR_AREA]=0;   /* nothing to skip: met at once, nothing pressed */
+      pause_fn=sv_pause; }
+    /* @talk: five pages, each answered with one new A press; the step ends only when `not message` held `stable` frames in a row,
+     * so the one-frame gaps between pages do not end it; no A while no message waits */
+    { memset(t_val,0,sizeof t_val); t30_pages=5; t30_wait_at=10; t30_a_without_msg=0; t30_tprev=0;
+      PCHECK(t_load(g,"@talk until not message stable 30 timeout 2000\n+1 +1 B\n") && nsteps==1 && steps[0].type==ST_TALK && steps[0].c.kind==KR_MESSAGE && steps[0].c.neg &&
+             steps[0].stable==30 && steps[0].every==20 && steps[0].hold==2);
+      u64 n=1; for(;n<=600 && !steps[0].met;n++) t30_talk_run(g,n,n);
+      PCHECK(steps[0].met>0 && t30_pages==0 && talk_presses==5 && t30_a_without_msg==0);
+      PCHECK(steps[0].met>=10+4*20+30);                                                      /* not before 30 quiet frames after the last page */
+      PCHECK(t_load(g,"@talk until area 3 every 10 hold 3 stable 5 timeout 99\n") && steps[0].every==10 && steps[0].hold==3 && steps[0].stable==5 && steps[0].timeout==99);
+      memset(t_val,0,sizeof t_val); }
+    /* 3. named fatals and load errors in a child */
+    if(kh_fork_ok()){
+        char o[16384];
+        t29_x=0; t29_z=0; t29_cam=0; t29_enemies=0; t_fatal_txt="@fight until area 7 stall 30 timeout 5000\n"; t30_ticks=100;
+        PCHECK(t_child(t30_body,o,sizeof o)==0);                                                /* 100 frames without an enemy: no stall */
+        t29_x=0; t29_z=0; t29_cam=0; t29_enemies=1; t29_ex=0; t29_ez=400; t_fatal_txt="@fight until area 7 radius 100 stall 20\n";
+        PCHECK(t_child(t30_knock_body,o,sizeof o)==0);                                          /* knocked back from about 130 to 400: walks again, no stall */
+        t29_enemies=1; t29_ex=3000; t29_ez=0; t29_frozen=1; t_fatal_txt="@fight until area 7 stall 30\n"; t30_ticks=200;
+        PCHECK(t_child(t30_body,o,sizeof o)==3 && strstr(o,"route-goto-stalled:") && strstr(o,"`@fight until area 7 stall 30`") && strstr(o,"no progress toward the nearest enemy (3000, 0) for 30 game frames") && strstr(o,"1 enemies"));
+        t29_frozen=0; t29_ex=0; t29_ez=50; t_fatal_txt="@fight until area 7 timeout 40\n"; t30_ticks=200;
+        PCHECK(t_child(t30_body,o,sizeof o)==3 && strstr(o,"route-wait-timeout:") && strstr(o,"the fight's end (the current area id is N) did not come within 40 game frames") && strstr(o,"1 enemies at the last look, 3 attacks pressed"));   /* counters 1, 21 and 41 (the press of the tick that times out) */
+        t29_enemies=0;
+        cursor_fn=t30_pcur; target_fn=t30_ptgt; t29_rows[0]=6; t29_rows[1]=5; t29_nrows=2; t29_cursor=0; t_fatal_txt="@select pause-id 9 timeout 30\n"; t30_ticks=100;
+        PCHECK(t_child(t30_body,o,sizeof o)==3 && strstr(o,"route-wait-timeout:") && strstr(o,"the pause screen's cursor did not reach the row with id 9 within 30 game frames; that row is -1"));
+        cursor_fn=t29_cur; target_fn=t29_target;
+        { int (*sv_pause)(KCtx *,KhPauseMenu *)=pause_fn; pause_fn=t30_pause;
+          t30_events=2; t30_up=0; t30_nrows=1; t30_rows[0]=6; t30_prev=0; t_val[KR_AREA]=0; t_fatal_txt="@skip until area 7 timeout 500\n"; t30_skip_ticks=200;
+          PCHECK(t_child(t30_skip_body,o,sizeof o)==3 && strstr(o,"route-skip-no-skip-row:") && strstr(o,"the pause screen is up without a row to skip an event (id 5); its rows: 6"));
+          t30_events=0; t30_rows[0]=6; t30_rows[1]=5; t30_nrows=2; t_val[KR_AREA]=0; t_fatal_txt="@skip until area 8 timeout 70\n"; t30_skip_ticks=200;   /* no event plays: START opens nothing */
+          PCHECK(t_child(t30_skip_body,o,sizeof o)==3 && strstr(o,"route-wait-timeout:") && strstr(o,"the end of the events (the current area id is N) did not come within 70 game frames; START pressed 3 times, \"skip\" chosen 0 times"));
+          pause_fn=sv_pause; }
+        memset(t_val,0,sizeof t_val); t30_pages=1000; t30_wait_at=1; t30_tprev=0; t_fatal_txt="@talk until not message timeout 80\n"; t30_talk_ticks=200;
+        PCHECK(t_child(t30_talk_body,o,sizeof o)==3 && strstr(o,"route-wait-timeout:") && strstr(o,"the end of the dialogue (NOT: a field message window waits for a button for 30 game frames in a row) did not come within 80 game frames; A pressed 4 times; a message waits now"));
+        memset(t_val,0,sizeof t_val);
+        static const struct { const char *txt, *msg; } bad[]={
+            {"@fight\n","line 1: @fight needs `until COND`"}, {"@fight until\n","line 1: a condition is missing"}, {"@fight until area 1 radius\n","line 1: @fight: radius, every, hold, stall and timeout take a number"},
+            {"@fight until area 1 hold 5 every 5\n","line 1: @fight: hold must be shorter than every"}, {"@fight until area 1 speed 2\n","line 1: unknown option for @fight"},
+            {"@fight until area 1 until area 2\n","line 1: @fight: one `until` only"}, {"@fight radius 50\n","line 1: @fight needs `until COND`"},
+            {"@wait btl-program 0x10000\n","line 1: the condition's number is out of range"}, {"@wait door 0x1g\n","line 1: the condition's number is out of range"},
+            {"@wait evt-program 0x\n","line 1: the condition's number is out of range"},
+            {"@skip\n","line 1: @skip until COND"}, {"@skip area 7\n","line 1: @skip until COND"}, {"@skip until area 7 every\n","line 1: @skip: every, hold and timeout take a number"},
+            {"@skip until area 7 speed 3\n","line 1: unknown option for @skip"},
+            {"@talk\n","line 1: @talk until COND"}, {"@talk until not message stable\n","line 1: @talk: every, hold, stable and timeout take a number"},
+            {"@talk until not message hold 4 every 4\n","line 1: @talk: hold must be shorter than every"}, {"@talk until not message wait 3\n","line 1: unknown option for @talk"},
+        };
+        for(size_t i=0;i<sizeof bad/sizeof *bad;i++){ t_fatal_txt=bad[i].txt; t30_ticks=1;
+            int st=t_child(t30_body,o,sizeof o); PCHECK(st==3 && strstr(o,"scripted XInput: ") && strstr(o,bad[i].msg)); if(st!=3||!strstr(o,bad[i].msg)) fprintf(stderr,"  case %zu: status %d: %.300s\n",i,st,o); }
+    } else kh_selftest_not_run("input route P30","@fight / @select pause-id / @skip / @talk fatals, stall-free waiting and load errors (in a child)",26);
+    kh_input_load(g,NULL);
+    cond_fn=sv_cond; cursor_fn=sv_cur; target_fn=sv_tgt; pos_fn=sv_pos; yaw_fn=sv_yaw; enemy_fn=sv_en;
+    /* Part 2: the programs reader on a synthetic place block (0x152be0's layout), and the map report line */
+    { u8 sv[12]; memcpy(sv,(void*)XL(g,GS_BASE+0x717008ull),12); int door=-1,mp=-1,bp=-1,ep=-1;
+      wr8(g,GS_BASE+0x717008,0x12); wr8(g,GS_BASE+0x717009,3); wr8(g,GS_BASE+0x71700a,1); wr8(g,GS_BASE+0x71700b,0x77);
+      wr16(g,GS_BASE+0x71700c,0x1300); wr16(g,GS_BASE+0x71700e,0x1301); wr16(g,GS_BASE+0x717010,0x41);
+      PCHECK(kh_route_programs(g,&door,&mp,&bp,&ep) && door==1 && mp==0x1300 && bp==0x1301 && ep==0x41);
+      { KhRouteBase rb={0,0,kh_mod_item_obs(NULL)};
+        PCHECK(kh_route_cond_eval(g,KR_DOOR,1,10,&rb) && !kh_route_cond_eval(g,KR_DOOR,0,10,&rb) && kh_route_cond_eval(g,KR_MAP_PROGRAM,0x1300,10,&rb) && !kh_route_cond_eval(g,KR_MAP_PROGRAM,0x1301,10,&rb) &&
+               kh_route_cond_eval(g,KR_BTL_PROGRAM,0x1301,10,&rb) && !kh_route_cond_eval(g,KR_BTL_PROGRAM,0x1300,10,&rb) && kh_route_cond_eval(g,KR_EVT_PROGRAM,0x41,10,&rb) && !kh_route_cond_eval(g,KR_EVT_PROGRAM,0x1301,10,&rb));
+        wr8(g,GS_BASE+0x717008,0xff); PCHECK(!kh_route_cond_eval(g,KR_DOOR,1,10,&rb) && !kh_route_cond_eval(g,KR_BTL_PROGRAM,0x1301,10,&rb)); wr8(g,GS_BASE+0x717008,0x12); }
+      { FILE *f=kh_tmpfile(); if(f){ kh_route_map_report(g,f,"selftest"); rewind(f); char l[2048]=""; size_t nr=fread(l,1,sizeof l-1,f); l[nr]=0; fclose(f);
+          PCHECK(strstr(l,"world 12 area 03 (door 1, programs map 0x1300 btl 0x1301 evt 0x41)") && strstr(l,"far zone")); }
+        else kh_selftest_not_run("input route P30","map report into a temp file",1); }
+      wr8(g,GS_BASE+0x717008,0xff); door=mp=bp=ep=-7; PCHECK(!kh_route_programs(g,&door,&mp,&bp,&ep) && door==-7 && mp==-7);
+      memcpy((void*)XL(g,GS_BASE+0x717008ull),sv,12); }
+    /* the pause screen's readers on synthetic memory: MENU::isRunning, the menu id 50, the cursor and row-id pointers */
+    { u8 run0=rd8(g,GS_BASE+0x9006b0); u32 id0=rd32(g,GS_BASE+0x900724); u64 cp0=rd64(g,GS_BASE+0xbef528), ip0=rd64(g,GS_BASE+0xbef538);
+      u64 cw=ga_calloc(1,16), ids=ga_calloc(1,32); KhPauseMenu pm; KhRouteBase rb={0,0,kh_mod_item_obs(NULL)};
+      for(int i=0;i<12;i++) wr16(g,ids+2*(u64)i,0xffff);
+      wr8(g,GS_BASE+0x9006b0,1); wr32(g,GS_BASE+0x900724,50); wr64(g,GS_BASE+0xbef528,cw); wr64(g,GS_BASE+0xbef538,ids);
+      PCHECK(!kh_route_pause_menu(g,&pm) && !kh_route_cond_eval(g,KR_PAUSE_MENU,-1,10,&rb));                                /* opened, rows not filled yet */
+      wr16(g,ids,6); wr16(g,ids+2,5); wr16(g,cw,1);
+      PCHECK(kh_route_pause_menu(g,&pm) && pm.rows==2 && pm.cursor==1 && pm.id[0]==6 && pm.id[1]==5);
+      PCHECK(kh_route_cond_eval(g,KR_PAUSE_MENU,-1,10,&rb) && kh_route_cond_eval(g,KR_PAUSE_ID,5,10,&rb) && !kh_route_cond_eval(g,KR_PAUSE_ID,6,10,&rb) &&
+             kh_route_cond_eval(g,KR_PAUSE_HAS,6,10,&rb) && kh_route_cond_eval(g,KR_PAUSE_HAS,5,10,&rb) && !kh_route_cond_eval(g,KR_PAUSE_HAS,7,10,&rb));
+      PCHECK(kh_route_cursor(g,KR_PAUSE_ID)==1 && kh_route_cursor_target(g,KR_PAUSE_ID,6)==0 && kh_route_cursor_target(g,KR_PAUSE_ID,5)==1 && kh_route_cursor_target(g,KR_PAUSE_ID,7)==-1);
+      wr16(g,cw,2); PCHECK(kh_route_pause_menu(g,&pm) && pm.cursor==-1 && !kh_route_cond_eval(g,KR_PAUSE_ID,5,10,&rb)); wr16(g,cw,1);   /* cursor past the last row */
+      wr32(g,GS_BASE+0x900724,0); PCHECK(!kh_route_pause_menu(g,&pm) && kh_route_cursor(g,KR_PAUSE_ID)==-1); wr32(g,GS_BASE+0x900724,50);   /* another menu (0 = the camp menu) */
+      wr8(g,GS_BASE+0x9006b0,0); PCHECK(!kh_route_pause_menu(g,&pm)); wr8(g,GS_BASE+0x9006b0,1);
+      wr64(g,GS_BASE+0xbef538,0); PCHECK(!kh_route_pause_menu(g,&pm) && kh_route_cursor_target(g,KR_PAUSE_ID,5)==-1);
+      wr8(g,GS_BASE+0x9006b0,run0); wr32(g,GS_BASE+0x900724,id0); wr64(g,GS_BASE+0xbef528,cp0); wr64(g,GS_BASE+0xbef538,ip0); ga_free(cw); ga_free(ids); }
+    if(sv_env) setenv("KHNMC_ROUTE_DIFFICULTY",sv_envv,1);
+    kh_input_load(g,getenv("KHNMC_INPUT_SCRIPT"));
+    fprintf(stderr,"kh: input route P30 selftest: %d checks, %d failures\n",checks,fails);
+#undef PCHECK
     return fails;
 }
