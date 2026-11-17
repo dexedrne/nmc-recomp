@@ -14,8 +14,8 @@ static u64 invoke(KCtx *g,int i,u64 args,u32 a,u32 b){
 static u32 idof(KCtx *g,u64 p){ return (u32)kh_call(g,GS_BASE+0x4ad240,p,0,0,0); }
 static void wf(KCtx *g,u64 p,float v){ u32 b; memcpy(&b,&v,4); wr32(g,p,b); }
 static int fatal_case(KCtx *g,int idx,u64 args,const char *match){
-    FILE *f=tmpfile(); if(!f) return 0;
-    pid_t child=fork();
+    FILE *f=kh_tmpfile(); if(!f) return 0;
+    pid_t child=kh_fork();
     if(child==0){
         dup2(fileno(f),2);
         u64 sp=KH_RSP(g)-0x108; wr64(g,sp,GS_BASE+0x41c4fc); KH_RSP(g)=sp; A0(g)=args;
@@ -32,8 +32,8 @@ static u64 sc_hook(KCtx *g,u32 rva,const u64 *a){
     sc.n++; return rva==0x3b3e80?0x3e80aaa0ull:0x9900ull+rva;
 }
 static int fatal_text(KCtx *g,int idx,u64 args,const char *match){          /* like fatal_case, for fatals that are not the "unimplemented" one */
-    FILE *f=tmpfile(); if(!f) return 0;
-    pid_t child=fork();
+    FILE *f=kh_tmpfile(); if(!f) return 0;
+    pid_t child=kh_fork();
     if(child==0){ dup2(fileno(f),2); u64 sp=KH_RSP(g)-0x108; wr64(g,sp,GS_BASE+0x41c4fc); KH_RSP(g)=sp; A0(g)=args; kh_dispatch(g,rd64(g,rd64(g,GS_BASE+0x7534a8)+16*idx)); _exit(99); }
     int status=0; if(child<0){ fclose(f); return 0; } waitpid(child,&status,0);
     rewind(f); char output[32768]; size_t n=fread(output,1,sizeof output-1,f); output[n]=0; fclose(f);
@@ -54,8 +54,10 @@ int kh_mod_syscalls_selftest(KCtx *g){
     }
     T(rd64(g,table+3*16+8)==0x40000002); T(rd64(g,table+69*16+8)==2);
     T(rd64(g,table+113*16+8)==0x40000001);
+    if(kh_fork_ok()){
     T(fatal_case(g,2,args,"index=2 name=AddFormExp"));          /* Set_Action (0) is implemented since Task 23 */
     T(fatal_case(g,50,args,"index=50 name=GetCurrentRC_MEM"));
+    } else kh_selftest_not_run("mod syscall","two unimplemented syscalls (named fatal with the call site)",2);   /* iOS: no fork (host_env.c) */
 
     /* Snapshot globals touched by the fixtures; restore them before other selftests. */
     const u32 globals[]={0x2ae57b0,0x2a25370,0x2aea8a0,0x2a253d0,0x2a105d0,0x2a0ff68};
@@ -146,7 +148,9 @@ int kh_mod_syscalls_selftest(KCtx *g){
       T(invoke(g,55,args,0x12345ef,0)==0x12345ef); T(rd32(g,GS_BASE+0x718ca8)==0xa1b2c3efu);
       invoke(g,55,args,0x0b,0); T(rd32(g,GS_BASE+0x718ca8)==0xa1b2c30bu);
       wr64(g,GS_BASE+0x2ae5768,0); wr64(g,args,0x0b);
-      T(fatal_text(g,55,args,"mod syscall SetCameraMode (table 3 index 55, DLL 0x12a40) before the DLL's worker thread")); T(rd32(g,GS_BASE+0x718ca8)==0xa1b2c30bu);
+      if(kh_fork_ok()) T(fatal_text(g,55,args,"mod syscall SetCameraMode (table 3 index 55, DLL 0x12a40) before the DLL's worker thread"));
+      else kh_selftest_not_run("mod syscall","SetCameraMode before the DLL's worker thread (named fatal)",1);   /* iOS: no fork (host_env.c) */
+      T(rd32(g,GS_BASE+0x718ca8)==0xa1b2c30bu);
       wr64(g,GS_BASE+0x2ae5768,svG); wr32(g,GS_BASE+0x718ca8,svC);
       kh_mod_syscalls_call_hook=sc_hook;
       /* 0 (DLL 0x115c0): 0x3b4da0(decode(arg0), arg1 as a dword) */
@@ -170,7 +174,9 @@ int kh_mod_syscalls_selftest(KCtx *g){
       { int same=1; for(int i=0;i<9;i++) if(rd64(g,a9+8*(u64)i)!=v9[i]) same=0; T(same); }                        /* no slot is written (no return value) */
       kh_mod_syscalls_call_hook=NULL; ga_free(a9);
       /* Set_Action on a handle that decodes to no object: 0x3b4da0 would read [NULL+0xc] on the PC */
-      wr64(g,args,0); wr64(g,args+8,3); T(fatal_text(g,0,args,"mod syscall invalid guest memory")); }
+      wr64(g,args,0); wr64(g,args+8,3);
+      if(kh_fork_ok()) T(fatal_text(g,0,args,"mod syscall invalid guest memory"));
+      else kh_selftest_not_run("mod syscall","Set_Action on a handle that decodes to no object (named fatal)",1); }   /* iOS: no fork */
     for(int i=0;i<6;i++) wr64(g,GS_BASE+globals[i],saved[i]);
     /* Script teardown must preserve the installed extension and the vanilla tables. */
     kh_call(g,GS_BASE+0x1f9a80,0,0,0,0); T(rd64(g,GS_BASE+0x7534a8)==table);

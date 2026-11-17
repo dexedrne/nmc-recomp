@@ -19,7 +19,11 @@ void ga_init(u64 lo,u64 hi); void kh_trace_init(void); void kh_install_signals(v
 void kh_set_cur_g(KCtx *g);
 extern u64 kh_import_addr_base;
 extern int kh_cnt_init_xi, kh_cnt_init_xc;
+#if KH_IOS_PATHS
+static char exe_path[1024];                   /* always from KH_EXE: host_env.c sets the app container default (Documents/kh2fm.exe) */
+#else
 static char exe_path[1024]="/home/user/projects/kh2-nmc-analysis/pc/kh2fm.exe";
+#endif
 static const char *entry_mode="crt";
 static u64 guest_space_size=0x300000000ull;   /* 12 GiB reserve, lazily committed */
 static int exit_code_main=-1; static int selftest; static int hd_check; static const char *hd_check_report;
@@ -84,7 +88,7 @@ void kh_exit_process(int code){
     { extern void kh_import_counts_report(FILE*); kh_import_counts_report(stderr); }      /* KH_IMPORT_COUNTS=1 */
     { extern void kh_import_sites_report(FILE*); kh_import_sites_report(stderr); }        /* KH_IMPORT_SITES=text */
     { extern void kh_libm_args_close(void); kh_libm_args_close(); }                       /* KH_LIBM_ARGS=file */
-    kh_report_seams(stderr); { extern void kh_dump_threads(FILE*); if(getenv("KH_DUMP_THREADS")) kh_dump_threads(stderr); } fflush(stderr); fflush(stdout); _exit(code);
+    kh_report_seams(stderr); { extern void kh_dump_threads(FILE*); if(getenv("KH_DUMP_THREADS")) kh_dump_threads(stderr); } fflush(stderr); fflush(stdout); kh_host_exit(code);
 }
 
 /* oracle snapshot: after the main thread is set up, write the sparse guest arena (every non-zero 4 KiB page) + boot state so an independent
@@ -131,8 +135,9 @@ static void *guest_main(void *arg){
     exit_code_main=(int)rc; kh_exit_process((int)rc); return NULL;
 }
 
-int main(int argc,char **argv){
+static int kh_main_body(int argc,char **argv){
     setvbuf(stderr,NULL,_IOLBF,0);
+    kh_host_env_init(&argc,&argv);                  /* host_env.c: nothing unless KH_IOS_PATHS (app container directories, Documents/khnmc.conf) */
     const char *e;
     if((e=getenv("KH_EXE"))) snprintf(exe_path,sizeof exe_path,"%s",e);
     if((e=getenv("KH_ROOT"))) snprintf(kh_root,sizeof kh_root,"%s",e);
@@ -163,4 +168,16 @@ int main(int argc,char **argv){
     pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at,128ull<<20); pthread_t th;
     if(pthread_create(&th,&at,guest_main,0)){ perror("pthread_create"); return 1; }
     pthread_join(th,0); return exit_code_main;
+}
+/* The game ends in kh_exit_process -> kh_host_exit; the early returns above (usage 2, image / thread errors 1) come back here and
+ * pass the same hook, so a status file (host_env.c) never keeps saying "running" for a process that has ended.
+ * An app shell that owns the process's main() (runtime/ios/ios_main.m) builds this file with -DKH_MAIN_NAME=kh_main and calls it. */
+#ifdef KH_MAIN_NAME
+int KH_MAIN_NAME(int argc,char **argv){
+#else
+int main(int argc,char **argv){
+#endif
+    int rc=kh_main_body(argc,argv);
+    void (*h)(int)=kh_exit_hook; if(h){ fflush(stdout); fflush(stderr); h(rc); }
+    return rc;
 }

@@ -13,33 +13,81 @@
 #   make XLATE=2 HOOKMODE=rename  -> obj-x2-rename/,  ./khnmc-x2-rename    (Linux: the Darwin hook mechanism under the GNU linker)
 #   make  (on Darwin)             -> XLATE=2 HOOKMODE=rename by default, obj/, ./khnmc, clang, no vkd3d backend (tools/darwin_build.sh)
 # SHARDS_DIR = where the lifted shard_*.c are read from (default $(LIFTED)/shards; never written).
+#
+# Task 26:
+#   IOS_PATHS=1      the iOS code paths on this host (-DKH_IOS_PATHS=1, runtime/kh_compat.h, runtime/host_env.c): no fork, no fixed
+#                    /tmp, app-container directories, Documents/khnmc.conf.  Only the hand-written runtime depends on it, so the
+#                    variant keeps its own runtime objects and binary ($(O) and $(BIN) get the suffix -iospaths) and REUSES the
+#                    lifted shard objects and archive of the same build without the switch ($(OL)).  `all` then also runs
+#                    tools/check_ios_symbols.py (the program must not import fork, system, popen, tmpfile, ...).
+#   make IOS_PATHS=1              -> obj-iospaths/, ./khnmc-iospaths   (Linux; on Darwin the same names, bias mode + rename hooks)
+#   make [IOS_PATHS=1] hostshell  -> $(BIN)-shell: the link an iOS app makes (the game as two static libraries + a shell that owns
+#                    main() and runs the game on a second thread: tools/ios/host_shell.c), with the same link checks.  `applib`
+#                    makes only the libraries: $(O)/libkhnmc-rt.a (every directly linked object; loader.c with
+#                    -DKH_MAIN_NAME=kh_main) and $(OL)/libkh2loose.a.
+#   IOS_SDK=iphonesimulator|iphoneos   PREPARED, NOT RUN (no iOS SDK on the machines this was written on): `make IOS_SDK=... applib`
+#                    compiles everything for that SDK with xcrun clang (arm64, bias mode, rename hooks, obj-<sdk>/); the app
+#                    itself is linked by the Xcode project tools/ios/make_project.py writes.  See tools/ios/.
+#   GEN_PREBUILT=1   $(GEN)/mod_static_lifted.c and the three tables are INPUTS (copied from the Linux dev host, where the lifter
+#                    environment lives) and are never regenerated; a missing one is an error that says so.  Default on Darwin.
 ROOT ?= .
 LIFTED ?= $(ROOT)/lifted
 CC ?= gcc
 OPT ?= -O2 -g
 UNAME_S := $(shell uname -s)
+IOS_PATHS ?= 0
+ifeq ($(filter $(IOS_PATHS),0 1),)
+$(error IOS_PATHS must be 0 or 1)
+endif
+ifeq ($(IOS_PATHS),1)
+IOSSFX = -iospaths
+IOSFLAGS = -DKH_IOS_PATHS=1
+# no vkd3d backend in such a build (an iOS build is a bias build, which never has it; its selftest also uses a fixed /tmp)
+GFX_VKD3D = 0
+endif
+# PREPARED, NOT RUN: an iOS SDK as the target (needs Xcode; arm64 only)
+IOS_MIN ?= 17.0
+ifneq ($(IOS_SDK),)
+ifeq ($(IOS_SDK),iphoneos)
+IOS_TRIPLE = arm64-apple-ios$(IOS_MIN)
+else ifeq ($(IOS_SDK),iphonesimulator)
+IOS_TRIPLE = arm64-apple-ios$(IOS_MIN)-simulator
+else
+$(error IOS_SDK must be iphoneos or iphonesimulator)
+endif
+ifneq ($(UNAME_S),Darwin)
+$(error IOS_SDK needs a Mac with Xcode)
+endif
+CC = xcrun --sdk $(IOS_SDK) clang -target $(IOS_TRIPLE)
+OL = obj-$(IOS_SDK)
+BIN = $(OL)/khnmc-not-an-app
+endif
 ifeq ($(UNAME_S),Darwin)
 XLATE ?= 2
 HOOKMODE ?= rename
-O ?= obj
-BIN ?= khnmc
+OL ?= obj
+BIN ?= khnmc$(IOSSFX)
 GFX_VKD3D = 0
 LDEXPORT =
+GEN_PREBUILT ?= 1
 else
 LDEXPORT = -rdynamic
 endif
+GEN_PREBUILT ?= 0
 XLATE ?= 0
 HOOKMODE ?= objcopy
+# $(OL): objects of the lifted shards and their archive (they do not depend on IOS_PATHS); $(O): everything else of the variant
 ifeq ($(XLATE)-$(HOOKMODE),0-objcopy)
-O ?= obj
-BIN ?= khnmc
+OL ?= obj
+BIN ?= khnmc$(IOSSFX)
 LIFTLIB ?= $(LIFTED)/lib/x86/libkh2lifted.a
 else
-O ?= obj-x$(XLATE)-$(HOOKMODE)
-BIN ?= khnmc-x$(XLATE)-$(HOOKMODE)
-LIFTLIB = $(O)/libkh2lifted.a
+OL ?= obj-x$(XLATE)-$(HOOKMODE)
+BIN ?= khnmc-x$(XLATE)-$(HOOKMODE)$(IOSSFX)
+LIFTLIB = $(OL)/libkh2lifted.a
 XFLAGS = -DKH_XLATE_MODE=$(XLATE)
 endif
+O ?= $(OL)$(IOSSFX)
 ifneq ($(XLATE),0)
 # the vkd3d backend hands guest pointers to vkd3d as host pointers: identity mode on x86-64 only (KHNMC_GFX=vkd3d is a named fatal here)
 GFX_VKD3D = 0
@@ -48,7 +96,7 @@ ifeq ($(filter $(HOOKMODE),objcopy rename),)
 $(error HOOKMODE must be objcopy or rename)
 endif
 CFLAGS = -std=gnu11 $(OPT) -w -fno-strict-aliasing -fwrapv -fno-delete-null-pointer-checks -fno-math-errno -ffp-contract=off -pthread \
-         -I$(ROOT)/lifter-rt -I$(ROOT)/runtime -I$(LIFTED)/gen $(XFLAGS) $(EXTRA)
+         -I$(ROOT)/lifter-rt -I$(ROOT)/runtime -I$(LIFTED)/gen $(XFLAGS) $(IOSFLAGS) $(EXTRA)
 RTSRC = $(wildcard $(ROOT)/runtime/*.c)
 RTOBJ = $(patsubst $(ROOT)/runtime/%.c,$(O)/%.o,$(RTSRC))
 LIFTOBJ = $(O)/khrt_cpu.o $(O)/khrt_rcp_tab.o $(O)/rt_libm.o $(O)/kh_table.o $(O)/rt_imports_default.o $(O)/nep_stubs.o
@@ -155,42 +203,42 @@ $(O)/gfx_vkd3d.o $(BIN): $(O)/.gfx-vkd3d-$(GFX_VKD3D)
 # ---- lifted shards compiled here (every variant except the default one, which links the prebuilt archive) ----
 SHARDS_DIR ?= $(LIFTED)/shards
 SHARD_NAMES := $(patsubst %.c,%,$(notdir $(wildcard $(SHARDS_DIR)/shard_*.c)))
-SHARD_OBJ = $(patsubst %,$(O)/lifted/%.o,$(SHARD_NAMES))
+SHARD_OBJ = $(patsubst %,$(OL)/lifted/%.o,$(SHARD_NAMES))
 # the lifter's flags (lifted/tools/buildgen.py, docs/LIFT-POLICY.md section 8) + the address mode
 LIFT_CFLAGS = -O1 -w -fno-strict-aliasing -fwrapv -fno-delete-null-pointer-checks -fno-math-errno -ffp-contract=off -I$(ROOT)/lifter-rt -I$(LIFTED)/gen $(XFLAGS) $(LIFT_EXTRA)
 ifeq ($(HOOKMODE),objcopy)
-$(O)/lifted/%.o: $(SHARDS_DIR)/%.c
-	@mkdir -p $(O)/lifted && $(CC) $(LIFT_CFLAGS) -c $< -o $@
-$(O)/libkh2lifted.a: $(SHARD_OBJ)
+$(OL)/lifted/%.o: $(SHARDS_DIR)/%.c
+	@mkdir -p $(OL)/lifted && $(CC) $(LIFT_CFLAGS) -c $< -o $@
+$(OL)/libkh2lifted.a: $(SHARD_OBJ)
 	@test -n "$(SHARD_OBJ)" || { echo "no shard_*.c in $(SHARDS_DIR)" >&2; exit 1; }
 	rm -f $@ && ar rcs $@ $(SHARD_OBJ)
 # Weak definitions also allow same-shard relocations to bind to the runtime hooks.
-$(O)/libkh2loose.a: $(LIFTLIB) Makefile tools/alias_file_hooks.py
-	@mkdir -p $(O)
+$(OL)/libkh2loose.a: $(LIFTLIB) Makefile tools/alias_file_hooks.py
+	@mkdir -p $(OL)
 	python3 tools/alias_file_hooks.py $< $@ $(FILE_HOOKS)
 HOOK_LINK = $(WRAP)
 else
 # HOOKMODE=rename: the generated copy of the shards.  The stamp reruns the generator when a shard, the hook lists (Makefile) or the
 # tool changes; the generator rewrites only files whose content changed, so unchanged shards are not recompiled.
 # the expanded hook lists as a file that changes only when the lists do (also when they are overridden on the command line)
-$(O)/hooks.list: FORCE
-	@mkdir -p $(O); echo "hooks: $(strip $(HOOKS_UNIQ)) wrap: $(strip $(WRAP_FNS))" | cmp -s - $@ || echo "hooks: $(strip $(HOOKS_UNIQ)) wrap: $(strip $(WRAP_FNS))" > $@
+$(OL)/hooks.list: FORCE
+	@mkdir -p $(OL); echo "hooks: $(strip $(HOOKS_UNIQ)) wrap: $(strip $(WRAP_FNS))" | cmp -s - $@ || echo "hooks: $(strip $(HOOKS_UNIQ)) wrap: $(strip $(WRAP_FNS))" > $@
 FORCE:
-$(O)/shards/.stamp: $(wildcard $(SHARDS_DIR)/shard_*.c) Makefile tools/hook_shards.py $(O)/hooks.list
-	@mkdir -p $(O)/shards
-	python3 tools/hook_shards.py shards $(SHARDS_DIR) $(O)/shards --hooks $(HOOKS_UNIQ) --wrap $(WRAP_FNS)
+$(OL)/shards/.stamp: $(wildcard $(SHARDS_DIR)/shard_*.c) Makefile tools/hook_shards.py $(OL)/hooks.list
+	@mkdir -p $(OL)/shards
+	python3 tools/hook_shards.py shards $(SHARDS_DIR) $(OL)/shards --hooks $(HOOKS_UNIQ) --wrap $(WRAP_FNS)
 	@touch $@
-SHARD_GEN = $(patsubst %,$(O)/shards/%.c,$(SHARD_NAMES))
-$(SHARD_GEN): $(O)/shards/.stamp ;
-$(O)/lifted/%.o: $(O)/shards/%.c
-	@mkdir -p $(O)/lifted && $(CC) $(LIFT_CFLAGS) -c $< -o $@
-$(O)/libkh2loose.a: $(SHARD_OBJ)
+SHARD_GEN = $(patsubst %,$(OL)/shards/%.c,$(SHARD_NAMES))
+$(SHARD_GEN): $(OL)/shards/.stamp ;
+$(OL)/lifted/%.o: $(OL)/shards/%.c
+	@mkdir -p $(OL)/lifted && $(CC) $(LIFT_CFLAGS) -c $< -o $@
+$(OL)/libkh2loose.a: $(SHARD_OBJ)
 	@test -n "$(SHARD_OBJ)" || { echo "no shard_*.c in $(SHARDS_DIR)" >&2; exit 1; }
 	rm -f $@ && ar rcs $@ $(SHARD_OBJ)
 # forwarders: f_X -> __wrap_f_X for the wrapped functions, and f_X -> orig_f_X (with a NOTE) for a hooked function that NO linked
 # object defines.  The scan covers every directly linked object ($(RTOBJ) and $(LIFTOBJ): a replacement may also be a re-lifted body
 # in another lifted object), so it is driven by the final FILE_HOOKS list and by what is really in the link.
-$(O)/hook_forwarders.c: $(RTOBJ) $(LIFTOBJ) Makefile tools/hook_shards.py $(O)/hooks.list
+$(O)/hook_forwarders.c: $(RTOBJ) $(LIFTOBJ) Makefile tools/hook_shards.py $(OL)/hooks.list
 	nm $(RTOBJ) $(LIFTOBJ) > $(O)/link-objects.nm
 	python3 tools/hook_shards.py forwarders $@ --nm $(O)/link-objects.nm --hooks $(HOOKS_UNIQ) --wrap $(WRAP_FNS)
 $(O)/hook_forwarders.o: $(O)/hook_forwarders.c
@@ -219,12 +267,51 @@ $(O)/nep_stubs.c: $(LIFTED)/gen/nep_stubs.c $(ROOT)/tools/gen_nep.sh
 	@mkdir -p $(O) && sh $(ROOT)/tools/gen_nep.sh $< $@
 $(O)/nep_stubs.o: $(O)/nep_stubs.c
 	$(CC) $(CFLAGS) -c $< -o $@
-$(BIN): $(RTOBJ) $(LIFTOBJ) $(HOOK_OBJ) $(O)/libkh2loose.a
-	$(CC) -o $@ $(RTOBJ) $(LIFTOBJ) $(HOOK_OBJ) $(O)/libkh2loose.a -lm -lpthread $(LDEXPORT) $(HOOK_LINK) $(GFX_LDFLAGS)
+$(BIN): $(RTOBJ) $(LIFTOBJ) $(HOOK_OBJ) $(OL)/libkh2loose.a
+	$(CC) -o $@ $(RTOBJ) $(LIFTOBJ) $(HOOK_OBJ) $(OL)/libkh2loose.a -lm -lpthread $(LDEXPORT) $(HOOK_LINK) $(GFX_LDFLAGS)
+# ---- Task 26: the game as two static libraries and a shell that owns main() (what an iOS app links) ----
+APP_RTOBJ = $(filter-out $(O)/loader.o,$(RTOBJ)) $(O)/loader_app.o
+$(O)/loader_app.o: $(ROOT)/runtime/loader.c $(wildcard $(ROOT)/runtime/*.h)
+	@mkdir -p $(O) && $(CC) $(CFLAGS) -DKH_MAIN_NAME=kh_main -c $< -o $@
+$(O)/libkhnmc-rt.a: $(APP_RTOBJ) $(LIFTOBJ) $(HOOK_OBJ)
+	rm -f $@ && ar rcs $@ $(APP_RTOBJ) $(LIFTOBJ) $(HOOK_OBJ)
+applib: $(O)/libkhnmc-rt.a $(OL)/libkh2loose.a
+ifeq ($(UNAME_S),Darwin)
+APP_WHOLE = -Wl,-force_load,$(O)/libkhnmc-rt.a
+else
+APP_WHOLE = -Wl,--whole-archive $(O)/libkhnmc-rt.a -Wl,--no-whole-archive
+endif
+$(BIN)-shell: $(ROOT)/tools/ios/host_shell.c $(O)/libkhnmc-rt.a $(OL)/libkh2loose.a
+	$(CC) $(CFLAGS) -o $@ $(ROOT)/tools/ios/host_shell.c $(APP_WHOLE) $(OL)/libkh2loose.a -lm -lpthread $(LDEXPORT) $(HOOK_LINK) $(GFX_LDFLAGS)
+hostshell: $(O)/hostshell.ok
+$(O)/hostshell.ok: $(BIN)-shell tools/check_hook_link.py tools/check_mod_static_link.py tools/check_ios_symbols.py
+	python3 tools/check_hook_link.py --bin $(BIN)-shell --objs $(APP_RTOBJ) $(LIFTOBJ) $(HOOK_OBJ) --hooks $(HOOKS_UNIQ) --wrap $(WRAP_FNS) $(if $(HOOK_OBJ),--forwarders $(HOOK_OBJ)) $(if $(filter 1,$(HOOK_STRICT)),--strict)
+	python3 tools/check_mod_static_link.py --bin $(BIN)-shell --obj $(O) --skip $(O)/loader.o --funcs "$(MOD_LIFT_FUNCS)" --chained "$(MOD_STATIC_CHAINED) $(MOD_NEVERLAND_HOOKS)" --replaced "$(MOD_STATIC_REPLACED)" --choice "$(MOD_MOOSE_FUNCS)" --dll-replaces "$(MOD_DLL_REPLACES)"
+	$(if $(filter 1,$(IOS_PATHS)),python3 tools/check_ios_symbols.py --bin $(BIN)-shell)
+	@touch $@
+# the same three checks for a program linked elsewhere from these libraries (the app binary Xcode links: tools/ios/mac/build.sh);
+# PREPARED, NOT RUN with an app binary:  make IOS_SDK=<sdk> appcheck APP_BIN=<path to KHNMC.app/KHNMC>
+appcheck:
+	@test -n "$(APP_BIN)" && test -f "$(APP_BIN)" || { echo "appcheck: APP_BIN=<linked program> is required" >&2; exit 2; }
+	python3 tools/check_hook_link.py --bin $(APP_BIN) --objs $(APP_RTOBJ) $(LIFTOBJ) $(HOOK_OBJ) --hooks $(HOOKS_UNIQ) --wrap $(WRAP_FNS) $(if $(HOOK_OBJ),--forwarders $(HOOK_OBJ)) $(if $(filter 1,$(HOOK_STRICT)),--strict)
+	python3 tools/check_mod_static_link.py --bin $(APP_BIN) --obj $(O) --skip $(O)/loader.o --funcs "$(MOD_LIFT_FUNCS)" --chained "$(MOD_STATIC_CHAINED) $(MOD_NEVERLAND_HOOKS)" --replaced "$(MOD_STATIC_REPLACED)" --choice "$(MOD_MOOSE_FUNCS)" --dll-replaces "$(MOD_DLL_REPLACES)"
+	python3 tools/check_ios_symbols.py --bin $(APP_BIN)
+# Task 26: a KH_IOS_PATHS program must not import what an iOS app cannot use (fork, system, popen, exec*, posix_spawn, tmpfile, ...)
+ifeq ($(IOS_PATHS),1)
+all: $(O)/ios_symbols.ok
+$(O)/ios_symbols.ok: $(BIN) tools/check_ios_symbols.py
+	python3 tools/check_ios_symbols.py --bin $(BIN) && touch $@
+endif
 # arm64 compile check of the hand-written runtime only (no lifted shards): clang -arch arm64 on macOS
 arm64check:
 	@for f in $(RTSRC) $(ROOT)/lifter-rt/khrt_cpu.c $(ROOT)/lifter-rt/rt_libm.c; do echo CC $$f; clang -arch arm64 -std=gnu11 -O1 -w -fno-strict-aliasing -fwrapv -fno-math-errno -ffp-contract=off -I$(ROOT)/lifter-rt -I$(ROOT)/runtime -I$(LIFTED)/gen -DKH_XLATE_MODE=2 -c $$f -o /tmp/khnmc_arm_chk.o || exit 1; done
 # ---- Task 12 rules: generated table (python3 stdlib), re-lift (needs the lifter environment: KHLIFT, KHLIFT_PY, KH_UNIVERSE), link check
+ifeq ($(GEN_PREBUILT),1)
+# the generated files are inputs here (tools/darwin_build.sh copies gen/ from the Linux dev host); a rule without prerequisites
+# runs only when the file is missing, and then it is an error, not a silent build without the mod's static edits
+$(GEN)/mod_static_table.h $(GEN)/mod_neverland_table.h $(GEN)/mod_moose_table.h $(GEN)/mod_static_lifted.c:
+	@echo "GEN_PREBUILT=1: $@ is missing.  It is generated on the Linux dev host (make there, then copy gen/: tools/darwin_build.sh does)" >&2; exit 1
+else
 $(GEN)/mod_static_table.h: tools/gen_mod_static.py $(MOD_EDITS) Makefile
 	python3 tools/gen_mod_static.py --edits $(MOD_EDITS) --exe $(MOD_EXE) --universe $(KH_UNIVERSE) --funcs "$(MOD_STATIC_FUNCS)" \
 	    --inline "$(MOD_STATIC_INLINE)" --chained "$(MOD_STATIC_CHAINED) $(MOD_STATIC_REPLACED)" --out $@ --report $(GEN)/mod_static_classify.json
@@ -235,17 +322,18 @@ $(MOD_NEVERLAND_EDITS): tools/gen_mod_neverland.py tools/gen_mod_static.py $(MOD
 # one run writes both files; the header rule only regenerates when the header alone went missing
 $(GEN)/mod_neverland_table.h: $(MOD_NEVERLAND_EDITS)
 	@test -f $@ || $(GEN_MOD_NEVERLAND)
-$(O)/mod_neverland.o $(O)/mod_neverland_test.o: $(GEN)/mod_neverland_table.h
 GEN_MOD_MOOSE = python3 tools/gen_mod_moose.py --dll $(MOD_MOOSE_DLL) --exe $(MOD_EXE) --universe $(KH_UNIVERSE) --edits $(MOD_EDITS) \
 	    --out-json $(MOD_MOOSE_EDITS) --out-h $(GEN)/mod_moose_table.h
 $(MOD_MOOSE_EDITS): tools/gen_mod_moose.py tools/gen_mod_static.py $(MOD_MOOSE_DLL) $(MOD_EDITS) Makefile
 	$(GEN_MOD_MOOSE)
 $(GEN)/mod_moose_table.h: $(MOD_MOOSE_EDITS)
 	@test -f $@ || $(GEN_MOD_MOOSE)
-$(O)/moose.o: $(GEN)/mod_moose_table.h
 $(GEN)/mod_static_lifted.c: tools/mod_static_lift.py $(MOD_EDITS) $(MOD_NEVERLAND_EDITS) $(MOD_MOOSE_EDITS) $(LIFTED)/shards.json Makefile
 	KH_UNIVERSE=$(KH_UNIVERSE) $(KHLIFT_PY) tools/mod_static_lift.py --khlift $(KHLIFT) --edits $(MOD_EDITS) --exe $(MOD_EXE) $(MOD_EXTRA_EDITS) \
 	    --funcs "$(MOD_LIFT_FUNCS)" --chained "$(MOD_LIFT_CHAINED)" --vanilla-shards $(LIFTED)/shards --out $@ --report $(GEN)/mod_static_lift.json
+endif
+$(O)/mod_neverland.o $(O)/mod_neverland_test.o: $(GEN)/mod_neverland_table.h
+$(O)/moose.o: $(GEN)/mod_moose_table.h
 $(O)/mod_static.o: $(GEN)/mod_static_table.h
 $(O)/mod_static_lifted.o: $(GEN)/mod_static_lifted.c
 	@mkdir -p $(O) && $(CC) $(LIFT_CFLAGS) -c $< -o $@
@@ -276,6 +364,8 @@ mod-dll-slots:
 	python3 tools/mod_dll_slots.py --dll $(MOD_TWEAKS_DLL) --exe $(MOD_EXE) --expect tools/mod_dll_slots_h23.txt --json $(GEN)/mod_dll_slots.json
 # compile every hand-written and lifter-rt object of the variant without the shards and without linking (`make -k rtobjs`: all errors of a port)
 rtobjs: $(RTOBJ) $(LIFTOBJ)
+# `make -s print-OL`, `print-BIN`: the value of a variable of this variant (tools/darwin_remote_build.sh)
+print-%: ; @echo $($*)
 clean:
 	rm -rf $(O) $(BIN)
-.PHONY: all clean arm64check rtobjs FORCE mod-static-difftest mod-neverland-difftest mod-moose-difftest mod-dll-slots
+.PHONY: all clean arm64check rtobjs FORCE mod-static-difftest mod-neverland-difftest mod-moose-difftest mod-dll-slots applib hostshell appcheck

@@ -671,11 +671,11 @@ static void xa2_create(KCtx *g){
 void kh_seam_audio_init(void){
     const char *mode=getenv("KHNMC_AUDIO");
     if(mode&&*mode&&strcmp(mode,"null")){
-        if(strncmp(mode,"wav:",4)||!mode[4]||strlen(mode+4)>=sizeof wav_path){ fprintf(stderr,"kh: FATAL: KHNMC_AUDIO=%s not understood (use: null | wav:<file>)\n",mode); exit(2); }
+        if(strncmp(mode,"wav:",4)||!mode[4]||strlen(mode+4)>=sizeof wav_path){ fprintf(stderr,"kh: FATAL: KHNMC_AUDIO=%s not understood (use: null | wav:<file>)\n",mode); fflush(stdout); kh_host_exit(2); }
         snprintf(wav_path,sizeof wav_path,"%s",mode+4); soft_mode=1;
     }
     { const char *e=getenv("KHNMC_AUDIO_WAV_GAIN_DB"); if(e&&*e){ char *end; double db=strtod(e,&end);
-        if(*end||!(db<=0.0)||db<-60.0){ fprintf(stderr,"kh: FATAL: KHNMC_AUDIO_WAV_GAIN_DB=%s not understood (a gain in dB from -60 to 0)\n",e); exit(2); }
+        if(*end||!(db<=0.0)||db<-60.0){ fprintf(stderr,"kh: FATAL: KHNMC_AUDIO_WAV_GAIN_DB=%s not understood (a gain in dB from -60 to 0)\n",e); fflush(stdout); kh_host_exit(2); }
         wav_gain_db=db; wav_gain=(float)pow(10.0,db/20.0); } }
     C_enum=kh_com_class("xa2:IMMDeviceEnumerator",8,COM_STRICT,h_device);
     C_device=kh_com_class("xa2:IMMDevice",7,COM_STRICT,h_device);

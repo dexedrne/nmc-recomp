@@ -84,14 +84,14 @@ void kh_stream_report(FILE *f){
 }
 /* synthetic tree: open (case-insensitive, BasePath prefix), read at offsets, short read at the end, close, miss, traversal */
 int kh_stream_selftest(KCtx *g){
-    int bad=0,checks=0; char dir[]="/tmp/khnmc-stream-XXXXXX",path[512];
+    int bad=0,checks=0; char dir[KH_TMP_MAX],path[KH_TMP_MAX+256]; kh_tmp_path(dir,sizeof dir,"khnmc-stream-XXXXXX");   /* host_env.c: /tmp, or the app container on iOS */
 #define TEST(c) do{ checks++; if(!(c)){ fprintf(stderr,"stream selftest FAIL: %s (line %d)\n",#c,__LINE__); bad++; } }while(0)
     const char *oldroot=getenv("KHNMC_DATA"),*oldlog=getenv("KHNMC_FILELOG"); char *root=oldroot?strdup(oldroot):NULL,*log=oldlog?strdup(oldlog):NULL;
     if(!mkdtemp(dir)) return 1;
     snprintf(path,sizeof path,"%s/VagStream",dir); mkdir(path,0700);
     snprintf(path,sizeof path,"%s/VagStream/Title.win32.scd",dir); FILE *f=fopen(path,"wb"); if(!f) return 1;
     for(int i=0;i<1000;i++) fputc(i&0xff,f); fclose(f);
-    char lp[300]; snprintf(lp,sizeof lp,"%s/log",dir); setenv("KHNMC_DATA",dir,1); setenv("KHNMC_FILELOG",lp,1);
+    char lp[KH_TMP_MAX+256]; snprintf(lp,sizeof lp,"%s/log",dir); setenv("KHNMC_DATA",dir,1); setenv("KHNMC_FILELOG",lp,1);
     char win[2048]; snprintf(win,sizeof win,"%s/vagstream/title.win32.scd",gstr(g,GS_BASE+0x2bd4340));
     u64 name=ga_strdup(win),missing=ga_strdup("vagstream/none.win32.scd"),parent=ga_strdup("../Title.win32.scd"),buf=ga_calloc(1,64);
     u64 o0=st_open,m0=st_miss;

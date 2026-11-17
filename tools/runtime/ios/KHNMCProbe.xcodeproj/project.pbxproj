@@ -1,0 +1,271 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		64CB8ECDE37F4F2C5371825F /* probe_main.m in Sources */ = {isa = PBXBuildFile; fileRef = 7397CE0E340126411B941382 /* probe_main.m */; };
+		AFABE1DF667F720EB0F0835F /* probe_core.c in Sources */ = {isa = PBXBuildFile; fileRef = 9C3FB59F562D397C20E62AC4 /* probe_core.c */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		7397CE0E340126411B941382 /* probe_main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = probe_main.m; path = probe/probe_main.m; sourceTree = "<group>"; };
+		888296890A2AA41D4FC610EC /* KHNMCProbe.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = KHNMCProbe.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		9C3FB59F562D397C20E62AC4 /* probe_core.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; name = probe_core.c; path = probe/probe_core.c; sourceTree = "<group>"; };
+		C009AB3313C32DA9AF2DF67D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; name = Info.plist; path = probe/Info.plist; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A3DB22BA61BD98080C9108E2 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		148C476A8CABB7F0BB14DA5C = {
+			isa = PBXGroup;
+			children = (
+				9BCFB52D9C8FE7636DB88941 /* Probe */,
+				4DCF5BAB6E3DC679540DCE73 /* App */,
+				300AC29D78312292222ABC4B /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		300AC29D78312292222ABC4B /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				888296890A2AA41D4FC610EC /* KHNMCProbe.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		4DCF5BAB6E3DC679540DCE73 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				C009AB3313C32DA9AF2DF67D /* Info.plist */,
+			);
+			name = App;
+			sourceTree = "<group>";
+		};
+		9BCFB52D9C8FE7636DB88941 /* Probe */ = {
+			isa = PBXGroup;
+			children = (
+				7397CE0E340126411B941382 /* probe_main.m */,
+				9C3FB59F562D397C20E62AC4 /* probe_core.c */,
+			);
+			name = Probe;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		401B5EA2543ED670102B3227 /* KHNMCProbe */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = CFFBA677D6FFE889B7705B1C;
+			buildPhases = (
+				CEBB7DEB4AA083B101615F84 /* Sources */,
+				A3DB22BA61BD98080C9108E2 /* Frameworks */,
+				DFDDBFA7AEE0E60F9C37C483 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = KHNMCProbe;
+			productName = KHNMCProbe;
+			productReference = 888296890A2AA41D4FC610EC /* KHNMCProbe.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		8EB2B4CB1D837F896F63DB60 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastUpgradeCheck = 2700;
+			};
+			buildConfigurationList = E279C9148AC05EF94171740A;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 148C476A8CABB7F0BB14DA5C;
+			productRefGroup = 300AC29D78312292222ABC4B /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				401B5EA2543ED670102B3227 /* KHNMCProbe */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		DFDDBFA7AEE0E60F9C37C483 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		CEBB7DEB4AA083B101615F84 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				64CB8ECDE37F4F2C5371825F /* probe_main.m */,
+				AFABE1DF667F720EB0F0835F /* probe_core.c */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		22C66C95808F9A3BB7D9CA2D /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ARCHS = arm64;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_REQUIRED = NO;
+				CODE_SIGN_IDENTITY = "";
+				CODE_SIGN_STYLE = Manual;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_BITCODE = NO;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				ONLY_ACTIVE_ARCH = NO;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+		4A8162EF6FB09BF211A4019D /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ARCHS = arm64;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_REQUIRED = NO;
+				CODE_SIGN_IDENTITY = "";
+				CODE_SIGN_STYLE = Manual;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_BITCODE = NO;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				ONLY_ACTIVE_ARCH = NO;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		9C3742220759733C658141E4 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CURRENT_PROJECT_VERSION = 1;
+				GCC_GENERATE_DEBUGGING_SYMBOLS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = probe/Info.plist;
+				KHNMC_REPO = "$(SRCROOT)/../..";
+				MARKETING_VERSION = 0.1.0;
+				OTHER_CFLAGS = (
+					"-ffp-contract=off",
+					"-ffile-prefix-map=$(KHNMC_REPO)/=khnmc/",
+				);
+				OTHER_LDFLAGS = (
+					"-framework",
+					Foundation,
+					"-framework",
+					UIKit,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = beer.vyvanse.khnmc.probe;
+				PRODUCT_NAME = KHNMCProbe;
+				WARNING_CFLAGS = (
+					"-Wall",
+					"-Wextra",
+					"-Wno-unused-parameter",
+				);
+			};
+			name = Debug;
+		};
+		EF1EC7E7FFFCC47ED55621E1 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				GCC_GENERATE_DEBUGGING_SYMBOLS = NO;
+				GCC_OPTIMIZATION_LEVEL = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = probe/Info.plist;
+				KHNMC_REPO = "$(SRCROOT)/../..";
+				MARKETING_VERSION = 0.1.0;
+				OTHER_CFLAGS = (
+					"-ffp-contract=off",
+					"-ffile-prefix-map=$(KHNMC_REPO)/=khnmc/",
+				);
+				OTHER_LDFLAGS = (
+					"-framework",
+					Foundation,
+					"-framework",
+					UIKit,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = beer.vyvanse.khnmc.probe;
+				PRODUCT_NAME = KHNMCProbe;
+				STRIP_INSTALLED_PRODUCT = NO;
+				VALIDATE_PRODUCT = NO;
+				WARNING_CFLAGS = (
+					"-Wall",
+					"-Wextra",
+					"-Wno-unused-parameter",
+				);
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		CFFBA677D6FFE889B7705B1C /* Build configuration list for PBXNativeTarget "KHNMCProbe" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				9C3742220759733C658141E4 /* Debug */,
+				EF1EC7E7FFFCC47ED55621E1 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		E279C9148AC05EF94171740A /* Build configuration list for PBXProject "KHNMCProbe" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				4A8162EF6FB09BF211A4019D /* Debug */,
+				22C66C95808F9A3BB7D9CA2D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 8EB2B4CB1D837F896F63DB60 /* Project object */;
+}

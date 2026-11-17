@@ -27,8 +27,26 @@
 
 #ifdef __APPLE__
 #define KH_DARWIN 1
+#include <TargetConditionals.h>
 #else
 #define KH_DARWIN 0
+#endif
+/* KH_IOS: the target OS is iOS (device or Simulator).
+ * KH_IOS_PATHS: THE switch for everything an iOS app does differently from a command-line program (runtime/host_env.c has the
+ * table: no fork(), no fixed /tmp, directories from the app container, a config file instead of a caller's command line and
+ * environment, the exit status in a file, mincore for the resident-memory report).  Default: on when the target OS is iOS, off
+ * elsewhere.  `make IOS_PATHS=1` (-DKH_IOS_PATHS=1) forces it on Linux and macOS, so that these paths are compiled and run before
+ * an iOS SDK is involved.  It cannot be switched off for iOS. */
+#if KH_DARWIN && TARGET_OS_IPHONE
+#define KH_IOS 1
+#else
+#define KH_IOS 0
+#endif
+#ifndef KH_IOS_PATHS
+#define KH_IOS_PATHS KH_IOS
+#endif
+#if KH_IOS && !KH_IOS_PATHS
+#error "KH_IOS_PATHS=0 with an iOS target: an iOS app has no fork(), no writable /tmp and no caller that passes directories"
 #endif
 
 /* ---- file systems ---- */

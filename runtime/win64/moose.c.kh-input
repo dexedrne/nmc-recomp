@@ -398,8 +398,8 @@ static struct { int n; int which[8]; u64 rcx[8], rsp[8], ret[8]; } pl;          
 static void st_body(KCtx *g,int which){ if(pl.n<8){ pl.which[pl.n]=which; pl.rcx[pl.n]=KH_RCX(g); pl.rsp[pl.n]=KH_RSP(g); pl.ret[pl.n]=rd64(g,KH_RSP(g)); } pl.n++; KH_RAX(g)=0xb0d70000u+(u32)which; KH_RET(g); }
 static void st_b00(KCtx *g){ st_body(g,0); } static void st_b01(KCtx *g){ st_body(g,1); } static void st_b10(KCtx *g){ st_body(g,2); } static void st_b11(KCtx *g){ st_body(g,3); }
 static int st_child(void (*body)(void),char *out,size_t cap){                              /* run body in a child, stderr captured; returns its exit status */
-    FILE *log=tmpfile(); if(!log) return -1; fflush(stderr);
-    pid_t c=fork(); if(c<0){ fclose(log); return -1; }
+    FILE *log=kh_tmpfile(); if(!log) return -1; fflush(stderr);
+    pid_t c=kh_fork(); if(c<0){ fclose(log); return -1; }                                    /* callers ask kh_fork_ok() first */
     if(!c){ dup2(fileno(log),2); body(); _exit(99); }
     int st=0; waitpid(c,&st,0); rewind(log); size_t n=fread(out,1,cap-1,log); out[n]=0; fclose(log);
     return WIFEXITED(st)?WEXITSTATUS(st):-1;
@@ -418,7 +418,7 @@ static void glob_put(KCtx *g,const Globals *s){ memcpy(hp(g,LIST_HEAD),s->glob,s
 int kh_moose_selftest(KCtx *g){
     int checks=0,fails=0;
     /* 0. the ini as shipped (CRLF, comments, commented-out keys) and the DLL's rules */
-    { char p[]="/tmp/khnmc-moose-XXXXXX"; int fd=mkstemp(p); FILE *f=fd>=0?fdopen(fd,"w"):NULL; CHECK(f!=NULL);
+    { char p[KH_TMP_MAX]; kh_tmp_path(p,sizeof p,"khnmc-moose-XXXXXX"); int fd=mkstemp(p); FILE *f=fd>=0?fdopen(fd,"w"):NULL; CHECK(f!=NULL);
       if(f){ fputs("; All sizes are KiB.\r\n\r\n[kh2.cache]\r\n; Game default: 30720; 0 to skip replacement\r\nsize=524288\r\n; Reserved block size increases\r\nplayer=32768\r\n;menu=0\r\n;magic=0\r\nfriend=32768\r\n;drive=0\r\n\r\n"
                    "[kh2.data]\r\n;size=0\r\nsize=131072\r\n\r\n[kh2.fixes]\r\n; Bitfield:\r\n;  1: Voice\r\n;  2: Sound effects (may cause deafening sound levels)\r\nscd_priority=1\r\n\r\n[kh2.hacks]\r\nfast_title=1\r\n"
                    "attempt_continue_after_exception_but_probably_make_things_worse=1",f); fclose(f);          /* the shipped file: no newline behind the last key */
@@ -440,7 +440,8 @@ int kh_moose_selftest(KCtx *g){
         static const struct { const char *ini, *msg; } bad[]={{"[kh2.fixes]\nscd_priority=2\n","scd_priority=2 has bit 2"},{"[kh2.fixes]\nscd_priority=3\n","scd_priority=3 has bit 2"},
             {"[kh2.hacks]\nno_death=1\n","no_death=1"},{"[kh2.hacks]\ntest_crash=1\n","test_crash=1"}};
         for(unsigned i=0;i<sizeof bad/sizeof *bad;i++){ char out[4096]; f=fopen(p,"w"); fputs(bad[i].ini,f); fclose(f); st_g=g; CHECK(ini_parse(p,&st_cfg)==1);
-            CHECK(st_child(st_fatal_cfg,out,sizeof out)==3 && strstr(out,bad[i].msg)!=NULL); }
+            if(kh_fork_ok()) CHECK(st_child(st_fatal_cfg,out,sizeof out)==3 && strstr(out,bad[i].msg)!=NULL);
+            else kh_selftest_not_run("moose","an ini switch the port does not have, turned on (named fatal)",1); }   /* iOS: no fork (host_env.c) */
         memcpy(patch_on,sv_on,sizeof sv_on); continue_on=sv_c; continue_default=sv_d;
         f=fopen(p,"w"); fputs("[kh2.cache]\nplayer = 0x100\n[kh2.data]\n",f); fclose(f); CHECK(ini_parse(p,&c)==1 && c.cache_kib==122880 && !c.has_data && c.data_kib==0 && c.add_kib[1]==256);   /* missing cache size: the DLL's 120 MiB */
         f=fopen(p,"w"); fputs("[kh2.cache]\nsize=0\nmenu=2097151\n",f); fclose(f); CHECK(ini_parse(p,&c)==1 && c.cache_kib==0 && c.add_kib[4]==0x1fffff);                                     /* 0 = leave the pool alone */
@@ -476,18 +477,20 @@ int kh_moose_selftest(KCtx *g){
       memcpy(patch_body,sv_body,sizeof sv_body);
       CHECK(patch_body[0][0]==orig_f_92680 && patch_body[0][1]==mod_f_92680 && patch_body[1][0]==orig_f_2b4590 && patch_body[1][1]==mod_f_2b4590 && mod_f_92680!=orig_f_92680 && mod_f_2b4590!=orig_f_2b4590);
       /* a build whose bytes at a patch site are neither the old nor the new ones: the DLL's "Pattern not found." */
-      { char out[4096]; wr8(g,GS_BASE+0x2b46eb,0x90); memset(&st_cfg,0,sizeof st_cfg); st_cfg.has_fast=1; st_cfg.fast_title=1; st_g=g;
+      if(kh_fork_ok()){ char out[4096]; wr8(g,GS_BASE+0x2b46eb,0x90); memset(&st_cfg,0,sizeof st_cfg); st_cfg.has_fast=1; st_cfg.fast_title=1; st_g=g;
         CHECK(st_child(st_fatal_cfg,out,sizeof out)==3 && strstr(out,"[kh2.hacks] fast_title: the exe does not have the expected bytes at rva 0x2b46eb")!=NULL); }
+      else kh_selftest_not_run("moose","fast_title on an exe without the expected bytes (named fatal)",1);   /* iOS: no fork (host_env.c) */
       for(int i=0;i<KH_MOOSE_NPATCH;i++) memcpy(hp(g,GS_BASE+kh_moose_patches[i].rva),sv_b[i],5);
       memcpy(patch_on,sv_on,sizeof sv_on); continue_on=sv_c; continue_default=sv_d;
       /* ---- the fault report: what the modded PC game would have done (the DLL's handler is not emulated) ---- */
       char out[8192];
-      { FILE *t=tmpfile(); continue_on=1; continue_default=1; kh_moose_fault_note(t,SIGSEGV,NULL,NULL); kh_moose_fault_note(t,SIGFPE,NULL,NULL); continue_default=0; kh_moose_fault_note(t,SIGILL,NULL,NULL);
+      { FILE *t=kh_tmpfile(); continue_on=1; continue_default=1; kh_moose_fault_note(t,SIGSEGV,NULL,NULL); kh_moose_fault_note(t,SIGFPE,NULL,NULL); continue_default=0; kh_moose_fault_note(t,SIGILL,NULL,NULL);
         continue_on=0; long before=ftell(t); kh_moose_fault_note(t,SIGSEGV,NULL,NULL); long after=ftell(t); rewind(t); size_t n=fread(out,1,sizeof out-1,t); out[n]=0; fclose(t);
         CHECK(before==after);                                                                  /* handler off in the ini: no note */
         CHECK(strstr(out,"WOULD NOT HAVE STOPPED HERE")&&strstr(out,"reading or writing a bad address")&&strstr(out,"dividing by zero")&&strstr(out,"(the key is missing: the DLL's default)"));
         CHECK(strstr(out,"call / jmp / ret")&&strstr(out,"cannot continue the same way")&&strstr(out,"does not take this kind of fault"));
         continue_on=sv_c; continue_default=sv_d; }
+      if(kh_fork_ok()){
       CHECK(st_child(st_fault_write,out,sizeof out)==4 && strstr(out,"kh: SIGNAL 11")&&strstr(out,"WOULD NOT HAVE STOPPED HERE")&&strstr(out,"reading or writing a bad address")&&!strstr(out,"the key is missing"));
       CHECK(st_child(st_fault_read,out,sizeof out)==4 && strstr(out,"WOULD NOT HAVE STOPPED HERE")&&strstr(out,"the key is missing"));
       CHECK(st_child(st_fault_div,out,sizeof out)==4 && strstr(out,"kh: SIGNAL 8")&&strstr(out,"dividing by zero")&&strstr(out,"WOULD NOT HAVE STOPPED HERE"));
@@ -496,6 +499,12 @@ int kh_moose_selftest(KCtx *g){
       CHECK(st_child(st_fault_write,out,sizeof out)==4 && strstr(out,"(this one was a WRITE)"));
       CHECK(st_child(st_fault_read,out,sizeof out)==4 && strstr(out,"(this one was a READ)"));
       CHECK(st_child(st_fault_exec,out,sizeof out)==4 && strstr(out,"INSTRUCTION FETCH"));
+#endif
+      } else kh_selftest_not_run("moose","faults in a child process: the report for write, read, divide and the handler off"
+#if defined(__x86_64__) && defined(__linux__)
+                                 ", and the access kind of write, read, instruction fetch (3)",7);
+#else
+                                 "",4);
 #endif
     }
     CHECK(sat_add(5,7)==12 && sat_add(0x7ffffff0,0x100)==0x7fffffff && sat_add(-5,3)==-2 && sat_add(-0x7ffffff0,-0x100)==(s32)0x80000000u && sat_add(0xc0000,32768<<10)==0x20c0000 && sat_add(0,0)==0);

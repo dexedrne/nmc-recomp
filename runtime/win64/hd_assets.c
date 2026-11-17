@@ -643,7 +643,7 @@ int kh_hd_check(const char *report){
 /* ---- selftest ---------------------------------------------------------------------------------------------------- */
 static int rm_cb(const char *p,const struct stat *s,int fl,struct FTW *w){ (void)s;(void)fl;(void)w; return remove(p); }
 static int put_file(const char *root,const char *rel,const void *data,size_t n){
-    char path[1024],dir[1024]; snprintf(path,sizeof path,"%s/%s",root,rel); snprintf(dir,sizeof dir,"%s",path);
+    char path[KH_TMP_MAX+256],dir[KH_TMP_MAX+256]; snprintf(path,sizeof path,"%s/%s",root,rel); snprintf(dir,sizeof dir,"%s",path);
     for(char *p=dir+strlen(root)+1;*p;p++) if(*p=='/'){ *p=0; mkdir(dir,0700); *p='/'; }
     FILE *f=fopen(path,"wb"); if(!f) return 0; int ok=fwrite(data,1,n,f)==n; return fclose(f)==0&&ok;
 }
@@ -659,7 +659,8 @@ static int st_pkg(const char *line){ char b[1024],e[300]; snprintf(b,sizeof b,"%
 static int st_pkg_err(const char *line,const char *want){ char b[1024],e[300]; e[0]=0; snprintf(b,sizeof b,"%s",line); return pkg_parse_line(b,e,sizeof e)==-1&&strstr(e,want)!=NULL; }
 /* runs the configuration loader in a child with the given environment; returns its exit status (3 = named fatal), -1 on a set-up error */
 static int st_cfg_child(const char *root,const char *modlist,const char *packages,int want_pkg_state,int want_prov_state,int want_nohd){
-    pid_t pid=fork(); if(pid<0) return -1;
+    if(!kh_fork_ok()) return -2;                    /* KH_IOS_PATHS: no child process (host_env.c); the caller reports these cases NOT RUN */
+    pid_t pid=kh_fork(); if(pid<0) return -1;
     if(pid==0){
         if(modlist) setenv("KHNMC_HD_MODLIST",modlist,1); else unsetenv("KHNMC_HD_MODLIST");
         if(packages) setenv("KHNMC_HD_PACKAGES",packages,1); else unsetenv("KHNMC_HD_PACKAGES");
@@ -669,7 +670,7 @@ static int st_cfg_child(const char *root,const char *modlist,const char *package
     int st=-1; if(waitpid(pid,&st,0)!=pid||!WIFEXITED(st)) return -1; return WEXITSTATUS(st);
 }
 int kh_hd_selftest(KCtx *g){
-    char dir[]="/tmp/khnmc-hd-XXXXXX"; int bad=0,checks=0;
+    char dir[KH_TMP_MAX]; int bad=0,checks=0; kh_tmp_path(dir,sizeof dir,"khnmc-hd-XXXXXX");   /* host_env.c: /tmp, or the app container on iOS */
 #define TEST(c) do { checks++; if(!(c)){ fprintf(stderr,"hd selftest FAIL (line %d): %s\n",__LINE__,#c); bad++; } } while(0)
 #define ORIG(i) (0x20000000u+0x100u+0x40u*(unsigned)(i)+0x20u+(unsigned)(i))
 #define BUILD(rel,buf) (t=NULL,!hd_build(dir,rel,buf,0x1000,&t,err,sizeof err)&&t)
@@ -702,7 +703,7 @@ int kh_hd_selftest(KCtx *g){
     TEST(st_pkg_err("\t1\t-0.dds:1:1","empty or over-long path"));
     TEST(pkg_files==1&&!pkg_find("obj/B.mdlx"));                                        /* a refused line leaves nothing behind */
     { const char *good="# two tables\n\nobj/A.mdlx\t1\t-0.dds:20000120:16\r\nmsg/us/B.bar\t2\tUS_B_bar0.png:00000030:5\tse/obj/se1:ffffffff:9\n";
-      char lp[1100]; TEST(put_file(dir,"good.tsv",good,strlen(good))); snprintf(lp,sizeof lp,"%s/good.tsv",dir);
+      char lp[KH_TMP_MAX+256]; TEST(put_file(dir,"good.tsv",good,strlen(good))); snprintf(lp,sizeof lp,"%s/good.tsv",dir);
       pkg_clear(); TEST(!pkg_load_file(lp,err,sizeof err)&&pkg_state==2&&pkg_files==2&&pkg_entries==3&&!strcmp(pkg_file,lp));
       { const PkgTab *p=pkg_find("msg/us/b.bar"); TEST(p&&p->n==2&&p->e[1].orig==0xffffffffu&&!strcmp(p->e[1].name,"se/obj/se1")); }
       TEST(put_file(dir,"bad.tsv","obj/A.mdlx\t1\t-0.dds:20000120:16\nobj/C.mdlx\t1\t-0.dds:zz:16\n",58)); snprintf(lp,sizeof lp,"%s/bad.tsv",dir);
@@ -715,7 +716,7 @@ int kh_hd_selftest(KCtx *g){
     prov_clear(); TEST(prov_state==1&&!prov_dir_files("obj/PV.mdlx"));
     TEST(prov_add("obj/PV.mdlx")&&prov_add("remastered/obj/PV.mdlx/-0.png")&&prov_add("./remastered/OBJ/pv.MDLX/-1.png")&&prov_add("/remastered/obj/PV.mdlx/se/obj/se7")&&prov_add("remastered/obj/PV.mdlx/-0.png"));
     TEST(prov_state==2&&prov_mods==4&&prov_hd==3&&prov_find("OBJ/pv.mdlx")&&!prov_find("remastered/obj/PV.mdlx/-0.dds")&&prov_dir_files("obj/pv.MDLX")==3&&prov_dir_files("obj/PV.mdlx/se")==1&&!prov_dir_files("obj/PV")&&prov_dir_files("obj")==3);   /* every directory level counts what lies below it */
-    { char lp[1100]; const char *good="# made by a test\n\nmod obj/PV.mdlx\nmod remastered/obj/PV.mdlx/-0.png  # the mod's\n  nohd field2d/us/zz0command.2dd  # moved\n";
+    { char lp[KH_TMP_MAX+256]; const char *good="# made by a test\n\nmod obj/PV.mdlx\nmod remastered/obj/PV.mdlx/-0.png  # the mod's\n  nohd field2d/us/zz0command.2dd  # moved\n";
       TEST(put_file(dir,"modlist.txt",good,strlen(good))); snprintf(lp,sizeof lp,"%s/modlist.txt",dir);
       prov_clear(); TEST(!prov_load_file(lp,err,sizeof err)&&prov_state==2&&prov_mods==2&&prov_hd==1&&prov_nohd_ignored==1&&prov_find("remastered/obj/PV.mdlx/-0.png")&&!prov_find("field2d/us/zz0command.2dd")&&!strcmp(prov_file,lp));
       TEST(put_file(dir,"badlist.txt","mod obj/A.mdlx\nvanilla obj/B.mdlx\n",34)); snprintf(lp,sizeof lp,"%s/badlist.txt",dir);
@@ -725,8 +726,9 @@ int kh_hd_selftest(KCtx *g){
       snprintf(lp,sizeof lp,"%s/does-not-exist.txt",dir); prov_clear(); TEST(prov_load_file(lp,err,sizeof err)==-1&&strstr(err,"cannot open")); }
 
     /* ---- start-up configuration (in a child): defaults, `none`, and every named fatal ---- */
-    { char cfg[1100],pk[1200],ml[1200],bare[1100]; snprintf(cfg,sizeof cfg,"%s/cfgtree",dir); snprintf(bare,sizeof bare,"%s/baretree",dir); snprintf(pk,sizeof pk,"%s/good.tsv",dir); snprintf(ml,sizeof ml,"%s/modlist.txt",dir);
+    { char cfg[KH_TMP_MAX+256],pk[KH_TMP_MAX+256],ml[KH_TMP_MAX+256],bare[KH_TMP_MAX+256]; snprintf(cfg,sizeof cfg,"%s/cfgtree",dir); snprintf(bare,sizeof bare,"%s/baretree",dir); snprintf(pk,sizeof pk,"%s/good.tsv",dir); snprintf(ml,sizeof ml,"%s/modlist.txt",dir);
       TEST(put_file(dir,"cfgtree/remastered/obj/A.mdlx/-0.dds","x",1)&&put_file(dir,"baretree/obj/A.mdlx","x",1));
+      if(kh_fork_ok()){
       TEST(st_cfg_child(cfg,NULL,NULL,0,0,0)==3);                                       /* remastered folder, no tables: named fatal */
       TEST(st_cfg_child(cfg,NULL,"none",1,1,0)==0);                                     /* ... unless switched off explicitly (no list needed then) */
       TEST(st_cfg_child(bare,NULL,NULL,3,1,0)==0);                                      /* a tree without a remastered folder needs neither */
@@ -734,11 +736,13 @@ int kh_hd_selftest(KCtx *g){
       TEST(st_cfg_child(cfg,"none",pk,2,1,0)==0);                                       /* ... unless the tree is said to hold no mod */
       TEST(st_cfg_child(cfg,ml,pk,2,2,1)==0);                                           /* both named: loaded, the nohd line counted as ignored */
       TEST(st_cfg_child(cfg,ml,"none",1,2,1)==0);
-      { char x[1200]; snprintf(x,sizeof x,"%s/does-not-exist.tsv",dir); TEST(st_cfg_child(cfg,ml,x,0,0,0)==3); snprintf(x,sizeof x,"%s/bad.tsv",dir); TEST(st_cfg_child(cfg,ml,x,0,0,0)==3);
+      { char x[KH_TMP_MAX+256]; snprintf(x,sizeof x,"%s/does-not-exist.tsv",dir); TEST(st_cfg_child(cfg,ml,x,0,0,0)==3); snprintf(x,sizeof x,"%s/bad.tsv",dir); TEST(st_cfg_child(cfg,ml,x,0,0,0)==3);
         snprintf(x,sizeof x,"%s/does-not-exist.txt",dir); TEST(st_cfg_child(cfg,x,pk,0,0,0)==3); snprintf(x,sizeof x,"%s/badlist.txt",dir); TEST(st_cfg_child(cfg,x,pk,0,0,0)==3); }
       /* the defaults live in the tree */
       { char a[1300]; snprintf(a,sizeof a,"cfgtree/khnmc-hd-packages.tsv"); TEST(put_file(dir,a,"obj/A.mdlx\t1\t-0.dds:20000120:1\n",31)); TEST(st_cfg_child(cfg,NULL,NULL,0,0,0)==3);   /* tables found, list missing */
-        TEST(put_file(dir,"cfgtree/khnmc-hd-modlist.txt","mod obj/A.mdlx\n",15)); TEST(st_cfg_child(cfg,NULL,NULL,2,2,0)==0); } }
+        TEST(put_file(dir,"cfgtree/khnmc-hd-modlist.txt","mod obj/A.mdlx\n",15)); TEST(st_cfg_child(cfg,NULL,NULL,2,2,0)==0); }
+      } else kh_selftest_not_run("hd","the start-up configuration read in a child process: defaults, `none` and every named fatal (13), with the two fixture files written for them (2)",15);   /* iOS: no fork (host_env.c) */
+    }
 
     /* ==== rule 1: the package's own table, verbatim ==== */
     /* a vanilla game file: package order (not sorted), names, flag bits 0/2/4/6, an origOffset of -1 with a nested name; the walker is not asked (the bytes are no container at all) */

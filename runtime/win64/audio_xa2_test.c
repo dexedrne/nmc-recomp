@@ -267,7 +267,7 @@ int kh_audio_soft_selftest(KCtx *g){
 void kh_audio_test_wav(const char *path); u64 kh_audio_test_quanta(void); int kh_audio_test_stop_clock(KCtx *g); u64 kh_audio_vclock_t0(void);
 int kh_audio_vclock_selftest(KCtx *g){
     int c0=checks, f0=fails;
-    char path[]="/tmp/khnmc-vclock-wav-XXXXXX"; int fd=mkstemp(path); CHECK(fd>=0); if(fd<0) return 1; close(fd);
+    char path[KH_TMP_MAX]; kh_tmp_path(path,sizeof path,"khnmc-vclock-wav-XXXXXX"); int fd=mkstemp(path); CHECK(fd>=0); if(fd<0) return 1; close(fd);
     const u64 T0=9000000000000ull; kh_vclock_test_begin(T0);
     extern float kh_audio_test_wav_gain(float); float prev_gain=kh_audio_test_wav_gain(0.5f);        /* the file gain (KHNMC_AUDIO_WAV_GAIN_DB) at -6.02 dB: exact halves */
     int prev=kh_audio_test_mode(2); kh_audio_test_wav(path);

@@ -170,7 +170,7 @@ int kh_input_hold_selftest(KCtx *g){
 #define ICHECK(c) do{ checks++; if(!(c)){ fails++; fprintf(stderr,"input hold selftest FAIL: %s (line %d)\n",#c,__LINE__); } }while(0)
     void kh_phase_test_set_initial_first(int state,long long present);
     long long saved=kh_phase_initial_first(3);
-    char path[]="/tmp/khnmc-hold-XXXXXX"; int fd=mkstemp(path); ICHECK(fd>=0); if(fd<0) return fails;
+    char path[KH_TMP_MAX]; kh_tmp_path(path,sizeof path,"khnmc-hold-XXXXXX"); int fd=mkstemp(path); ICHECK(fd>=0); if(fd<0) return fails;
     const char *txt="# hold test\n@hold 165 until initial-state 3\n180 182 A\n"; ICHECK(write(fd,txt,strlen(txt))==(ssize_t)strlen(txt)); close(fd);
     u64 out=ga_alloc(32,16);
     kh_phase_test_set_initial_first(3,-1); kh_input_load(g,path);
@@ -186,7 +186,7 @@ int kh_input_hold_selftest(KCtx *g){
     ICHECK(script_frame(101)==101 && script_frame(164)==164 && script_frame(165)==165 && script_frame(180)==180 && kh_input_hold_pending()==0);
     kh_input_load(g,NULL); ICHECK(script_frame(165)==165 && script_frame(9999)==9999);                                  /* no script, no hold */
     /* @clock game-frames: after the release the script follows the game thread's frames, whatever the present counter does */
-    { char p2[]="/tmp/khnmc-hold-XXXXXX"; int f2=mkstemp(p2); ICHECK(f2>=0);
+    { char p2[KH_TMP_MAX]; kh_tmp_path(p2,sizeof p2,"khnmc-hold-XXXXXX"); int f2=mkstemp(p2); ICHECK(f2>=0);
       if(f2>=0){ const char *t2="@hold 165 until initial-state 3\n@clock game-frames\n180 182 A\n"; ICHECK(write(f2,t2,strlen(t2))==(ssize_t)strlen(t2)); close(f2);
         u64 sv_gf=atomic_load(&game_frames);
         kh_phase_test_set_initial_first(3,-1); kh_input_load(g,p2); atomic_store(&game_frames,1000);

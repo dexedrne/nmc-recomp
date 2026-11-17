@@ -25,32 +25,54 @@ For every function in --funcs:
 handler never reaches its trampoline (the REPLACES rows of the 35-detour table in implementation notes).  On the PC no state runs the
 vanilla body of such a function, so the port must not have a path into it either: exactly one runtime object defines a strong
 f_<rva>, and that object does not reference orig_f_<rva>.  (Other objects may: the selftests call some originals for comparison.)
+
+ELF and Mach-O: on Mach-O `nm` prints C symbols with a leading underscore; it is removed (symbols without one are not C symbols and
+are ignored), so both formats read alike.  The format is taken from the program: it is Mach-O when it has `__mh_execute_header`.
+--skip OBJ (Task 26): an object in --obj that is not part of this link (loader.o when the program links loader_app.o).
 """
 import sys, os, subprocess, argparse, glob
 
 def die(msg):
     sys.stderr.write('check_mod_static_link: ERROR: %s\n' % msg); sys.exit(1)
 
-def nm(path, extra=()):
-    out = {}
-    for ln in subprocess.check_output(['nm', *extra, path], text=True).splitlines():
+MACHO = False
+
+def nm_raw(path):
+    out = []
+    for ln in subprocess.check_output(['nm', path], universal_newlines=True, stderr=subprocess.DEVNULL).splitlines():
         p = ln.split()
-        if len(p) == 3: out[p[2]] = (p[1], int(p[0], 16))
-        elif len(p) == 2: out[p[1]] = (p[0], None)
+        if len(p) == 3: out.append((p[2], p[1], int(p[0], 16)))
+        elif len(p) == 2: out.append((p[1], p[0], None))
+    return out
+
+def nm(path):
+    """symbol -> (type, value or None), C names (see the module text for Mach-O)"""
+    out = {}
+    for n, t, v in nm_raw(path):
+        if MACHO:
+            if not n.startswith('_'): continue
+            n = n[1:]
+        if n in out and out[n][0] in 'TW' and t not in 'TW': continue       # a definition is not replaced by a later reference row
+        out[n] = (t, v)
     return out
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--bin', required=True); ap.add_argument('--obj', required=True); ap.add_argument('--funcs', required=True); ap.add_argument('--chained', default='')
     ap.add_argument('--replaced', default=''); ap.add_argument('--choice', default=''); ap.add_argument('--dll-replaces', default='')
+    ap.add_argument('--skip', action='append', default=[], help='an object in --obj that is not part of this link')
     a = ap.parse_args()
     funcs = a.funcs.split(); chained = set(a.chained.split()); replaced = set(a.replaced.split()); choice = set(a.choice.split())
     for k, st in (('--chained', chained), ('--replaced', replaced), ('--choice', choice)):
         if st - set(funcs): die('%s names functions that are not in --funcs: %s' % (k, sorted(st - set(funcs))))
     if (chained & replaced) or (chained & choice) or (replaced & choice): die('--chained, --replaced and --choice must be disjoint')
+    global MACHO
+    MACHO = any(n == '__mh_execute_header' for n, _, _ in nm_raw(a.bin))
     b = nm(a.bin)
+    if not funcs: die('empty --funcs list')
     lifted = os.path.join(a.obj, 'mod_static_lifted.o'); lo = nm(lifted)
-    objs = {p: nm(p) for p in sorted(glob.glob(os.path.join(a.obj, '*.o'))) if os.path.abspath(p) != os.path.abspath(lifted)}
+    skip = {os.path.abspath(p) for p in a.skip} | {os.path.abspath(lifted)}
+    objs = {p: nm(p) for p in sorted(glob.glob(os.path.join(a.obj, '*.o'))) if os.path.abspath(p) not in skip}
     dll_replaces = a.dll_replaces.split()
     for r in dll_replaces:
         f, o = 'f_' + r, 'orig_f_' + r
@@ -93,10 +115,10 @@ def main():
         else:
             if lo.get(f, ('',))[0] != 'T': die('%s does not define %s' % (lifted, f))
             if any(s.get(f, ('',))[0] == 'T' for s in objs.values()): die('%s is also defined by a runtime object' % f)
-    print('check_mod_static_link: %d functions: strong f_<rva> + distinct orig_f_<rva> for all, %d chained through their runtime hook to mod_f_<rva>, '
+    print('check_mod_static_link: %s: %d functions: strong f_<rva> + distinct orig_f_<rva> for all, %d chained through their runtime hook to mod_f_<rva>, '
           '%d replaced outright by their runtime hook (mod_f_<rva> linked but unreferenced), %d ini-switched (the hook picks mod_f_ or orig_f_), no other orig_f_ callers; '
           '%d DLL full replacements whose port does not reference orig_f_<rva>'
-          % (len(funcs), len(chained), len(replaced), len(choice), len(dll_replaces)))
+          % ('Mach-O' if MACHO else 'ELF', len(funcs), len(chained), len(replaced), len(choice), len(dll_replaces)))
 
 if __name__ == '__main__':
     main()

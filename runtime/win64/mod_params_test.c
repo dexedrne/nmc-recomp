@@ -296,9 +296,9 @@ static void real_tests(KCtx *g){
 
 /* ---- named fatals --------------------------------------------------------------------------------------------------------- */
 static void fatal_case(KCtx *g,int range,int kind,u64 callsite,void (*prep)(KCtx*),const char *needle){
-    FILE *cap=tmpfile(); if(!cap) kh_fatal(g,"mod params selftest: tmpfile failed");
+    FILE *cap=kh_tmpfile(); if(!cap) kh_fatal(g,"mod params selftest: tmpfile failed");
     u64 sp=KH_RSP(g);
-    pid_t child=fork(); if(child<0) kh_fatal(g,"mod params selftest: fork failed");
+    pid_t child=kh_fork(); if(child<0) kh_fatal(g,"mod params selftest: fork failed");
     if(!child){
         if(dup2(fileno(cap),STDERR_FILENO)<0) _exit(98);
         fixture(g); if(range) rrec(g,kind,1,1,1,1,1,9); else frec(g,kind,1,1);
@@ -320,6 +320,7 @@ static void prep_null_sheet(KCtx *g){ wr64(g,A_+0x5c0,0); }
 static void prep_null_t148(KCtx *g){ wr64(g,A_+0x148,0); }
 static void prep_null_sheet_active(KCtx *g){ wr64(g,A_+0x5c0,0); setf(g,C_+0x44,-5.0f); }
 static void fatal_tests(KCtx *g){
+    if(!kh_fork_ok()){ kh_selftest_not_run("mod params","seven named fatals of the range and frame hooks (7 checks each)",49); return; }   /* iOS: no fork (host_env.c) */
     fatal_case(g,1,54,0x40e7b3,prep_null_actor,"range hook 40d810 kind 54: actor pointer");
     fatal_case(g,1,66,0x40e7b3,prep_null_sheet,"range hook 40d810 kind 66: actor sheet");
     fatal_case(g,1,62,0x40e7b3,prep_null_sheet,"kind 62: actor sheet");

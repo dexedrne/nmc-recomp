@@ -22,7 +22,7 @@ extern void rt_imp_api_ms_win_crt_stdio_l1_1_0___sopen_dispatch(KCtx *g);
 extern void rt_imp_api_ms_win_crt_stdio_l1_1_0___lseeki64(KCtx *g);
 extern void rt_imp_api_ms_win_crt_stdio_l1_1_0___read(KCtx *g);
 static int io_selftest(KCtx *g){
-    int fails=0,checks=0; char path[]="/tmp/khnmc-io-XXXXXX";
+    int fails=0,checks=0; char path[KH_TMP_MAX]; kh_tmp_path(path,sizeof path,"khnmc-io-XXXXXX");
     int fd=mkstemp(path); if(fd<0) return 1;
     const u64 offset=0x100000123ull;
     if(pwrite(fd,"seek",4,offset)!=4){ close(fd); unlink(path); return 1; } close(fd);
@@ -182,7 +182,7 @@ static void sleep_ms(int ms){ usleep((useconds_t)ms*1000); }
 static void input_selftest(KCtx *g){
     extern void kh_input_load(KCtx *,const char *);
     extern u32 kh_input_state(KCtx *,u32,u64,u64);
-    char path[]="/tmp/khnmc-input-XXXXXX"; int fd=mkstemp(path); CHECK(fd>=0);
+    char path[KH_TMP_MAX]; kh_tmp_path(path,sizeof path,"khnmc-input-XXXXXX"); int fd=mkstemp(path); CHECK(fd>=0);
     FILE *f=fdopen(fd,"w"); CHECK(f!=NULL);
     fputs("10 12 A+START+LT+RT -32768 32767\n20 20 B+X+Y+BACK+LB+RB+DPAD_UP+DPAD_DOWN+DPAD_LEFT+DPAD_RIGHT+LSTICK+RSTICK\n30 31 - 1 -1\n",f); fclose(f);
     u64 out=ga_alloc(32,16); memset(hp(g,out),0xa5,32);
@@ -286,5 +286,7 @@ int kh_selftest(KCtx *g){
     /* task 17, after everything else: these move the arena's high-water mark by hundreds of MiB (the enlarged pools, the stress placement), and
      * some older fixtures assume the low heap addresses of an untouched arena (mod_syscalls_test splits a heap pointer into two halves) */
     { extern int kh_ga_selftest(KCtx *); extern int kh_idtable_selftest(KCtx *); extern int kh_moose_selftest(KCtx *); fails += kh_ga_selftest(g) + kh_idtable_selftest(g) + kh_moose_selftest(g); }
+    fails+=kh_host_env_selftest();          /* task 26: only in a KH_IOS_PATHS build (container directories, the conf file, the status hook) */
+    kh_selftest_not_run_report(stderr);     /* task 26: fatal-path cases a KH_IOS_PATHS build (no fork()) did not run; prints nothing when all ran */
     return fails;
 }

@@ -5,8 +5,8 @@ static int checks, failures;
 #define T(x) do { checks++; if(!(x)){ failures++; fprintf(stderr,"difficulty rewards FAIL line %d: %s\n",__LINE__,#x); } } while(0)
 /* One hook call in a child with stderr captured: 1 when it ended in kh_fatal (exit status 3) and printed every needle. */
 static int fatal_child(KCtx *g,u32 rva,u64 a0,u64 a1,u64 a2,const char *n1,const char *n2,const char *n3){
-    FILE *log=tmpfile(); if(!log) kh_fatal(g,"rewards selftest cannot open a fatal log");
-    pid_t child=fork(); if(child<0) kh_fatal(g,"rewards selftest fork failed");
+    FILE *log=kh_tmpfile(); if(!log) kh_fatal(g,"rewards selftest cannot open a fatal log");
+    pid_t child=kh_fork(); if(child<0) kh_fatal(g,"rewards selftest fork failed");      /* never reached without fork: the caller asks kh_fork_ok() */
     if(!child){ if(dup2(fileno(log),2)<0) _exit(98); kh_call(g,GS_BASE+rva,a0,a1,a2,0); _exit(99); }
     int status=0; if(waitpid(child,&status,0)!=child) kh_fatal(g,"rewards selftest waitpid failed");
     rewind(log); char out[4096]; size_t len=fread(out,1,sizeof out-1,log); out[len]=0; fclose(log);
@@ -72,9 +72,10 @@ int kh_mod_rewards_selftest(KCtx *g,u64 sheet){
     for(int d=0;d<4;d++){
         wr32(g,GS_BASE+0x9abd48,(u32)invalid[d]); memset(hp(g,rec-16),0,48); wr8(g,rec+1,2); wr8(g,rec+2,255);
         wr32(g,sheet+4,1000); wr32(g,sheet+0x184,1000);
-        T(fatal_child(g,0x3edf90,rec,sheet,0,"mod-difficulty-out-of-range:",shown[d],"exe 0x3edf90 = DLL 0x2f9b0"));
+        if(kh_fork_ok()) T(fatal_child(g,0x3edf90,rec,sheet,0,"mod-difficulty-out-of-range:",shown[d],"exe 0x3edf90 = DLL 0x2f9b0"));
         wr8(g,rec+14,3); wr8(g,rec+15,255);
-        T(fatal_child(g,0x3ed7d0,rec,2,1,"mod-difficulty-out-of-range:",shown[d],"exe 0x3ed7d0 = DLL 0x31ee0"));
+        if(kh_fork_ok()) T(fatal_child(g,0x3ed7d0,rec,2,1,"mod-difficulty-out-of-range:",shown[d],"exe 0x3ed7d0 = DLL 0x31ee0"));
+        else kh_selftest_not_run("difficulty rewards","3edf90 and 3ed7d0 with a difficulty outside 0..3 (named fatals)",2);   /* iOS: no fork (host_env.c) */
         T(rd32(g,sheet+4)==1000 && rd32(g,sheet+0x184)==1000);
     }
     /* Stat-sheet AP stays the vanilla unsigned-byte, character-1/14-only rule. */

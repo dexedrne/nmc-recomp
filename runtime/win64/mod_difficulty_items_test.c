@@ -94,8 +94,8 @@ static s32 model_mp(s32 cur,s32 amount,s32 max){ s32 v=(s32)((u32)cur+(u32)amoun
 
 /* Run a call in a child and return its stderr; the child must die through a named fatal (exit status neither 0 nor 99). */
 static int fatal_child(KCtx *g,int usable,u64 effect,u32 target,const char *needle1,const char *needle2){
-    FILE *log=tmpfile(); if(!log) kh_fatal(g,"items selftest cannot open a fatal log");
-    pid_t child=fork();
+    FILE *log=kh_tmpfile(); if(!log) kh_fatal(g,"items selftest cannot open a fatal log");
+    pid_t child=kh_fork();
     if(child<0) kh_fatal(g,"items selftest fork failed");
     if(!child){ dup2(fileno(log),2); kh_call(g,GS_BASE+(usable?0x3c3da0:0x3c4b80),effect,target,0,100); _exit(99); }
     int status=0; waitpid(child,&status,0);
@@ -186,8 +186,10 @@ int kh_mod_items_selftest(KCtx *g,u64 sheet){
     /* Named fatals of the apply path: a null sheet and a null command record (shipped DLL faults at both). */
     {
         memset(hp(g,rec),0,0x18); wr16(g,rec,1); wr8(g,rec+4,40); wr16(g,rec+0x10,23); wr32(g,GS_BASE+0x9abd48,3);
+        if(kh_fork_ok()){
         user.null_sheet=1; T(fatal_child(g,0,rec,2,"mod item effect: no sheet for character 2","0x31bb6")); user.null_sheet=0;
         user.null_cmd=1; T(fatal_child(g,0,rec,2,"mod item effect: no cmd record for command 23 of item 0x1","0x31482")); user.null_cmd=0;
+        } else kh_selftest_not_run("difficulty items","apply path with a null sheet and with a null command record (named fatals)",2);   /* iOS: no fork (host_env.c) */
     }
     kh_item_mock_sink=NULL;
 
@@ -307,6 +309,7 @@ int kh_mod_items_selftest(KCtx *g,u64 sheet){
         /* An active kind is never forwarded to the vanilla function, stock id or not. */
         static const u8 active_apply[]={1,2,3,10,13,24,30,31},active_usable[]={1,2,3,10,13,21,23,24};
         wr32(g,GS_BASE+0x9abd48,3); reset_sheet(g,sheet); wr32(g,sheet,30); wr32(g,sheet+4,60);
+        if(kh_fork_ok()){
         for(unsigned i=0;i<sizeof active_apply;i++){
             char want[32]; snprintf(want,sizeof want,"id=0x1 kind=%u",active_apply[i]); wr8(g,rec+5,active_apply[i]);
             T(fatal_child(g,0,rec,2,"unimplemented mod item effect DLL RVA=0x31260",want));
@@ -318,6 +321,7 @@ int kh_mod_items_selftest(KCtx *g,u64 sheet){
         /* A null sheet with the real acquire (character 0). */
         wr8(g,rec+5,0); T(fatal_child(g,0,rec,0,"mod item effect: no sheet for character 0",NULL));
         wr8(g,rec+5,25); T(fatal_child(g,0,rec,0,"mod item effect: no sheet for character 0",NULL));
+        } else kh_selftest_not_run("difficulty items","active kinds never forwarded (8 apply + 8 usable named fatals) and the null sheet of character 0 (2)",(int)(sizeof active_apply+sizeof active_usable)+2);   /* iOS: no fork (host_env.c) */
         wr8(g,rec+5,0);
     }
     /* ---- (2e) usability: the command byte is not consulted, the answer is the original's, and the handler's own acquisition

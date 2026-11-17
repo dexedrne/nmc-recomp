@@ -166,8 +166,9 @@ static double xmm0_d(KCtx *g){ double d; memcpy(&d,&KH_XMM(g,0),8); return d; }
 static float xmm0_f(KCtx *g){ float f; memcpy(&f,&KH_XMM(g,0),4); return f; }
 /* a dispatch to `target` must end in kh_fault ("not a function start", exit code 5) */
 static int fault_case(KCtx *g,u64 target){
-    FILE *f=tmpfile(); if(!f) return 0;
-    fflush(stderr); pid_t child=fork();
+    if(!kh_fork_ok()){ kh_selftest_not_run("native-call","a dispatch to an address that is not a function start (fault 5)",1); checks--; return 1; }   /* the caller's T() must not count it */
+    FILE *f=kh_tmpfile(); if(!f) return 0;
+    fflush(stderr); pid_t child=kh_fork();
     if(child==0){ dup2(fileno(f),2); u64 sp=(KH_RSP(g)-0x200)&~15ull; sp-=8; wr64(g,sp,0x7ff7ffff0000ull); KH_RSP(g)=sp; kh_dispatch(g,target); _exit(99); }
     int status=0; if(child<0){ fclose(f); return 0; } waitpid(child,&status,0);
     rewind(f); char out[8192]; size_t n=fread(out,1,sizeof out-1,f); out[n]=0; fclose(f);

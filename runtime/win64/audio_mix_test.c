@@ -9,6 +9,9 @@
 #include <math.h>
 #include <unistd.h>
 #include <fcntl.h>
+/* runtime/host_env.c: the scratch directory the host gives (this file is independent of khnmc_rt.h, like the mixer itself) */
+#define KH_TMP_MAX 1024
+char *kh_tmp_path(char *out, size_t cap, const char *leaf);
 
 static int fails, checks;
 #define CHECK(c) do{ checks++; if(!(c)){ fails++; fprintf(stderr, "audio mix selftest FAIL: %s (line %d)\n", #c, __LINE__); } }while(0)
@@ -485,7 +488,7 @@ static uint64_t scenario(void){
 
 /* ---- WAV writer ---- */
 static void test_wav(void){
-    char path[] = "/tmp/khnmc-wav-XXXXXX"; int fd = mkstemp(path); CHECK(fd >= 0); if(fd < 0) return; close(fd);
+    char path[KH_TMP_MAX]; kh_tmp_path(path, sizeof path, "khnmc-wav-XXXXXX"); int fd = mkstemp(path); CHECK(fd >= 0); if(fd < 0) return; close(fd);
     KmxWav *w = kmx_wav_open(path, 48000, 2); CHECK(w != NULL); if(!w) return;
     float x[8] = {0.0f, 0.5f, -1.0f, 1.0f, 1.5f, -2.0f, 0.25f, 1.0f / 65536.0f};
     CHECK(kmx_wav_write(w, x, 4) == 0 && kmx_wav_sync(w) == 0);

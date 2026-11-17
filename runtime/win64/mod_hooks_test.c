@@ -15,9 +15,11 @@ int kh_mod_hooks_selftest(KCtx *g){
         T(result==0x123456789abcdef0ull); T(KH_RSP(g)==sp);
         T(rd32(g,desc+offsets[i]+0x24)==3);
     }
-    FILE *capture=tmpfile();
+    if(!kh_fork_ok()) kh_selftest_not_run("mod hooks","the refused gummi start (named fatal gummi-gate-contract)",7);   /* iOS: no fork (host_env.c) */
+    else {
+    FILE *capture=kh_tmpfile();
     if(!capture) kh_fatal(g,"mod hooks selftest: tmpfile failed");
-    pid_t child=fork();
+    pid_t child=kh_fork();
     if(child<0) kh_fatal(g,"mod hooks selftest: fork failed");
     if(!child){
         if(dup2(fileno(capture),STDERR_FILENO)<0) _exit(98);
@@ -35,6 +37,7 @@ int kh_mod_hooks_selftest(KCtx *g){
     T(strstr(output,"which original transition restores the world map")!=NULL);
     T(strstr(output,"rva 0x250230")!=NULL);
     T(KH_RSP(g)==sp);
+    }
     ga_free(desc);
     fprintf(stderr,"kh: mod hooks selftest: %d checks, %d failures\n",checks,failures);
     return failures;

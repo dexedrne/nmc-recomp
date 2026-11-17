@@ -10,6 +10,7 @@
 #include <stdarg.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <sys/types.h>
 #include "kh_compat.h"                             /* host primitives that differ between Linux and Darwin (timed waits, pages) */
 
 /* ---- guest space -------------------------------------------------------------------------------------------------- */
@@ -126,6 +127,22 @@ void kh_warn(const char *fmt, ...) __attribute__((format(printf,1,2)));
 void kh_log(const char *fmt, ...) __attribute__((format(printf,1,2)));
 extern int kh_verbose;
 #define KH_UNIMPL(g,what) kh_fatal((g),"unimplemented: %s",(what))
+
+/* ---- the host process (host_env.c): scratch directory, child processes for the fatal cases, the end of the process, and with
+ * KH_IOS_PATHS (kh_compat.h) the app container's directories and config file ------------------------------------------------- */
+#define KH_TMP_MAX      1024                         /* buffer for a path under kh_tmpdir() */
+#define KH_TMP_LEAF_MAX 64                           /* longest name / mkstemp template appended to it */
+const char *kh_tmpdir(void);                         /* $KH_TMPDIR, else "/tmp" (KH_IOS_PATHS: else $TMPDIR, else a named fatal); no trailing slash */
+char *kh_tmp_path(char *out,size_t cap,const char *leaf);   /* "<tmpdir>/<leaf>"; a named fatal when it does not fit */
+FILE *kh_tmpfile(void);                              /* tmpfile(); KH_IOS_PATHS: an unlinked file in kh_tmpdir() */
+int   kh_fork_ok(void);                              /* 1 = the selftests' fatal cases can run in a forked child; 0 with KH_IOS_PATHS */
+pid_t kh_fork(void);                                 /* fork(); KH_IOS_PATHS: -1 / ENOSYS, and the build has no reference to fork */
+void  kh_selftest_not_run(const char *suite,const char *what,int checks);   /* a skipped fatal case: loud line + count */
+int   kh_selftest_not_run_report(FILE *f);           /* total line (only when something was skipped); returns the number of checks */
+extern void (*kh_exit_hook)(int status);             /* called with the exit status right before the process ends (async-signal-safe) */
+void  kh_host_exit(int status) __attribute__((noreturn));   /* kh_exit_hook, then _exit(status) */
+void  kh_host_env_init(int *argc,char ***argv);      /* first thing in main(); KH_IOS_PATHS: container directories + Documents/khnmc.conf, else nothing */
+int   kh_host_env_selftest(void);                    /* KH_IOS_PATHS only (returns 0 and prints nothing otherwise) */
 
 /* ---- host function registry: synthetic guest addresses that dispatch to host code ---------------------------------- */
 #define KH_HOSTFN_BASE 0x7ff7f8000000ull

@@ -23,8 +23,8 @@ static u64 kc(KCtx *g,u64 target,u64 a,u64 b,u64 c,u64 d){
     return r;
 }
 static int run_fatal(KCtx *g,void (*body)(KCtx *),char *out,size_t cap){
-    FILE *log=tmpfile(); if(!log) kh_fatal(g,"mod B selftest: tmpfile failed");
-    pid_t child=fork(); if(child<0) kh_fatal(g,"mod B selftest: fork failed");
+    FILE *log=kh_tmpfile(); if(!log) kh_fatal(g,"mod B selftest: tmpfile failed");
+    pid_t child=kh_fork(); if(child<0) kh_fatal(g,"mod B selftest: fork failed");        /* never reached without fork: callers ask kh_fork_ok() */
     if(!child){ if(dup2(fileno(log),STDERR_FILENO)<0) _exit(98); body(g); _exit(99); }
     int status=0; if(waitpid(child,&status,0)!=child) kh_fatal(g,"mod B selftest: waitpid failed");
     rewind(log); size_t n=fread(out,1,cap-1,log); out[n]=0; fclose(log);
@@ -402,9 +402,11 @@ static void test_3f27d0(KCtx *g){
     { u32 v[14]={0}; static const u16 s[4]={1,2,3,4}, t[4]={2,2,2,2}, w[4]={0x100,0x101,0x102,0x103}; static const u32 c[4]={5,6,7,8}; run_reset(g,v,s,t,w,c,__LINE__); }
     T(KH_RSP(g)==sp);
     char out[4096];
+    if(kh_fork_ok()){
     T(run_fatal(g,fatal_overflow,out,sizeof out)==3); T(strstr(out,"mod-3f27d0-extra-list-overflow")!=NULL&&strstr(out,"__report_rangecheckfailure")!=NULL);
     T(run_fatal(g,fatal_null_obj,out,sizeof out)==3); T(strstr(out,"mod 3f29e0 (DLL 0x306c0): [this+0xae0] is not a valid guest pointer")!=NULL);
     T(run_fatal(g,fatal_null_row,out,sizeof out)==3); T(strstr(out,"the 0x3b2660 row")!=NULL);
+    } else kh_selftest_not_run("mod B","3f27d0 extra-list overflow, 3f29e0 without its object, without its 0x3b2660 row (named fatals)",6);   /* iOS: no fork (host_env.c) */
 }
 
 /* ---- the three item hooks: 0x3c4780 (DLL 0x31c60), 0x351390 (DLL 0x2d5c0), 0x368820 (DLL 0x2da70) ------------------------------- */
@@ -425,7 +427,8 @@ static void test_items(KCtx *g){
         u64 r=run4(g,0x3c4780,0xabcdef0000001234ull,0x21,0x22,0x23,0,NULL);
         SEQ("3c4780"); T(r==(c1[i].own?((rec&~0xffull)|1):ORIG_RET(0x3c4780)));                           /* 0x31c89: mov al,1 on the record pointer */
     }
-    T(run_fatal(g,fatal_3c4780,out,sizeof out)==3); T(strstr(out,"mod 3c4780 (DLL 0x31c60): the item record returned by 0x3e39a0")!=NULL);
+    if(kh_fork_ok()){ T(run_fatal(g,fatal_3c4780,out,sizeof out)==3); T(strstr(out,"mod 3c4780 (DLL 0x31c60): the item record returned by 0x3e39a0")!=NULL); }
+    else kh_selftest_not_run("mod B","3c4780 without its item record (named fatal)",2);   /* iOS: no fork (host_env.c) */
     /* 0x351390: full replacement.  ids 0x112 / 0x113, then the kind byte through the DLL's 18-entry table */
     u64 menu=fx.self,list=fx.save+0x100;
     for(int row=-1;row<=3;row+=2) for(u32 kind=0;kind<0x1c;kind++){
@@ -450,7 +453,8 @@ static void test_items(KCtx *g){
       nex=0; E(0x304df0,0,0,0,0); E(0x34bc50,menu,0,0,0); T(run4(g,0x351390,0,0,0,0,0,NULL)==HI32); SEQ("351390 empty"); }
     { ov_clear(); ov(0x304df0,menu); ov(0x34bc50,1); ov(0x34bc40,list); memset(hp(g,fx.save),0,0x400); wr16(g,list,0x113);   /* 0x113 with no record at all: still 1 */
       nex=0; E(0x304df0,0,0,0,0); E(0x34bc50,menu,0,0,0); E(0x34bc40,menu,0,0,0); E(0x3e39a0,0x113,0,0,0); T(run4(g,0x351390,0,0,0,0,0,NULL)==1); SEQ("351390 0x113"); }
-    T(run_fatal(g,fatal_351390,out,sizeof out)==3); T(strstr(out,"mod 351390 (DLL 0x2d5c0): the item record returned by 0x3e39a0")!=NULL);
+    if(kh_fork_ok()){ T(run_fatal(g,fatal_351390,out,sizeof out)==3); T(strstr(out,"mod 351390 (DLL 0x2d5c0): the item record returned by 0x3e39a0")!=NULL); }
+    else kh_selftest_not_run("mod B","351390 without its item record (named fatal)",2);   /* iOS: no fork (host_env.c) */
     /* 0x368820: kinds 1..24 through the DLL's table, everything else to the original */
     static const s8 cat[26]={-1, 0,0,0, 5,5,5,5,5, 0,0,0,0,0,0,0, 1,2,3,4, 5,5, -1, 0,0, -1};              /* by kind 0..25: DLL byte table 0x2db18 and its 7 targets */
     for(u32 kind=0;kind<0x102;kind+=(kind<0x20?1:0x37)){
@@ -459,7 +463,8 @@ static void test_items(KCtx *g){
         nex=0; E(0x3e39a0,0x77,0,0,0); if(c<0) EO(0x368820,0x77,0x31,0x32,0x33);
         u64 r=run4(g,0x368820,0x5555555500000077ull,0x31,0x32,0x33,0,NULL); SEQ("368820"); T(r==(c<0?ORIG_RET(0x368820):(u64)c));
     }
-    T(run_fatal(g,fatal_368820,out,sizeof out)==3); T(strstr(out,"mod 368820 (DLL 0x2da70): the item record returned by 0x3e39a0")!=NULL);
+    if(kh_fork_ok()){ T(run_fatal(g,fatal_368820,out,sizeof out)==3); T(strstr(out,"mod 368820 (DLL 0x2da70): the item record returned by 0x3e39a0")!=NULL); }
+    else kh_selftest_not_run("mod B","368820 without its item record (named fatal)",2);   /* iOS: no fork (host_env.c) */
     ov_clear(); T(KH_RSP(g)==sp); (void)fatal_arg;
 }
 
@@ -518,10 +523,12 @@ static void test_extra_files(KCtx *g){
     /* 0x3f6510: nothing to release, straight to the original */
     ov_clear(); nex=0; EO(0x3f6510,0x41,0x42,0x43,0x44); T(run4(g,0x3f6510,0x41,0x42,0x43,0x44,0,NULL)==ORIG_RET(0x3f6510)); SEQ("3f6510");
     /* a probe that finds a file stops loudly, with the name; 64-bit test in 0x3a17f0 / 0x3f65a0, 32-bit in 0x3f6620 */
+    if(kh_fork_ok()){
     T(run_fatal(g,fatal_probe_3a17f0,out,sizeof out)==3); T(strstr(out,"mod-extra-file-not-ported: 3a17f0 (DLL 0x33610)")!=NULL&&strstr(out,"\"04common.bdx\"")!=NULL);
     T(run_fatal(g,fatal_probe_3f6620,out,sizeof out)==3); T(strstr(out,"mod-extra-file-not-ported: 3f6620 (DLL 0x300a0)")!=NULL&&strstr(out,"\"13effect.bar\"")!=NULL);
     T(run_fatal(g,fatal_probe_3f65a0,out,sizeof out)==3); T(strstr(out,"mod-extra-file-not-ported: 3f65a0 (DLL 0x2fd20)")!=NULL&&strstr(out,"\"01common.bdx\"")!=NULL);
     T(run_fatal(g,fatal_script_3f65a0,out,sizeof out)==3); T(strstr(out,"mod 3f65a0 (DLL 0x2fd20): common script allocation")!=NULL);
+    } else kh_selftest_not_run("mod B","extra-file probes that find a file in 3a17f0, 3f6620, 3f65a0, and 3f65a0's script allocation (named fatals)",8);   /* iOS: no fork (host_env.c) */
     ov_clear();
 }
 
@@ -535,7 +542,7 @@ static int text_ok(KCtx *g,u64 out,u8 icon,u8 colour){
     return 1;
 }
 static void test_icons(KCtx *g){
-    char path[]="/tmp/khnmc-modb-XXXXXX", err[160]="", out_txt[4096]; int fd=mkstemp(path); FILE *f=fd>=0?fdopen(fd,"wb"):NULL; T(f!=NULL); if(!f) return;
+    char path[KH_TMP_MAX], err[160]="", out_txt[4096]; kh_tmp_path(path,sizeof path,"khnmc-modb-XXXXXX"); int fd=mkstemp(path); FILE *f=fd>=0?fdopen(fd,"wb"):NULL; T(f!=NULL); if(!f) return;
     /* a table like the shipped one: 16 header bytes (count at +4), 16-byte entries: name, byte +0xc (0x15aab0), byte +0xe (0x153850) */
     static const struct { const char *name; u8 c,e; } ent[]={{"bb0",0xeb,0xec},{"tt6",0xe8,0xea},{"abcdefghijkl",0x11,0x22},{"dup",0x01,0x02},{"dup",0x03,0x04},{"",0x7e,0x7f}};
     u8 hdr[16]={0}; u32 n=sizeof ent/sizeof *ent; memcpy(hdr+4,&n,4); fwrite(hdr,1,16,f);
@@ -580,7 +587,8 @@ static void test_icons(KCtx *g){
         if(tc[i].icon>=0) prev=(u8)tc[i].icon;
         T(r==outb); T(text_ok(g,outb,prev,0x1d));
     }
-    T(run_fatal(g,fatal_15aba0,out_txt,sizeof out_txt)==3); T(strstr(out_txt,"mod 15aba0 (DLL 0x10100): the list's owner [arg5+8] is not a valid guest pointer")!=NULL);
+    if(kh_fork_ok()){ T(run_fatal(g,fatal_15aba0,out_txt,sizeof out_txt)==3); T(strstr(out_txt,"mod 15aba0 (DLL 0x10100): the list's owner [arg5+8] is not a valid guest pointer")!=NULL); }
+    else kh_selftest_not_run("mod B","15aba0 without the list's owner (named fatal)",2);   /* iOS: no fork (host_env.c) */
     memcpy(hp(g,GS_BASE+0x9babb0),svname,32); ov_clear();
     /* back to the table of the data tree, and its shipped shape when it is there (29 entries, first "bb0" with eb / ec) */
     const char *root=getenv("KHNMC_DATA"); char host[4096]; int have=kh_resolve_ci(root?root:"data-full","dll/tweaks/command_menu_offsets.bin",host,sizeof host);
@@ -631,16 +639,17 @@ static void test_menu(KCtx *g){
             T(mock.c[jump_at].a[0]<esp&&mock.c[jump_at].a[0]>=esp-0x80&&mock.c[jump_at].memok&&!memcmp(mock.c[jump_at].mem,want,10)); }
         SEQ("31dd70 custom row"); T(r==(id==0x204?ORIG_RET(0x31dd70):ret));
     }
-    T(run_fatal(g,fatal_31dd70,out,sizeof out)==3); T(strstr(out,"mod 31dd70 (DLL 0x2d670): the menu cursor pointer")!=NULL);
+    if(kh_fork_ok()){ T(run_fatal(g,fatal_31dd70,out,sizeof out)==3); T(strstr(out,"mod 31dd70 (DLL 0x2d670): the menu cursor pointer")!=NULL); }
+    else kh_selftest_not_run("mod B","31dd70 without its menu cursor (named fatal)",2);   /* iOS: no fork (host_env.c) */
     wr64(g,GS_BASE+0xbef528,sv1); wr64(g,GS_BASE+0xbef538,sv2); memcpy(hp(g,GS_BASE+0x717008),svw,0x30); ov_clear();
 }
 
 /* ---- the options whose detours are not ported: off in the shipped ini files, a named fatal when a tree turns one on ---------------- */
-static char opt_root[64];
+static char opt_root[KH_TMP_MAX];
 static void fatal_option(KCtx *g){ kh_mod_b_check_options(g,opt_root); }
-static void put(const char *dir,const char *name,const char *text){ char p[256]; snprintf(p,sizeof p,"%s/dll/%s",dir,name); FILE *f=fopen(p,"w"); if(f){ fputs(text,f); fclose(f); } }
+static void put(const char *dir,const char *name,const char *text){ char p[KH_TMP_MAX+64]; snprintf(p,sizeof p,"%s/dll/%s",dir,name); FILE *f=fopen(p,"w"); if(f){ fputs(text,f); fclose(f); } }
 static void test_options(KCtx *g){
-    char dir[]="/tmp/khnmc-modb-opt-XXXXXX", sub[96], out[4096]; if(!mkdtemp(dir)){ T(0); return; }
+    char dir[KH_TMP_MAX], sub[KH_TMP_MAX+8], out[4096]; kh_tmp_path(dir,sizeof dir,"khnmc-modb-opt-XXXXXX"); if(!mkdtemp(dir)){ T(0); return; }
     snprintf(sub,sizeof sub,"%s/dll",dir); T(mkdir(sub,0700)==0); snprintf(opt_root,sizeof opt_root,"%s",dir);
     T(kh_mod_b_option_on(dir,"KH2_Tweaks_Retry.ini","retry")==-1);                                        /* no file */
     put(dir,"KH2_Tweaks_Retry.ini","[Settings]\r\nretry=off");                                             /* the shipped files: CRLF, no final newline */
@@ -689,10 +698,14 @@ static void test_options(KCtx *g){
     for(unsigned i=0;i<sizeof oc/sizeof *oc;i++){
         put(dir,"KH2_Tweaks_Retry.ini","[Settings]\nretry=off\n"); put(dir,"KH2_Tweaks_Savepoint.ini","[Settings]\nsavepoint_qol=off\n"); put(dir,"KH2_Tweaks_Worlds.ini","[Settings]\npatch_gummiskip=off\n");
         put(dir,oc[i].ini,oc[i].text);
+        if(!kh_fork_ok()){                                                                  /* iOS: no fork (host_env.c) */
+            if(oc[i].on) kh_selftest_not_run("mod B","an option the port does not have, turned on in the ini (named fatal)",2);
+            else { kh_mod_b_check_options(g,opt_root); T(1); }                                 /* off: returns, in this process */
+            continue; }
         int st=run_fatal(g,fatal_option,out,sizeof out);
         if(oc[i].on){ T(st==3); T(strstr(out,"mod-option-not-ported:")!=NULL&&strstr(out,oc[i].msg)!=NULL); } else T(st==99);
     }
-    char p[256]; static const char *const fn[]={"KH2_Tweaks_Retry.ini","KH2_Tweaks_Savepoint.ini","KH2_Tweaks_Worlds.ini"};
+    char p[KH_TMP_MAX+64]; static const char *const fn[]={"KH2_Tweaks_Retry.ini","KH2_Tweaks_Savepoint.ini","KH2_Tweaks_Worlds.ini"};
     for(int i=0;i<3;i++){ snprintf(p,sizeof p,"%s/dll/%s",dir,fn[i]); unlink(p); } rmdir(sub); rmdir(dir);
 }
 

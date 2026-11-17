@@ -153,13 +153,13 @@ void f_106870(KCtx *g){ load(g,0,1); }
 
 /* Fixtures are synthetic and local; this also exercises hooks through the dispatch table. */
 int kh_file_selftest(KCtx *g){
-    char dir[]="/tmp/khnmc-files-XXXXXX",path[256]; int bad=0,checks=0;
+    char dir[KH_TMP_MAX],path[KH_TMP_MAX+256]; int bad=0,checks=0; kh_tmp_path(dir,sizeof dir,"khnmc-files-XXXXXX");   /* host_env.c: /tmp, or the app container on iOS */
     const char *oldroot=getenv("KHNMC_DATA"),*oldlog=getenv("KHNMC_FILELOG");
     char *root=oldroot?strdup(oldroot):NULL,*log=oldlog?strdup(oldlog):NULL;
     if(!mkdtemp(dir)) return 1;
     snprintf(path,sizeof path,"%s/MiXeD.bin",dir); FILE *f=fopen(path,"wb");
     if(!f) return 1; fwrite("test",1,4,f); fclose(f);
-    setenv("KHNMC_DATA",dir,1); char lp[256]; snprintf(lp,sizeof lp,"%s/log",dir); setenv("KHNMC_FILELOG",lp,1);
+    setenv("KHNMC_DATA",dir,1); char lp[KH_TMP_MAX+256]; snprintf(lp,sizeof lp,"%s/log",dir); setenv("KHNMC_FILELOG",lp,1);
     u64 name=ga_strdup("mixed.bin"),missing=ga_strdup("missing"),dst=ga_alloc(16,16),sz=ga_alloc(16,16);
 #define TEST(c) do { checks++; if(!(c)){ fprintf(stderr,"file selftest FAIL: %s\n",#c); bad++; } } while(0)
     TEST(kh_call(g,GS_BASE+0x1063d0,0,name,0,0)==4);
@@ -176,7 +176,7 @@ int kh_file_selftest(KCtx *g){
     wr32(g,sz,0); u64 p=kh_call5(g,GS_BASE+0x106870,0,name,sz,0,0); TEST(p&&!(p&15)&&rd32(g,sz)==4&&!memcmp(hp(g,p),"test",4)); ga_free(p);
     u64 obj=ga_alloc(0x260,16); TEST(kh_call(g,GS_BASE+0x106000,obj,name,0,0)==obj&&rd64(g,obj+8)&&rd32(g,obj+0x14)==0); ga_free(rd64(g,obj+8)); ga_free(obj);
     const char *oldpkg=getenv("KHNMC_PKGDIR"); char *pkg=oldpkg?strdup(oldpkg):NULL;
-    char image[256],mapped[2048],expected[256];
+    char image[KH_TMP_MAX+256],mapped[2048],expected[KH_TMP_MAX+256];
     snprintf(image,sizeof image,"%s/Image",dir); mkdir(image,0700);
     snprintf(expected,sizeof expected,"%s/Image/SettingMenu.hed",dir);
     f=fopen(expected,"wb"); if(!f) return 1; fclose(f);
@@ -185,7 +185,7 @@ int kh_file_selftest(KCtx *g){
     TEST(kh_winpath("C:\\KH2\\image/SettingMenu.hed",mapped,sizeof mapped)&&!strcmp(mapped,expected));
     TEST(!kh_winpath("C:/hd28/STEAM/Image/../SettingMenu.hed",mapped,sizeof mapped));
     TEST(!real_package("C:/KH2/Image/SettingMenu")); /* HED alone must not select the original constructor. */
-    char pkgpath[256]; snprintf(pkgpath,sizeof pkgpath,"%s/Image/SettingMenu.pkg",dir);
+    char pkgpath[KH_TMP_MAX+256]; snprintf(pkgpath,sizeof pkgpath,"%s/Image/SettingMenu.pkg",dir);
     f=fopen(pkgpath,"wb"); if(!f) return 1; fclose(f);
     TEST(real_package("C:/KH2/Image/SettingMenu"));
     unlink(pkgpath);

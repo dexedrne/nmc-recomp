@@ -112,15 +112,11 @@ static void frame_calibrate(u64 now,u64 *q_since,long *q_diff){
     } else *q_since=0;
 }
 
-static void vc_once(void){ pthread_condattr_t a; pthread_condattr_init(&a); pthread_condattr_setclock(&a,CLOCK_MONOTONIC); pthread_cond_init(&vcv,&a); }
+/* the condition's timed wait takes CLOCK_MONOTONIC deadlines (abs_in): kh_compat.h, because Darwin has no pthread_condattr_setclock
+ * and reads a deadline given to pthread_cond_timedwait as wall-clock time (a monotonic one would time out at once) */
+static void vc_once(void){ kh_cond_init(&vcv); }
 static void abs_in(struct timespec *ts,u64 ns){ u64 t=kh_host_ns()+ns; ts->tv_sec=(time_t)(t/1000000000ull); ts->tv_nsec=(long)(t%1000000000ull); }
-static void host_sleep_until(u64 t){ struct timespec d={(time_t)(t/1000000000ull),(long)(t%1000000000ull)};
-#ifdef __linux__
-    while(clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&d,NULL)==EINTR){}
-#else
-    for(u64 now=kh_host_ns();now<t;now=kh_host_ns()){ struct timespec r={(time_t)((t-now)/1000000000ull),(long)((t-now)%1000000000ull)}; nanosleep(&r,NULL); }
-#endif
-}
+static void host_sleep_until(u64 t){ struct timespec d={(time_t)(t/1000000000ull),(long)(t%1000000000ull)}; kh_sleep_until(&d); }   /* kh_compat.h: clock_nanosleep on Linux, a nanosleep loop on Darwin */
 
 void kh_vclock_init(void){
     pthread_once(&vonce,vc_once);
@@ -171,7 +167,7 @@ static void advance_locked(KCtx *g,u64 target){
         struct timespec dl; abs_in(&dl,(u64)VC_CLIENT_WAIT_S*1000000000ull);
         for(;;){ int behind=-1; for(int i=0;i<MAXCLIENTS;i++) if(clients[i].used&&clients[i].due<=now){ behind=i; break; }
             if(behind<0) break;
-            if(pthread_cond_timedwait(&vcv,&vm,&dl)==ETIMEDOUT){ const char *nm=clients[behind].name; u64 due=clients[behind].due; pthread_mutex_unlock(&vm);
+            if(kh_cond_wait_until(&vcv,&vm,&dl)==ETIMEDOUT){ const char *nm=clients[behind].name; u64 due=clients[behind].due; pthread_mutex_unlock(&vm);
                 kh_fatal(g,"vclock-client-stuck: clock client '%s' did not finish its work due at virtual time %llu ns within %d s of host time (the clock is at %llu ns)",nm,(unsigned long long)due,VC_CLIENT_WAIT_S,(unsigned long long)now); } }
         if(now>=target) return;
         u64 stop=target; for(int i=0;i<MAXCLIENTS;i++) if(clients[i].used&&clients[i].due<stop) stop=clients[i].due;
@@ -386,9 +382,10 @@ int kh_vclock_selftest(KCtx *g){
       wr64(g,FRAME_SEM_VA,saved); ga_free(o); ga_free(o2); ga_free(dev); }
     kh_vclock_test_end(); ga_free(m);
     /* 8. KHNMC_CLOCK values */
-    { pid_t pid=fork(); if(pid==0){ setenv("KHNMC_CLOCK","bogus",1); if(!freopen("/dev/null","w",stderr)){} kh_vclock_init(); _exit(0); }
+    if(!kh_fork_ok()) kh_selftest_not_run("vclock","KHNMC_CLOCK=bogus and frames with KHNMC_CLOCK_PACE=warp (named fatals at start-up)",2);   /* iOS: no fork (host_env.c) */
+    else { pid_t pid=kh_fork(); if(pid==0){ setenv("KHNMC_CLOCK","bogus",1); if(!freopen("/dev/null","w",stderr)){} kh_vclock_init(); _exit(0); }
       int stt=0; VCHECK(pid>0&&waitpid(pid,&stt,0)==pid&&WIFEXITED(stt)&&WEXITSTATUS(stt)!=0);             /* unknown mode: named fatal, not a silent host clock */
-      pid=fork(); if(pid==0){ setenv("KHNMC_CLOCK","frames",1); setenv("KHNMC_CLOCK_PACE","warp",1); if(!freopen("/dev/null","w",stderr)){} kh_vclock_init(); _exit(0); }
+      pid=kh_fork(); if(pid==0){ setenv("KHNMC_CLOCK","frames",1); setenv("KHNMC_CLOCK_PACE","warp",1); if(!freopen("/dev/null","w",stderr)){} kh_vclock_init(); _exit(0); }
       stt=0; VCHECK(pid>0&&waitpid(pid,&stt,0)==pid&&WIFEXITED(stt)&&WEXITSTATUS(stt)!=0); }
     fprintf(stderr,"kh: vclock selftest: %d checks, %d failures\n",checks,fails);
     return fails;

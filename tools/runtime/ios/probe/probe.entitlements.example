@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- tools/ios/probe/probe.entitlements.example : NOT used by the generated project (which signs nothing and has no entitlements).
+     For the SECOND probe run only, by the owner: both keys need a paid developer team that has the capability, and the signature
+     carries the signer's identity.  Run the probe once without this file, once with it, and compare the two probe.txt files:
+     the difference is what the entitlements buy (docs/IOS-SHELL.md "Memory"). -->
+<plist version="1.0">
+<dict>
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+</dict>
+</plist>

@@ -12,7 +12,8 @@
 #ifdef __APPLE__
 #include <sys/ucontext.h>
 #include <TargetConditionals.h>
-#if TARGET_OS_OSX                      /* <mach/mach_vm.h> is "unsupported" in the iOS SDK: there the report falls back to mincore */
+#if TARGET_OS_OSX && !KH_IOS_PATHS     /* <mach/mach_vm.h> is "unsupported" in the iOS SDK: an iOS build, and any KH_IOS_PATHS build (so that
+                                        * this path runs on macOS first), uses mincore for the report */
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #define KH_HAVE_PAGE_QUERY 1
@@ -349,7 +350,12 @@ void ga_report(FILE *f){
     /* what the host really holds in memory (mincore): committed is address space, resident is RAM.  The windows that belong to the
      * enlarged pools entirely are counted on their own: they are committed in full and meant to stay untouched until used. */
     { u64 pg=kh_host_page(), g1, img=ga_resident2(GS_BASE,arena_lo-GS_BASE,&g1), tot=img, gone=g1, pool=0, poolg=0, poolw=0;
-      fprintf(f,"kh: guest arena: memory now, resident + compressed-or-swapped (the second number is 0 where the host does not tell: Linux): image %llu+%llu MiB",(unsigned long long)(img>>20),(unsigned long long)(g1>>20));
+#ifdef KH_HAVE_PAGE_QUERY
+      const char *how="mach_vm_page_range_query";
+#else
+      const char *how="mincore: resident only, the second number is always 0";
+#endif
+      fprintf(f,"kh: guest arena: memory now (%s), resident + compressed-or-swapped (the second number is 0 where the host does not tell: Linux): image %llu+%llu MiB",how,(unsigned long long)(img>>20),(unsigned long long)(g1>>20));
       for(int i=0;i<nzones;i++){ u64 r=ga_resident2(zones[i].lo,zones[i].commit-zones[i].lo,&g1); tot+=r; gone+=g1; fprintf(f,", %s %llu+%llu MiB",zones[i].name,(unsigned long long)(r>>20),(unsigned long long)(g1>>20)); }
       for(u64 w=0;w<nwin;w++) if(win_live[w*GA_NSRC+GA_SRC_POOL]==GA_WIN){ poolw++; pool+=ga_resident2(GS_BASE+(w<<GA_WIN_SHIFT),GA_WIN,&g1); poolg+=g1; }
       fprintf(f,", total %llu+%llu MiB; of the id zone, the %llu windows held entirely by the enlarged pools: %llu+%llu MiB touched of %llu MiB (host page %llu bytes)\n",
@@ -573,7 +579,7 @@ void kh_trace_init(void){
     p=getenv("KH_TRACE_NOSYNC"); trace_skip_sync=p&&*p=='1';
     p=getenv("KH_IMPORT_COUNTS"); impc_on=p&&*p=='1';
     p=getenv("KH_IMPORT_SITES"); if(p&&*p) imps_pat=p;
-    p=getenv("KH_LIBM_ARGS"); if(p&&*p){ libm_f=fopen(p,"wb"); libm_seen=calloc(LIBM_SEEN,sizeof *libm_seen); if(!libm_f||!libm_seen){ fprintf(stderr,"kh: cannot write KH_LIBM_ARGS=%s\n",p); _exit(2); } }
+    p=getenv("KH_LIBM_ARGS"); if(p&&*p){ libm_f=fopen(p,"wb"); libm_seen=calloc(LIBM_SEEN,sizeof *libm_seen); if(!libm_f||!libm_seen){ fprintf(stderr,"kh: cannot write KH_LIBM_ARGS=%s\n",p); kh_host_exit(2); } }
 }
 u64 kh_trace_count(void){ return trseq; }
 /* KH_IMPORT_COUNTS=1: calls per import, printed at exit (`kh: import count <n> <dll!name>`, sorted by name).  A cheap fingerprint of
@@ -623,7 +629,7 @@ void kh_trace_import(KCtx *g,const char *name){
     u64 rv=e->ret-GS_BASE;
     if(rv>=0x109000&&rv<0x12a000 && !atomic_exchange(&kh_gx_reached,1)){
         fprintf(stderr,"kh: FIRST GX CALL REACHED: import %s from call-site RVA 0x%llx (import call #%llu)\n",name,(unsigned long long)rv,(unsigned long long)s);
-        if(stop_at_gx){ fflush(stderr); if(trf) fflush(trf); _exit(0); }
+        if(stop_at_gx){ fflush(stderr); if(trf) fflush(trf); kh_host_exit(0); }
     }
     if(trf && s<trmax){
         if(trace_skip_sync && (strstr(name,"CriticalSection")||strstr(name,"Mtx_"))) return;
@@ -671,7 +677,7 @@ void kh_fatal(KCtx *g,const char *fmt,...){
     fault_who(stderr); dump_last(stderr,30); guest_bt(g?g:tl_cur_g,stderr);
     void *bt[40]; int n=backtrace(bt,40); fprintf(stderr,"---- host backtrace ----\n"); backtrace_symbols_fd(bt,n,2);
     fault_extras(stderr);
-    fflush(stderr); if(trf) fflush(trf); _exit(3);
+    fflush(stderr); if(trf) fflush(trf); kh_host_exit(3);
 }
 void kh_warn(const char *fmt,...){ va_list ap; fprintf(stderr,"kh: warn: "); va_start(ap,fmt); vfprintf(stderr,fmt,ap); va_end(ap); fputc('\n',stderr); }
 void kh_log(const char *fmt,...){ if(!kh_verbose) return; va_list ap; va_start(ap,fmt); vfprintf(stderr,fmt,ap); va_end(ap); fputc('\n',stderr); }
@@ -702,7 +708,7 @@ static void on_sig(int sig,siginfo_t *si,void *uc){
     { extern void kh_moose_fault_note(FILE *,int,void *,void *); kh_moose_fault_note(stderr,sig,si->si_addr,uc); }   /* Task 23: what the modded PC game would have done here */
     fault_who(stderr); dump_last(stderr,30); guest_bt(tl_cur_g,stderr);
     void *bt[48]; int n=backtrace(bt,48); fprintf(stderr,"---- host backtrace ----\n"); backtrace_symbols_fd(bt,n,2);
-    fault_extras(stderr); fflush(stderr); if(trf) fflush(trf); _exit(4);
+    fault_extras(stderr); fflush(stderr); if(trf) fflush(trf); kh_host_exit(4);
 }
 static __thread char *altstack_mem;
 void kh_install_sigaltstack(void){
@@ -762,7 +768,7 @@ void kh_fault(KCtx *g,u64 va,const char *kind){
     if(g&&GA_OK(KH_RSP(g))) fprintf(stderr,"kh: top of guest stack (return addr) = 0x%llx\n",(unsigned long long)rd64(g,KH_RSP(g)));
     fault_who(stderr); dump_last(stderr,30); guest_bt(g,stderr);
     void *bt[40]; int n=backtrace(bt,40); fprintf(stderr,"---- host backtrace ----\n"); backtrace_symbols_fd(bt,n,2);
-    fault_extras(stderr); fflush(stderr); if(trf) fflush(trf); _exit(5);
+    fault_extras(stderr); fflush(stderr); if(trf) fflush(trf); kh_host_exit(5);
 }
 void kh_unimplemented_import(KCtx *g,const char *dll,const char *name){
     u64 ra=GA_OK(KH_RSP(g))?rd64(g,KH_RSP(g)):0;

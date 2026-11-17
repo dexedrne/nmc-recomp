@@ -1,0 +1,273 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		EAC253D1D6B0C81F4DB24A34 /* ios_main.m in Sources */ = {isa = PBXBuildFile; fileRef = D1F860AC5E1D1D79AD68E57F /* ios_main.m */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		692E7ECCB8E1BB5BD6CB5F05 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; name = Info.plist; path = Info.plist; sourceTree = "<group>"; };
+		6C947568E980A3811F7C8015 /* KHNMC.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = KHNMC.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		D1F860AC5E1D1D79AD68E57F /* ios_main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = ios_main.m; path = ../../runtime/ios/ios_main.m; sourceTree = SOURCE_ROOT; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		7F9661FA087B4C712F768EBB /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		20724E4E09D5AF912FD57DD9 = {
+			isa = PBXGroup;
+			children = (
+				C60DE5D6221CDB2986DF50B3 /* App shell */,
+				79AFF52C77796B7813D19D51 /* App */,
+				9981940C002E467B3E091C49 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		79AFF52C77796B7813D19D51 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				692E7ECCB8E1BB5BD6CB5F05 /* Info.plist */,
+			);
+			name = App;
+			sourceTree = "<group>";
+		};
+		9981940C002E467B3E091C49 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				6C947568E980A3811F7C8015 /* KHNMC.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		C60DE5D6221CDB2986DF50B3 /* App shell */ = {
+			isa = PBXGroup;
+			children = (
+				D1F860AC5E1D1D79AD68E57F /* ios_main.m */,
+			);
+			name = "App shell";
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		AD810D7286D179CE8060312B /* KHNMC */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 9370F2BAEDD1F8D146CFDDE1;
+			buildPhases = (
+				484A711E51ADF6D656F0F203 /* Sources */,
+				7F9661FA087B4C712F768EBB /* Frameworks */,
+				4D3E60C0D3B7E690194D9E36 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = KHNMC;
+			productName = KHNMC;
+			productReference = 6C947568E980A3811F7C8015 /* KHNMC.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		AEB831D3BD0AAEEA00833FDC /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastUpgradeCheck = 2700;
+			};
+			buildConfigurationList = F9B156E46422FBCE2301B8CF;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 20724E4E09D5AF912FD57DD9;
+			productRefGroup = 9981940C002E467B3E091C49 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				AD810D7286D179CE8060312B /* KHNMC */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		4D3E60C0D3B7E690194D9E36 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		484A711E51ADF6D656F0F203 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				EAC253D1D6B0C81F4DB24A34 /* ios_main.m */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		AC931BF90A7E23CAAAA30E76 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ARCHS = arm64;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_REQUIRED = NO;
+				CODE_SIGN_IDENTITY = "";
+				CODE_SIGN_STYLE = Manual;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_BITCODE = NO;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				ONLY_ACTIVE_ARCH = NO;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+		D3EB934E4BC8C2D35540FAC4 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COPY_PHASE_STRIP = NO;
+				CURRENT_PROJECT_VERSION = 1;
+				GCC_GENERATE_DEBUGGING_SYMBOLS = NO;
+				GCC_OPTIMIZATION_LEVEL = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Info.plist;
+				KHNMC_LIBS = "$(KHNMC_REPO)/obj-$(PLATFORM_NAME)";
+				KHNMC_REPO = "$(SRCROOT)/../..";
+				MARKETING_VERSION = 0.1.0;
+				OTHER_CFLAGS = (
+					"-ffp-contract=off",
+					"-ffile-prefix-map=$(KHNMC_REPO)/=khnmc/",
+				);
+				OTHER_LDFLAGS = (
+					"-Wl,-force_load,$(KHNMC_LIBS)/libkhnmc-rt.a",
+					"$(KHNMC_LIBS)/libkh2loose.a",
+					"-framework",
+					Foundation,
+					"-framework",
+					UIKit,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = beer.vyvanse.khnmc;
+				PRODUCT_NAME = KHNMC;
+				STRIP_INSTALLED_PRODUCT = NO;
+				VALIDATE_PRODUCT = NO;
+				WARNING_CFLAGS = (
+					"-Wall",
+					"-Wextra",
+					"-Wno-unused-parameter",
+				);
+			};
+			name = Release;
+		};
+		F9A58A6CCB075254CC7109BD /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CURRENT_PROJECT_VERSION = 1;
+				GCC_GENERATE_DEBUGGING_SYMBOLS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Info.plist;
+				KHNMC_LIBS = "$(KHNMC_REPO)/obj-$(PLATFORM_NAME)";
+				KHNMC_REPO = "$(SRCROOT)/../..";
+				MARKETING_VERSION = 0.1.0;
+				OTHER_CFLAGS = (
+					"-ffp-contract=off",
+					"-ffile-prefix-map=$(KHNMC_REPO)/=khnmc/",
+				);
+				OTHER_LDFLAGS = (
+					"-Wl,-force_load,$(KHNMC_LIBS)/libkhnmc-rt.a",
+					"$(KHNMC_LIBS)/libkh2loose.a",
+					"-framework",
+					Foundation,
+					"-framework",
+					UIKit,
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = beer.vyvanse.khnmc;
+				PRODUCT_NAME = KHNMC;
+				WARNING_CFLAGS = (
+					"-Wall",
+					"-Wextra",
+					"-Wno-unused-parameter",
+				);
+			};
+			name = Debug;
+		};
+		FA2E8D0C3260385EA1C66EBA /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ARCHS = arm64;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CODE_SIGNING_ALLOWED = NO;
+				CODE_SIGNING_REQUIRED = NO;
+				CODE_SIGN_IDENTITY = "";
+				CODE_SIGN_STYLE = Manual;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_BITCODE = NO;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				ONLY_ACTIVE_ARCH = NO;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		9370F2BAEDD1F8D146CFDDE1 /* Build configuration list for PBXNativeTarget "KHNMC" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F9A58A6CCB075254CC7109BD /* Debug */,
+				D3EB934E4BC8C2D35540FAC4 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		F9B156E46422FBCE2301B8CF /* Build configuration list for PBXProject "KHNMC" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				FA2E8D0C3260385EA1C66EBA /* Debug */,
+				AC931BF90A7E23CAAAA30E76 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = AEB831D3BD0AAEEA00833FDC /* Project object */;
+}

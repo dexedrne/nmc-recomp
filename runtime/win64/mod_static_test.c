@@ -13,8 +13,8 @@ extern const struct kh_mod_static_fn kh_mod_static_fn_table[]; extern const u32 
 extern const u32 kh_mod_dual_slots_image[6];
 
 static int run_fatal(KCtx *g,void (*body)(KCtx *),char *out,size_t cap){
-    FILE *log=tmpfile(); if(!log) kh_fatal(g,"mod static selftest: tmpfile failed");
-    pid_t child=fork(); if(child<0) kh_fatal(g,"mod static selftest: fork failed");
+    FILE *log=kh_tmpfile(); if(!log) kh_fatal(g,"mod static selftest: tmpfile failed");
+    pid_t child=kh_fork(); if(child<0) kh_fatal(g,"mod static selftest: fork failed");
     if(!child){ if(dup2(fileno(log),STDERR_FILENO)<0) _exit(98); body(g); _exit(99); }
     int status=0; if(waitpid(child,&status,0)!=child) kh_fatal(g,"mod static selftest: waitpid failed");
     rewind(log); size_t n=fread(out,1,cap-1,log); out[n]=0; fclose(log);
@@ -92,6 +92,7 @@ static void test_tables(KCtx *g){
     /* named fatals (child processes; exit status 3 = kh_fatal) */
     char out[8192];
     const int probe[]={0,n/2,n-1};
+    if(kh_fork_ok()){
     for(unsigned k=0;k<3;k++){
         fatal_edit=probe[k]; kh_mod_static_edit(fatal_edit,&rva,&len,&kind,&rel,&o,&nw);
         char want[64]; snprintf(want,sizeof want,"mod-static-old-bytes: edit %d of %d at rva 0x%x ",fatal_edit,n,rva);
@@ -99,6 +100,7 @@ static void test_tables(KCtx *g){
     }
     T(run_fatal(g,fatal_busy,out,sizeof out)==3); T(strstr(out,"mod-static-nmc-busy:")!=NULL&&strstr(out,"+0xfff")!=NULL);
     T(run_fatal(g,fatal_reinit,out,sizeof out)==3); T(strstr(out,"mod-static-reinit:")!=NULL);
+    } else kh_selftest_not_run("mod static","named fatals of the image check: old bytes at three edits (9), busy buffer (2), second init (2)",13);   /* iOS: no fork (host_env.c) */
     ga_free(scratch); ga_free(scratch_nmc-16);
 }
 
@@ -173,7 +175,8 @@ static void test_sites(KCtx *g){
         T(KH_R8(g)==forms[i]); T(state_same_except(&before,g,1));
     }
     T(!memcmp(hp(g,kh_mod_dual_slots_va),kh_mod_dual_slots_image,24));
-    { char out[4096]; T(run_fatal(g,fatal_noslots,out,sizeof out)==5); T(strstr(out,"dual-wield slot block not initialised")!=NULL); }
+    if(kh_fork_ok()){ char out[4096]; T(run_fatal(g,fatal_noslots,out,sizeof out)==5); T(strstr(out,"dual-wield slot block not initialised")!=NULL); }
+    else kh_selftest_not_run("mod static","dual-wield site handler without its slot block (fault 5)",2);   /* iOS: no fork (host_env.c) */
 
     /* DLL 0x34460.  Expected: ok = (cat==dil && s16[rbx]<s16 di) || (word[rax+c]==1 && s16[rbx]<s16 di); flags = last compare run. */
     u64 info=ga_calloc(1,0x20), ent=ga_calloc(1,0x10);

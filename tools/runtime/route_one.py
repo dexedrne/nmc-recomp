@@ -3,7 +3,8 @@
 
   tools/route_one.py --bin ./khnmc --exe PATH/kh2fm.exe --data DATA_TREE --pkgdir PKGDIR --out OUTDIR
                      [--game-frames 7000] [--seconds 600] [--difficulty none|0..3] [--input runtime/task6-field-input.txt]
-                     [--env VAR=VALUE]... [--require field|none] [--label TEXT] [--no-nice] [--min-free-pct 30]
+                     [--env VAR=VALUE]... [--require field|none] [--label TEXT] [--no-nice] [--nice 10] [--min-free-pct 30]
+                     [--ios-paths]
 
 route_batch.sh is the Linux batch driver (waves, /proc/meminfo, taskset, coreutils timeout); macOS has none of those, and the Mac
 mini runs one route at a time.  This script makes the same run: fresh OUTDIR/{root,docs}, the same variables (KH_EXE KH_ROOT KH_DOCS
@@ -13,6 +14,13 @@ verdict: ok only for exit 0 AND the phase log showing FIELD_COMMAND.execute call
 Outputs: OUTDIR/run.out, phase.log, files.log, exit, env, summary.tsv (one header line + one row; the columns of route_batch.sh
 plus damage calls, HD assets served, source voices and the peak RSS) and summary.json with every counter that was parsed.
 macOS: before starting, `memory_pressure` must report at least --min-free-pct free (default 30), else the run is refused (exit 3).
+In an --env value `@OUT@` stands for OUTDIR (absolute), e.g. --env KHNMC_AUDIO=wav:@OUT@/audio.wav.
+--ios-paths (task 26): BIN is a KH_IOS_PATHS build (make IOS_PATHS=1).  The run is then started the way an app is: OUTDIR/home is
+the app container (Documents/kh2fm.exe, Documents/data, Documents/pkgdir as links, the input script as a copy, Documents/khnmc.conf
+with every variable of the run), the process gets an EMPTY environment except PATH, KH_APP_HOME and KH_TMPDIR, and its working
+directory is OUTDIR, not the game directory.  KH_EXE, KH_ROOT, KH_DOCS, KHNMC_DATA and KHNMC_PKGDIR are not passed at all: they
+must come from the container defaults (runtime/host_env.c).  The log, phase log and file log are written inside Documents and
+copied to OUTDIR afterwards; the status file must say `exit N` with the status the process really ended with, else the run FAILS.
 Exit status: 0 ok, 1 failed or diverged, 2 usage, 3 refused.  Python 3.6+, standard library.
 """
 import argparse
@@ -42,7 +50,10 @@ def main():
     ap.add_argument('--input', default=None); ap.add_argument('--env', action='append', default=[])
     ap.add_argument('--require', default='field', choices=['field', 'none']); ap.add_argument('--label', default='')
     ap.add_argument('--no-nice', action='store_true'); ap.add_argument('--min-free-pct', type=int, default=30)
+    ap.add_argument('--nice', type=int, default=10); ap.add_argument('--ios-paths', action='store_true')
     a = ap.parse_args()
+    if not 0 <= a.nice <= 20:
+        sys.stderr.write('route_one: --nice takes 0..20\n'); return 2
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     inp = a.input or os.path.join(here, 'runtime', 'task6-field-input.txt')
     for f in (a.bin, a.exe, a.data, a.pkgdir, inp):
@@ -61,8 +72,16 @@ def main():
     out = os.path.abspath(a.out)
     for sub in ('root', 'docs'):
         shutil.rmtree(os.path.join(out, sub), ignore_errors=True)
-    os.makedirs(os.path.join(out, 'root')); os.makedirs(os.path.join(out, 'docs'))
-    for f in ('run.out', 'phase.log', 'files.log', 'exit', 'summary.tsv', 'summary.json'):
+    home = os.path.join(out, 'home'); docs = os.path.join(home, 'Documents'); mark = os.path.join(home, '.khnmc-ios-paths-home')
+    if os.path.exists(home):
+        if not os.path.exists(mark):
+            sys.stderr.write('route_one: %s exists and is not from this script: not touching it\n' % home); return 2
+        shutil.rmtree(home)
+    if a.ios_paths:
+        os.makedirs(docs); os.makedirs(os.path.join(home, 'tmp')); open(mark, 'w').close()
+    else:
+        os.makedirs(os.path.join(out, 'root')); os.makedirs(os.path.join(out, 'docs'))
+    for f in ('run.out', 'launch.out', 'phase.log', 'files.log', 'exit', 'summary.tsv', 'summary.json'):
         try: os.unlink(os.path.join(out, f))
         except OSError: pass
     binc = os.path.join(out, 'khnmc.bin'); shutil.copy2(a.bin, binc)      # rebuilding during the run cannot change what runs
@@ -76,19 +95,52 @@ def main():
     for kv in a.env:
         if '=' not in kv:
             sys.stderr.write('route_one: --env takes VAR=VALUE\n'); return 2
-        k, v = kv.split('=', 1); run_env[k] = v
-    env.update(run_env)
-    with open(os.path.join(out, 'env'), 'w') as f:
-        f.write(''.join('%s=%s\n' % kv for kv in run_env.items()) + 'wrapper=%s\n' % ('' if a.no_nice else 'nice -n 10'))
-    cmd = ([] if a.no_nice else ['nice', '-n', '10']) + [binc]
+        k, v = kv.split('=', 1); run_env[k] = v.replace('@OUT@', out)
+    wrapper = '' if a.no_nice else 'nice -n %d' % a.nice
+    cmd = ([] if a.no_nice else ['nice', '-n', str(a.nice)]) + [binc]
+    if a.ios_paths:
+        # the app container: what the user would put into Documents, and a conf that carries the whole run
+        os.symlink(os.path.abspath(a.exe), os.path.join(docs, 'kh2fm.exe')); os.symlink(os.path.abspath(a.data), os.path.join(docs, 'data'))
+        os.symlink(os.path.abspath(a.pkgdir), os.path.join(docs, 'pkgdir')); shutil.copy(inp, os.path.join(docs, 'input.txt'))
+        for k in ('KH_EXE', 'KH_ROOT', 'KH_DOCS', 'KHNMC_DATA', 'KHNMC_PKGDIR'): del run_env[k]
+        run_env['KHNMC_INPUT_SCRIPT'] = '@DOCS@/input.txt'; run_env['KHNMC_PHASELOG'] = '@DOCS@/phase.log'; run_env['KHNMC_FILELOG'] = '@DOCS@/files.log'
+        with open(os.path.join(docs, 'khnmc.conf'), 'w') as f:
+            f.write('# written by tools/route_one.py --ios-paths: one headless field route, the way the app shell would be told to run it\n'
+                    'log khnmc.log\nstatus khnmc.status\n' + ''.join('env %s=%s\n' % kv for kv in run_env.items()))
+        env = {'PATH': '/usr/bin:/bin', 'KH_APP_HOME': home, 'KH_TMPDIR': os.path.join(home, 'tmp')}
+        cwd, first = out, 'launch.out'
+        with open(os.path.join(out, 'env'), 'w') as f:
+            f.write('KH_APP_HOME=%s\nKH_TMPDIR=%s\nPATH=/usr/bin:/bin\n(nothing else in the environment; Documents/khnmc.conf:)\n' % (home, os.path.join(home, 'tmp'))
+                    + open(os.path.join(docs, 'khnmc.conf')).read() + 'wrapper=%s\n' % wrapper)
+    else:
+        env.update(run_env); cwd, first = os.path.join(out, 'root'), 'run.out'
+        with open(os.path.join(out, 'env'), 'w') as f:
+            f.write(''.join('%s=%s\n' % kv for kv in run_env.items()) + 'wrapper=%s\n' % wrapper)
     t0 = time.time(); status = None
-    with open(os.path.join(out, 'run.out'), 'wb') as ro:
-        p = subprocess.Popen(cmd, cwd=os.path.join(out, 'root'), env=env, stdout=ro, stderr=subprocess.STDOUT)
+    with open(os.path.join(out, first), 'wb') as ro:
+        p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=ro, stderr=subprocess.STDOUT)
         try:
             p.wait(timeout=a.seconds + 90); status = p.returncode
         except subprocess.TimeoutExpired:                       # still alive 90 s after its own time limit: a hang
             p.kill(); p.wait(); status = 124
     wall = time.time() - t0
+    ios_note = ''
+    if a.ios_paths:
+        # the logs were written inside the container: bring them to where every other run has them
+        with open(os.path.join(out, 'run.out'), 'wb') as ro:
+            for src in (os.path.join(out, 'launch.out'), os.path.join(docs, 'khnmc.log')):
+                if os.path.exists(src): ro.write(open(src, 'rb').read())
+        for name in ('phase.log', 'files.log'):
+            if os.path.exists(os.path.join(docs, name)): shutil.copy(os.path.join(docs, name), os.path.join(out, name))
+        try: st = open(os.path.join(docs, 'khnmc.status')).read().strip()
+        except OSError: st = '<no status file>'
+        real = status if status >= 0 else 128 - status
+        left = sorted(os.listdir(os.path.join(home, 'tmp')))
+        stray = sorted(x for x in os.listdir(out) if x in ('docs', 'root', 'data'))
+        if st != 'exit %d' % real: ios_note = 'status file says %r, the process ended with %d' % (st, real)
+        elif stray: ios_note = 'the launch directory got %s: a path that did not come from the container' % ' '.join(stray)
+        print('route_one: ios-paths: status file %r (process exit %d); left in the scratch directory: %s; container: %s'
+              % (st, real, ' '.join(left) or 'nothing', ' '.join(sorted(os.listdir(docs)))))
     ru = resource.getrusage(resource.RUSAGE_CHILDREN)
     rss_mb = ru.ru_maxrss // (1 << 20) if darwin else ru.ru_maxrss // 1024      # bytes on macOS, KiB on Linux
     ex = status if status >= 0 else 128 - status
@@ -118,7 +170,9 @@ def main():
          'wall_s': int(wall), 'cpu_s': int(ru.ru_utime + ru.ru_stime), 'rss_mb': rss_mb,
          'binary_sha256': subprocess.check_output(['shasum', '-a', '256', binc] if darwin else ['sha256sum', binc], universal_newlines=True)[:16]}
     result, sig = 'ok', ''
-    if ex == 0 and a.require == 'field' and c['field_cmds'] == 0:
+    if ios_note:
+        result, sig = 'FAIL', 'ios-paths: ' + ios_note
+    elif ex == 0 and a.require == 'field' and c['field_cmds'] == 0:
         result = 'DIVERGED'
         ls = re.findall(r'kh: (InitialSetting frame=.*)', txt)
         sig = 'exit 0 but the route never reached the field | last %s' % (ls[-1] if ls else '-')

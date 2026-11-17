@@ -446,9 +446,10 @@ int kh_mod_caps_selftest(KCtx *g){
     memset(hp(g,sheet),0,sizeof backup); wr32(g,count,0); wr32(g,sheet+0x260,2); wr32(g,sheet+0x264,100); wr32(g,sheet+4,119);
     kh_call(g,GS_BASE+0x3c4b80,effect,2,0,100); CAP_T(rd32(g,sheet+4)==119); CAP_T(rd32(g,sheet+0x264)==100);
     wr16(g,effect,0x777); wr8(g,effect+5,13);
-    for(int apply=0;apply<2;apply++){
-        FILE *log=tmpfile(); if(!log) kh_fatal(g,"caps selftest cannot open fatal log");
-        pid_t child=fork();
+    if(!kh_fork_ok()) kh_selftest_not_run("difficulty caps","unimplemented item effect in the usable and the apply hook (named fatal)",4);   /* iOS: no fork (host_env.c) */
+    else for(int apply=0;apply<2;apply++){
+        FILE *log=kh_tmpfile(); if(!log) kh_fatal(g,"caps selftest cannot open fatal log");
+        pid_t child=kh_fork();
         if(!child){ dup2(fileno(log),2); kh_call(g,GS_BASE+(apply?0x3c4b80:0x3c3da0),effect,2,0,100); _exit(99); }
         int status=0; if(child<0) kh_fatal(g,"caps selftest fork failed"); waitpid(child,&status,0);
         rewind(log); char output[2048]; size_t len=fread(output,1,sizeof output-1,log); output[len]=0; fclose(log);

@@ -22,9 +22,9 @@ enum { S1=0x2e5380, S2=0x424570, S3=0x30660a, S4=0x2ffa30, S5=0x15b6d0, S5_SECON
 #define ROW_IMM    (GS_BASE+0x15b962)           /* S5+0x292: imm8 of `add ebp,imm8` at 0x15b960 */
 
 static int run_child(KCtx *g,void (*body)(KCtx *),int fd,char *out,size_t cap){
-    FILE *log=tmpfile(); if(!log) kh_fatal(g,"mod neverland selftest: tmpfile failed");
+    FILE *log=kh_tmpfile(); if(!log) kh_fatal(g,"mod neverland selftest: tmpfile failed");
     fflush(stdout); fflush(stderr);
-    pid_t child=fork(); if(child<0) kh_fatal(g,"mod neverland selftest: fork failed");
+    pid_t child=kh_fork(); if(child<0) kh_fatal(g,"mod neverland selftest: fork failed");
     if(!child){ if(dup2(fileno(log),fd)<0) _exit(98); body(g); fflush(stdout); _exit(99); }
     int status=0; if(waitpid(child,&status,0)!=child) kh_fatal(g,"mod neverland selftest: waitpid failed");
     rewind(log); size_t n=fread(out,1,cap-1,log); out[n]=0; fclose(log);
@@ -149,6 +149,7 @@ static void test_apply(KCtx *g){
     }
     T(kh_mod_neverland_check(g,scratch_base)==-1);
     const int probe[]={0,3,n-1};
+    if(kh_fork_ok()){
     for(unsigned k=0;k<3;k++){
         fatal_edit=probe[k]; kh_mod_neverland_edit(fatal_edit,&rva,&len,&pad,&func,&o,&nw);
         char want[80]; snprintf(want,sizeof want,"mod-neverland-old-bytes: edit %d of 6 at rva 0x%x ",fatal_edit,rva);
@@ -161,6 +162,7 @@ static void test_apply(KCtx *g){
     T(run_child(g,fatal_sig_first,STDERR_FILENO,out,sizeof out)==3); T(strstr(out,"mod-neverland-signature: S3 (12 bytes")!=NULL&&strstr(out,"first match 0x1000 of 2, the pinned kh2fm.exe has 0x30660a of 1")!=NULL);
     T(run_child(g,fatal_site,STDERR_FILENO,out,sizeof out)==5); T(strstr(out,"exe 0x15b960 is no longer `add ebp,imm8`")!=NULL);
     T(run_child(g,child_banner,STDOUT_FILENO,out,sizeof out)==99); T(!strcmp(out,"flytest\n"));       /* DLL 0x1692: printf to stdout, once */
+    } else kh_selftest_not_run("mod neverland","named fatals: old bytes at three edits (9), second init (2), four signature cases (8), the row-step site (2); and the stdout banner of the DLL (2)",23);   /* iOS: no fork (host_env.c) */
     ga_free(scratch);
 }
 

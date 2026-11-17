@@ -95,8 +95,8 @@ static void dump_log(const char *why){
 
 /* Run `body` in a forked child with stderr captured; returns the exit status and fills `out`. */
 static int run_fatal(KCtx *g,void (*body)(KCtx *),char *out,size_t cap){
-    FILE *log=tmpfile(); if(!log) kh_fatal(g,"mod A selftest: tmpfile failed");
-    pid_t child=fork(); if(child<0) kh_fatal(g,"mod A selftest: fork failed");
+    FILE *log=kh_tmpfile(); if(!log) kh_fatal(g,"mod A selftest: tmpfile failed");
+    pid_t child=kh_fork(); if(child<0) kh_fatal(g,"mod A selftest: fork failed");
     if(!child){ if(dup2(fileno(log),STDERR_FILENO)<0) _exit(98); body(g); _exit(99); }
     int status=0; if(waitpid(child,&status,0)!=child) kh_fatal(g,"mod A selftest: waitpid failed");
     rewind(log); size_t n=fread(out,1,cap-1,log); out[n]=0; fclose(log);
@@ -220,8 +220,9 @@ static void test_scripts(KCtx *g){
     CHECK_SEQ(a);
     T(nlg==5&&lg[2].s5==0);
     T(nfw==1&&r==FWD_RET&&fw.a[0]==self&&fw.a[1]==rdx&&fw.a[2]==r8&&fw.a[3]==r9&&fw.rsp==esp(sp)); T(KH_RSP(g)==sp);
-    { char out[4096]; int st=run_fatal(g,fatal_3a89a0,out,sizeof out);
+    if(kh_fork_ok()){ char out[4096]; int st=run_fatal(g,fatal_3a89a0,out,sizeof out);
       T(st==3); T(strstr(out,"mod 3a89a0: common script allocation (3e1730) returned null")!=NULL); T(KH_RSP(g)==sp); ret_cb=NULL; }
+    else { kh_selftest_not_run("mod A","3a89a0 with a null script allocation (named fatal)",3); ret_cb=NULL; }   /* iOS: no fork (host_env.c) */
     wr64(g,GS_BASE+0x2a0f688,oldg);
 
     /* 3d61d0: trigger 0x13 with four 8-byte slots */
@@ -364,10 +365,11 @@ static void test_abilities(KCtx *g){
     }
     /* fatal paths: null sheet, and an ability id with no table entry */
     char out[4096]; fatal_list=list;
-    wr64(g,list+0x28,0); T(run_fatal(g,fatal_ab_nosheet,out,sizeof out)==3); T(strstr(out,"mod 4014a0: ability list")&&strstr(out,"no actor block"));
+    if(!kh_fork_ok()) kh_selftest_not_run("mod A","4014a0 with a null sheet and with an ability id that has no table entry (named fatals)",4);   /* iOS: no fork (host_env.c) */
+    wr64(g,list+0x28,0); if(kh_fork_ok()){ T(run_fatal(g,fatal_ab_nosheet,out,sizeof out)==3); T(strstr(out,"mod 4014a0: ability list")&&strstr(out,"no actor block")); }
     wr64(g,list+0x28,sheet); wr32(g,sheet+0x250,id_first); wr32(g,sheet+0x254,id_second);
     memset(hp(g,lst1),0,0x100); wr16(g,lst1+0x54,0xc123);   /* decodes negative: no table entry (the DLL dereferences null) */
-    T(run_fatal(g,fatal_ab_noinfo,out,sizeof out)==3); T(strstr(out,"mod 4014a0: no ability table entry")&&strstr(out,"decoded id -16093"));
+    if(kh_fork_ok()){ T(run_fatal(g,fatal_ab_noinfo,out,sizeof out)==3); T(strstr(out,"mod 4014a0: no ability table entry")&&strstr(out,"decoded id -16093")); }
     T(KH_RSP(g)==sp);
     ret_cb=NULL;
     for(int i=0;i<ab_n;i++) ga_free(ab_mem[i]);
@@ -405,7 +407,7 @@ static void test_shopface(KCtx *g){
     char want[64]; snprintf(want,sizeof want,"menu/shopface/%s.bin","qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq");
     T(!strcmp(gstr(g,out),want));
     /* Resolution through the loose-tree file layer: mixed-case file names under menu/shopface, found via the 1063d0 size query. */
-    char dir[]="/tmp/khnmc-shop-XXXXXX",p[512],lp[512];
+    char dir[KH_TMP_MAX],p[KH_TMP_MAX+256],lp[KH_TMP_MAX+256]; kh_tmp_path(dir,sizeof dir,"khnmc-shop-XXXXXX");   /* host_env.c: /tmp, or the app container on iOS */
     if(!mkdtemp(dir)) kh_fatal(g,"mod A selftest: mkdtemp failed");
     snprintf(p,sizeof p,"%s/menu",dir); mkdir(p,0700); snprintf(p,sizeof p,"%s/menu/ShopFace",dir); mkdir(p,0700);
     snprintf(p,sizeof p,"%s/menu/ShopFace/P_LM100.BIN",dir); FILE *f=fopen(p,"wb"); if(!f) kh_fatal(g,"mod A selftest: cannot create fixture");
@@ -432,7 +434,8 @@ static void test_shopface(KCtx *g){
     snprintf(p,sizeof p,"%s/menu/ShopFace/P_LM100.BIN",dir); unlink(p);
     snprintf(p,sizeof p,"%s/menu/ShopFace",dir); rmdir(p); snprintf(p,sizeof p,"%s/menu",dir); rmdir(p); unlink(lp); rmdir(dir);
     char outbuf[4096];
-    T(run_fatal(g,fatal_shop,outbuf,sizeof outbuf)==3); T(strstr(outbuf,"mod 29efa0: no shop-face name entry for id 0x54"));
+    if(kh_fork_ok()){ T(run_fatal(g,fatal_shop,outbuf,sizeof outbuf)==3); T(strstr(outbuf,"mod 29efa0: no shop-face name entry for id 0x54")); }
+    else kh_selftest_not_run("mod A","29efa0 without a shop-face name entry (named fatal)",2);   /* iOS: no fork (host_env.c) */
     ret_cb=NULL; ga_free(name_entry); ga_free(out);
 }
 
