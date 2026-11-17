@@ -9,6 +9,17 @@
 #include <dirent.h>
 #include <errno.h>
 #include <execinfo.h>
+#ifdef __APPLE__
+#include <sys/ucontext.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_OSX                      /* <mach/mach_vm.h> is "unsupported" in the iOS SDK: there the report falls back to mincore */
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#define KH_HAVE_PAGE_QUERY 1
+#endif
+#else
+#include <ucontext.h>
+#endif
 #include <ctype.h>
 
 #define XLG(a) ((uintptr_t)(a)+gs_bias)
@@ -125,9 +136,24 @@ static u64 run_alloc(Zone *z,u64 size,int own_window){                   /* gm h
         return run_first_fit(z,size); }
     p=run_first_fit(z,size); return p?p:zone_take(z,rup(z->bump,4096),size);
 }
+/* A released run: its memory goes back to the host and it reads as zero from now on, on every host (the game sees zeroed
+ * memory in a reused large block and in a reused stack, as it does in a fresh one).  Linux with 4 KiB pages: MADV_DONTNEED on a
+ * private anonymous mapping does both.  Other hosts (Darwin: 16 KiB pages, and its MADV_DONTNEED / MADV_FREE neither zero nor
+ * release for certain): the whole host pages inside the run are replaced by fresh zero pages (mmap MAP_FIXED over our own
+ * reservation, the same effect), the partial pages at the two ends are cleared by hand. */
+static void host_discard(u64 lo,u64 size){
+    u64 pg=kh_host_page();
+#ifdef __linux__
+    if(pg<=4096){ madvise((void*)XLG(lo),size,MADV_DONTNEED); return; }
+#endif
+    u64 a=rup(lo,pg), b=(lo+size)&~(pg-1);
+    if(a>=b){ memset((void*)XLG(lo),0,size); return; }
+    memset((void*)XLG(lo),0,a-lo); memset((void*)XLG(b),0,lo+size-b);
+    if(mmap((void*)XLG(a),b-a,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0)==MAP_FAILED) memset((void*)XLG(a),0,b-a);
+}
 static void run_free(Zone *z,u64 lo,u64 size){                           /* gm held */
     if(ga_deterministic||!size) return;
-    madvise((void*)XLG(lo),size,MADV_DONTNEED);
+    host_discard(lo,size);
     Run **pp=&z->runs; while(*pp && (*pp)->lo<lo) pp=&(*pp)->next;
     Run *n=(Run*)malloc(sizeof(Run)); n->lo=lo; n->size=size; n->next=*pp; *pp=n; z->runfree+=size;
     if(n->next && n->lo+n->size==n->next->lo){ Run *m=n->next; n->size+=m->size; n->next=m->next; free(m); }
@@ -253,11 +279,7 @@ u64 ga_realloc(u64 p,u64 n){
 }
 u64 ga_calloc_src(u64 n,u64 s,int src){ u64 t; if(__builtin_mul_overflow(n,s,&t)) return 0; u64 p=ga_alloc_src(t,16,src); if(p) memset((void*)XLG(p),0,t); return p; }
 static void zero_run(u64 p,u64 size){
-#ifdef __linux__
-    if(p&&ga_deterministic) memset((void*)XLG(p),0,size);      /* Linux: fresh and madvise(DONTNEED)-released pages read as zero */
-#else
-    if(p) memset((void*)XLG(p),0,size);                        /* other hosts: zero explicitly */
-#endif
+    if(p&&ga_deterministic) memset((void*)XLG(p),0,size);      /* every host: fresh pages and released runs (host_discard) read as zero; writing zeros here would also commit the mod's untouched 640 MiB of pools */
 }
 u64 ga_pages_src(u64 size,int src){
     size=rup(size,4096); int zi=zone_for(src,size); Zone *z=&zones[zi];
@@ -296,6 +318,24 @@ u64 kh_ga_spread_seg(void){ return ga_spread_seg; }
 /* reports also run from the fatal and signal paths, possibly with the allocator lock held by the faulting thread: never wait for it */
 static int diag_lock(void){ return pthread_mutex_trylock(&gm)==0; }
 static void diag_unlock(int got){ if(got) pthread_mutex_unlock(&gm); }
+/* bytes of [a,a+n) (guest, host-page aligned outwards) that are in physical memory right now, and (*out, Darwin only) bytes the
+ * kernel has moved to its compressor or to swap: touched memory that no longer counts as resident.  0 when the host cannot tell. */
+static u64 ga_resident2(u64 a,u64 n,u64 *out){
+    u64 pg=kh_host_page(), lo=a&~(pg-1), hi=rup(a+n,pg), res=0, gone=0; if(out) *out=0; if(hi<=lo) return 0;
+    enum { CH=4096 }; static pthread_mutex_t vm=PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&vm);
+#ifdef KH_HAVE_PAGE_QUERY
+    static int disp[CH];
+    for(u64 p=lo;p<hi;p+=(u64)CH*pg){ u64 len=hi-p<(u64)CH*pg?hi-p:(u64)CH*pg; mach_vm_size_t cnt=len/pg; memset(disp,0,sizeof disp);
+        if(mach_vm_page_range_query(mach_task_self(),(mach_vm_offset_t)XLG(p),len,(mach_vm_address_t)(uintptr_t)disp,&cnt)==KERN_SUCCESS)
+            for(u64 i=0;i<cnt;i++){ if(disp[i]&VM_PAGE_QUERY_PAGE_PRESENT) res+=pg; else if(disp[i]&VM_PAGE_QUERY_PAGE_PAGED_OUT) gone+=pg; } }
+#else
+    static unsigned char vec[CH];
+    for(u64 p=lo;p<hi;p+=(u64)CH*pg){ u64 len=hi-p<(u64)CH*pg?hi-p:(u64)CH*pg; memset(vec,0,sizeof vec);
+        if(mincore((void*)XLG(p),len,(void*)vec)==0) for(u64 i=0;i<len/pg;i++) res+=(vec[i]&1)?pg:0; }
+#endif
+    pthread_mutex_unlock(&vm); if(out) *out=gone; return res;
+}
 void ga_report(FILE *f){
     int got=diag_lock();
     for(int i=0;i<nzones;i++){ Zone *z=&zones[i];
@@ -306,6 +346,14 @@ void ga_report(FILE *f){
                 (unsigned long long)(z->parked>>20),(unsigned long long)(z->runfree>>20)); }
     diag_unlock(got);
     if(ga_spread) fprintf(f,"kh: guest arena: KHNMC_HEAP_SPREAD gave %llu heap segments and large blocks a window of their own\n",(unsigned long long)ga_spread_blocks);
+    /* what the host really holds in memory (mincore): committed is address space, resident is RAM.  The windows that belong to the
+     * enlarged pools entirely are counted on their own: they are committed in full and meant to stay untouched until used. */
+    { u64 pg=kh_host_page(), g1, img=ga_resident2(GS_BASE,arena_lo-GS_BASE,&g1), tot=img, gone=g1, pool=0, poolg=0, poolw=0;
+      fprintf(f,"kh: guest arena: memory now, resident + compressed-or-swapped (the second number is 0 where the host does not tell: Linux): image %llu+%llu MiB",(unsigned long long)(img>>20),(unsigned long long)(g1>>20));
+      for(int i=0;i<nzones;i++){ u64 r=ga_resident2(zones[i].lo,zones[i].commit-zones[i].lo,&g1); tot+=r; gone+=g1; fprintf(f,", %s %llu+%llu MiB",zones[i].name,(unsigned long long)(r>>20),(unsigned long long)(g1>>20)); }
+      for(u64 w=0;w<nwin;w++) if(win_live[w*GA_NSRC+GA_SRC_POOL]==GA_WIN){ poolw++; pool+=ga_resident2(GS_BASE+(w<<GA_WIN_SHIFT),GA_WIN,&g1); poolg+=g1; }
+      fprintf(f,", total %llu+%llu MiB; of the id zone, the %llu windows held entirely by the enlarged pools: %llu+%llu MiB touched of %llu MiB (host page %llu bytes)\n",
+              (unsigned long long)(tot>>20),(unsigned long long)(gone>>20),(unsigned long long)poolw,(unsigned long long)(pool>>20),(unsigned long long)(poolg>>20),(unsigned long long)((poolw<<GA_WIN_SHIFT)>>20),(unsigned long long)pg); }
 }
 void ga_window_sources(u64 base,char *out,size_t cap){
     size_t o=0; if(cap) out[0]=0; u64 w=(base-GS_BASE)>>GA_WIN_SHIFT; if(base<GS_BASE||w>=nwin) return;
@@ -334,8 +382,14 @@ int ga_describe(u64 a,char *out,size_t cap){
         snprintf(out,cap,"stress-layout heap segment 0x%llx, no block header found",(unsigned long long)base); return 1; }
     Zone *z=zone_of_addr(a); if(!z){ snprintf(out,cap,"guest space, no zone"); return 1; }
     if(a>=z->bump){ snprintf(out,cap,"%s, %s",z->name,a>=z->commit?"not committed (never allocated)":"above the high-water mark (never allocated)"); return 1; }
+    /* A window that the enlarged pools own entirely holds no block header, and must not be READ by a report: its pages are
+     * committed but untouched, and a host without a shared zero page (Darwin) gives every page that is read real memory.  The
+     * backward scan below used to walk through all 640 MiB of the pools whenever a pointer above them had no header of its own. */
+    #define POOL_WIN(q) ({ u64 _w=((q)-GS_BASE)>>GA_WIN_SHIFT; _w<nwin && win_live[_w*GA_NSRC+GA_SRC_POOL]==GA_WIN; })
+    if(POOL_WIN(a)){ snprintf(out,cap,"%s: enlarged pool of the mod (header-less page run), window 0x%llx +0x%llx",z->name,(unsigned long long)(a&~(GA_WIN-1)),(unsigned long long)(a&(GA_WIN-1))); return 1; }
     int got=diag_lock(), found=0;
     for(u64 q=a&~0xfffull, n=0; q>=z->lo && n<(1ull<<18) && !found; q-=4096, n++){              /* big blocks: up to 1 GiB back */
+        if(POOL_WIN(q)) break;
         BHdr *h=(BHdr*)XLG(q); if(h->magic==MAGIC_LIVE&&h->cls==CLS_BIG&&h->src<GA_NSRC&&a<q+HDR+h->size){
             snprintf(out,cap,"%s: %s block 0x%llx (%llu bytes) +0x%llx",z->name,src_names[h->src],(unsigned long long)(q+HDR),(unsigned long long)h->size,(unsigned long long)(a-q-HDR)); found=1; }
         if(q<z->lo+4096) break; }
@@ -413,9 +467,9 @@ int kh_ga_selftest(KCtx *g){
     pthread_mutex_lock(&gm); u64 nofit=alloc_locked(ZONE_TEST,8u<<20,GA_SRC_CRT); pthread_mutex_unlock(&gm); GCHECK(nofit==0);
     { u64 lo0=idz->lo, hi0=idz->hi, bump_sv=idz->bump, commit_sv=idz->commit;                        /* the public entry on a zone made full for the moment */
       pthread_mutex_lock(&gm); idz->hi=idz->commit; u64 room=idz->hi-idz->bump; pthread_mutex_unlock(&gm);
-      const u64 HUGE=1ull<<32; u64 big=ga_alloc_src(room+HUGE,16,GA_SRC_CRT);
-      GCHECK(big==0 && ex_rec.calls==1 && ex_rec.z==idz && ex_rec.src==GA_SRC_CRT && ex_rec.need==room+HUGE && idz->bump==bump_sv && idz->commit==commit_sv);
-      u64 pr=ga_pages_src(room+HUGE,GA_SRC_STACK); GCHECK(pr==0 && ex_rec.calls==2 && ex_rec.src==GA_SRC_STACK);
+      const u64 HUGE_REQ=1ull<<32; u64 big=ga_alloc_src(room+HUGE_REQ,16,GA_SRC_CRT);      /* (HUGE is a macro of Darwin's math.h) */
+      GCHECK(big==0 && ex_rec.calls==1 && ex_rec.z==idz && ex_rec.src==GA_SRC_CRT && ex_rec.need==room+HUGE_REQ && idz->bump==bump_sv && idz->commit==commit_sv);
+      u64 pr=ga_pages_src(room+HUGE_REQ,GA_SRC_STACK); GCHECK(pr==0 && ex_rec.calls==2 && ex_rec.src==GA_SRC_STACK);
       u64 ov=ga_alloc_src(~0ull-8,4096,GA_SRC_CRT); GCHECK(ov==0 && ex_rec.calls==3);              /* size + alignment overflow */
       pthread_mutex_lock(&gm); idz->hi=hi0; pthread_mutex_unlock(&gm); GCHECK(idz->lo==lo0);
       u64 okp=ga_alloc_src(100,16,GA_SRC_CRT); GCHECK(okp!=0 && ex_rec.calls==3); ga_free(okp); }
@@ -428,8 +482,8 @@ int kh_ga_selftest(KCtx *g){
     GCHECK(t->live==0 && t->nblocks==0);
     pthread_mutex_lock(&gm); exhausted_fn=sv_ex; for(Run *r=t->runs;r;){ Run *n=r->next; free(r); r=n; } memset(t,0,sizeof *t); pthread_mutex_unlock(&gm);
     ga_spread=sv_spread;
-    GCHECK(mprotect((void*)XLG(blk),TZ,PROT_READ|PROT_WRITE)==0); madvise((void*)XLG(blk),TZ,MADV_DONTNEED);
-    ga_pages_free_src(blk,TZ,GA_SRC_RT);
+    GCHECK(mprotect((void*)XLG(blk),TZ,PROT_READ|PROT_WRITE)==0);
+    ga_pages_free_src(blk,TZ,GA_SRC_RT);                                                            /* run_free discards the block: zero again, memory back to the host */
     /* interior pointers are attributed to their block (after the private zone is gone: the scan reads the memory below an address) */
     { char d[200]; u64 p=ga_alloc_src(5000,16,GA_SRC_FILE), q=ga_alloc_src(700u<<10,16,GA_SRC_CRT), al=ga_alloc_src(3000,4096,GA_SRC_AUDIO);
       GCHECK(ga_describe(p+4999,d,sizeof d)==1&&strstr(d,"file block")&&strstr(d,"+0x1387")); GCHECK(ga_describe(q+(699u<<10),d,sizeof d)==1&&strstr(d,"crt-heap block")&&strstr(d,"(716800 bytes)"));
@@ -484,20 +538,86 @@ typedef struct { u64 seq; u32 tid; const char *name; u64 a[4]; u64 ret; } TrEnt;
 static TrEnt tring[TRN]; static _Atomic u64 trseq;
 static FILE *trf; static u64 trmax=~0ull; static int stop_at_gx; static pthread_mutex_t trm = PTHREAD_MUTEX_INITIALIZER;
 static int trace_skip_sync;
+static int impc_on;                                    /* KH_IMPORT_COUNTS=1 (see kh_import_counts_report) */
+static const char *imps_pat;                           /* KH_IMPORT_SITES=text (see kh_import_sites_report) */
 u64 guest_return_addr(KCtx *g){ return rd64(g,KH_RSP(g)); }
 static void tr_line(FILE *f,const TrEnt *e){
     u64 r=e->ret; fprintf(f,"%llu t%u %s(%llx,%llx,%llx,%llx) <- %llx\n",(unsigned long long)e->seq,e->tid,e->name,(unsigned long long)e->a[0],(unsigned long long)e->a[1],(unsigned long long)e->a[2],(unsigned long long)e->a[3],
                            (unsigned long long)((r>=GS_BASE&&r<GS_BASE+IMG_SIZE)?r-GS_BASE:r));
+}
+/* KH_LIBM_ARGS=file: the arguments of every call of a transcendental CRT math import (the ones whose result comes from the host's
+ * libm: rt_libm.c evaluates sinf.. in double and rounds once, sin.. directly), as 24-byte records {name[8], xmm0 low 8 bytes, xmm1
+ * low 8 bytes}, so that the SAME inputs can be replayed on another host (tools/float_probe.c replay) and compared bit for bit.
+ * A direct-mapped filter drops most repeats (a game calls sinf with the same few thousand angles); the file is deduplicated later. */
+static FILE *libm_f; static pthread_mutex_t libm_m=PTHREAD_MUTEX_INITIALIZER;
+#define LIBM_SEEN (1u<<20)
+static struct { u64 a,b; u32 id; } *libm_seen;
+static void libm_args(KCtx *g,const char *name){
+    static const char *const want[]={"sinf","cosf","tanf","asinf","acosf","atanf","atan2f","expf","logf","log10f","powf","sin","cos","atan","acos","exp","log","pow",NULL};
+    const char *fn=name+27; int id=-1; for(int i=0;want[i];i++) if(!strcmp(fn,want[i])){ id=i; break; }
+    if(id<0) return;
+    u64 a,b; memcpy(&a,&KH_XMM(g,0),8); memcpy(&b,&KH_XMM(g,1),8);
+    int single=fn[strlen(fn)-1]=='f', two=!strcmp(fn,"atan2f")||!strcmp(fn,"powf")||!strcmp(fn,"pow");
+    if(single){ a&=0xffffffffull; b&=0xffffffffull; } if(!two) b=0;
+    u64 h=((a^((u64)(id+1)*0xD6E8FEB86659FD93ull))*0x9E3779B97F4A7C15ull)^(b*0xC2B2AE3D27D4EB4Full); h^=h>>32; u32 k=(u32)h&(LIBM_SEEN-1);   /* the import is part of the slot: sinf(x) and cosf(x) come in pairs */
+    pthread_mutex_lock(&libm_m);
+    if(libm_f && !(libm_seen[k].id==(u32)id+1&&libm_seen[k].a==a&&libm_seen[k].b==b)){
+        libm_seen[k].id=(u32)id+1; libm_seen[k].a=a; libm_seen[k].b=b;
+        char rec[24]; memset(rec,0,8); memcpy(rec,fn,strlen(fn)<8?strlen(fn):8); memcpy(rec+8,&a,8); memcpy(rec+16,&b,8); fwrite(rec,1,24,libm_f); }
+    pthread_mutex_unlock(&libm_m);
 }
 void kh_trace_init(void){
     const char *p=getenv("KH_TRACE"); if(p&&*p){ trf=fopen(p,"w"); }
     p=getenv("KH_TRACE_MAX"); if(p) trmax=strtoull(p,0,0);
     p=getenv("KH_STOP_AT_GX"); stop_at_gx=p&&*p=='1';
     p=getenv("KH_TRACE_NOSYNC"); trace_skip_sync=p&&*p=='1';
+    p=getenv("KH_IMPORT_COUNTS"); impc_on=p&&*p=='1';
+    p=getenv("KH_IMPORT_SITES"); if(p&&*p) imps_pat=p;
+    p=getenv("KH_LIBM_ARGS"); if(p&&*p){ libm_f=fopen(p,"wb"); libm_seen=calloc(LIBM_SEEN,sizeof *libm_seen); if(!libm_f||!libm_seen){ fprintf(stderr,"kh: cannot write KH_LIBM_ARGS=%s\n",p); _exit(2); } }
 }
 u64 kh_trace_count(void){ return trseq; }
+/* KH_IMPORT_COUNTS=1: calls per import, printed at exit (`kh: import count <n> <dll!name>`, sorted by name).  A cheap fingerprint of
+ * a run for comparing two hosts: which CRT math imports the game really calls and how often, directory enumeration, allocation
+ * counts.  Keyed by the name pointer (one string literal per import wrapper); lock-free, fixed table. */
+#define IMPC_N 2048
+static struct { _Atomic(const char *) name; _Atomic u64 n; } impc[IMPC_N];
+static void impc_add(const char *name){
+    u32 k=(u32)(((uintptr_t)name>>2)*2654435761u)&(IMPC_N-1);
+    for(u32 i=0;i<IMPC_N;i++,k=(k+1)&(IMPC_N-1)){ const char *cur=atomic_load(&impc[k].name);
+        if(!cur){ const char *z=NULL; if(atomic_compare_exchange_strong(&impc[k].name,&z,name)) cur=name; else cur=z; }
+        if(cur==name){ atomic_fetch_add(&impc[k].n,1); return; } }
+}
+static int impc_cmp(const void *a,const void *b){ return strcmp(*(const char *const*)a,*(const char *const*)b); }
+void kh_import_counts_report(FILE *f){
+    if(!impc_on) return; const char *names[IMPC_N]; int n=0; u64 total=0;
+    for(u32 k=0;k<IMPC_N;k++){ const char *nm=atomic_load(&impc[k].name); if(nm) names[n++]=nm; }
+    qsort(names,(size_t)n,sizeof *names,impc_cmp);
+    for(int i=0;i<n;i++){ u64 c=0; for(u32 k=0;k<IMPC_N;k++) if(atomic_load(&impc[k].name)&&!strcmp(atomic_load(&impc[k].name),names[i])&&(i==0||strcmp(names[i],names[i-1]))) c+=atomic_load(&impc[k].n);
+        if(i&&!strcmp(names[i],names[i-1])) continue; total+=c; fprintf(f,"kh: import count %llu %s\n",(unsigned long long)c,names[i]); }
+    fprintf(f,"kh: import counts: %llu calls of %d distinct imports\n",(unsigned long long)total,n);
+}
+void kh_libm_args_close(void){ if(libm_f){ pthread_mutex_lock(&libm_m); fclose(libm_f); libm_f=NULL; pthread_mutex_unlock(&libm_m); } }
+/* KH_IMPORT_SITES=text: for every import whose "dll!name" ends with text (e.g. "!sin"), the call sites (return RVA) and how
+ * often each called it, printed at exit.  Answers "who calls the double-precision sin" without a 58-million-line trace. */
+#define IMPS_N 512
+static const char *imps_pat; static pthread_mutex_t imps_m=PTHREAD_MUTEX_INITIALIZER;
+static struct { const char *name; u64 ra, n; } imps[IMPS_N]; static int imps_n, imps_over;
+static void imps_add(const char *name,u64 ra){
+    size_t ln=strlen(name), lp=strlen(imps_pat); if(ln<lp||strcmp(name+ln-lp,imps_pat)) return;
+    pthread_mutex_lock(&imps_m); int i; for(i=0;i<imps_n;i++) if(imps[i].ra==ra&&imps[i].name==name){ imps[i].n++; break; }
+    if(i==imps_n){ if(imps_n<IMPS_N){ imps[i].name=name; imps[i].ra=ra; imps[i].n=1; imps_n++; } else imps_over=1; }
+    pthread_mutex_unlock(&imps_m);
+}
+void kh_import_sites_report(FILE *f){
+    if(!imps_pat) return;
+    for(int i=0;i<imps_n;i++) fprintf(f,"kh: import site %s called %llu times from return rva 0x%llx\n",imps[i].name,(unsigned long long)imps[i].n,(unsigned long long)(imps[i].ra-GS_BASE));
+    fprintf(f,"kh: import sites: %d distinct (import, call site) for imports ending in \"%s\"%s\n",imps_n,imps_pat,imps_over?" (table full: more exist)":"");
+}
 void kh_trace_import(KCtx *g,const char *name){
     u64 s=atomic_fetch_add(&trseq,1);
+    if(__builtin_expect(impc_on,0)) impc_add(name);
+    if(__builtin_expect(imps_pat!=NULL,0)) imps_add(name,rd64(g,KH_RSP(g)));
+    if(__builtin_expect(libm_f!=NULL,0) && !strncmp(name,"api_ms_win_crt_math_l1_1_0!",27)) libm_args(g,name);
     TrEnt *e=&tring[s%TRN]; e->seq=s; e->tid=cur_thread()?cur_thread()->tid:0; e->name=name; e->a[0]=KH_RCX(g); e->a[1]=KH_RDX(g); e->a[2]=KH_R8(g); e->a[3]=KH_R9(g); e->ret=rd64(g,KH_RSP(g));
     tl_imp_name=name; tl_imp_ra=e->ret;
     u64 rv=e->ret-GS_BASE;
@@ -555,8 +675,30 @@ void kh_fatal(KCtx *g,const char *fmt,...){
 }
 void kh_warn(const char *fmt,...){ va_list ap; fprintf(stderr,"kh: warn: "); va_start(ap,fmt); vfprintf(stderr,fmt,ap); va_end(ap); fputc('\n',stderr); }
 void kh_log(const char *fmt,...){ if(!kh_verbose) return; va_list ap; va_start(ap,fmt); vfprintf(stderr,fmt,ap); va_end(ap); fputc('\n',stderr); }
+/* host program counter of the interrupted code, from the signal's machine context (0 on a host this does not know) */
+static uintptr_t sig_host_pc(void *ucv){
+    ucontext_t *uc=(ucontext_t*)ucv; if(!uc) return 0;
+#if defined(__APPLE__) && defined(__aarch64__)
+    return (uintptr_t)__darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss);
+#elif defined(__APPLE__) && defined(__x86_64__)
+    return (uintptr_t)uc->uc_mcontext->__ss.__rip;
+#elif defined(__linux__) && defined(__x86_64__)
+    return (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+#elif defined(__linux__) && defined(__aarch64__)
+    return (uintptr_t)uc->uc_mcontext.pc;
+#else
+    return 0;
+#endif
+}
 static void on_sig(int sig,siginfo_t *si,void *uc){
-    (void)uc; fprintf(stderr,"\nkh: SIGNAL %d (%s) addr=%p\n",sig,strsignal(sig),si->si_addr);
+    uintptr_t fa=(uintptr_t)si->si_addr, pc=sig_host_pc(uc);
+    fprintf(stderr,"\nkh: SIGNAL %d (%s) addr=%p host-pc=%p\n",sig,strsignal(sig),si->si_addr,(void*)pc);
+    if(sig==SIGSEGV||sig==SIGBUS){                       /* which guest address that is (bias mode: host = guest + bias), and what lies there */
+        u64 ga=(u64)(fa-gs_bias); char d[256]; d[0]=0; int in=fa>=gs_host_base&&fa-gs_host_base<gs_size; if(in) ga_describe(ga,d,sizeof d);
+        if(in) fprintf(stderr,"kh: the address is guest 0x%llx (%s)%s\n",(unsigned long long)ga,d,GA_OK(ga)?"":": not committed guest memory");
+        else if(gs_bias) fprintf(stderr,"kh: the address is outside guest space (host 0x%llx..0x%llx, bias 0x%llx); as a guest address it would be 0x%llx: a host pointer used as a guest pointer, or a guest pointer used without the bias\n",
+                                 (unsigned long long)gs_host_base,(unsigned long long)(gs_host_base+gs_size),(unsigned long long)gs_bias,(unsigned long long)ga);
+    }
     fault_who(stderr); dump_last(stderr,30); guest_bt(tl_cur_g,stderr);
     void *bt[48]; int n=backtrace(bt,48); fprintf(stderr,"---- host backtrace ----\n"); backtrace_symbols_fd(bt,n,2);
     fault_extras(stderr); fflush(stderr); if(trf) fflush(trf); _exit(4);
@@ -686,8 +828,13 @@ int kh_resolve_ci(const char *base,const char *rel,char *out,size_t cap){
         char comp[512]; size_t cl=(size_t)(e-p); if(cl>=sizeof comp) cl=sizeof comp-1; memcpy(comp,p,cl); comp[cl]=0; p=e;
         if(!strcmp(comp,".")) continue; if(!strcmp(comp,"..")){ char *sl=strrchr(out,'/'); if(sl&&sl>out){ *sl=0; len=strlen(out);} continue; }
         char cand[2048]; snprintf(cand,sizeof cand,"%s/%s",out,comp); struct stat st;
-        if(ok && stat(cand,&st)!=0){
-            DIR *d=opendir(out); int found=0; if(d){ struct dirent *de; while((de=readdir(d))){ if(!strcasecmp(de->d_name,comp)){ snprintf(cand,sizeof cand,"%s/%s",out,de->d_name); found=1; break; } } closedir(d); }
+        /* The result is the name as the directory stores it.  A case-sensitive file system says so through stat (exact name or
+         * nothing).  On a host whose file system may fold case (macOS: stat succeeds for any spelling) the directory is always
+         * asked: the exactly spelled entry if there is one, else the first that matches without case, as on Linux. */
+        if(ok && (KH_FS_MAY_FOLD_CASE || stat(cand,&st)!=0)){
+            DIR *d=opendir(out); int found=0; char ci[512]; ci[0]=0;
+            if(d){ struct dirent *de; while((de=readdir(d))){ if(!strcmp(de->d_name,comp)){ found=1; ci[0]=0; break; } if(!ci[0]&&!strcasecmp(de->d_name,comp)){ snprintf(ci,sizeof ci,"%s",de->d_name); if(!KH_FS_MAY_FOLD_CASE){ found=1; break; } } } closedir(d); }
+            if(ci[0]){ snprintf(cand,sizeof cand,"%s/%s",out,ci); found=1; }
             if(!found) ok=0;
         }
         snprintf(out+len,cap-len,"/%s",strrchr(cand,'/')+1); len=strlen(out);

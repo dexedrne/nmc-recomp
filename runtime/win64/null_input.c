@@ -33,6 +33,7 @@ static int clock_game; static _Atomic u64 game_frames; static _Atomic long long 
 /* KH_RUN_GAME_FRAMES=n ends the run (exit 0, with the reports) when the game thread has made n frames: a route length that does not
  * depend on the machine's load, unlike KH_RUN_SECONDS, which then only serves as the watchdog. */
 static u64 run_game_frames;
+u64 kh_game_frames(void){ return atomic_load(&game_frames); }      /* frames the game thread has made (diagnostic logs) */
 void orig_f_105e10(KCtx *g);
 void f_105e10(KCtx *g){
     u64 n=atomic_fetch_add(&game_frames,1)+1;

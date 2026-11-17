@@ -49,6 +49,10 @@ static int load_image(void){
     if(mprotect(m,image_hi-GS_BASE,PROT_READ|PROT_WRITE)){ perror("kh: commit image"); return -1; }
 #endif
     gs_host_base=(uintptr_t)m; gs_size=guest_space_size;
+#if KH_XLATE_MODE!=0
+    fprintf(stderr,"kh: guest space: bias mode, guest 0x%llx..0x%llx is host 0x%llx..0x%llx (bias 0x%llx), host page %lu bytes\n",(unsigned long long)GS_BASE,(unsigned long long)(GS_BASE+guest_space_size),
+            (unsigned long long)gs_host_base,(unsigned long long)(gs_host_base+guest_space_size),(unsigned long long)gs_bias,(unsigned long)sysconf(_SC_PAGESIZE));
+#endif
 #ifdef MADV_DONTDUMP
     madvise(m,guest_space_size,MADV_DONTDUMP);
 #endif
@@ -77,6 +81,9 @@ void kh_exit_process(int code){
     { extern void kh_input_report(FILE*); kh_input_report(stderr); }
     kh_vclock_report(stderr);
     { extern void kh_gfx_vkd3d_finish(void); kh_gfx_vkd3d_finish(); }
+    { extern void kh_import_counts_report(FILE*); kh_import_counts_report(stderr); }      /* KH_IMPORT_COUNTS=1 */
+    { extern void kh_import_sites_report(FILE*); kh_import_sites_report(stderr); }        /* KH_IMPORT_SITES=text */
+    { extern void kh_libm_args_close(void); kh_libm_args_close(); }                       /* KH_LIBM_ARGS=file */
     kh_report_seams(stderr); { extern void kh_dump_threads(FILE*); if(getenv("KH_DUMP_THREADS")) kh_dump_threads(stderr); } fflush(stderr); fflush(stdout); _exit(code);
 }
 

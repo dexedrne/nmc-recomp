@@ -57,7 +57,7 @@ void kh_register_fault_diag(void (*fn)(FILE*));
 typedef struct { int depth, is_loader; } BgTls;
 static __thread BgTls bg_tl;
 static __attribute__((noinline)) BgTls *bg_tls(void){ BgTls *t; __asm__ __volatile__("" ::: "memory"); t=&bg_tl; return t; }
-static pthread_mutex_t bg_m=PTHREAD_MUTEX_INITIALIZER;
+static kh_tmutex bg_m=KH_TMUTEX_INITIALIZER;         /* a mutex with a timed lock (kh_compat.h): a blocked holder becomes a named fatal, not a hang */
 static int bg_lock_on=1;
 static _Atomic u32 bg_owner_tid;
 static _Atomic u64 c_enq, c_free, c_released, c_contended, c_wait_ns_max, c_loaders, c_chaos, c_scan_steps;
@@ -66,10 +66,9 @@ static void bg_lock(KCtx *g){
     if(!bg_lock_on) return;
     BgTls *t=bg_tls();
     if(t->depth++) return;
-    if(pthread_mutex_trylock(&bg_m)!=0){
+    if(kh_tmutex_trylock(&bg_m)!=0){
         atomic_fetch_add(&c_contended,1); u64 t0=kh_host_ns();
-        struct timespec dl; clock_gettime(CLOCK_REALTIME,&dl); dl.tv_sec+=BG_LOCK_WAIT_MAX_S;
-        int rc=pthread_mutex_timedlock(&bg_m,&dl);
+        int rc=kh_tmutex_lock_timeout_ms(&bg_m,BG_LOCK_WAIT_MAX_S*1000u);
         if(rc) kh_fatal(g,"bgload: waited %d s for the load-list lock (held by thread %u, pthread rc %d): a holder is blocked, which the design excludes",BG_LOCK_WAIT_MAX_S,atomic_load(&bg_owner_tid),rc);
         u64 w=kh_host_ns()-t0, m=atomic_load(&c_wait_ns_max); while(w>m && !atomic_compare_exchange_weak(&c_wait_ns_max,&m,w)){}
     }
@@ -80,7 +79,7 @@ static void bg_unlock(KCtx *g){
     BgTls *t=bg_tls();
     if(t->depth<=0) kh_fatal(g,"bgload: unlock without lock");
     if(--t->depth) return;
-    atomic_store(&bg_owner_tid,0); pthread_mutex_unlock(&bg_m);
+    atomic_store(&bg_owner_tid,0); kh_tmutex_unlock(&bg_m);
 }
 
 /* ---- redirectable originals (the selftest replaces the loader's blocking calls) ------------------------------------------------- */

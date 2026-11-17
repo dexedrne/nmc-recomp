@@ -13,6 +13,7 @@ static int C_factory,C_adapter,C_output,C_swap,C_dev,C_queue,C_alloc,C_list,C_re
 static u64 o_adapter,o_output;
 static _Atomic u64 res_ids=1, heap_ids=1;
 _Atomic u64 gfx_draws, gfx_clears, gfx_barriers, gfx_execs, gfx_presents, gfx_copies, gfx_psos, gfx_resources, gfx_buffers_bytes;
+static long vblank_ns=16666667;            /* the null backend's frame sleep; KHNMC_NULL_VBLANK_NS=n (1,000,000..100,000,000) overrides it */
 void kh_gfx_report(FILE *f);
 void kh_gfx_tex_report(FILE *f);
 static int log_gfx;
@@ -90,7 +91,7 @@ static int h_output(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return
     if(s==10){                                                                                                        /* WaitForVBlank */
         if(kh_vclock_on){ u64 ra=guest_return_addr(g)-GS_BASE;                 /* KHNMC_CLOCK=frames: one virtual display period; rbx = GXDevice at the timing thread's two call sites (0x1288cc, 0x128f3b) */
             kh_vclock_vblank(g,(ra==0x1288cf||ra==0x128f3e)&&GA_OK(KH_RBX(g))?KH_RBX(g):0); SET_RAX(g,0); return 1; }
-        struct timespec ts={0,16666667}; nanosleep(&ts,0); SET_RAX(g,0); return 1; }                                 /* host clock: pace at 60 Hz */
+        struct timespec ts={0,vblank_ns}; nanosleep(&ts,0); SET_RAX(g,0); return 1; }                                 /* host clock: pace at 60 Hz (KHNMC_NULL_VBLANK_NS: another frame time, for timing experiments) */
     if(s==7){ u64 d=A1(g); memset(hp(g,d),0,0x60); utf8_to_gw(g,d,32,"\\\\.\\DISPLAY1");
         /* DesktopCoordinates RECT at +0x40, AttachedToDesktop +0x50 */ wr32(g,d+0x48,1920); wr32(g,d+0x4c,1080); wr32(g,d+0x50,1); wr64(g,d+0x58,0xAB0100); SET_RAX(g,0); return 1; }
     return 0; }
@@ -118,11 +119,31 @@ static int h_swap(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1
     case 33: SET_RAX(g,rd64(g,o+48)); return 1;                                                             /* GetFrameLatencyWaitableObject (manual-reset, always signalled) */
     case 36: SET_RAX(g,rd32(g,o+40)%3); return 1;                                                           /* GetCurrentBackBufferIndex */
     default: return 0; } }
+/* KHNMC_GFX_PSOLOG=1: one line per CreateGraphicsPipelineState with a content key of the pipeline (hashes of the vertex and pixel
+ * shader bytecode and of the fixed-function state of the D3D12 desc, no pointers), the game frame, the thread and the guest
+ * return sites on the stack.  Two runs (two hosts) then compare as SETS of pipelines: which ones a run never created, and who
+ * creates them.  The offsets are those of D3D12_GRAPHICS_PIPELINE_STATE_DESC on x64 (656 bytes). */
+static int log_pso;
+static u64 pso_fnv(KCtx *g,u64 a,u64 n){ u64 h=0xcbf29ce484222325ull; if(!a||!GA_OK(a)||(n&&!GA_OK(a+n-1))) return 0; const u8 *p=hp(g,a); for(u64 i=0;i<n;i++){ h^=p[i]; h*=0x100000001b3ull; } return h; }
+static void pso_log(KCtx *g,u64 d){
+    extern void kh_guest_bt(KCtx *,FILE *); extern u64 kh_game_frames(void);
+    u64 vs=rd64(g,d+0x08), vsn=rd64(g,d+0x10), ps=rd64(g,d+0x18), psn=rd64(g,d+0x20);
+    u64 st=pso_fnv(g,d+0x78,0x228-0x78)^(pso_fnv(g,d+0x238,0x278-0x238)*31)^((u64)rd32(g,d+0x230)<<56);     /* blend .. depth-stencil, strip-cut .. node mask, input element count */
+    char *bt=NULL; size_t btn=0; FILE *m=open_memstream(&bt,&btn); char sites[400]; sites[0]=0;
+    if(m){ kh_guest_bt(g,m); fclose(m); size_t o=0; int k=0;
+        for(char *p=bt;p&&(p=strstr(p,"return-site rva 0x"))&&k<10;k++){ p+=18; size_t l=strspn(p,"0123456789abcdef"); if(o+l+2<sizeof sites){ memcpy(sites+o,p,l); o+=l; sites[o++]=' '; sites[o]=0; } }
+        free(bt); }
+    KThread *t=cur_thread();
+    fprintf(stderr,"kh: gfx pso #%llu game-frame=%llu present=%llu thread=%u key=%016llx-%016llx-%016llx vs-bytes=%llu ps-bytes=%llu rtv0=%u nrt=%u dsv=%u topo=%u sites: %s\n",(unsigned long long)gfx_psos,
+            (unsigned long long)kh_game_frames(),(unsigned long long)gfx_presents,t?t->tid:0,(unsigned long long)pso_fnv(g,vs,vsn),(unsigned long long)pso_fnv(g,ps,psn),(unsigned long long)st,
+            (unsigned long long)vsn,(unsigned long long)psn,rd32(g,d+0x244),rd32(g,d+0x240),rd32(g,d+0x264),rd32(g,d+0x23c),sites);
+}
 static int h_dev(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)o;(void)c;
     switch(s){
     case 8: { u64 q=new_obj(C_queue,32); out_obj(g,ARG(g,3),q); SET_RAX(g,0); return 1; }                  /* CreateCommandQueue(desc, riid, **pp) */
     case 9: out_obj(g,ARG(g,3),new_obj(C_alloc,16)); SET_RAX(g,0); return 1;                               /* CreateCommandAllocator(type, riid, **pp) */
-    case 10: out_obj(g,ARG(g,3),new_obj(C_pso,16)); gfx_psos++; SET_RAX(g,0); return 1;                    /* CreateGraphicsPipelineState(desc, riid, **pp) */
+    case 10: if(__builtin_expect(log_pso,0)) pso_log(g,A1(g));
+             out_obj(g,ARG(g,3),new_obj(C_pso,16)); gfx_psos++; SET_RAX(g,0); return 1;                    /* CreateGraphicsPipelineState(desc, riid, **pp) */
     case 12: out_obj(g,ARG(g,6),new_obj(C_list,16)); SET_RAX(g,0); return 1;                               /* CreateCommandList(node,type,alloc,pso,riid,**pp) */
     case 13: { u32 feat=(u32)A1(g); u64 d=A2(g); u32 sz=(u32)A3(g);
         if(feat==4){ u32 sc=rd32(g,d+4); wr32(g,d+12,sc<=8?1:0); }                                          /* MULTISAMPLE_QUALITY_LEVELS: NumQualityLevels */
@@ -219,6 +240,9 @@ static u64 mk_blob(KCtx *g,u64 src,u64 size){ u64 b=new_obj(C_blob,16); u64 d=ga
 
 void kh_seam_gfx_init(void){
     const char *e=getenv("KH_LOG_GFX"); log_gfx=e&&*e=='1'; (void)log_gfx;
+    e=getenv("KHNMC_GFX_PSOLOG"); log_pso=e&&*e=='1';
+    e=getenv("KHNMC_NULL_VBLANK_NS"); if(e&&*e){ long v=strtol(e,0,10); if(v<1000000||v>100000000) kh_fatal(NULL,"KHNMC_NULL_VBLANK_NS=%s: expected 1000000..100000000 nanoseconds",e);
+        vblank_ns=v; fprintf(stderr,"kh: gfx: null backend frame sleep %ld ns instead of 16666667 (KHNMC_NULL_VBLANK_NS)\n",v); }
     e=getenv("KHNMC_GFX");                                                    /* graphics backend: unset / "null" = this recorder, "vkd3d" = gfx_vkd3d.c */
     if(e&&!strcmp(e,"vkd3d")) kh_gfx_vkd3d_init();
     else if(e&&*e&&strcmp(e,"null")) kh_fatal(NULL,"gfx-backend-unknown: KHNMC_GFX=%s (known backends: null, vkd3d)",e);

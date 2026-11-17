@@ -10,6 +10,7 @@
 #include <stdarg.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include "kh_compat.h"                             /* host primitives that differ between Linux and Darwin (timed waits, pages) */
 
 /* ---- guest space -------------------------------------------------------------------------------------------------- */
 #define GS_BASE      KH_IMAGE_BASE                 /* guest address of the first byte of guest space (= image base) */
@@ -185,7 +186,7 @@ int  h_kind(u64 h);
 
 /* sync objects (waitable) */
 typedef struct KWaitObj {
-    int kind; pthread_mutex_t m; pthread_cond_t cv;   /* cv uses CLOCK_MONOTONIC */
+    int kind; pthread_mutex_t m; pthread_cond_t cv;   /* cv: kh_cond_init, waits take CLOCK_MONOTONIC deadlines (kh_compat.h) */
     int signaled, manual; long count, maxcount;       /* event: signaled/manual; semaphore: count/maxcount; mutex: owner/recursion */
     u64 owner; int recurse; KThread *thread;         /* mutex / thread */
     _Atomic int refs;                                 /* the handle + every thread currently inside a wait/signal on the object */

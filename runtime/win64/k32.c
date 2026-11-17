@@ -162,7 +162,7 @@ static void timer_proc(KCtx *g){ Timer *t=(Timer*)(uintptr_t)A0(g);
             struct timespec now; clock_gettime(CLOCK_MONOTONIC,&now);
             s64 late=((s64)now.tv_sec-next.tv_sec)*1000000000ll+((s64)now.tv_nsec-next.tv_nsec);
             if(late>(s64)t->delay*1000000ll) next=now;                                      /* more than one period behind: resynchronise */
-            else while(clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&next,0)==EINTR){} }
+            else kh_sleep_until(&next); }
         if(t->killed) break;
         timer_fire(g,t);
         if(!(t->flags&1)) break; }

@@ -10,7 +10,7 @@
 #   -g  end every run after GAME_FRAMES frames of the game thread (KH_RUN_GAME_FRAMES): the same route length on a loaded and on
 #       an idle machine; -s is then only the time limit (give it room: a loaded machine makes 20 game frames per second, not 60)
 #   -d  KHNMC_DIFFICULTY: none = not set (default), cycle = run index mod 4, or a fixed 0..3
-#   -i  KHNMC_INPUT_SCRIPT (default runtime/task6-field-input.txt)
+#   -i  KHNMC_INPUT_SCRIPT (default runtime/task20-field-input.txt)
 #   -c  pin every run to its own block of CPUS_PER_RUN cpus (taskset; parallel slot k gets cpus k*C .. k*C+C-1): a stress
 #       variant that forces the guest threads of one run to share few cpus (0 = no pinning, default)
 #   -w  command prefix for every run, e.g. -w "nice -n 10"
@@ -30,7 +30,7 @@
 # input (- = no hold line or not released), wall_s / cpu_s / rss_mb = wall time, cpu time and peak RSS of the run.
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
-N=8; J=4; SECS=120; GFR=0; OUT=""; DIFF=none; INPUT="$HERE/runtime/task6-field-input.txt"; WRAP=""; MINMB=1500; TRACE=0; PIN=0; KEEP=0; REQ=field
+N=8; J=4; SECS=120; GFR=0; OUT=""; DIFF=none; INPUT="$HERE/runtime/task20-field-input.txt"; WRAP=""; MINMB=1500; TRACE=0; PIN=0; KEEP=0; REQ=field
 BIN="$HERE/khnmc"; EXTRA=()
 while getopts "n:j:s:g:o:d:i:c:w:e:m:b:r:tk" o; do case "$o" in
   n) N=$OPTARG;; j) J=$OPTARG;; s) SECS=$OPTARG;; g) GFR=$OPTARG;; o) OUT=$OPTARG;; d) DIFF=$OPTARG;; i) INPUT=$OPTARG;; c) PIN=$OPTARG;;

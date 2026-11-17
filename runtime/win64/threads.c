@@ -48,13 +48,17 @@ static void *make_frame(void *top,void *arg){
     return sp;
 }
 #elif defined(__aarch64__)
-__asm__(".text\n.globl kh_ctx_switch\nkh_ctx_switch:\n"
+/* C symbols carry the object format's prefix in assembly: none on ELF, an underscore on Mach-O (macOS / iOS) */
+#define KH_ASM_STR_(x) #x
+#define KH_ASM_STR(x) KH_ASM_STR_(x)
+#define KH_ASM_SYM(name) KH_ASM_STR(__USER_LABEL_PREFIX__) #name
+__asm__(".text\n.p2align 2\n.globl " KH_ASM_SYM(kh_ctx_switch) "\n" KH_ASM_SYM(kh_ctx_switch) ":\n"
         " sub sp, sp, #176\n stp x19,x20,[sp,#0]\n stp x21,x22,[sp,#16]\n stp x23,x24,[sp,#32]\n stp x25,x26,[sp,#48]\n stp x27,x28,[sp,#64]\n stp x29,x30,[sp,#80]\n"
         " stp d8,d9,[sp,#96]\n stp d10,d11,[sp,#112]\n stp d12,d13,[sp,#128]\n stp d14,d15,[sp,#144]\n"
         " mov x9, sp\n str x9,[x0]\n mov sp, x1\n"
         " ldp x19,x20,[sp,#0]\n ldp x21,x22,[sp,#16]\n ldp x23,x24,[sp,#32]\n ldp x25,x26,[sp,#48]\n ldp x27,x28,[sp,#64]\n ldp x29,x30,[sp,#80]\n"
         " ldp d8,d9,[sp,#96]\n ldp d10,d11,[sp,#112]\n ldp d12,d13,[sp,#128]\n ldp d14,d15,[sp,#144]\n add sp, sp, #176\n ret\n"
-        ".globl kh_fiber_tramp\nkh_fiber_tramp:\n mov x0, x19\n bl kh_fiber_main\n brk #0\n");
+        ".p2align 2\n.globl " KH_ASM_SYM(kh_fiber_tramp) "\n" KH_ASM_SYM(kh_fiber_tramp) ":\n mov x0, x19\n bl " KH_ASM_SYM(kh_fiber_main) "\n brk #0\n");
 static void *make_frame(void *top,void *arg){
     u64 *sp=(u64*)(((uintptr_t)top)&~0xFull); sp-=22;
     memset(sp,0,176); sp[0]=(u64)arg; sp[11]=(u64)kh_fiber_tramp;       /* x19 = arg ; x30 = tramp */
@@ -93,7 +97,7 @@ void kh_run_tls_callbacks(KCtx *g,u32 reason){
 }
 static KThread *thread_new(void){
     KThread *t=calloc(1,sizeof *t); t->g=kh_new_ctx(); t->tid=atomic_fetch_add(&next_tid,4); t->prio=0;
-    pthread_mutex_init(&t->m,0); { pthread_condattr_t a; pthread_condattr_init(&a); pthread_condattr_setclock(&a,CLOCK_MONOTONIC); pthread_cond_init(&t->cv,&a); pthread_condattr_destroy(&a); }
+    pthread_mutex_init(&t->m,0); kh_cond_init(&t->cv);
     pthread_mutex_lock(&tlist_m); if(ntlist<4096) tlist[ntlist++]=t; pthread_mutex_unlock(&tlist_m); return t;
 }
 static void thread_bind(KThread *t){ tl_thread=t; t->g->rt=t; kh_install_sigaltstack(); kh_set_cur_g(t->g); }
@@ -114,7 +118,7 @@ void kh_thread_init_main(void){
  *  - an object lives while a thread waits on it, also when its last handle is closed meanwhile.
  *  - timeouts are relative and immune to wall-clock steps (CLOCK_MONOTONIC). */
 static KWaitObj *wobj_new(int kind){ KWaitObj *w=calloc(1,sizeof *w); w->kind=kind; w->refs=1; pthread_mutex_init(&w->m,0);
-    pthread_condattr_t a; pthread_condattr_init(&a); pthread_condattr_setclock(&a,CLOCK_MONOTONIC); pthread_cond_init(&w->cv,&a); pthread_condattr_destroy(&a); return w; }
+    kh_cond_init(&w->cv); return w; }
 static void abs_deadline(struct timespec *ts,u32 ms){ clock_gettime(CLOCK_MONOTONIC,ts); ts->tv_sec+=ms/1000; ts->tv_nsec+=(long)(ms%1000)*1000000L; if(ts->tv_nsec>=1000000000L){ ts->tv_sec++; ts->tv_nsec-=1000000000L; } }
 u32 kh_wait_timeout_ms_max;
 /* one test of the object for the calling thread; takes what a satisfied wait takes.  blocked = the thread has been waiting already
@@ -143,9 +147,9 @@ u32 kh_wait(KCtx *g,u64 h,u32 ms){
         if(ms==0){ res=0x102; break; }
         if(!blocked){ blocked=1; if(!th) w->waiters++; }
         int rc;
-        if(ms==0xFFFFFFFFu){ struct timespec d2; abs_deadline(&d2,10000); rc=pthread_cond_timedwait(cv,m,&d2);
+        if(ms==0xFFFFFFFFu){ struct timespec d2; abs_deadline(&d2,10000); rc=kh_cond_wait_until(cv,m,&d2);
             if(rc==ETIMEDOUT){ waited+=10; if(kh_verbose||(waited%60==0)) fprintf(stderr,"kh: thread %u ('%s') waiting %llus on handle %llx kind %d (site rva %llx)\n",me->tid,me->name,(unsigned long long)waited,(unsigned long long)h,k,(unsigned long long)(rd64(g,KH_RSP(g))-GS_BASE)); } }
-        else { rc=pthread_cond_timedwait(cv,m,&dl); if(rc==ETIMEDOUT){ if(!(th?th->done:wobj_try(w,k,me,gen0,blocked))) res=0x102; break; } }
+        else { rc=kh_cond_wait_until(cv,m,&dl); if(rc==ETIMEDOUT){ if(!(th?th->done:wobj_try(w,k,me,gen0,blocked))) res=0x102; break; } }
     }
     if(blocked&&!th){ w->waiters--; if(w->pulse_tokens>w->waiters) w->pulse_tokens=w->waiters; }
     pthread_mutex_unlock(m); kh_wobj_unref(w); return res;

@@ -239,6 +239,7 @@ int kh_selftest(KCtx *g){
     fails+=kh_bgload_selftest(g);
     extern int kh_sync_selftest(KCtx *);
     fails+=kh_sync_selftest(g);
+    { extern int kh_compat_selftest(void); fails+=kh_compat_selftest(); }      /* task 20: the host primitives that differ between Linux and Darwin */
     input_selftest(g);
     { extern int kh_input_hold_selftest(KCtx *); fails+=kh_input_hold_selftest(g); }
     /* allocator */

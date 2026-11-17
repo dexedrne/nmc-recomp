@@ -325,13 +325,7 @@ static u32 soft_create_voice(KCtx *g,SoftEngine *e,int s,u64 vobj,Voice *st,u64 
 static SoftEngine *soft_engine_of(KCtx *g,u64 o){ return (SoftEngine*)(uintptr_t)rd64(g,o+32); }
 static void soft_quantum(KCtx *g);
 static u64 mono_ns(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (u64)ts.tv_sec*1000000000ull+(u64)ts.tv_nsec; }
-static void sleep_until_ns(u64 t){
-#ifdef __linux__
-    struct timespec d={(time_t)(t/1000000000ull),(long)(t%1000000000ull)}; while(clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&d,NULL)==EINTR){}
-#else
-    for(u64 now=mono_ns();now<t;now=mono_ns()){ struct timespec d={(time_t)((t-now)/1000000000ull),(long)((t-now)%1000000000ull)}; nanosleep(&d,NULL); }   /* hosts without clock_nanosleep */
-#endif
-}
+static void sleep_until_ns(u64 t){ struct timespec d={(time_t)(t/1000000000ull),(long)(t%1000000000ull)}; kh_sleep_until(&d); }   /* absolute CLOCK_MONOTONIC (kh_compat.h) */
 /* The device clock: one pass per 10 ms of CLOCK_MONOTONIC.  A real device is never late; this thread can be (no real-time priority).
  * When it is behind it catches up, but never back to back: at least 5 ms between pass starts (twice real time at most), so the
  * engine's own threads can refill the queues between passes as they would against a steady device.  More than a second behind =
