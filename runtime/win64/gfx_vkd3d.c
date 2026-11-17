@@ -60,6 +60,7 @@
 #define WIDL_C_INLINE_WRAPPERS
 #endif
 #include <vkd3d_windows.h>
+#include <signal.h>
 #include <vkd3d_d3d12.h>
 #include <vkd3d.h>
 #include <vkd3d_utils.h>
@@ -169,6 +170,10 @@ static void video_setup(void){
     if(e&&!strncmp(e,"field",5)){ video_from_field=1; if(e[5]=='+'&&e[6]){ video_lead=strtoull(e+6,&end,10); if(*end) kh_fatal(NULL,"gfx-video-from: KHNMC_GFX_VIDEO_FROM=%s (field or field+<vblanks>)",e); } else if(e[5]) kh_fatal(NULL,"gfx-video-from: KHNMC_GFX_VIDEO_FROM=%s (field or field+<vblanks>)",e); }
     else if(e&&*e){ video_from=strtoull(e,&end,10); if(*end) kh_fatal(NULL,"gfx-video-from: KHNMC_GFX_VIDEO_FROM=%s (a virtual vblank number, field, or field+<vblanks>)",e); }
     e=getenv("KHNMC_GFX_VIDEO_EXIT"); video_exit=e&&*e=='1';
+    /* The stream may be a FIFO.  A reader that goes away must end in the named fatal of video_vblank ("gfx-video-write: short
+     * write"), with the exit reports, not in a silent death by SIGPIPE (review 2026-11-17).  Only for a run that writes a video
+     * stream: every other run keeps the default, so `khnmc ... | head` still ends when the reader does. */
+    { struct sigaction ign; memset(&ign,0,sizeof ign); ign.sa_handler=SIG_IGN; sigaction(SIGPIPE,&ign,0); }
     kh_vclock_on_vblank(video_vblank);
 }
 /* KHNMC_GFX=vkd3d: the trampoline bridge */
@@ -917,7 +922,10 @@ void kh_vkd3d_present(KCtx *g,u64 o,u64 n){
 }
 /* process exit (loader.c, before the reports): an open video stream is closed here and nowhere else; the report says if it was cut short */
 void kh_gfx_vkd3d_finish(void){
-    if(hash_f){ if(fclose(hash_f)) fprintf(stderr,"kh: gfx hash log: ERROR: closing %s failed (%s)\n",hash_path,strerror(errno)); hash_f=NULL; }
+    /* The hash log is NOT closed here: a Present on another thread may still be inside its readback and write its line afterwards
+     * (review 2026-11-17: fclose and hash_f=NULL raced with hash_frame, a fault at the end of a finished run).  The stream is
+     * line-buffered, so a flush is all the exit needs. */
+    if(hash_f){ if(fflush(hash_f)||ferror(hash_f)) fprintf(stderr,"kh: gfx hash log: ERROR: writing %s failed (%s)\n",hash_path,strerror(errno)); }
     if(!video_path[0]) return; pthread_mutex_lock(&vid_m); if(video_f){ vid_cut=!vid_done; video_close(); } else if(!vid_done) vid_cut=vid_armed; vid_done=1; pthread_mutex_unlock(&vid_m); }
 void kh_gfx_vkd3d_report(FILE *f){
     fprintf(f,"kh: gfx vkd3d: bridge=%s device=%s driver-mode=%s devices-created=%llu (+%llu probes) native-calls=%llu fence-events-signalled=%llu bundles: recorded=%llu executed=%llu (%llu replayed calls) live=%llu; default-descriptor-tables=%llu on %d tracked command lists; frame-dumps=%llu%s%s\n",kh_gfx_wrap_on?"wrapped":"trampoline",vk_dev_name,drv_system?"system":"lavapipe",
