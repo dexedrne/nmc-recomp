@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""mod_update_check_variants.py - proof cases of the task 34 review: small, targeted changes to the PINNED mod (real DLL bytes, real
+data files), each of which the update checker must turn into the right step (task 34, "Review findings and what was done").
+
+  mod_update_check_variants.py [--clone ~/projects/SillyBillyMod1] [--tool tools/mod_update_check.py] [--fingerprint mod/nmc-version.json]
+                               [--exe pc/kh2fm.exe] [--work DIR] [--keep] [--jobs 2]
+
+What it does (read only on the clone: plain file reads, and `git show COMMIT:PATH` of three older DLLs; no checkout, no worktree):
+  * a SUBSET copy of the pinned checkout in WORK/base: dll/ in full, obj/P_EX020.mdlx (a script with table-3 calls), 03system.bin,
+    00progress.bin, and a mod.yml naming exactly those assets; and the fingerprint FILTERED to those files (the DLL, ini, item and
+    port records are the pinned ones, unchanged).  The base must compare IDENTICAL.
+  * variants of the base, each one change (byte patches at DLL addresses, verified against the pinned bytes first), checked with the
+    tool (`--json`) against what the step list must contain:
+      leaf      DLL 0x2dd70 `mov r8d,2` -> 3: the ability-level helper 0x2dd60 (no .pdata entry) that row 4's handler 0x2de50 tail-jumps to
+      handler   DLL 0x2def5 `cmp rbx,0x50` -> 0x51 inside row 4's handler (control)
+      keyname   .rdata 0x73e78 "crit_enemy_dmg" -> "crit_enemy_dmX": the damage loader 0x20590 no longer reads the shipped value
+      default   .rdata 0x75aa8 1.5f -> 2.0f: crit_ap_mult's default for an absent key (loader 0x21090)
+      dllcase   dll/KH2Tweaks_Refactor.dll renamed dll/kh2tweaks_refactor.dll (file and mod.yml) + the control patch
+      moosecase dll/KH2Moose.ini renamed dll/kh2moose.ini (runtime/moose.c opens it by exact name)
+      wm00      ard/us/wm00.ard added as an asset
+      itemkind  03system.bin: item 1 (Potion, type 0) effect kind 0 -> 5
+      probe     01effect.bar added as an asset (the DLL's extra-file probe finds it)
+  * pin-check cases (in process): the fingerprint with KH2Tweaks_Refactor.dll of 1bcc583 (every slot moved: the old expectation file
+    must not pass uncompared), KH2Moose.dll of a3b4bca (rebuilt: the cited functions must be found again or the pin fails),
+    NeverlandFly.dll of 899691a (rebuilt, same code: found again at new addresses).
+Exit status 0 when every expectation holds, 1 otherwise.  Run it with the ORIGINAL tool and fingerprint to see the misses.
+"""
+import argparse, concurrent.futures, copy, importlib.util, json, os, shutil, struct, subprocess, sys, tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PORT = os.path.dirname(HERE)
+SUBSET = ['obj/P_EX020.mdlx', '03system.bin', '00progress.bin']
+
+
+def load_tool(path):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(path)))
+    spec = importlib.util.spec_from_file_location('muc_under_test', path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def rva_off(M, data, rva):
+    pe = M.PE(data)
+    for n, va, vsz, rp, rsz, ch in pe.secs:
+        if va <= rva < va + rsz:
+            return rp + rva - va
+    raise SystemExit('rva 0x%x is in no section' % rva)
+
+
+def patch(M, path, rva, old, new):
+    b = bytearray(open(path, 'rb').read())
+    o = rva_off(M, bytes(b), rva)
+    if bytes(b[o:o + len(old)]) != old:
+        raise SystemExit('%s: DLL 0x%x has %s, expected %s (not the pinned build?)' % (path, rva, b[o:o + len(old)].hex(), old.hex()))
+    b[o:o + len(new)] = new
+    open(path, 'wb').write(bytes(b))
+
+
+def build_base(M, clone, fp, base):
+    rels = []
+    for dp, dn, fn in os.walk(os.path.join(clone, 'dll')):
+        for f in fn:
+            rels.append(os.path.relpath(os.path.join(dp, f), clone).replace(os.sep, '/'))
+    rels = sorted(rels) + SUBSET
+    for r in rels:
+        os.makedirs(os.path.dirname(os.path.join(base, r)) or base, exist_ok=True)
+        shutil.copyfile(os.path.join(clone, r), os.path.join(base, r))
+    open(os.path.join(base, 'mod.yml'), 'wb').write(M._yml(rels))
+    F = copy.deepcopy(fp)
+    keep = set(rels)
+    lst = [r for r in F['files']['list'] if r[0] in keep]
+    if len(lst) != len(rels):
+        raise SystemExit('the fingerprint lacks %s' % sorted(keep - {r[0] for r in lst}))
+    yml = open(os.path.join(base, 'mod.yml'), 'rb').read()
+    lst.append(['mod.yml', len(yml), M.sha256(yml), M.sha256(M.eol_normal(yml)), ''])
+    F['files'] = dict(F['files'], list=sorted(lst), count=len(lst), assets=len(rels))
+    Y = M.parse_mod_yml(yml)
+    F['mod_yml'] = dict(F['mod_yml'], assets=len(Y['assets']), plain_assets=len(Y['assets']), irregular=[], top=Y['top'],
+                        asset_list_sha256=M.asset_canon(Y['assets']))
+    uses = {k: v for k, v in F['scripts']['uses'].items() if k in keep}
+    F['scripts'] = dict(F['scripts'], uses=uses, traps_used=sorted(M.traps_used(uses)))
+    return rels, F
+
+
+def run_tool(tool, fpath, exe, d, out):
+    p = subprocess.run(['nice', '-n', '10', sys.executable, '-I', tool, '--fingerprint', fpath, '--exe', exe, '--json', out, d],
+                       capture_output=True, text=True)
+    J = json.load(open(out)) if os.path.isfile(out) else {}
+    return p.returncode, p.stdout, J
+
+
+def has(J, step, *words):
+    return any(all(w in r for w in words) for r in (J.get('steps') or {}).get(step, []))
+
+
+def loud(J, *words):
+    return any(all(w in x for w in words) for x in J.get('loud') or [])
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--clone', default=os.path.expanduser('~/projects/SillyBillyMod1'))
+    ap.add_argument('--tool', default=os.path.join(HERE, 'mod_update_check.py'))
+    ap.add_argument('--fingerprint', default=os.path.join(PORT, 'mod', 'nmc-version.json'))
+    ap.add_argument('--exe', default=os.path.join(PORT, 'pc', 'kh2fm.exe'))
+    ap.add_argument('--work')
+    ap.add_argument('--keep', action='store_true')
+    ap.add_argument('--jobs', type=int, default=2)
+    a = ap.parse_args()
+    M = load_tool(a.tool)
+    fp = json.load(open(a.fingerprint))
+    work = a.work or tempfile.mkdtemp(prefix='muc_variants_')
+    os.makedirs(work, exist_ok=True)
+    TW = os.path.join('dll', 'KH2Tweaks_Refactor.dll')
+    results = []
+    try:
+        base = os.path.join(work, 'base')
+        rels, F = build_base(M, a.clone, fp, base)
+        fpath = os.path.join(work, 'fingerprint-subset.json')
+        json.dump(F, open(fpath, 'w'))
+
+        def v_leaf(d):
+            patch(M, os.path.join(d, TW), 0x2dd70, bytes.fromhex('@KHINPUT(hex,pc/kh2fm.exe,305344,6,4c3f340f5fee20b9c9e89f9d4968c58aaa7728dfe1895baa723ec94a578d7f35)@'), bytes.fromhex('@KHINPUT(hex,pc/kh2fm.exe,509212,6,4d415bae4086a94d56d8b9d0acde79c85a5aa0f138abae8ce254c2554d5950c2)@'))
+
+        def v_handler(d):
+            patch(M, os.path.join(d, TW), 0x2def5, b'\x50', b'\x51')
+
+        def v_keyname(d):
+            patch(M, os.path.join(d, TW), 0x73e78, b'crit_enemy_dmg\0', b'crit_enemy_dmX\0')
+
+        def v_default(d):
+            patch(M, os.path.join(d, TW), 0x75aa8, struct.pack('<f', 1.5), struct.pack('<f', 2.0))
+
+        def v_dllcase(d):
+            v_handler(d)
+            os.rename(os.path.join(d, TW), os.path.join(d, 'dll', 'kh2tweaks_refactor.dll'))
+            open(os.path.join(d, 'mod.yml'), 'wb').write(M._yml([r if r != 'dll/KH2Tweaks_Refactor.dll' else 'dll/kh2tweaks_refactor.dll' for r in rels]))
+
+        def v_moosecase(d):
+            os.rename(os.path.join(d, 'dll', 'KH2Moose.ini'), os.path.join(d, 'dll', 'kh2moose.ini'))
+            open(os.path.join(d, 'mod.yml'), 'wb').write(M._yml([r if r != 'dll/KH2Moose.ini' else 'dll/kh2moose.ini' for r in rels]))
+
+        def add_asset(d, rel, data):
+            os.makedirs(os.path.dirname(os.path.join(d, rel)) or d, exist_ok=True)
+            open(os.path.join(d, rel), 'wb').write(data)
+            open(os.path.join(d, 'mod.yml'), 'wb').write(M._yml(rels + [rel]))
+
+        def v_wm00(d):
+            add_asset(d, 'ard/us/wm00.ard', b'BAR\x01' + b'\0' * 12)
+
+        def v_probe(d):
+            add_asset(d, '01effect.bar', b'BAR\x01' + b'\0' * 12)
+
+        def v_itemkind(d):
+            p = os.path.join(d, '03system.bin')
+            b = bytearray(open(p, 'rb').read())
+            n = struct.unpack_from('<I', b, 4)[0]
+            it = [struct.unpack_from('<HH4sII', b, 16 + 16 * i) for i in range(n) if b[16 + 16 * i + 4:16 + 16 * i + 8] == b'item'][0]
+            o = it[3] + 8                                  # first record: item 1 (Potion)
+            if struct.unpack_from('<HB', b, o) != (1, 0) or b[o + 5] != 0:
+                raise SystemExit('03system.bin: the first item record is not item 1, type 0, kind 0')
+            b[o + 5] = 5
+            open(p, 'wb').write(bytes(b))
+
+        V = [
+            ('base', None, [('IDENTICAL (exit 0)', lambda rc, J: rc == 0)]),
+            ('leaf', v_leaf, [('[hooks] row 4: a DLL function it reaches CHANGED', lambda rc, J: has(J, 'hooks', 'row 4', 'reaches CHANGED')),
+                              ('[gummi] after the bake', lambda rc, J: 'bake' in J.get('steps', {}) and 'gummi' in J.get('steps', {}))]),
+            ('handler', v_handler, [('[hooks] row 4: CODE CHANGED', lambda rc, J: has(J, 'hooks', 'row 4', 'CODE CHANGED'))]),
+            ('keyname', v_keyname, [('[ini] names crit_enemy_dmg', lambda rc, J: has(J, 'ini', 'crit_enemy_dmg')),
+                                    ('[gummi] after the bake', lambda rc, J: 'gummi' in J.get('steps', {}))]),
+            ('default', v_default, [('[ini] crit_ap_mult default 1.5 -> 2.0', lambda rc, J: has(J, 'ini', 'crit_ap_mult', 'default', '1.5', '2.0'))]),
+            ('dllcase', v_dllcase, [('the DLL is compared: [hooks] row 4 CODE CHANGED', lambda rc, J: has(J, 'hooks', 'row 4', 'CODE CHANGED')),
+                                    ('[edits] [gen] [slots] listed', lambda rc, J: {'edits', 'gen', 'slots'} <= set(J.get('steps', {}))),
+                                    ('[repin] names MOD_TWEAKS_DLL (exact case)', lambda rc, J: has(J, 'repin', 'MOD_TWEAKS_DLL'))]),
+            ('moosecase', v_moosecase, [('loud: runtime/moose.c opens KH2Moose.ini by exact name', lambda rc, J: loud(J, 'moose.c'))]),
+            ('wm00', v_wm00, [('[gummi] names the shipped wm00.ard', lambda rc, J: has(J, 'gummi', 'ard/us/wm00.ard added'))]),
+            ('itemkind', v_itemkind, [('[hooks] effect kind 5 -> f_3c4b80 / f_3c3da0', lambda rc, J: has(J, 'hooks', 'kind 5', 'f_3c4b80'))]),
+            ('probe', v_probe, [('loud + [hooks]: the extra-file probe would find 01effect.bar',
+                                 lambda rc, J: loud(J, '01effect.bar') and has(J, 'hooks', '01effect.bar'))]),
+        ]
+
+        def one(v):
+            name, mut, exp = v
+            d = os.path.join(work, name)
+            if mut is not None:
+                shutil.copytree(base, d)
+                mut(d)
+            else:
+                d = base
+            rc, out, J = run_tool(a.tool, fpath, a.exe, d, os.path.join(work, name + '.json'))
+            open(os.path.join(work, name + '.txt'), 'w').write(out)
+            res = [(w, bool(f(rc, J))) for w, f in exp]
+            steps = list((J.get('steps') or {}).keys())
+            if mut is not None and not a.keep:
+                shutil.rmtree(d, ignore_errors=True)
+            return name, rc, steps, len(J.get('loud') or []), res
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(a.jobs, 4))) as ex:
+            for name, rc, steps, nl, res in ex.map(one, V):
+                for w, ok in res:
+                    results.append(ok)
+                    print('%-9s %-4s %s' % (name, 'ok' if ok else 'MISS', w))
+                print('          exit %d, steps: %s, %d loud' % (rc, ' '.join(steps) or '-', nl))
+
+        # ---- pin-check cases ------------------------------------------------------------------------------------------------------
+        def git_show(commit, rel, dst):
+            with open(dst, 'wb') as f:
+                subprocess.run(['git', '--no-optional-locks', '-C', a.clone, 'show', '%s:%s' % (commit, rel)], stdout=f, check=True)
+            return dst
+        exe = a.exe if os.path.isfile(a.exe) else None
+        old_tw = git_show('1bcc583', 'dll/KH2Tweaks_Refactor.dll', os.path.join(work, 'tweaks-1bcc583.dll'))
+        fp2 = copy.deepcopy(fp)
+        fp2['dll'][M.TWEAKS] = M.strip_dll(M.analyse_tweaks(old_tw, exe))
+        pc = M.pin_checks(fp2, PORT)
+        slot_lines = [x for x in pc if 'slot' in x]
+        ok = any('active detour slots were compared' in x for x in slot_lines)
+        results.append(ok)
+        print('%-9s %-4s KH2Tweaks_Refactor.dll of 1bcc583 against %s: %d pin-check lines about slots (%s)' % (
+            'pin-slots', 'ok' if ok else 'MISS', (fp.get('port', {}).get('slots') or {}).get('file'), len(slot_lines),
+            next((x for x in slot_lines if 'compared' in x), 'no "compared" line')))
+        # a3b4bca's KH2Moose.dll: rebuilt, 2 of the 7 cited functions the same code; 899691a's NeverlandFly.dll: rebuilt without the
+        # disassembler library, 4 of 7 the same code, 0x1070 / 0x12d0 / 0x15a0 changed (their signature tables moved: lea [base+0x91e0]
+        # -> [base+0x31e0]).  Each changed function must fail the pin; each same one must be found again by its code.
+        for commit, rel, which, want_missing in (('a3b4bca', M.MOOSE, 'moose', None), ('899691a', M.NEVERLAND, 'neverland', [0x1070, 0x12d0, 0x15a0])):
+            p = git_show(commit, rel, os.path.join(work, '%s-%s.dll' % (which, commit)))
+            try:
+                R = M.analyse_small(p, exe, which, prev=fp['dll'][rel])
+            except TypeError:                          # the original tool: no previous pin, the constants are used as they are
+                R = M.analyse_small(p, exe, which)
+            probs = R.get('problems')
+            pinned = {f['norm']: f['begin'] for f in fp['dll'][rel]['cited']}
+            found = sorted(pinned[f['norm']] for f in R.get('cited', []) if f.get('norm') in pinned)
+            if probs is None:
+                ok, what = False, 'no problem reported (the tool has no such check: the cited addresses were taken as they are)'
+            else:
+                missing = sorted(int(x.split('function 0x')[1].split()[0], 16) for x in probs if 'function 0x' in x)
+                ok = bool(probs) and (want_missing is None or missing == want_missing) and \
+                    sorted(set(pinned.values()) - set(missing)) == found
+                what = 'rebuilt: %d pinned function(s) found again by code (%s); %d problem(s) fail the pin (%s)' % (
+                    len(found), ', '.join('0x%x' % x for x in found), len(probs), ', '.join('0x%x' % x for x in missing))
+            results.append(ok)
+            print('%-9s %-4s %s of %s: %s' % ('pin-' + which, 'ok' if ok else 'MISS', rel, commit, what))
+    finally:
+        if not a.keep:
+            shutil.rmtree(work, ignore_errors=True)
+    print('variants: %d expectations, %d held, %d MISSED' % (len(results), sum(results), len(results) - sum(results)))
+    return 0 if all(results) else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

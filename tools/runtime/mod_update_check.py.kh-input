@@ -1,0 +1,2966 @@
+#!/usr/bin/env python3
+"""mod_update_check.py - is a Nobody May Cry checkout the version this port is built from?  If not: what changed, and which steps of the
+port must be redone, in order (task 34).
+
+  mod_update_check.py [--fingerprint FILE] [--exe EXE] [--json OUT] [--quiet-files] NEW_MOD_DIR     compare a checkout with the pin
+  mod_update_check.py --write-fingerprint MOD_DIR [--fingerprint FILE] [--edit-list FILE] [--exe EXE] re-pin (after a port update)
+  mod_update_check.py --remote                    print the command that shows whether the public repository has new commits
+  mod_update_check.py --selftest                  comparison logic on small synthetic mod trees (no game or mod data needed)
+
+The port follows ONE version of the PC mod (the public repository ProjectNobodyMayCry/SillyBillyMod1).  `mod/nmc-version.json` (the
+"fingerprint", committed: hashes, counts and addresses only) records that version: every file's path, size and sha256; mod.yml's asset
+list; for each of the three DLLs its sha256, the functions the port was derived from (bounds from the DLL's own unwind table, .pdata)
+with a hash of their bytes, and for KH2Tweaks_Refactor.dll the detour table, the 114-entry script system call table and the static-edit
+list as the port records them; the ini keys and values as the DLLs read them; the mod's added script calls each script uses; the counts
+the port's selftests pin.  docs/MOD-VERSION-INVENTORY.md says what in the port depends on each of them, docs/MOD-UPDATES.md is the
+procedure.
+
+What the comparison does (everything is read; nothing is written except --json OUT and, with --write-fingerprint, the fingerprint):
+  * files: added, removed, changed, and "line endings only" (a text file whose bytes differ but whose content with CR LF / CR turned into
+    LF is the same).  Every changed path is put into a KIND by its place in the mod (mod.yml, a DLL, an ini file, the DLL's own data
+    files, HD textures, scripts, area files, ...).  A path that fits no known kind is reported as UNKNOWN, loudly, never dropped.
+  * mod.yml: assets added / removed, a method other than `copy` (the bake tool refuses those), sources that are not the file of the same
+    name, top-level keys.
+  * ini files: per key, with the semantics of GetPrivateProfileString as the DLLs use it (first occurrence wins, value trimmed, an inline
+    `#comment` is PART of the value: that is why the AntiForm options read as off); for each changed key what in the port depends on it.
+  * DLLs: sha256; then, statically (objdump listing + the PE file; no DLL code is run): the .pdata bounds and bytes of every function the
+    pin records, and a NORMALISED hash (instruction text with addresses replaced by what they name: an import, a string, a constant, an
+    exe function the slot's signature scanner resolves to, a place in the same function) that survives a rebuild that only moved code,
+    and a DEEP hash (the function and every DLL function it can reach).  For KH2Tweaks_Refactor.dll the detour table is re-derived from
+    the new DLL (every call of Detours' DetourAttach / DetourAttachEx, found by its byte signature, with the slot and handler it is given)
+    and matched row by row: same handler bytes / moved but the same code / code changed (re-audit) / removed; a detour the pin does not
+    have is NEW.  The script system call table is re-read from its builder function and compared entry by entry.  "Reaches" includes
+    leaf routines without a .pdata entry (a tail jump to one too), and identical bytes are "same" only when the deep hash is too.
+    The ini keys the port depends on are compared as the DLL reads them: the key still named, the loader / initialiser that reads
+    it (hashed like a handler: no handler reaches those), the default for an absent key (decoded from the loader).
+  * names in any letter case (Windows and Panacea do not see it); a case-only rename of a file the port opens by its exact name
+    (dll/KH2Moose.ini) is loud.
+  * data the port's subsets were chosen from: the item effect kinds of 03system.bin (the item-effect port has only the kinds the
+    shipped items use) and the extra files the DLL probes for; the gummi removal is redone after every bake.
+  * scripts: every BAR / BDX of the checkout is scanned with tools/bdxscan.py; the table-3 calls (the mod's added script system calls)
+    each file uses are compared with the pin; a call the port does not implement is a step of its own.
+Exit status: 0 = identical (every file byte for byte), 1 = changes found, 2 = usage error or an input that cannot be read.
+`--remote` only PRINTS a `git ls-remote` command: this tool never touches the network.
+"""
+import argparse, collections, hashlib, io, json, os, re, shutil, struct, subprocess, sys, tempfile
+sys.dont_write_bytecode = True
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PORT = os.path.dirname(HERE)
+DEFAULT_FP = os.path.join(PORT, 'mod', 'nmc-version.json')
+DEFAULT_EXE = os.path.join(PORT, 'pc', 'kh2fm.exe')
+DEFAULT_EDITS = '/home/user/projects/kh2-nmc-analysis/scratch/mod-gummi/edit_list.json'   # Makefile MOD_EDITS
+REPO = 'ProjectNobodyMayCry/SillyBillyMod1'
+REMOTE = 'https://github.com/ProjectNobodyMayCry/SillyBillyMod1.git'
+SCHEMA = 2          # 2 (task 34 review): ini-key records, leaf callees in the hashes, derived inline slots, item kinds, case map
+TEXT_EXT = ('.ini', '.yml', '.yaml', '.txt', '.lua', '.json', '.md', '.cfg', '.csv', '.log')
+EXE_SHA256 = '9002b2de6a1f91a790bd0673de125d1cf833f7942bfec827cdcf6ba64d5849ed'   # the pinned kh2fm.exe (Steam build)
+
+TWEAKS = 'dll/KH2Tweaks_Refactor.dll'
+MOOSE = 'dll/KH2Moose.dll'
+NEVERLAND = 'dll/NeverlandFly.dll'
+KNOWN_DLLS = (TWEAKS, MOOSE, NEVERLAND)
+
+
+def sha256(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+# =====================================================================================================================================
+# files
+# =====================================================================================================================================
+def eol_normal(b):
+    return b.replace(b'\r\n', b'\n').replace(b'\r', b'\n')
+
+
+def file_info(path):
+    """[size, sha256, sha256 of the LF-normalised text or None]"""
+    size = os.path.getsize(path)
+    if size <= (8 << 20):
+        with open(path, 'rb') as f:
+            b = f.read()
+        lf = None
+        if path.lower().endswith(TEXT_EXT) and b'\0' not in b:
+            lf = sha256(eol_normal(b))
+        return [len(b), sha256(b), lf]
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for blk in iter(lambda: f.read(1 << 22), b''):
+            h.update(blk)
+    return [size, h.hexdigest(), None]
+
+
+def walk_tree(root):
+    """relative path (forward slashes) -> [size, sha256, sha256_lf]; .git is skipped, a symbolic link is an error (a mod has none)"""
+    out = {}
+    for dp, dn, fn in os.walk(root):
+        dn[:] = sorted(d for d in dn if d != '.git')
+        for f in sorted(fn):
+            p = os.path.join(dp, f)
+            rel = os.path.relpath(p, root).replace(os.sep, '/')
+            if os.path.islink(p):
+                out[rel] = [-1, 'symlink:' + os.readlink(p), None]
+                continue
+            out[rel] = file_info(p)
+    return out
+
+
+# =====================================================================================================================================
+# mod.yml (OpenKH mod description) and ini files
+# =====================================================================================================================================
+def parse_mod_yml(data):
+    """-> dict(assets=[{name, method, sources:[{name, type?, ...}], extra:{}}], top={key: value}, unparsed=[lines]).  Handles the
+    shapes OpenKH mods use (`- name:` / `  method:` / `  source:` / `  - name:` / `    type:`); any other line is kept in `unparsed`."""
+    text = data.decode('utf-8', 'replace').replace('\r\n', '\n').replace('\r', '\n')
+    assets, top, unparsed = [], {}, []
+    cur = None
+    for line in text.split('\n'):
+        if not line.strip() or line.lstrip().startswith('#'):
+            continue
+        m = re.match(r'^- name:\s*(.*?)\s*$', line)
+        if m:
+            cur = {'name': m.group(1).strip('"\''), 'method': 'copy', 'sources': [], 'extra': {}}
+            assets.append(cur)
+            continue
+        m = re.match(r'^  - name:\s*(.*?)\s*$', line)
+        if m and cur is not None:
+            cur['sources'].append({'name': m.group(1).strip('"\'')})
+            continue
+        m = re.match(r'^    ([A-Za-z_][A-Za-z0-9_]*):\s*(.*?)\s*$', line)
+        if m and cur is not None and cur['sources']:
+            cur['sources'][-1][m.group(1)] = m.group(2).strip('"\'')
+            continue
+        m = re.match(r'^  ([A-Za-z_][A-Za-z0-9_]*):\s*(.*?)\s*$', line)
+        if m and cur is not None:
+            k, v = m.group(1), m.group(2).strip('"\'')
+            if k == 'method':
+                cur['method'] = v
+            elif k == 'source' and v == '':
+                pass
+            else:
+                cur['extra'][k] = v
+            continue
+        m = re.match(r'^([A-Za-z_][A-Za-z0-9_]*):\s*(.*?)\s*$', line)
+        if m:
+            cur = None
+            if m.group(1) != 'assets':
+                top[m.group(1)] = m.group(2)
+            continue
+        unparsed.append(line)
+    return dict(assets=assets, top=top, unparsed=unparsed)
+
+
+def norm_path(p):
+    return p.replace('\\', '/').lstrip('/')
+
+
+def asset_is_plain(a):
+    """a `copy` asset whose one source is the mod file of the same name (all 4,861 of the pinned version)"""
+    return (a['method'] == 'copy' and not a['extra'] and len(a['sources']) == 1 and set(a['sources'][0]) == {'name'}
+            and norm_path(a['sources'][0]['name']).lower() == norm_path(a['name']).lower())
+
+
+def parse_ini(data):
+    """[[section, key, value], ...] in file order, as GetPrivateProfileStringA reads the file: `;` lines are comments, a key line is
+    `key=value`, key and value trimmed, the value keeps an inline `#...` (the API does not strip it: that is why
+    `antiform_tweaks=on #Makes ...` is not "on" for the DLL's boolean reader)."""
+    text = data.decode('latin1').replace('\r\n', '\n').replace('\r', '\n')
+    out, sec = [], None
+    for ln in text.split('\n'):
+        s = ln.strip()
+        if not s or s[0] == ';':
+            continue
+        if s[0] == '[':
+            sec = s[1:s.index(']')] if ']' in s else s[1:]
+            continue
+        if '=' in s:
+            k, v = s.split('=', 1)
+            out.append([sec, k.strip(), v.strip()])
+    return out
+
+
+def ini_effective(entries):
+    """(section lower, key lower) -> value of the FIRST occurrence (what the API returns)"""
+    d = {}
+    for sec, k, v in entries:
+        d.setdefault(((sec or '').lower(), k.lower()), v)
+    return d
+
+
+# =====================================================================================================================================
+# PE files (stdlib only)
+# =====================================================================================================================================
+class PE:
+    def __init__(self, data):
+        r = self.raw = data
+        if r[:2] != b'MZ':
+            raise ValueError('not an MZ/PE file')
+        pe = struct.unpack_from('<I', r, 0x3c)[0]
+        if r[pe:pe + 4] != b'PE\0\0':
+            raise ValueError('no PE header')
+        self.machine, nsec, self.timestamp = struct.unpack_from('<HHI', r, pe + 4)
+        optsz = struct.unpack_from('<H', r, pe + 20)[0]
+        opt = pe + 24
+        if struct.unpack_from('<H', r, opt)[0] != 0x20b:
+            raise ValueError('not a PE32+ file')
+        self.base = struct.unpack_from('<Q', r, opt + 24)[0]
+        self.size_of_image = struct.unpack_from('<I', r, opt + 56)[0]
+        self.entry = struct.unpack_from('<I', r, opt + 16)[0]
+        ndd = struct.unpack_from('<I', r, opt + 108)[0]
+        self.dd = [struct.unpack_from('<II', r, opt + 112 + 8 * i) for i in range(min(ndd, 16))]
+        self.secs = []
+        for i in range(nsec):
+            o = opt + optsz + 40 * i
+            name = r[o:o + 8].rstrip(b'\0').decode('latin1')
+            vsz, va, rsz, rp = struct.unpack_from('<IIII', r, o + 8)
+            chars = struct.unpack_from('<I', r, o + 36)[0]
+            self.secs.append((name, va, vsz, rp, rsz, chars))
+        img = bytearray(self.size_of_image)
+        hdr = struct.unpack_from('<I', r, opt + 60)[0]
+        img[:hdr] = r[:hdr]
+        for name, va, vsz, rp, rsz, ch in self.secs:
+            n = min(rsz, vsz) if vsz else rsz
+            img[va:va + n] = r[rp:rp + n]
+        self.img = bytes(img)
+        self._funcs = None
+
+    def section_of(self, rva):
+        for s in self.secs:
+            if s[1] <= rva < s[1] + max(s[2], s[4]):
+                return s
+        return None
+
+    def u32(self, rva):
+        return struct.unpack_from('<I', self.img, rva)[0]
+
+    def cstr(self, rva, maxlen=256):
+        if not (0 <= rva < len(self.img)):
+            return None
+        e = self.img.find(b'\0', rva, rva + maxlen)
+        if e < 0:
+            return None
+        return self.img[rva:e]
+
+    def exports(self):
+        """rva -> sorted list of export names"""
+        out = collections.defaultdict(list)
+        rva, size = self.dd[0] if self.dd else (0, 0)
+        if not rva:
+            return {}
+        nfun, nnames, afun, anames, aords = struct.unpack_from('<IIIII', self.img, rva + 20)
+        for i in range(nnames):
+            nm = self.cstr(self.u32(anames + 4 * i)).decode('latin1')
+            ordi = struct.unpack_from('<H', self.img, aords + 2 * i)[0]
+            out[self.u32(afun + 4 * ordi)].append(nm)
+        return {k: sorted(v) for k, v in out.items()}
+
+    def imports(self):
+        """IAT rva -> 'dll!name'"""
+        out = {}
+        rva = self.dd[1][0] if len(self.dd) > 1 else 0
+        while rva:
+            oft, _, _, name, ft = struct.unpack_from('<IIIII', self.img, rva)
+            if not name:
+                break
+            dll = self.cstr(name).decode('latin1').lower()
+            k = 0
+            while True:
+                v = struct.unpack_from('<Q', self.img, (oft or ft) + 8 * k)[0]
+                if not v:
+                    break
+                out[ft + 8 * k] = dll + '!' + (('#%d' % (v & 0xffff)) if v >> 63 else self.cstr(v + 2).decode('latin1'))
+                k += 1
+            rva += 20
+        return out
+
+    def functions(self):
+        """primary begin rva -> sorted list of (begin, end) fragments, from the exception directory (.pdata); a fragment whose
+        UNWIND_INFO carries UNW_FLAG_CHAININFO belongs to the function its chained entry names"""
+        if self._funcs is not None:
+            return self._funcs
+        rva, size = self.dd[3] if len(self.dd) > 3 else (0, 0)
+        ents = [struct.unpack_from('<III', self.img, rva + 12 * i) for i in range(size // 12)]
+        byb = {b: (b, e, u) for b, e, u in ents}
+
+        def root(ent, depth=0):
+            b, e, u = ent
+            if depth > 32 or not (0 < u < len(self.img) - 4):
+                return b
+            flags = self.img[u] >> 3
+            if flags & 4:
+                cnt = self.img[u + 2]
+                o = u + 4 + 2 * ((cnt + 1) & ~1)
+                pb, pe_, pu = struct.unpack_from('<III', self.img, o)
+                par = byb.get(pb, (pb, pe_, pu))
+                return root(par, depth + 1)
+            return b
+        f = collections.defaultdict(list)
+        for ent in ents:
+            if ent[0] == 0 and ent[1] == 0:
+                continue
+            f[root(ent)].append((ent[0], ent[1]))
+        self._funcs = {k: sorted(set(v)) for k, v in f.items()}
+        self._starts = sorted((b, e, k) for k, fr in self._funcs.items() for b, e in fr)
+        return self._funcs
+
+    def func_of(self, rva):
+        """primary begin of the .pdata function that contains rva, or None"""
+        self.functions()
+        lo, hi = 0, len(self._starts)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._starts[mid][0] <= rva:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo and self._starts[lo - 1][0] <= rva < self._starts[lo - 1][1]:
+            return self._starts[lo - 1][2]
+        return None
+
+    def func_bytes(self, begin):
+        return b''.join(self.img[b:e] for b, e in self.functions().get(begin, []))
+
+
+# =====================================================================================================================================
+# static listing (objdump) and normalised function hashes
+# =====================================================================================================================================
+class Listing:
+    """objdump -d -Mintel of a PE file: (rva, text) per instruction; None when objdump is not installed"""
+    def __init__(self, path, pe):
+        self.ok = False
+        self.ins, self.idx = [], {}
+        exe = shutil.which('objdump')
+        if not exe:
+            self.err = 'objdump not found (binutils): the normalised hashes and the detour / syscall-table re-derivation are SKIPPED'
+            return
+        try:
+            out = subprocess.run(['nice', '-n', '10', exe, '-d', '-Mintel', '--no-show-raw-insn', path], capture_output=True,
+                                 text=True, check=True).stdout
+        except Exception as e:
+            self.err = 'objdump failed on %s: %s' % (path, e)
+            return
+        for ln in out.splitlines():
+            m = re.match(r'^\s*([0-9a-f]+):\t(.*)$', ln)
+            if m:
+                a = int(m.group(1), 16) - pe.base
+                self.idx[a] = len(self.ins)
+                self.ins.append((a, m.group(2).strip()))
+        self.ok = bool(self.ins)
+        if not self.ok:
+            self.err = 'objdump produced no instructions for %s' % path
+
+    def range(self, b, e):
+        i = self.idx.get(b)
+        if i is None:
+            return []
+        out = []
+        while i < len(self.ins) and self.ins[i][0] < e:
+            out.append(self.ins[i])
+            i += 1
+        return out
+
+
+class SlotResolver:
+    """slot (a .data qword the DLL fills by a signature scan of the exe) -> exe rva, through tools/mod_dll_slots.py's scanner reader.
+    Optional: without the exe or that module every slot stays unresolved; normalised hashes then write every global as 'G', detour
+    rows have no exe target and are matched by their handler's code instead."""
+    def __init__(self, dll_path, exe_path, listing):
+        self.ok = False
+        self.cache = {}
+        try:
+            sys.path.insert(0, HERE)
+            import mod_dll_slots as M
+            self.M = M
+            if not exe_path or not os.path.isfile(exe_path):
+                self.err = 'exe not found (%s): slots are not resolved' % exe_path
+                return
+            self.dll = M.PE(dll_path)
+            self.exe = M.PE(exe_path)
+            self.ins = [(a + M.DLL_BASE, t) for a, t in listing.ins]
+            self.by_addr = {x[0]: i for i, x in enumerate(self.ins)}
+            M.IMPORTS.clear(); M.IMPORTS.update(M.imports(self.dll))
+            M.BY_TAG.clear(); M.RANGE_OK.clear()
+            for i, (ad, t) in enumerate(self.ins):
+                m = re.search(r'# 0x([0-9a-f]+)$', t)
+                if m:
+                    M.BY_TAG.setdefault(int(m.group(1), 16) - M.DLL_BASE, []).append(i)
+            self.ok = True
+        except SystemExit as e:
+            self.err = 'mod_dll_slots stopped: %s' % e
+        except Exception as e:
+            self.err = 'mod_dll_slots not usable: %s' % e
+
+    def resolve(self, slot):
+        if not self.ok:
+            return None
+        if slot in self.cache:
+            return self.cache[slot]
+        v = None
+        try:
+            if slot in self.M.BY_TAG:
+                r = self.M.resolve_scanner(self.ins, self.by_addr, self.dll, self.exe, slot)
+                if 'value' in r:
+                    v = r['value']
+        except SystemExit:
+            v = None
+        except Exception:
+            v = None
+        self.cache[slot] = v
+        return v
+
+
+ADDR_RE = re.compile(r'0x(1800[0-9a-f]{5})\b')
+
+
+def norm_function(pe, lst, begin, imports, exports, slots, frs, leaf_ref=None):
+    """normalised instruction text of the function `begin` (fragments frs) and the DLL functions it refers to (calls, jumps, lea of
+    a code address).  Addresses are replaced by what they name, so a rebuild that only moves code keeps the text.
+    leaf_ref(rva): called for a code address that belongs to no .pdata function (a leaf routine: MSVC gives a function that touches
+    neither the stack nor a non-volatile register no unwind entry); when it returns True the address is a function of its own (leaf
+    bounds, DllInfo.leaf_bounds) and is followed like any callee, so a call to it, a jump to it (a tail jump: row 4's handler DLL
+    0x2de50 ends with `jmp 0x2dd60`, the ability-level helper the port transcribes) and a lea of it all reach its code."""
+    lines, refs = [], set()
+    rdata = [s for s in pe.secs if s[0] in ('.rdata',)]
+
+    def tok(va, text):
+        rva = va - pe.base
+        for b, e in frs:
+            if b <= rva < e:
+                return 'L%x' % (rva - begin)
+        if rva in imports:
+            return 'I:' + imports[rva]
+        f = pe.func_of(rva)
+        if f is not None:
+            refs.add(f)
+            return 'F' + ('+%x' % (rva - f) if rva != f else '') + (':' + exports[f][0] if f in exports else '')
+        s = pe.section_of(rva)
+        if s is None:
+            return 'A?'
+        if s[0] == '.text':
+            if leaf_ref is not None and leaf_ref(rva):
+                refs.add(rva)
+                return 'F' + (':' + exports[rva][0] if rva in exports else '')
+            return 'T'          # not an instruction start of the listing (data in .text): named only as "code"
+        if s in rdata:
+            st = pe.cstr(rva, 200)
+            if st is not None and len(st) >= 2 and all(32 <= c < 127 or c in (9, 10, 13) for c in st):
+                return 'S:' + st.decode('latin1')
+            n = 16 if 'XMMWORD' in text else 8 if 'QWORD' in text else 4 if 'DWORD' in text else 2 if 'WORD' in text else 1 if 'BYTE' in text else 0
+            return 'K:' + pe.img[rva:rva + n].hex() if n else 'R'
+        x = slots.resolve(rva) if slots else None
+        if x is not None:
+            return 'X:%x' % x
+        return 'G'
+    for b, e in frs:
+        for a, t in lst.range(b, e):
+            m = re.search(r'\s+#\s+0x([0-9a-f]+)\s*(<[^>]*>)?$', t)
+            body = t[:m.start()] if m else t
+            body = re.sub(r'rip[+-]0x[0-9a-f]+', 'rip', body)
+            body = ADDR_RE.sub(lambda mm: tok(int(mm.group(0), 16), body), body)
+            body = re.sub(r'\s+', ' ', body)
+            if m:
+                body += ' ;' + tok(int(m.group(1), 16), t)
+            lines.append(body)
+    return '\n'.join(lines), refs
+
+
+REG32 = {'eax': 'rax', 'ebx': 'rbx', 'ecx': 'rcx', 'edx': 'rdx', 'esi': 'rsi', 'edi': 'rdi', 'ebp': 'rbp', 'esp': 'rsp'}
+
+
+def reg64(r):
+    if r in REG32:
+        return REG32[r]
+    m = re.match(r'^(r\d+)[dwb]$', r)
+    return m.group(1) if m else r
+
+
+class DllInfo:
+    """static facts of one DLL file: hashes of chosen functions, re-derived tables"""
+    def __init__(self, path, exe_path=None, want_listing=True):
+        self.path = path
+        self.data = open(path, 'rb').read()
+        self.sha256 = sha256(self.data)
+        self.pe = PE(self.data)
+        self.funcs = self.pe.functions()
+        self.imports = self.pe.imports()
+        self.exports = self.pe.exports()
+        self.lst = Listing(path, self.pe) if want_listing else None
+        self.slots = SlotResolver(path, exe_path, self.lst) if (self.lst and self.lst.ok and exe_path) else None
+        self._norm = {}
+        self.leaf = {}
+
+    def frags(self, begin):
+        return self.funcs.get(begin) or self.leaf.get(begin) or []
+
+    def leaf_bounds(self, rva):
+        """a function with no .pdata entry (a leaf: the two inline-detour handlers are such stubs): from rva to the first int3 at
+        an instruction boundary, or to the next .pdata function, whichever comes first"""
+        nxt = min([b for b in self.funcs if b > rva] + [len(self.pe.img)])
+        end = nxt
+        if self.lst and self.lst.ok and rva in self.lst.idx:
+            for a, t in self.lst.range(rva, nxt):
+                if t == 'int3':
+                    end = a
+                    break
+        else:
+            k = self.pe.img.find(b'\xcc\xcc', rva, nxt)
+            end = k if k >= 0 else nxt
+        return [(rva, end)]
+
+    def leaf_ref(self, rva):
+        """a code address no .pdata function contains: when it starts an instruction of the listing it becomes a leaf function
+        (bounds: leaf_bounds) that norm() and deep() follow like any other.  -> True when it is one"""
+        if rva in self.leaf:
+            return True
+        if not (self.lst and self.lst.ok and rva in self.lst.idx) or self.pe.func_of(rva) is not None:
+            return False
+        self.leaf[rva] = self.leaf_bounds(rva)
+        return True
+
+    def raw_hash(self, begin):
+        fr = self.frags(begin)
+        return sha256(b''.join(self.pe.img[b:e] for b, e in fr)) if fr else None
+
+    def norm(self, begin):
+        if begin not in self._norm:
+            if not (self.lst and self.lst.ok) or not self.frags(begin):
+                self._norm[begin] = (None, set())
+            else:
+                text, refs = norm_function(self.pe, self.lst, begin, self.imports, self.exports, self.slots, self.frags(begin),
+                                           leaf_ref=self.leaf_ref)
+                self._norm[begin] = (sha256(text.encode()), refs)
+        return self._norm[begin]
+
+    def deep(self, begin):
+        """hash over the normalised hashes of every DLL function reachable from begin (begin included)"""
+        if self.norm(begin)[0] is None:
+            return None, 0
+        seen, todo = set(), [begin]
+        while todo:
+            f = todo.pop()
+            if f in seen:
+                continue
+            seen.add(f)
+            todo.extend(self.norm(f)[1] - seen)
+        return sha256('\n'.join(sorted(self.norm(f)[0] for f in seen)).encode()), len(seen)
+
+    def func_record(self, rva):
+        """the .pdata function containing rva: bounds and the three hashes"""
+        f = self.pe.func_of(rva)
+        bounds = 'pdata'
+        if f is None:
+            if not (0 < rva < len(self.pe.img)):
+                return dict(rva=rva, error='0x%x is outside the image' % rva)
+            f = rva
+            self.leaf[f] = self.leaf_bounds(rva)
+            bounds = 'leaf (no .pdata entry): to the first int3'
+        dh, nreach = self.deep(f)
+        fr = self.frags(f)
+        return dict(rva=rva, begin=f, bounds=bounds, fragments=[list(x) for x in fr], size=sum(e - b for b, e in fr),
+                    sha256=self.raw_hash(f), norm=self.norm(f)[0], deep=dh, reach=nreach)
+
+    def by_norm(self):
+        """normalised hash -> [begin] over every function of the DLL (for "moved but the same code")"""
+        if not hasattr(self, '_bynorm'):
+            d = collections.defaultdict(list)
+            for f in self.funcs:
+                h = self.norm(f)[0]
+                if h:
+                    d[h].append(f)
+            self._bynorm = d
+        return self._bynorm
+
+    # ---- KH2Tweaks_Refactor.dll: Detours' attach calls ----------------------------------------------------------------------------
+    # DetourAttach(ppPointer, pDetour) = DetourAttachEx(ppPointer, pDetour, NULL, NULL, NULL) as compiled into the pinned DLL (rva
+    # 0x35d00): spill rdx / rcx, sub rsp,0x38, [rsp+0x20] = 0, r9d = r8d = 0, reload rdx / rcx, call DetourAttachEx.
+    ATTACH_SIG = bytes.fromhex('@KHINPUT(hex,mod/dll/KH2Tweaks_Refactor.dll,217344,40,ae279f5c0fd557649d7719e924fb6827f6ddd3c140723327e230637e374194fd)@')
+
+    def detour_sites(self):
+        """-> dict(attach, attach_ex, sites=[{site, kind, slot, handler, func}], error)"""
+        R = dict(attach=None, attach_ex=None, sites=[], error=None)
+        hits = []
+        p = self.pe.img.find(self.ATTACH_SIG)
+        while p >= 0:
+            hits.append(p)
+            p = self.pe.img.find(self.ATTACH_SIG, p + 1)
+        if len(hits) != 1:
+            R['error'] = 'DetourAttach signature found %d times (expected once): the Detours library changed; derive the detour table by hand' % len(hits)
+            return R
+        att = hits[0]
+        call = att + len(self.ATTACH_SIG) - 1
+        ex = call + 5 + struct.unpack_from('<i', self.pe.img, call + 1)[0]
+        R['attach'], R['attach_ex'] = att, ex
+        if not (self.lst and self.lst.ok):
+            R['error'] = self.lst.err if self.lst else 'no listing'
+            return R
+        for i, (a, t) in enumerate(self.lst.ins):
+            m = re.match(r'call\s+0x([0-9a-f]+)$', t)
+            if not m:
+                continue
+            tgt = int(m.group(1), 16) - self.pe.base
+            if tgt not in (att, ex) or self.pe.func_of(a) == att:
+                continue
+            regs = {}
+            for j in range(i - 1, max(-1, i - 14), -1):
+                tj = self.lst.ins[j][1]
+                if re.match(r'(call|ret|jmp|int3)\b', tj):
+                    break
+                m2 = re.match(r'lea\s+(rcx|rdx),\[rip[+-]0x[0-9a-f]+\]\s+#\s+0x([0-9a-f]+)', tj)
+                if m2 and m2.group(1) not in regs:
+                    regs[m2.group(1)] = int(m2.group(2), 16) - self.pe.base
+                    continue
+                m3 = re.match(r'(?:mov|lea|xor|movsxd|movzx|pop)\s+(rcx|rdx|ecx|edx),', tj)
+                if m3:
+                    r64 = 'r' + m3.group(1)[1:]
+                    regs.setdefault(r64, None)
+            ent = dict(site=a, kind='attach' if tgt == att else 'attach_ex', slot=regs.get('rcx'), handler=regs.get('rdx'),
+                       func=self.pe.func_of(a))
+            if ent['kind'] == 'attach_ex':
+                # an inline site: the target is a place inside an exe function, formed as `mov REG,[slot]; add REG,N` in front of the
+                # call (DLL 0x1bdd7 / 0x1bde7 for dualwield_forms, 0x1ee9d / 0x1eea4 for patch_ability_categories): exe = slot + N
+                ent['slot'], ent['site_add'] = None, None
+                for j in range(i - 1, max(-1, i - 40), -1):
+                    tj = self.lst.ins[j][1]
+                    if re.match(r'(ret|int3)\b', tj):
+                        break
+                    m4 = re.match(r'add\s+(r\w+),0x([0-9a-f]+)$', tj)
+                    if not m4:
+                        continue
+                    for k in range(j - 1, max(-1, j - 10), -1):
+                        tk = self.lst.ins[k][1]
+                        m5 = re.match(r'mov\s+%s,QWORD PTR \[rip[+-]0x[0-9a-f]+\]\s+#\s+0x([0-9a-f]+)' % m4.group(1), tk)
+                        if m5:
+                            ent['slot'], ent['site_add'] = int(m5.group(1), 16) - self.pe.base, int(m4.group(2), 16)
+                            break
+                        if re.match(r'(?!test|cmp)\w+\s+%s,' % m4.group(1), tk) or re.match(r'(call|ret|jmp)\b', tk):
+                            break
+                    break
+            R['sites'].append(ent)
+        return R
+
+    def function_strings(self, begin):
+        """printable strings the function names through rip-relative operands (the ini keys an option initialiser reads)"""
+        out = []
+        if not (self.lst and self.lst.ok):
+            return out
+        for b, e in self.funcs.get(begin, []):
+            for a, t in self.lst.range(b, e):
+                m = re.search(r'#\s+0x([0-9a-f]+)', t)
+                if not m:
+                    continue
+                rva = int(m.group(1), 16) - self.pe.base
+                s = self.pe.section_of(rva)
+                if not s or s[0] != '.rdata':
+                    continue
+                st = self.pe.cstr(rva, 120)
+                if st and len(st) >= 3 and all(32 <= c < 127 for c in st):
+                    out.append(st.decode('latin1'))
+        return out
+
+    # ---- KH2Tweaks_Refactor.dll: the ini keys the port depends on, as the DLL reads them ----------------------------------------------
+    # The option loaders (DLL 0x20590 damage percent, 0x21090 AP / HP / MP multipliers, 0x22440 drive_add_mult, the option
+    # initialisers) build the key as a std::string from a NUL-terminated .rdata string (`lea rdx,[key]; call <ctor>`), then call the
+    # reader (0x2ab00 integer, 0x2ad10 float, 0x2a840 boolean) with the key, the section and the file name; the 4th argument is the
+    # default for an absent key (r9d for the integer reader, xmm3 for the float reader; the boolean reader takes none).  No handler
+    # reaches these functions (they only read the stored global), so they are recorded here: a new key name, default or parse is a
+    # step even when every detour handler is byte-identical.
+    def key_sites(self):
+        """lower-cased printable .rdata string -> [(listing index, site rva)] of every `lea reg,[rip+X]` that names it (cached)"""
+        if getattr(self, '_keysites', None) is not None:
+            return self._keysites
+        out = collections.defaultdict(list)
+        if self.lst and self.lst.ok:
+            for i, (a, t) in enumerate(self.lst.ins):
+                m = re.match(r'lea\s+\w+,\[rip[+-]0x[0-9a-f]+\]\s+#\s+0x([0-9a-f]+)', t)
+                if not m:
+                    continue
+                r = int(m.group(1), 16) - self.pe.base
+                s = self.pe.section_of(r)
+                if not s or s[0] != '.rdata':
+                    continue
+                st = self.pe.cstr(r, 120)
+                if st and len(st) >= 2 and all(32 <= c < 127 for c in st):
+                    out[st.decode('latin1').lower()].append((i, a))
+        self._keysites = out
+        return out
+
+    def _xmm_source(self, k, reg, lo):
+        """the value the last write before listing index k gives xmm register `reg` (searching back to index lo)"""
+        for j in range(k - 1, lo - 1, -1):
+            t = self.lst.ins[j][1]
+            m = re.match(r'(\w+)\s+%s,(.*)$' % reg, t)
+            if not m:
+                continue
+            op, src = m.group(1), m.group(2)
+            if op in ('xorps', 'pxor', 'xorpd') and src.strip() == reg:
+                return 0.0, '%s = 0 at DLL 0x%x' % (reg, self.lst.ins[j][0])
+            mm = re.match(r'DWORD PTR \[rip[+-]0x[0-9a-f]+\]\s+#\s+0x([0-9a-f]+)', src)
+            if op == 'movss' and mm:
+                r = int(mm.group(1), 16) - self.pe.base
+                return struct.unpack_from('<f', self.pe.img, r)[0], '%s = float [DLL 0x%x] at DLL 0x%x' % (reg, r, self.lst.ins[j][0])
+            mm = re.match(r'(xmm\d+)$', src.strip())
+            if op in ('movaps', 'movss', 'movups', 'movapd') and mm:
+                v, how = self._xmm_source(j, mm.group(1), lo)
+                return v, '%s = %s at DLL 0x%x; %s' % (reg, mm.group(1), self.lst.ins[j][0], how)
+            return None, '%s written by `%s` at DLL 0x%x (not decoded)' % (reg, t, self.lst.ins[j][0])
+        return None, '%s not written in the function before the call' % reg
+
+    def key_read(self, i):
+        """the read that follows the key's lea at listing index i: the first direct call is the std::string constructor, the next call
+        to another function is the reader.  -> dict(reader, default, default_type, default_how)"""
+        a0 = self.lst.ins[i][0]
+        f = self.pe.func_of(a0)
+        fr = self.funcs.get(f, []) if f is not None else []
+        lo = self.lst.idx.get(fr[0][0], i) if fr else i
+        ctor = reader = None
+        j = i + 1
+        while j < len(self.lst.ins) and j < i + 120:
+            a, t = self.lst.ins[j]
+            if fr and not any(b <= a < e for b, e in fr):
+                break
+            if re.match(r'ret\b', t):
+                break
+            m = re.match(r'call\s+0x([0-9a-f]+)$', t)
+            if m:
+                tgt = int(m.group(1), 16) - self.pe.base
+                if ctor is None:
+                    ctor = tgt
+                elif tgt != ctor:
+                    reader = tgt
+                    break
+            j += 1
+        if reader is None:
+            return dict(reader=None, default=None, default_type=None, default_how='no reader call follows the key at DLL 0x%x' % a0)
+        for k in range(j - 1, i, -1):
+            t = self.lst.ins[k][1]
+            if re.match(r'\w+\s+xmm3,', t):
+                v, how = self._xmm_source(k + 1, 'xmm3', lo)
+                return dict(reader=reader, default=v, default_type='float', default_how=how)
+            m = re.match(r'(xor|mov)\s+(r9d|r9),(.*)$', t)
+            if m:
+                if m.group(1) == 'xor' and m.group(3) == m.group(2):
+                    return dict(reader=reader, default=0, default_type='int', default_how='r9d = 0 at DLL 0x%x' % self.lst.ins[k][0])
+                mm = re.match(r'0x([0-9a-f]+)$', m.group(3))
+                if m.group(1) == 'mov' and mm:
+                    return dict(reader=reader, default=int(mm.group(1), 16), default_type='int',
+                                default_how='r9d = 0x%s at DLL 0x%x' % (mm.group(1), self.lst.ins[k][0]))
+                return dict(reader=reader, default=None, default_type='int', default_how='r9 written by `%s` (not decoded)' % t)
+            if re.match(r'\w+\s+r9[dwb]?,', t):
+                return dict(reader=reader, default=None, default_type='int', default_how='r9 written by `%s` (not decoded)' % t)
+        return dict(reader=reader, default=None, default_type=None,
+                    default_how='no 4th argument written before the reader call (a reader without a default: absent = off / empty)')
+
+    def ini_key_record(self, key):
+        """-> dict(named, sites, functions, reader, default, default_type, default_how) for one ini key"""
+        ss = self.key_sites().get(key.lower(), [])
+        rec = dict(named=bool(ss), sites=[a for i, a in ss], functions=sorted({self.pe.func_of(a) for i, a in ss} - {None}))
+        rec.update(self.key_read(ss[0][0]) if ss else dict(reader=None, default=None, default_type=None, default_how='not named'))
+        return rec
+
+    # ---- KH2Tweaks_Refactor.dll: the script system call table (VM directory slot 3) -------------------------------------------------
+    def syscall_table(self):
+        """re-read the table builder: the function with the most `lea reg,[exported function]`; it allocates the table, keeps its
+        address in a global, and stores {handler, flags} pairs through a register loaded from that global.  -> dict(builder, table
+        global, entries=[{index, handler, names, flags}], error)"""
+        R = dict(builder=None, table_global=None, entries=[], error=None)
+        if not (self.lst and self.lst.ok):
+            R['error'] = self.lst.err if self.lst else 'no listing'
+            return R
+        cnt = collections.Counter()
+        for a, t in self.lst.ins:
+            m = re.match(r'lea\s+\w+,\[rip[+-]0x[0-9a-f]+\]\s+#\s+0x([0-9a-f]+)', t)
+            if m and int(m.group(1), 16) - self.pe.base in self.exports:
+                f = self.pe.func_of(a)
+                if f is not None:
+                    cnt[f] += 1
+        if not cnt:
+            R['error'] = 'no function takes the address of exported functions: table builder not found'
+            return R
+        bld, n = cnt.most_common(1)[0]
+        if n < 50:
+            R['error'] = 'table builder candidate 0x%x names only %d exported functions' % (bld, n)
+            return R
+        R['builder'] = bld
+        regs, slots, gl = {}, {}, collections.Counter()
+        for b, e in self.funcs[bld]:
+            for a, t in self.lst.range(b, e):
+                m = re.match(r'lea\s+(\w+),\[rip[+-]0x[0-9a-f]+\]\s+#\s+0x([0-9a-f]+)', t)
+                if m:
+                    regs[m.group(1)] = ('fn', int(m.group(2), 16) - self.pe.base)
+                    continue
+                m = re.match(r'mov\s+(\w+),QWORD PTR \[rip[+-]0x[0-9a-f]+\]\s+#\s+0x([0-9a-f]+)', t)
+                if m:
+                    regs[m.group(1)] = ('glob', int(m.group(2), 16) - self.pe.base)
+                    continue
+                m = re.match(r'mov\s+QWORD PTR \[(\w+)(?:\+0x([0-9a-f]+))?\],(\w+|0x[0-9a-f]+)$', t)
+                if m and regs.get(m.group(1), ('',))[0] == 'glob':
+                    g = regs[m.group(1)][1]
+                    off = int(m.group(2) or '0', 16)
+                    v = m.group(3)
+                    val = ('imm', int(v, 16)) if v.startswith('0x') else regs.get(reg64(v), ('?',))
+                    slots.setdefault(g, {})[off] = val
+                    gl[g] += 1
+                    continue
+                m = re.match(r'xor\s+(\w+),(\w+)$', t)
+                if m and m.group(1) == m.group(2):
+                    regs[reg64(m.group(1))] = ('imm', 0)
+                    continue
+                m = re.match(r'mov\s+(\w+),(0x[0-9a-f]+)$', t)
+                if m:
+                    regs[reg64(m.group(1))] = ('imm', int(m.group(2), 16))
+                    continue
+                m = re.match(r'(?:mov|lea|xor|add|sub|or|and|movsxd|movzx|pop|inc|dec|shl|shr)\s+(\w+)', t)
+                if m:
+                    regs.pop(reg64(m.group(1)), None)
+                if t.startswith('call'):
+                    for r in ('rax', 'rcx', 'rdx', 'r8', 'r9', 'r10', 'r11'):
+                        regs.pop(r, None)
+        if not gl:
+            R['error'] = 'no stores through a table global in 0x%x' % bld
+            return R
+        g = gl.most_common(1)[0][0]
+        R['table_global'] = g
+        tab = slots[g]
+        n = max(tab) // 16 + 1
+        for i in range(n):
+            h, fl = tab.get(16 * i), tab.get(16 * i + 8)
+            ent = dict(index=i, handler=h[1] if h and h[0] == 'fn' else None, flags=fl[1] if fl and fl[0] == 'imm' else None)
+            ent['names'] = self.exports.get(ent['handler'], []) if ent['handler'] is not None else []
+            R['entries'].append(ent)
+        return R
+
+
+# =====================================================================================================================================
+# scripts: table-3 system calls (the mod's added calls) per file
+# =====================================================================================================================================
+def scan_scripts(root, files=None):
+    """-> dict(files_scanned, scripts, uses={relpath: {trap: [entry, callback, sweep, raw]}})"""
+    sys.path.insert(0, HERE)
+    import bdxscan
+    out = {}
+    nfiles = nbdx = 0
+    rels = sorted(files) if files is not None else None
+    if rels is None:
+        rels = []
+        for dp, dn, fn in os.walk(root):
+            dn[:] = sorted(d for d in dn if d != '.git')
+            for f in sorted(fn):
+                rels.append(os.path.relpath(os.path.join(dp, f), root).replace(os.sep, '/'))
+    for rel in rels:
+        p = os.path.join(root, rel)
+        try:
+            with open(p, 'rb') as fh:
+                magic = fh.read(4)
+        except OSError:
+            continue
+        if magic != b'BAR\x01' and not p.lower().endswith('.bdx'):
+            continue
+        nfiles += 1
+        for lab, r in bdxscan.scan_file(p):
+            nbdx += 1
+            for t, tr, pc, cls in r['syscalls']:
+                if t != 3:
+                    continue
+                u = out.setdefault(rel, {}).setdefault(str(tr), [0, 0, 0, 0])
+                u[('entry', 'callback', 'sweep', 'raw').index(cls)] += 1
+    return dict(files_scanned=nfiles, scripts=nbdx, uses=out)
+
+
+def traps_used(uses, include_raw=False):
+    s = set()
+    for rel, d in uses.items():
+        for tr, c in d.items():
+            if sum(c[:3]) or (include_raw and c[3]):
+                s.add(int(tr))
+    return s
+
+
+# =====================================================================================================================================
+# the port's records (what the port was derived from; see docs/MOD-VERSION-INVENTORY.md)
+# =====================================================================================================================================
+# The 35 active detours of KH2Tweaks_Refactor.dll (implementation notes section 2: row, class; slots and exe targets in
+# tools/mod_dll_slots_h23.txt, checked by `make mod-dll-slots`).  exe target -> (H23 row, class, where the port is).
+#   chains   the handler reaches its trampoline: the port's hook forwards to the original (or re-lifted) body on those paths
+#   replaces the handler never does: the port owns the function outright (Makefile MOD_DLL_REPLACES, build check)
+#   inline   a DetourAttachEx site inside a function: a site handler spliced into the re-lifted body (Task 12)
+DETOUR_PORT = {
+    0x3c40a9: (0, 'inline', 'runtime/mod_static_sites.c kh_mod_site_3c40a9 (spliced into the re-lifted f_3c3fe0)'),
+    0x3a7cb0: (1, 'chains', 'runtime/mod_hooks_a.c f_3a7cb0'),
+    0x29efa0: (2, 'replaces', 'runtime/mod_hooks_a.c f_29efa0'),
+    0x360a5a: (3, 'inline', 'runtime/mod_static_sites.c kh_mod_site_360a5a (spliced into the re-lifted f_360920)'),
+    0x4014a0: (4, 'replaces', 'runtime/mod_hooks_a.c f_4014a0'),
+    0x3a9cf0: (5, 'replaces', 'runtime/mod_syscalls.c f_3a9cf0'),
+    0x3c4b80: (6, 'replaces', 'runtime/mod_difficulty.c f_3c4b80'),
+    0x3c3da0: (7, 'chains', 'runtime/mod_difficulty.c f_3c3da0'),
+    0x3c4780: (8, 'chains', 'runtime/mod_hooks_b.c f_3c4780'),
+    0x351390: (9, 'replaces', 'runtime/mod_hooks_b.c f_351390'),
+    0x368820: (10, 'chains', 'runtime/mod_hooks_b.c f_368820'),
+    0x2fc860: (11, 'replaces', 'runtime/mod_hooks_a.c f_2fc860'),
+    0x2fc4e0: (12, 'replaces', 'runtime/mod_hooks_a.c f_2fc4e0'),
+    0x405440: (13, 'chains', 'runtime/mod_hooks_a.c f_405440'),
+    0x3ed7d0: (14, 'replaces', 'runtime/mod_difficulty.c f_3ed7d0'),
+    0x3c12f0: (15, 'replaces', 'runtime/mod_difficulty.c f_3c12f0'),
+    0x3a89a0: (16, 'chains', 'runtime/mod_hooks_a.c f_3a89a0 -> mod_f_3a89a0'),
+    0x40dd70: (17, 'chains', 'runtime/mod_params.c f_40dd70'),
+    0x40d810: (18, 'chains', 'runtime/mod_params.c f_40d810'),
+    0x1f9a80: (19, 'replaces', 'runtime/mod_syscalls.c f_1f9a80'),
+    0x31dd70: (20, 'chains', 'runtime/mod_hooks_b.c f_31dd70'),
+    0x4060e0: (21, 'chains', 'runtime/mod_hooks_b.c f_4060e0'),
+    0x3f29e0: (22, 'replaces', 'runtime/mod_hooks_b.c f_3f29e0'),
+    0x3f27d0: (23, 'replaces', 'runtime/mod_hooks_b.c f_3f27d0'),
+    0x3d1730: (24, 'chains', 'runtime/mod_hooks_b.c f_3d1730'),
+    0x15aba0: (25, 'replaces', 'runtime/mod_hooks_b.c f_15aba0'),
+    0x15aab0: (26, 'replaces', 'runtime/mod_hooks_b.c f_15aab0'),
+    0x153850: (27, 'replaces', 'runtime/mod_hooks_b.c f_153850'),
+    0x3d61d0: (28, 'chains', 'runtime/mod_hooks_a.c f_3d61d0'),
+    0x3f6620: (29, 'chains', 'runtime/mod_hooks_b.c f_3f6620'),
+    0x3f65a0: (30, 'chains', 'runtime/mod_hooks_b.c f_3f65a0'),
+    0x3f6510: (31, 'chains', 'runtime/mod_hooks_b.c f_3f6510'),
+    0x3a17f0: (32, 'chains', 'runtime/mod_hooks_b.c f_3a17f0'),
+    0x3edf90: (33, 'replaces', 'runtime/mod_difficulty.c f_3edf90'),
+    0x3d60c0: (34, 'chains', 'runtime/mod_hooks_a.c f_3d60c0'),
+}
+# the two inline sites the port splices (runtime/mod_static_sites.c): option the initialiser reads -> (exe function, exe site).  The
+# checker derives each row's slot and offset from the DLL (`mov REG,[slot]; add REG,N` in front of DetourAttachEx: pinned build
+# 0x82300 + 0xc9, 0x81e20 + 0x13a), resolves the slot through the scanner and requires function + N == site at re-pin.
+INLINE_SITES = {'dualwield_forms': (0x3c3fe0, 0x3c40a9), 'patch_ability_categories': (0x360920, 0x360a5a)}
+# attach sites behind an option whose detours the port does NOT have (it stops at start-up with mod-option-not-ported when on)
+GUARDED_OPTIONS = {'retry', 'savepoint_qol', 'patch_gummiskip'}
+GUARDED_SITES = 7                    # retry x5, savepoint_qol, patch_gummiskip in the pinned build (runtime/mod_hooks_b.c option table)
+SLOTS_FILE_DEFAULT = 'tools/mod_dll_slots_h23.txt'   # the slot expectation file of the pinned build (Makefile rule mod-dll-slots --expect)
+# options the port left out as out of scope (docs/mod/MOD-HOOKS.md: debug, multiple_shortcuts) and has NO guard for: on = loud
+OUT_OF_SCOPE_OPTIONS = {'debug_on', 'soft_reset', 'multiple_shortcuts'}
+INACTIVE_PORT = 'not ported: runtime/mod_hooks_b.c kh_mod_b_check_options stops with mod-option-not-ported when the option reads as on'
+
+# ini keys whose value the port carries as a compiled constant (KH2_Tweaks_*.ini, read by the DLL into handler state)
+CONST_KEYS = {
+    **{'%s_%s_dmg' % (d, w): 'runtime/mod_config.h kh_mod_difficulty_config (damage percent; exe 0x3c12f0 = DLL 0x32d30) and the damage '
+       'selftest / tools/native_difficulty_oracle.c expectations' for d in ('beginner', 'standard', 'proud', 'crit') for w in ('party', 'enemy')},
+    **{'%s_ap_mult' % d: 'runtime/mod_config.h kh_mod_difficulty_config (.ap; exe 0x3ed7d0 = DLL 0x31ee0) and the rewards selftest'
+       for d in ('beginner', 'standard', 'proud', 'crit')},
+    **{'%s_%s_mult' % (d, w): 'runtime/mod_config.h kh_mod_difficulty_config (.%s; exe 0x3edf90 = DLL 0x2f9b0) and the rewards selftest' % w
+       for d in ('standard', 'proud', 'crit') for w in ('hp', 'mp')},
+    # absent from the shipped ini (it has the misspelt begginer_*, which no DLL reads): the port's 1.0 is the DLL's own default
+    # (loader DLL 0x21090: xmm7 = float [0x75aa4] = 1.0, passed to the float reader 0x2ad10 as xmm3); the fingerprint records it
+    **{'beginner_%s_mult' % w: 'runtime/mod_config.h kh_mod_difficulty_config (beginner .%s = 1.0: the DLL\'s default, the key is absent '
+       'from the ini; exe 0x3edf90 = DLL 0x2f9b0) and the rewards selftest' % w for w in ('hp', 'mp')},
+    'drive_add_mult': 'runtime/mod_syscalls.c (drive_multiplier = 1.0f, exe 0x3a9cf0 = DLL 0x327e0); also the gate of that detour',
+    'dualwield_forms': 'runtime/mod_static_sites.c + mod_hooks_a.c (the six form slots 0,2,3,0,5,0 of the inline site 0x3c40a9 and of '
+                       'exe 0x2fc860 / 0x2fc4e0); also static edits (.rdata form tables)',
+}
+# KH2Moose.ini: read at RUN time from the data tree by runtime/moose.c (no rebuild); these keys / values the port does not have
+MOOSE_KEYS = {('kh2.cache', 'size'), ('kh2.cache', 'player'), ('kh2.cache', 'friend'), ('kh2.cache', 'magic'), ('kh2.cache', 'menu'),
+              ('kh2.cache', 'drive'), ('kh2.data', 'size'), ('kh2.fixes', 'scd_priority'), ('kh2.hacks', 'fast_title'),
+              ('kh2.hacks', 'attempt_continue_after_exception_but_probably_make_things_worse'), ('kh2.hacks', 'no_death'),
+              ('kh2.hacks', 'test_crash')}
+MOOSE_NOT_PORTED = 'scd_priority bit 2, no_death, test_crash are named fatals in runtime/moose.c'
+# the DLL functions the KH2Moose / NeverlandFly ports were decoded from (runtime/moose.c, tools/gen_mod_moose.py, implementation notes,
+# implementation notes section 4; tools/gen_mod_neverland.py, implementation notes): any address inside the function names it
+MOOSE_CITED = [0x1d60, 0x1fba, 0x2144, 0x3050, 0x3470, 0xb640, 0xbbf0, 0xc670]
+MOOSE_DATA = [(0x44038, 64, 'scd_priority pattern'), (0x440a0, 64, 'fast_title pattern'), (0x495a0, 64, 'NOP table')]
+NEVERLAND_OWN_END = 0x17d0          # the DLL's own code is 0x1000..0x17cb; the rest of .text is an unused disassembler library
+# The builds the DLL addresses above were read from (sha256).  Re-pinning to another build does NOT trust those addresses: each
+# function and data block of the previous pin is found again in the new build (same bytes at the same place, else by its
+# normalised code / its bytes' hash anywhere in the image); one that is not found fails the pin check until the port is re-decoded
+# and these constants (addresses AND the build hash) are updated.  docs/MOD-UPDATES.md "repin" lists every build-specific constant.
+CONST_BUILD = {
+    'dll/KH2Moose.dll': '6ef0785bf31ac2ff65242a866faa1dd8cd1573a1211446fd6fb9b5deaa66df69',       # MOOSE_CITED, MOOSE_DATA
+    'dll/NeverlandFly.dll': '1fca202b4c3f90dac5b593d5423a88e894c1b1cc9ff6efedb64aecc50d107dfb',   # NEVERLAND_OWN_END
+}
+
+# ---- data the port's subsets were chosen from ------------------------------------------------------------------------------------
+# Item effects (runtime/mod_difficulty.c f_3c4b80 = DLL 0x31260, f_3c3da0 = DLL 0x30f60): the kind byte +5 of an item record of
+# 03system.bin `item` (24-byte entries: id u16 +0, type u8 +2, percent u8 +4, kind u8 +5, command u16 +0x10).  Ported: 0 (the stock
+# path, Task 16), 11 and 12 (max HP / MP caps, Task 7), the DLL's no-op kinds 25..29 and > 31 (and 22 for usability); every other
+# kind is a named fatal ("unimplemented mod item effect"): that subset was chosen because the shipped items of the types the item
+# functions take (0 consumables, 1 boosts: ids 1..7, 0x83, 0x112..0x117, implementation notes) are all kind 0.
+ITEM_USE_TYPES = (0, 1)
+ITEM_KINDS_UNPORTED = set(range(1, 11)) | set(range(13, 25)) | {30, 31}
+# The extra-file chain (runtime/mod_hooks_b.c f_3a17f0 / f_3f6620 / f_3f65a0 / f_3f6510): the DLL probes the data tree for these
+# names; the mod as shipped has none, so the code that loads them is not ported (a hit is the fatal mod-extra-file-not-ported).
+EXTRA_PROBE_RE = r'^(0[1-5]common\.bdx|(0[1-9]|1[0-9]|20)effect\.bar)$'
+# Files the port opens by their EXACT name (no case-insensitive lookup): a case-only rename is not harmless for these.
+EXACT_NAME_USERS = {
+    'dll/kh2moose.ini': ('loud', 'runtime/moose.c kh_moose_init opens <tree>/dll/KH2Moose.ini by exact name (no kh_resolve_ci): under '
+                                 'another letter case the port runs with vanilla pool sizes and no code patch, the PC (case-insensitive) '
+                                 'does not. Rename it in the tree or make moose.c use kh_resolve_ci'),
+    'dll/kh2tweaks_refactor.dll': ('repin', 'Makefile MOD_TWEAKS_DLL and tools/mod/*.py name it by exact case'),
+    'dll/kh2moose.dll': ('repin', 'Makefile MOD_MOOSE_DLL names it by exact case'),
+    'dll/neverlandfly.dll': ('repin', 'Makefile MOD_NEVERLAND_DLL names it by exact case'),
+}
+
+# where a changed / added / removed file of each kind leaves its mark in the port (first match wins; anything else is UNKNOWN)
+KIND_RULES = [
+    ('mod.yml', r'^mod\.yml$'),
+    ('dll:tweaks', r'^dll/KH2Tweaks_Refactor\.dll$'),
+    ('dll:moose', r'^dll/KH2Moose\.dll$'),
+    ('dll:neverland', r'^dll/NeverlandFly\.dll$'),
+    ('dll:other', r'^dll/[^/]+\.dll$'),
+    ('ini:moose', r'^dll/KH2Moose\.ini$'),
+    ('ini:tweaks', r'^dll/KH2_Tweaks_[A-Za-z]+\.ini$'),
+    ('ini:other', r'^dll/[^/]+\.ini$'),
+    ('dll:tweaks-data', r'^dll/tweaks/[^/]+$'),
+    ('dll:misc', r'^dll/'),
+    ('hd', r'^remastered/'),
+    ('area', r'^ard/'),
+    ('mission', r'^msn/'),
+    ('object', r'^obj/'),
+    ('map', r'^map/'),
+    ('progress', r'^00progress\.bin$'),
+    ('system-table', r'^[0-9]{2}[a-z_]+\.(bin|bar|bdx)$'),         # 00battle.bin, 03system.bin, 14mission.bar, 00common.bdx, ...
+    ('sound', r'^(bgm|se|voice|vagstream)/|^12soundinfo\.bar$'),
+    ('text', r'^msg/|^libretto-[a-z]+\.bar$'),
+    ('ui', r'^(field2d|menu|itempic)/'),
+    ('magic', r'^magic/'),
+    ('artwork', r'^(icon|preview)\.png$'),
+    ('git-meta', r'^\.git(attributes|ignore|modules)$'),         # git only (line-ending rules of a checkout): never reaches the game
+]
+LOUD_KINDS = {'dll:other', 'ini:other', 'dll:misc', 'unknown'}
+
+
+def kind_of(rel):
+    for k, rx in KIND_RULES:
+        if re.match(rx, rel, re.I):
+            return k
+    return 'unknown'
+
+
+# ---- the ordered steps of a port update (docs/MOD-UPDATES.md explains each) ---------------------------------------------------------
+R = '~/projects/khnmc-decomp-edition'
+STEPS = [
+    ('decide', 'Owner decisions / things this tool cannot classify (read these first)', []),
+    ('bake', 'Re-bake the data tree (a NEW tree next to data-full; never write into data-full)', [
+        'python3 %s/tools/bake_nmc_tree.py --vanilla <VANILLA_EXTRACTION> --mod {NEW} --out <NEW_TREE> --link' % R,
+        'cp data-full/khnmc-hd-packages.tsv <NEW_TREE>/     # the game packages\' HD tables: vanilla, the mod does not change them']),
+    ('gummi', 'Redo the gummi removal on the new tree (port deviation kept by owner decision: 00progress.bin + wm00.ard in all five languages)', [
+        'cp -r %s/tools/gummi <WORK>/gummi   # in the copy: PROG_IN = {NEW}/00progress.bin, WM_IN = the wm00.ard the tree gets (vanilla, or the mod\'s)' % R,
+        'python3 <WORK>/gummi/make_gummi_removal.py   # asserts WLDF entry 53 / block cmd 5 at offset 36636; otherwise find the entry that re-blocks Twilight Town (wldf_decode.py)',
+        'python3 tools/apply_gummi_overlay.py --in-prog $(sha256sum {NEW}/00progress.bin | cut -c1-64) <NEW_TREE> <WORK>/gummi/wm00.gummi-removed.ard <WORK>/gummi/00progress.gummi-removed.bin   # ard/{us,fr,gr,it,sp}/wm00.ard + 00progress.bin; exit 1 on REFUSED / absent',
+        'at re-pin: IN_PROG (and IN_WM00 when the mod ships wm00.ard) in tools/apply_gummi_overlay.py = those input hashes (a pin check)']),
+    ('hd', 'Regenerate the HD provenance list and check the HD table', [
+        'python3 tools/hd_modlist.py --tree <NEW_TREE> --manifest <NEW_TREE>.manifest.json --out <NEW_TREE>/khnmc-hd-modlist.txt --expect-mod <mod files in the manifest>',
+        'KHNMC_DATA=<NEW_TREE> KHNMC_HD_PACKAGES=<NEW_TREE>/khnmc-hd-packages.tsv KHNMC_HD_MODLIST=<NEW_TREE>/khnmc-hd-modlist.txt nice -n 10 ./khnmc --hd-check']),
+    ('edits', 'Re-derive the static-edit list of KH2Tweaks_Refactor.dll (emulates the DLL\'s DllMain in Unicorn: needs the owner\'s OK)', [
+        'python3 %s/tools/mod/emu_rerun.py <ini dir> <run.pkl>   # MOD path inside the script -> {NEW}/dll/' % R,
+        'python3 %s/tools/mod/derive_edits.py && python3 %s/tools/mod/apply_edits.py && python3 %s/tools/mod/verify_edits.py' % (R, R, R),
+        'Makefile: MOD_EDITS = the new edit_list.json; MOD_STATIC_FUNCS = the functions whose bytes the edits change (tools/mod_static_lift.py refuses a mismatch)']),
+    ('gen', 'Regenerate gen/ and re-run the differential tests of the re-lifted functions', [
+        'nice -n 10 make -j4     # gen/mod_static_table.h, mod_static_lifted.c, mod_neverland_*, mod_moose_* (Makefile rules)',
+        'nice -n 10 make mod-static-difftest MOD_STATIC_DIFFTEST_JOBS=4 && nice -n 10 make mod-neverland-difftest mod-moose-difftest']),
+    ('slots', 'Re-resolve the DLL\'s signature-scanned slots (every slot address moves with a new build)', [
+        'python3 tools/mod_dll_slots.py --dll {NEW}/dll/KH2Tweaks_Refactor.dll --exe pc/kh2fm.exe --show <slots>',
+        'write tools/mod_dll_slots_<version>.txt (slot -> exe rva; every active detour slot + every slot the ports use); tools/mod_dll_slots.py DERIVED / OFFSET / AVOID from the new listing',
+        'Makefile rule mod-dll-slots: --expect tools/mod_dll_slots_<version>.txt (a pin check requires the fingerprint\'s file); make mod-dll-slots MOD_TWEAKS_DLL={NEW}/dll/KH2Tweaks_Refactor.dll']),
+    ('hooks', 'Re-audit the detours listed below against the new DLL (objdump -d -Mintel; static only)', [
+        'objdump -d -Mintel {NEW}/dll/KH2Tweaks_Refactor.dll > /tmp/tweaks.lst   # per hook: compare the handler with the port named in the line',
+        'Makefile: MOD_A_HOOKS / MOD_B_HOOKS / DIFFICULTY_HOOKS / MOD_PARAMS_HOOKS / MOD_DLL_REPLACES for new / removed / re-classified hooks']),
+    ('syscall-table', 'Re-transcribe the script system call table (runtime/mod_syscalls.c entries[])', [
+        'compare runtime/mod_syscalls.c entries[] (name, flags, DLL rva) with the builder listed below; the port\'s indices are the table\'s']),
+    ('moose', 'Re-decode KH2Moose.dll', [
+        'python3 tools/gen_mod_moose.py --dll {NEW}/dll/KH2Moose.dll --exe pc/kh2fm.exe --universe <KH_UNIVERSE> --edits <MOD_EDITS> --out-json /tmp/m.json --out-h /tmp/m.h   # fails loudly on another build: then re-decode its templates',
+        'runtime/moose.c (pool sites, ini keys), Makefile MOOSE_HOOKS / MOD_MOOSE_FUNCS; make mod-moose-difftest']),
+    ('neverland', 'Re-decode NeverlandFly.dll', [
+        'python3 tools/gen_mod_neverland.py --dll {NEW}/dll/NeverlandFly.dll --exe pc/kh2fm.exe --universe <KH_UNIVERSE> --edits <MOD_EDITS> --out-json /tmp/n.json --out-h /tmp/n.h',
+        'runtime/mod_neverland.c, Makefile MOD_NEVERLAND_HOOKS; make mod-neverland-difftest']),
+    ('scripts', 'Script system calls: implement the newly used ones, re-audit the ported ones whose DLL handler changed', [
+        'python3 tools/bdxscan.py --mod-syscalls runtime/mod_syscalls.c --detail {NEW}',
+        'runtime/mod_syscalls.c (decode the DLL handler statically) + cases in runtime/mod_syscalls_test.c']),
+    ('ini', 'Re-check the ini defaults the port carries', [
+        'runtime/mod_config.h (difficulty table), runtime/mod_syscalls.c (drive multiplier), runtime/mod_static_sites.c / mod_hooks_a.c (dual-wield slots), runtime/mod_hooks_b.c (option guard), runtime/moose.c (read at run time)']),
+    ('tweaks-data', 'The DLL\'s own data files (dll/tweaks/)', [
+        'runtime/mod_hooks_b.c reads command_menu_offsets.bin at run time; its selftest pins the shipped shape (runtime/mod_hooks_b_test.c: 29 entries, first "bb0")']),
+    ('events', 'Cutscenes and music (area files changed)', [
+        'python3 tools/event_refs.py --data <NEW_TREE> selfcheck && python3 tools/event_refs.py --data <NEW_TREE> summary',
+        'KH_EXE=$PWD/pc/kh2fm.exe KHNMC_DATA=<NEW_TREE> nice -n 10 ./khnmc --selftest   # includes the events-stub tree check over every area file']),
+    ('prune', 'Regenerate the data pruning lists (profile A, profile B, unproven actors)', [
+        'python3 tools/prune_lists.py --data <NEW_TREE> --exe pc/kh2fm.exe --out-a prune-A.list --out-b prune-B.list --out-actors prune-B-actors-unproven.list',
+        'routes with KHNMC_DATA_DENY=prune-A.list KHNMC_DATA_DENY_FATAL=1 must stay clean (0 denied)']),
+    ('subset', 'Regenerate the route data subset (what the Mac mini gets)', [
+        'tools/make_route_subset.sh -o route-subset-<version>   # logging runs of the routes on the full tree, then verification on the subset',
+        'tools/darwin_route.sh sync']),
+    ('mechanics', 'Re-check the mechanics reference (docs/mod/MECHANICS.md) for the changed files', [
+        'python3 %s/tools/mod/msgdump.py <msg file>   # the mod\'s own words for its mechanics' % R]),
+    ('repin', 'Re-pin the fingerprint to the new version (after the port is updated)', [
+        'python3 tools/mod_update_check.py --write-fingerprint {NEW} --edit-list <the new edit_list.json> --slots-file tools/mod_dll_slots_<version>.txt',
+        'must end with "pin checks: ... agrees" (exit 0); then `python3 tools/mod_update_check.py {NEW}` must say IDENTICAL',
+        'build-specific constants, updated from the new build where it changed (the pin checks name the stale ones): mod_update_check.py '
+        'DETOUR_PORT, INLINE_SITES, GUARDED_OPTIONS / GUARDED_SITES, OUT_OF_SCOPE_OPTIONS, CONST_KEYS, MOOSE_KEYS, MOOSE_CITED / MOOSE_DATA / '
+        'NEVERLAND_OWN_END with CONST_BUILD, ITEM_USE_TYPES / ITEM_KINDS_UNPORTED, EXTRA_PROBE_RE, EXACT_NAME_USERS, DEFAULT_EDITS; '
+        'tools/mod_dll_slots.py DERIVED / OFFSET / AVOID; tools/apply_gummi_overlay.py IN_PROG / IN_WM00; the slot expectation file',
+        'Makefile: MOD_TWEAKS_DLL / MOD_MOOSE_DLL / MOD_NEVERLAND_DLL (exact letter case), MOD_EDITS, the --expect file of the mod-dll-slots rule; tools/mod/*.py and tools/gummi/make_gummi_removal.py clone paths']),
+    ('verify', 'Verify', [
+        'nice -n 10 make -j4 && KH_EXE=$PWD/pc/kh2fm.exe KHNMC_DATA=$PWD/data-full nice -n 10 ./khnmc --selftest',
+        'tools/route_batch.sh -n 4 -j 2 -d cycle -g 7000 -s 600 -w "nice -n 10" -o run-<version>',
+        'tools/route_batch.sh -n 1 -j 1 -i $PWD/input/route-story.txt -r none -g 9300 -s 600 -w "nice -n 10" -o run-<version>-story',
+        'tools/room_sweep.sh (task 33) over every area file; then the Mac mini: tools/darwin_route.sh sync / selftest / run']),
+]
+STEP_INDEX = {s[0]: i for i, s in enumerate(STEPS)}
+
+
+def parse_makefile_lists(path):
+    """NAME = values (and +=) of the mod-related lists in the Makefile"""
+    want = ('MOD_A_HOOKS', 'MOD_B_HOOKS', 'DIFFICULTY_HOOKS', 'MOD_PARAMS_HOOKS', 'MOOSE_HOOKS', 'MOD_STATIC_FUNCS', 'MOD_STATIC_INLINE',
+            'MOD_STATIC_CHAINED', 'MOD_STATIC_REPLACED', 'MOD_DLL_REPLACES', 'MOD_NEVERLAND_HOOKS', 'MOD_MOOSE_FUNCS', 'PHASE_HOOKS')
+    out = {}
+    if not os.path.isfile(path):
+        return out
+    text = open(path).read().replace('\\\n', ' ')
+    for ln in text.split('\n'):
+        m = re.match(r'^([A-Z_]+)\s*(\+?=|\?=)\s*(.*)$', ln)
+        if m and m.group(1) in want:
+            vals = m.group(3).split('#')[0].split()
+            out.setdefault(m.group(1), [])
+            if m.group(2) == '+=':
+                out[m.group(1)] += vals
+            else:
+                out[m.group(1)] = vals
+    return out
+
+
+def port_syscalls(path):
+    """runtime/mod_syscalls.c: entries[] (name, flags, DLL rva) and the implemented indices (case labels of the dispatch switch)"""
+    src = open(path).read()
+    ents = [dict(index=int(m.group(4)), name=m.group(1), flags=int(m.group(2), 16), handler=int(m.group(3), 16))
+            for m in re.finditer(r'\{"([A-Za-z_0-9]+)",\s*0x([0-9a-fA-F]+)u?,\s*0x([0-9a-fA-F]+)\},\s*/\*\s*(\d+)\s*\*/', src)]
+    sw = src[src.index('switch(idx){'):]
+    sw = sw[:sw.index('default:')]
+    impl = sorted({int(m.group(1)) for m in re.finditer(r'case\s+(\d+)\s*:', sw)})
+    return ents, impl
+
+
+def port_difficulty(path):
+    """runtime/mod_config.h kh_mod_difficulty_config[4] = {enemy, party, ap, hp, mp}"""
+    src = open(path).read()
+    m = re.search(r'kh_mod_difficulty_config\[4\]\s*=\s*\{(.*?)\};', src, re.S)
+    rows = re.findall(r'\{\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*([0-9.]+)f\s*,\s*([0-9.]+)f\s*,\s*([0-9.]+)f\s*\}', m.group(1)) if m else []
+    return [dict(enemy=int(a), party=int(b), ap=float(c), hp=float(d), mp=float(e)) for a, b, c, d, e in rows]
+
+
+def makefile_slots_expect(path):
+    """the --expect file of the Makefile's mod-dll-slots rule (`make mod-dll-slots` checks the DLL's slots against it)"""
+    if not os.path.isfile(path):
+        return None
+    m = re.search(r'tools/mod_dll_slots\.py[^\n]*?--expect\s+(\S+)', open(path).read())
+    return m.group(1) if m else None
+
+
+def port_drive_multiplier(path):
+    """runtime/mod_syscalls.c: the drive multiplier the port starts with (`wr32(g,drive_multiplier,0x3f800000)`), as a float"""
+    m = re.search(r'wr32\(g,\s*drive_multiplier,\s*0x([0-9a-fA-F]+)u?\)', open(path).read())
+    return struct.unpack('<f', struct.pack('<I', int(m.group(1), 16)))[0] if m else None
+
+
+def port_command_menu_pin(path):
+    """runtime/mod_hooks_b_test.c: the shipped shape of dll/tweaks/command_menu_offsets.bin the selftest pins -> [entries, first name]"""
+    m = re.search(r'T\(cnt==(\d+)&&e&&!memcmp\(e,"([^"\\]*)', open(path).read())
+    return [int(m.group(1)), m.group(2)] if m else None
+
+
+def gummi_overlay_inputs(path):
+    """tools/apply_gummi_overlay.py: the input hashes it accepts (IN_PROG = the mod's 00progress.bin, IN_WM00 = the wm00.ard the edit
+    was made from)"""
+    src = open(path).read()
+    out = {}
+    for n in ('IN_PROG', 'IN_WM00'):
+        m = re.search(r"^%s\s*=\s*'([0-9a-f]{64})'" % n, src, re.M)
+        out[n] = m.group(1) if m else None
+    return out
+
+
+def expect_slots(path):
+    """tools/mod_dll_slots_h23.txt: slot -> (exe rva, hits, comment)"""
+    out = {}
+    for ln in open(path):
+        body, _, com = ln.partition('#')
+        w = body.split()
+        if len(w) >= 2:
+            hits = 1
+            for x in w[2:]:
+                if x.startswith('hits='):
+                    hits = int(x[5:])
+            out[int(w[0], 16)] = (int(w[1], 16), hits, com.strip())
+    return out
+
+
+# =====================================================================================================================================
+# analysis of one mod checkout (shared by --write-fingerprint and the comparison)
+# =====================================================================================================================================
+def gate_of(dll, site, installer):
+    """'installer' or the ini key / file the option initialiser around the attach site names"""
+    if site['func'] == installer:
+        return dict(gate='installer')
+    strs = dll.function_strings(site['func'])
+    ini = [s for s in strs if s.lower().endswith('.ini')]
+    keys = [s for s in strs if re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', s) and s != 'Settings']
+    return dict(gate=keys[0] if keys else '?', ini=ini[0] if ini else None)
+
+
+def analyse_tweaks(path, exe):
+    d = DllInfo(path, exe)
+    out = dict(sha256=d.sha256, size=len(d.data), timestamp=d.pe.timestamp, functions=len(d.funcs),
+               listing=d.lst.ok if d.lst else False, listing_error=None if (d.lst and d.lst.ok) else getattr(d.lst, 'err', 'no listing'),
+               slot_resolver=bool(d.slots and d.slots.ok), slot_resolver_error=None if (d.slots and d.slots.ok) else getattr(d.slots, 'err', 'not run'))
+    S = d.detour_sites()
+    out['detour_attach'] = S['attach']
+    out['detour_attach_ex'] = S['attach_ex']
+    out['detour_error'] = S['error']
+    rows = []
+    if S['sites']:
+        installer = collections.Counter(s['func'] for s in S['sites']).most_common(1)[0][0]
+        out['installer'] = installer
+        for s in S['sites']:
+            g = gate_of(d, s, installer)
+            row = dict(kind=s['kind'], site=s['site'], slot=s['slot'], handler=s['handler'], func=s['func'], **g)
+            res = d.slots.resolve(s['slot']) if (s['slot'] is not None and d.slots and d.slots.ok) else None
+            if s['kind'] == 'attach':
+                row['exe'] = res
+            else:                                   # inline site: the slot's exe function + the offset the DLL adds (not a constant)
+                row['site_add'] = s.get('site_add')
+                row['exe'] = res + s['site_add'] if (res is not None and s.get('site_add') is not None) else None
+            row['handler_fn'] = d.func_record(s['handler']) if s['handler'] is not None else None
+            rows.append(row)
+    out['detours'] = rows
+    # the ini keys the port depends on (CONST_KEYS, the detour gates, the guarded and out-of-scope options): where the DLL names
+    # each, the function that reads it (hashed like a handler) and the default it passes for an absent key
+    keys = set(CONST_KEYS) | GUARDED_OPTIONS | OUT_OF_SCOPE_OPTIONS | {r['gate'].lower() for r in rows if r.get('gate') not in (None, 'installer', '?')}
+    out['ini_keys'] = {k: d.ini_key_record(k) for k in sorted(keys)}
+    fns = sorted({f for r in out['ini_keys'].values() for f in r['functions']})
+    out['ini_key_functions'] = [d.func_record(f) for f in fns]
+    T = d.syscall_table()
+    out['syscall_builder'] = T['builder']
+    out['syscall_table_global'] = T['table_global']
+    out['syscall_error'] = T['error']
+    ents = []
+    for e in T['entries']:
+        r = dict(e)
+        if e['handler'] is not None:
+            fr = d.func_record(e['handler'])
+            r.update(sha256=fr.get('sha256'), norm=fr.get('norm'), deep=fr.get('deep'))
+        ents.append(r)
+    out['syscalls'] = ents
+    out['_dll'] = d
+    return out
+
+
+def find_block(img, n, digest):
+    """offset of the first n-byte window of img whose sha256 is digest, or None (the fingerprint keeps hashes, not DLL bytes)"""
+    for o in range(0, len(img) - n + 1):
+        if hashlib.sha256(img[o:o + n]).hexdigest() == digest:
+            return o
+    return None
+
+
+def analyse_small(path, exe, which, prev=None):
+    """KH2Moose.dll / NeverlandFly.dll: the functions (and Moose's data blocks) the port was decoded from.  In the build the
+    constants were read from (CONST_BUILD) they are the constants; in another build each one of the previous pin `prev` is found again
+    (same bytes at the same place, else the normalised code / the bytes' hash anywhere); one that is not found is a `problem` (the
+    pin check fails: re-decode the port, then update the constants)."""
+    rel = MOOSE if which == 'moose' else NEVERLAND
+    d = DllInfo(path, exe)
+    out = dict(sha256=d.sha256, size=len(d.data), timestamp=d.pe.timestamp, functions=len(d.funcs),
+               listing=d.lst.ok if d.lst else False)
+    problems = []
+    blocks = None
+    if d.sha256 == CONST_BUILD[rel] or not (prev and prev.get('cited')):
+        cites = MOOSE_CITED if which == 'moose' else sorted(f for f in d.funcs if f < NEVERLAND_OWN_END)
+        blocks = MOOSE_DATA if which == 'moose' else []
+        out['located'] = 'the tool\'s constants (CONST_BUILD)'
+        if d.sha256 != CONST_BUILD[rel]:
+            problems.append('%s is not the build the tool\'s address constants were read from (CONST_BUILD) and there is no previous pin to '
+                            'find its functions by code: the cited addresses may name other code' % rel)
+    else:
+        bn = d.by_norm()
+        cites = []
+        for f in prev.get('cited', []):
+            b = f.get('begin')
+            if b in d.funcs and d.raw_hash(b) == f.get('sha256'):
+                cites.append(b)
+            elif f.get('norm') and f['norm'] in bn:
+                cites.append(bn[f['norm']][0])
+            else:
+                problems.append('%s function 0x%x of the previous pin (%d bytes) is not in this build by its normalised code: re-decode '
+                                'the port from the new build, then update MOOSE_CITED / NEVERLAND_OWN_END and CONST_BUILD' %
+                                (rel, b or 0, f.get('size', 0)))
+        blocks = []
+        for b in prev.get('data', []):
+            if d.pe.img[b['rva']:b['rva'] + b['len']] and sha256(d.pe.img[b['rva']:b['rva'] + b['len']]) == b['sha256']:
+                blocks.append((b['rva'], b['len'], b['what']))
+                continue
+            o = find_block(d.pe.img, b['len'], b['sha256'])
+            if o is None:
+                problems.append('%s data block %s (%d bytes at 0x%x in the previous pin) is not in this build: re-decode it, then update '
+                                'MOOSE_DATA and CONST_BUILD' % (rel, b['what'], b['len'], b['rva']))
+            else:
+                blocks.append((o, b['len'], b['what']))
+        out['located'] = 'found again from the previous pin (by bytes / normalised code)'
+    if which == 'moose':
+        out['data'] = [dict(rva=r, len=n, what=w, sha256=sha256(d.pe.img[r:r + n])) for r, n, w in blocks]
+    fns, seen = [], set()
+    for c in cites:
+        fr = d.func_record(c)
+        if fr.get('begin') in seen:
+            continue
+        seen.add(fr.get('begin'))
+        fns.append(fr)
+    out['cited'] = fns
+    out['problems'] = problems
+    out['_dll'] = d
+    return out
+
+
+def ini_class(fname, sec, key, edit_keys, gate_keys, dll_strings):
+    """what the port does with this key (see docs/MOD-VERSION-INVENTORY.md section 4)"""
+    k = key.lower()
+    if fname.lower() == 'kh2moose.ini':
+        return 'moose-runtime' if ((sec or '').lower(), k) in MOOSE_KEYS else 'moose-unknown'
+    cls = []
+    if (fname, k) in edit_keys:
+        cls.append('static-edit')
+    if k in gate_keys or k in GUARDED_OPTIONS:
+        cls.append('detour-gate' + (':guarded' if k in GUARDED_OPTIONS else ''))
+    if k in CONST_KEYS:
+        cls.append('port-constant')
+    if not cls:
+        cls.append('read-no-effect' if k.encode() in dll_strings else 'not-read')
+    return '+'.join(cls)
+
+
+def item_kinds(data):
+    """03system.bin -> {'by_type': {type: {kind: count}}} from its `item` subfile (counts only), or {'error': ...}"""
+    try:
+        if data[:4] != b'BAR\x01':
+            return dict(error='not a BAR file')
+        n = struct.unpack_from('<I', data, 4)[0]
+        ents = [struct.unpack_from('<HH4sII', data, 16 + 16 * i) for i in range(n)]
+        it = [e for e in ents if e[2].rstrip(b'\0') == b'item']
+        if len(it) != 1:
+            return dict(error='%d `item` subfiles' % len(it))
+        d = data[it[0][3]:it[0][3] + it[0][4]]
+        ver, cnt = struct.unpack_from('<ii', d, 0)
+        if not (0 <= cnt and 8 + 24 * cnt <= len(d)):
+            return dict(error='item table count %d does not fit its %d bytes' % (cnt, len(d)))
+        h = collections.defaultdict(collections.Counter)
+        for i in range(cnt):
+            typ, kind = d[8 + 24 * i + 2], d[8 + 24 * i + 5]
+            h[typ][kind] += 1
+        return dict(version=ver, items=cnt, by_type={str(t): {str(k): c for k, c in sorted(h[t].items())} for t in sorted(h)})
+    except Exception as e:
+        return dict(error='unreadable: %s' % e)
+
+
+def unported_item_kinds(ik):
+    """[(type, kind, count)] of item-use records (ITEM_USE_TYPES) whose effect kind the port does not have"""
+    out = []
+    for t, h in sorted(((ik or {}).get('by_type') or {}).items(), key=lambda x: int(x[0])):
+        if int(t) in ITEM_USE_TYPES:
+            out += [(int(t), int(k), c) for k, c in sorted(h.items(), key=lambda x: int(x[0])) if int(k) in ITEM_KINDS_UNPORTED]
+    return out
+
+
+def analyse(mod, exe, edit_list=None, port=PORT, scripts=True, prev=None):
+    """everything the fingerprint records about one checkout.  Mod paths are looked up case-insensitively (OpenKH / Panacea and
+    Windows do not see the letter case of a name): A['case'] maps the canonical names this tool uses to the checkout's names.
+    prev: the fingerprint of the previous pin (to find Moose's / Neverland's cited functions again in another build)."""
+    A = dict(files=walk_tree(mod))
+    lower = {}
+    for rel in sorted(A['files']):
+        lower.setdefault(rel.lower(), rel)
+    A['case'] = {}
+
+    def actual(rel):
+        a = lower.get(rel.lower())
+        if a is not None:
+            A['case'][rel] = a
+        return a
+    yml = os.path.join(mod, 'mod.yml')
+    A['mod_yml'] = parse_mod_yml(open(yml, 'rb').read()) if os.path.isfile(yml) else None
+    A['ini'] = {}
+    for rel in sorted(A['files']):
+        if re.match(r'^dll/[^/]+\.ini$', rel, re.I):
+            A['ini'][rel] = parse_ini(open(os.path.join(mod, rel), 'rb').read())
+    A['dll'] = {}
+    for rel, which in ((TWEAKS, 'tweaks'), (MOOSE, 'moose'), (NEVERLAND, 'neverland')):
+        a = actual(rel)
+        p = os.path.join(mod, a) if a else None
+        if p and os.path.isfile(p):
+            try:
+                A['dll'][rel] = analyse_tweaks(p, exe) if which == 'tweaks' else \
+                    analyse_small(p, exe, which, prev=((prev or {}).get('dll') or {}).get(rel))
+            except Exception as e:
+                A['dll'][rel] = dict(error='cannot analyse: %s' % e, sha256=sha256(open(p, 'rb').read()))
+    A['scripts'] = scan_scripts(mod) if scripts else None
+    A['dll_data'] = {}
+    cm = actual('dll/tweaks/command_menu_offsets.bin')
+    if cm:
+        b = open(os.path.join(mod, cm), 'rb').read()
+        A['dll_data']['command_menu_offsets_entries'] = struct.unpack_from('<I', b, 4)[0] if len(b) >= 8 else None
+    sy = actual('03system.bin')
+    A['item_kinds'] = item_kinds(open(os.path.join(mod, sy), 'rb').read()) if sy else None
+    return A
+
+
+def git_info(mod):
+    """read-only facts of a git checkout (no index refresh: --no-optional-locks)"""
+    if not os.path.isdir(os.path.join(mod, '.git')):
+        return {}
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS='0')
+
+    def g(*a):
+        try:
+            return subprocess.run(['git', '--no-optional-locks', '-C', mod] + list(a), capture_output=True, text=True, env=env,
+                                  check=True).stdout.strip()
+        except Exception:
+            return None
+    head = g('rev-parse', 'HEAD')
+    log = g('log', '-1', '--format=%cd%x09%s', '--date=short') or '\t'
+    st = g('status', '--porcelain', '--untracked-files=no')
+    return dict(commit=head, date=log.split('\t')[0], subject=log.split('\t', 1)[-1], branch=g('rev-parse', '--abbrev-ref', 'HEAD'),
+                local_modifications=len([x for x in (st or '').split('\n') if x.strip()]) if st is not None else None)
+
+
+# =====================================================================================================================================
+# fingerprint (write)
+# =====================================================================================================================================
+def home_rel(p):
+    """an absolute path with the home directory written as ~ (the fingerprint is committed)"""
+    p, h = os.path.abspath(p), os.path.expanduser('~')
+    return '~' + p[len(h):] if h and h != '/' and (p == h or p.startswith(h + os.sep)) else p
+
+
+def strip_dll(d):
+    return {k: v for k, v in d.items() if not k.startswith('_')}
+
+
+def asset_canon(assets):
+    return sha256(json.dumps([[norm_path(a['name']).lower(), a['method'], [sorted((k, norm_path(v) if k == 'name' else v) for k, v in s.items())
+                                                                          for s in a['sources']], sorted(a['extra'].items())] for a in assets],
+                             sort_keys=True).encode())
+
+
+def edit_keys_of(E):
+    ks = set()
+    for e in (E or {}).get('edits', []) + (E or {}).get('inactive_edits', []):
+        for s in e.get('source_ini') or []:
+            ks.add((s['file'], s['key'].lower()))
+    return ks
+
+
+def make_fingerprint(mod, exe, edit_list, port=PORT, with_port=True, prev=None, slots_file=None):
+    """prev: the fingerprint being replaced (Moose / Neverland functions are found again by code in another build); slots_file: the
+    slot expectation file of this build (default: the one the previous pin used, else SLOTS_FILE_DEFAULT)"""
+    A = analyse(mod, exe, prev=prev)
+    E = json.load(open(edit_list)) if edit_list and os.path.isfile(edit_list) else None
+    fp = dict(schema=SCHEMA, made_by='tools/mod_update_check.py --write-fingerprint (task 34)',
+              note='Hashes, counts and addresses of the mod version the port is built from; no game or mod content. '
+                   'docs/MOD-VERSION-INVENTORY.md explains every field; docs/MOD-UPDATES.md the procedure.')
+    gi = git_info(mod)
+    fp['mod'] = dict(repo=REPO, remote=REMOTE, commit=gi.get('commit'), date=gi.get('date'), subject=gi.get('subject'),
+                     branch=gi.get('branch'), local_modifications=gi.get('local_modifications'),
+                     checkout=home_rel(mod))
+    # ---- files and mod.yml
+    Y = A['mod_yml']
+    plain = {norm_path(a['name']).lower() for a in Y['assets'] if asset_is_plain(a)} if Y else set()
+    lst = []
+    for rel in sorted(A['files']):
+        size, sh, lf = A['files'][rel]
+        lst.append([rel, size, sh, lf, 'A' if rel.lower() in plain else ''])
+    fp['files'] = dict(count=len(lst), bytes=sum(x[1] for x in lst if x[1] > 0), assets=sum(1 for x in lst if x[4] == 'A'),
+                       by_top=dict(sorted(collections.Counter(x[0].split('/')[0] if '/' in x[0] else '(root)' for x in lst).items())),
+                       list=lst)
+    if Y:
+        fp['mod_yml'] = dict(assets=len(Y['assets']), methods=dict(collections.Counter(a['method'] for a in Y['assets'])),
+                             plain_assets=len(plain), irregular=[a for a in Y['assets'] if not asset_is_plain(a)], top=Y['top'],
+                             unparsed=len(Y['unparsed']), asset_list_sha256=asset_canon(Y['assets']))
+    fp['dll_data'] = A['dll_data']
+    fp['case'] = A['case']                    # canonical name -> the checkout's name (letter case), for the DLLs and data the tool reads
+    fp['item_kinds'] = A['item_kinds']        # 03system.bin `item`: {type: {effect kind: count}} (the item-effect port's data subset)
+    # ---- DLLs
+    fp['dll'] = {}
+    tw = A['dll'].get(TWEAKS)
+    dll_strings = tw['_dll'].data.lower() if tw and '_dll' in tw else b''
+    for rel, d in A['dll'].items():
+        fp['dll'][rel] = strip_dll(d)
+    gate_keys = {r['gate'].lower() for r in (tw or {}).get('detours', []) if r.get('gate') not in (None, 'installer', '?')}
+    # ---- ini files (keys and values as the DLLs read them, and what the port does with each)
+    ek = edit_keys_of(E)
+    fp['ini'] = {}
+    for rel, ents in A['ini'].items():
+        fname = rel.split('/')[-1]
+        eff = ini_effective(ents)
+        rows = []
+        for sec, k, v in ents:
+            first = eff.get(((sec or '').lower(), k.lower())) == v
+            rows.append([sec, k, v, ini_class(fname, sec, k, ek, gate_keys, dll_strings), 1 if first else 0])
+        fp['ini'][rel] = rows
+    # ---- scripts
+    S = A['scripts']
+    fp['scripts'] = dict(files_scanned=S['files_scanned'], scripts=S['scripts'], traps_used=sorted(traps_used(S['uses'])),
+                         files_using=len([r for r, d in S['uses'].items() if any(sum(c[:3]) for c in d.values())]),
+                         uses=S['uses'])
+    # ---- static edits of KH2Tweaks_Refactor.dll (derived by emulation, task B1; tools/mod/derive_edits.py)
+    if E:
+        def er(e):
+            hb = lambda x: sha256(bytes.fromhex(x)) if x else None
+            return dict(rva=e['rva'], len=e.get('length'), cls=e.get('cls', 'inactive'), section=e.get('section'), old=hb(e.get('old')),
+                        new=hb(e.get('new')), ini=['%s:%s' % (s['file'], s['key']) for s in e.get('source_ini') or []])
+        fp['static_edits'] = dict(source=home_rel(edit_list), exe_sha256=E.get('exe_sha256'), summary=E.get('summary'),
+                                  nmc_buffer=dict(size=E['nmc_buffer']['size'], sha256=sha256(bytes.fromhex(E['nmc_buffer']['nonzero_hex']))),
+                                  edits=[er(e) for e in E['edits']], inactive=[er(e) for e in E['inactive_edits']],
+                                  detour_regions=len(E.get('detour_hook_regions', [])))
+    if with_port:
+        sf = slots_file or ((prev or {}).get('port', {}).get('slots') or {}).get('file') or SLOTS_FILE_DEFAULT
+        fp['port'] = port_records(port, fp, sf)
+    fp['pin_checks'] = pin_checks(fp, port if with_port else None)
+    return fp
+
+
+def port_records(port, fp, slots_file=SLOTS_FILE_DEFAULT):
+    P = {}
+    mk = parse_makefile_lists(os.path.join(port, 'Makefile'))
+    P['makefile'] = mk
+    P['makefile_slots_expect'] = makefile_slots_expect(os.path.join(port, 'Makefile'))
+    sc = os.path.join(port, 'runtime', 'mod_syscalls.c')
+    if os.path.isfile(sc):
+        ents, impl = port_syscalls(sc)
+        P['syscalls'] = dict(entries=len(ents), implemented=impl)
+    cfg = os.path.join(port, 'runtime', 'mod_config.h')
+    if os.path.isfile(cfg):
+        P['difficulty'] = port_difficulty(cfg)
+    ex = os.path.join(port, slots_file)
+    P['slots'] = dict(file=slots_file, count=None, sha256=None)
+    if os.path.isfile(ex):
+        es = expect_slots(ex)
+        P['slots'].update(count=len(es), sha256=sha256(open(ex, 'rb').read()))
+    if os.path.isfile(sc):
+        P['drive_multiplier'] = port_drive_multiplier(sc)
+    bt = os.path.join(port, 'runtime', 'mod_hooks_b_test.c')
+    if os.path.isfile(bt):
+        P['command_menu_pin'] = port_command_menu_pin(bt)
+    go = os.path.join(port, 'tools', 'apply_gummi_overlay.py')
+    P['gummi_overlay'] = gummi_overlay_inputs(go) if os.path.isfile(go) else None
+    for name in ('mod_moose_edits.json', 'mod_neverland_edits.json'):
+        p = os.path.join(port, 'gen', name)
+        if os.path.isfile(p):
+            J = json.load(open(p))
+            P[name] = dict(dll_sha256=J.get('dll_sha256'), exe_sha256=J.get('exe_sha256'), functions=J.get('functions'),
+                           edits=[dict(rva=e['rva'], len=len(bytes.fromhex(e['old'])), old=sha256(bytes.fromhex(e['old'])),
+                                       new=sha256(bytes.fromhex(e['new']))) for e in J.get('edits', [])])
+    # counts the selftests and build checks pin
+    rows = (fp['dll'].get(TWEAKS) or {}).get('detours', [])
+    P['pinned_counts'] = {
+        'selftest checks (KH_EXE=pc/kh2fm.exe ./khnmc --selftest, merged build of task 32)': 169449,
+        'static edits file-backed / runtime-only (mod static selftest, gen/mod_static_table.h)':
+            '%d / %d' % (sum(1 for e in fp.get('static_edits', {}).get('edits', []) if e['cls'] != 'runtime_only_bss'),
+                         sum(1 for e in fp.get('static_edits', {}).get('edits', []) if e['cls'] == 'runtime_only_bss')),
+        're-lifted functions (Makefile MOD_STATIC_FUNCS + MOD_NEVERLAND_HOOKS + MOD_MOOSE_FUNCS; selftest kh_mod_static_fn_count==30)':
+            '%d + %d + %d' % (len(mk.get('MOD_STATIC_FUNCS', [])), len(mk.get('MOD_NEVERLAND_HOOKS', [])), len(mk.get('MOD_MOOSE_FUNCS', []))),
+        'detours: DetourAttach + DetourAttachEx sites / active as shipped (implementation notes)':
+            '%d + %d / 35' % (sum(1 for r in rows if r['kind'] == 'attach'), sum(1 for r in rows if r['kind'] == 'attach_ex')),
+        'full replacements (Makefile MOD_DLL_REPLACES, build check --dll-replaces)': len(mk.get('MOD_DLL_REPLACES', [])),
+        'script syscall table entries / implemented (runtime/mod_syscalls.c)':
+            '%d / %d' % (P.get('syscalls', {}).get('entries', 0), len(P.get('syscalls', {}).get('implemented', []))),
+        'table-3 calls used by the mod\'s scripts (tools/bdxscan.py)': len(fp['scripts']['traps_used']),
+        'signature-scanned slots resolved (make mod-dll-slots)': P.get('slots', {}).get('count'),
+        'NeverlandFly edits (mod neverland selftest n==6)': len(P.get('mod_neverland_edits.json', {}).get('edits', [])),
+        'KH2Moose code patches (gen/mod_moose_edits.json)': len(P.get('mod_moose_edits.json', {}).get('edits', [])),
+        'command_menu_offsets.bin entries (mod B selftest: 29, first "bb0")': command_menu_entries(fp),
+        'mod files / mod.yml copy assets (bake; hd_modlist --expect-mod)': '%d / %d' % (fp['files']['count'], fp['files']['assets']),
+    }
+    return P
+
+
+def command_menu_entries(fp):
+    return fp.get('dll_data', {}).get('command_menu_offsets_entries')
+
+
+def pin_checks(fp, port):
+    """the fingerprint must agree with what the port records; every disagreement is listed (and --write-fingerprint exits 1)"""
+    out = []
+    tw = fp['dll'].get(TWEAKS) or {}
+    rows = tw.get('detours', [])
+    if not rows:
+        out.append('KH2Tweaks_Refactor.dll: no detour rows derived (%s)' % (tw.get('detour_error') or tw.get('error') or 'no DLL'))
+    else:
+        act = [r for r in rows if r.get('gate', '').lower() not in GUARDED_OPTIONS]
+        ex = collections.Counter(r.get('exe') for r in act)
+        for x, (n, cls, where) in DETOUR_PORT.items():
+            if ex.get(x) != 1:
+                out.append('detour row %d (exe 0x%x, %s): found %d times among the active attach sites' % (n, x, where, ex.get(x, 0)))
+        for r in act:
+            if r.get('exe') not in DETOUR_PORT:
+                out.append('active attach site 0x%x (handler 0x%x) targets exe %s, which the port does not record' %
+                           (r['site'], r['handler'] or 0, '0x%x' % r['exe'] if r.get('exe') is not None else 'UNRESOLVED'))
+        ng = sum(1 for r in rows if r.get('gate', '').lower() in GUARDED_OPTIONS)
+        if ng != GUARDED_SITES:
+            out.append('%d attach sites behind retry / savepoint_qol / patch_gummiskip (the port records %d: GUARDED_SITES, '
+                       'runtime/mod_hooks_b.c option table)' % (ng, GUARDED_SITES))
+        for r in rows:
+            if r.get('kind') == 'attach_ex' and (r.get('gate') or '').lower() in INLINE_SITES:
+                fn, site = INLINE_SITES[r['gate'].lower()]
+                if r.get('exe') != site:
+                    out.append('inline site of %s: slot %s + %s resolves to exe %s, the port splices exe 0x%x (INLINE_SITES, '
+                               'runtime/mod_static_sites.c)' % (r['gate'], hx(r.get('slot')), hx(r.get('site_add')), hx(r.get('exe')), site))
+    # Moose / Neverland: the functions and data the ports were decoded from must be found in this build
+    for rel in (MOOSE, NEVERLAND):
+        for p in (fp['dll'].get(rel) or {}).get('problems', []):
+            out.append(p)
+    if port:
+        P = fp.get('port', {})
+        sf = (P.get('slots') or {}).get('file') or SLOTS_FILE_DEFAULT
+        if not os.path.isfile(os.path.join(port, sf)):
+            out.append('the slot expectation file %s does not exist (--slots-file)' % sf)
+            es = {}
+        else:
+            es = expect_slots(os.path.join(port, sf))
+        mk_exp = P.get('makefile_slots_expect')
+        if mk_exp != sf:
+            out.append('the Makefile\'s mod-dll-slots rule checks --expect %s, the fingerprint\'s slot expectation file is %s: `make '
+                       'mod-dll-slots` would check another file' % (mk_exp, sf))
+        # every active detour's slot must be COMPARED with the expectation file (a new build moves every slot: a file of the old
+        # build would otherwise match nothing and pass); guarded rows are compared when the file lists them
+        nact = ncmp = 0
+        for r in rows:
+            guarded = (r.get('gate') or '').lower() in GUARDED_OPTIONS
+            fn_exe = r.get('exe') if r.get('kind') == 'attach' else \
+                (r['exe'] - r['site_add'] if (r.get('exe') is not None and r.get('site_add') is not None) else None)
+            if not guarded:
+                nact += 1
+            if r.get('slot') is None or r['slot'] not in es:
+                if not guarded:
+                    out.append('active %s site 0x%x (handler %s, exe %s): its slot %s is not in %s: write this build\'s slots there '
+                               '(step slots)' % (r.get('kind'), r.get('site', 0), hx(r.get('handler')), hx(r.get('exe')), hx(r.get('slot')), sf))
+                continue
+            if fn_exe is None:
+                out.append('slot 0x%x (%s site 0x%x) does not resolve in this build' % (r['slot'], r.get('kind'), r.get('site', 0)))
+                continue
+            if es[r['slot']][0] != fn_exe:
+                out.append('slot 0x%x resolves to 0x%x, %s says 0x%x' % (r['slot'], fn_exe, sf, es[r['slot']][0]))
+                continue
+            if not guarded:
+                ncmp += 1
+        if rows and ncmp != nact:
+            out.append('%d of %d active detour slots were compared with %s and equal' % (ncmp, nact, sf))
+        ents, impl = port_syscalls(os.path.join(port, 'runtime', 'mod_syscalls.c'))
+        mine = {e['index']: e for e in tw.get('syscalls', [])}
+        if len(mine) != len(ents):
+            out.append('syscall table: %d entries in the DLL, %d in runtime/mod_syscalls.c' % (len(mine), len(ents)))
+        for e in ents:
+            m = mine.get(e['index'])
+            if not m or m['handler'] != e['handler'] or m['flags'] != e['flags'] or e['name'] not in m['names']:
+                out.append('syscall %d %s: the DLL has %s' % (e['index'], e['name'], m and (hex(m['handler'] or 0), m['flags'], m['names'])))
+        unimpl = sorted(set(fp['scripts']['traps_used']) - set(impl))
+        if unimpl:
+            out.append('scripts use table-3 calls the port does not implement: %s' % unimpl)
+        diff = port_difficulty(os.path.join(port, 'runtime', 'mod_config.h'))
+        ini = {}
+        for rel, rows_ in fp['ini'].items():
+            if rel.lower().endswith('kh2_tweaks_combat.ini'):
+                ini = {k.lower(): v for s, k, v, c, first in rows_ if first}
+        kr = tw.get('ini_keys') or {}
+
+        def effective(key):
+            """the value the DLL ends up with for a key: the ini's when the DLL names the key and the ini has it, the DLL's own
+            default when the ini lacks it; (None, why) when neither is known"""
+            r = kr.get(key)
+            if not r or not r.get('named'):
+                return None, 'KH2Tweaks_Refactor.dll does not read %s (no ini-key record names it)' % key
+            if key in ini:
+                return ini[key], 'ini'
+            if r.get('default') is None:
+                return None, '%s is absent from the ini and the DLL\'s default for it was not decoded (%s)' % (key, r.get('default_how'))
+            return str(r['default']), 'the DLL\'s default (%s)' % r.get('default_how')
+        names = ('beginner', 'standard', 'proud', 'crit')
+        if len(diff) != 4:
+            out.append('runtime/mod_config.h kh_mod_difficulty_config: %d rows read (4 expected)' % len(diff))
+        for i, nm in enumerate(names):
+            if i >= len(diff):
+                break
+            for k, key in (('enemy', nm + '_enemy_dmg'), ('party', nm + '_party_dmg'), ('ap', nm + '_ap_mult'), ('hp', nm + '_hp_mult'),
+                           ('mp', nm + '_mp_mult')):
+                v, src = effective(key)
+                if v is None:
+                    out.append('mod_config.h difficulty %s.%s = %s has no source: %s' % (nm, k, diff[i][k], src))
+                    continue
+                try:
+                    if float(v.split('#')[0]) != float(diff[i][k]):
+                        out.append('mod_config.h difficulty %s.%s = %s, the DLL reads %s from %s' % (nm, k, diff[i][k], v, src))
+                except ValueError:
+                    out.append('ini value %s = %r is not a number' % (key, v))
+        if P.get('drive_multiplier') is not None or kr:
+            v, src = effective('drive_add_mult')
+            if v is None:
+                out.append('runtime/mod_syscalls.c drive multiplier %s has no source: %s' % (P.get('drive_multiplier'), src))
+            else:
+                try:
+                    if P.get('drive_multiplier') is None or float(v.split('#')[0]) != float(P['drive_multiplier']):
+                        out.append('runtime/mod_syscalls.c drive multiplier %s, the DLL reads %s from %s' % (P.get('drive_multiplier'), v, src))
+                except ValueError:
+                    out.append('ini value drive_add_mult = %r is not a number' % v)
+        for name, rel in (('mod_moose_edits.json', MOOSE), ('mod_neverland_edits.json', NEVERLAND)):
+            if name in P and P[name]['dll_sha256'] != (fp['dll'].get(rel) or {}).get('sha256'):
+                out.append('gen/%s was made from another %s' % (name, rel))
+        n = command_menu_entries(fp)
+        pin = P.get('command_menu_pin')
+        if n is not None and (not pin or n != pin[0]):
+            out.append('dll/tweaks/command_menu_offsets.bin has %s entries; runtime/mod_hooks_b_test.c pins %s' % (n, pin))
+        se = fp.get('static_edits')
+        if se and se.get('exe_sha256') != EXE_SHA256:
+            out.append('the static-edit list was made against another exe')
+        # the gummi overlay accepts exactly the inputs the gummi edits were made from: the mod's 00progress.bin (and a wm00.ard the mod
+        # ships); a re-pin to a version with another 00progress.bin fails here until the edit is redone and IN_PROG updated
+        go = P.get('gummi_overlay')
+        files = {r[0].lower(): r for r in fp['files']['list']}
+        prog = files.get('00progress.bin')
+        if not go:
+            out.append('tools/apply_gummi_overlay.py is missing: the gummi removal (step gummi) cannot be applied to a new tree')
+        else:
+            if prog and go.get('IN_PROG') != prog[2]:
+                out.append('tools/apply_gummi_overlay.py IN_PROG %s.. is not the sha256 of the mod\'s 00progress.bin %s..: redo the gummi edit '
+                           '(tools/gummi/make_gummi_removal.py) on it and update IN_PROG' % ((go.get('IN_PROG') or '-')[:12], prog[2][:12]))
+            for rel, r in sorted(files.items()):
+                if re.match(r'^ard/[^/]+/wm00\.ard$', rel) and r[2] != go.get('IN_WM00'):
+                    out.append('the mod ships %s (%s..): the gummi edit of wm00.ard must be made from it; IN_WM00 is %s..' %
+                               (r[0], r[2][:12], (go.get('IN_WM00') or '-')[:12]))
+    # the item-effect port covers the kinds the shipped items use: a pinned version with another kind needs that kind ported first
+    for t, k, c in unported_item_kinds(fp.get('item_kinds')):
+        out.append('03system.bin: %d item(s) of type %d have effect kind %d, which runtime/mod_difficulty.c does not port (f_3c4b80 / '
+                   'f_3c3da0: named fatal)' % (c, t, k))
+    if (fp.get('item_kinds') or {}).get('error'):
+        out.append('03system.bin item table: %s' % fp['item_kinds']['error'])
+    return out
+
+
+def write_fingerprint(fp, path):
+    lst = fp['files']['list']
+    fp = dict(fp, files=dict(fp['files'], list='@@FILES@@'))
+    text = json.dumps(fp, indent=1, sort_keys=False)
+    rows = ',\n  '.join(json.dumps(x, separators=(',', ':')) for x in lst)
+    text = text.replace('"@@FILES@@"', '[\n  ' + rows + '\n ]')
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, 'w') as f:
+        f.write(text + '\n')
+
+
+# =====================================================================================================================================
+# comparison
+# =====================================================================================================================================
+class Report:
+    def __init__(self):
+        self.lines = []          # (section, text)
+        self.steps = collections.OrderedDict()
+        self.loud = []
+        self.facts = {}
+
+    def say(self, sec, text):
+        self.lines.append((sec, text))
+
+    def step(self, sid, reason):
+        assert sid in STEP_INDEX, sid
+        r = self.steps.setdefault(sid, [])
+        if reason not in r:
+            r.append(reason)
+
+    def shout(self, text):
+        self.loud.append(text)
+        self.step('decide', text)
+
+
+def bool_on(v):
+    """the Tweaks DLL's boolean reader (0x2a840): trimmed, lower-cased, exactly on / true / 1"""
+    v = (v or '').strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in '"\'':
+        v = v[1:-1].strip()
+    return v.lower() in ('on', 'true', '1')
+
+
+def compare_detours(old_rows, new_rows, have_new_hashes=True):
+    """match the pinned detour rows with the ones derived from a new DLL.  -> list of dict(status, old, new)
+    status: same (handler bytes identical at the same address), moved (same code modulo addresses), callee (own code the same, a
+    function it reaches changed), changed, removed, new.  Keys: the exe target of the slot (attach) or the option (inline sites)."""
+    def key(r):
+        if r.get('kind') == 'attach_ex':
+            return ('ex', (r.get('gate') or '?').lower())
+        return ('at', r.get('exe')) if r.get('exe') is not None else None
+    res, used = [], set()
+    by_key = collections.defaultdict(list)
+    for i, r in enumerate(new_rows):
+        k = key(r)
+        if k:
+            by_key[k].append(i)
+    pend = []
+    for o in old_rows:
+        k = key(o)
+        c = [i for i in by_key.get(k, []) if i not in used] if k else []
+        if c:
+            used.add(c[0])
+            res.append([o, new_rows[c[0]]])
+        else:
+            pend.append(o)
+    # fall back on the handler's code (a slot the resolver could not read, or an option renamed)
+    for o in pend:
+        oh = (o.get('handler_fn') or {})
+        hit = None
+        for field in ('deep', 'norm'):
+            if not oh.get(field):
+                continue
+            for i, r in enumerate(new_rows):
+                if i not in used and (r.get('handler_fn') or {}).get(field) == oh[field] and r.get('kind') == o.get('kind'):
+                    hit = i
+                    break
+            if hit is not None:
+                break
+        if hit is None:
+            for i, r in enumerate(new_rows):
+                if i not in used and r.get('slot') == o.get('slot') and r.get('handler') == o.get('handler') and r.get('kind') == o.get('kind'):
+                    hit = i
+                    break
+        if hit is None:
+            res.append([o, None])
+        else:
+            used.add(hit)
+            res.append([o, new_rows[hit]])
+    out = []
+    for o, n in res:
+        if n is None:
+            out.append(dict(status='removed', old=o, new=None))
+            continue
+        oh, nh = o.get('handler_fn') or {}, n.get('handler_fn') or {}
+        # identical handler bytes are "same" only when everything it reaches is the same too (deep hash): a helper it calls or
+        # tail-jumps to can change while the handler's own bytes do not (row 4: DLL 0x2de50 -> 0x2dd60)
+        if oh.get('sha256') and oh.get('sha256') == nh.get('sha256') and o.get('handler') == n.get('handler') and \
+                (not oh.get('deep') or not nh.get('deep') or oh['deep'] == nh['deep']):
+            st = 'same'
+        elif oh.get('norm') and oh.get('norm') == nh.get('norm'):
+            st = 'moved' if (not oh.get('deep') or oh.get('deep') == nh.get('deep')) else 'callee'
+        elif not have_new_hashes or not nh.get('norm'):
+            st = 'changed?' if oh.get('sha256') != nh.get('sha256') else 'same'
+        else:
+            st = 'changed'
+        d = dict(status=st, old=o, new=n)
+        if (o.get('gate') or '').lower() != (n.get('gate') or '').lower():
+            d['gate_changed'] = (o.get('gate'), n.get('gate'))
+        out.append(d)
+    for i, r in enumerate(new_rows):
+        if i not in used:
+            out.append(dict(status='new', old=None, new=r))
+    return out
+
+
+def hx(v):
+    return '-' if v is None else '0x%x' % v
+
+
+def compare(fp, A, mod, rep=None):
+    """fills a Report; returns (report, identical)"""
+    rep = rep or Report()
+    old = {r[0]: r for r in fp['files']['list']}
+    new = A['files']
+    added = sorted(set(new) - set(old))
+    removed = sorted(set(old) - set(new))
+    changed, eol = [], []
+    for rel in sorted(set(old) & set(new)):
+        o, n = old[rel], new[rel]
+        if o[1] == n[0] and o[2] == n[1]:
+            continue
+        if o[3] and n[2] and o[3] == n[2]:
+            eol.append(rel)
+        else:
+            changed.append(rel)
+    # case-only renames (OpenKH and Windows do not see a difference in the name; the content may still differ)
+    lo_rm = {r.lower(): r for r in removed}
+    case = [(lo_rm[a.lower()], a) for a in added if a.lower() in lo_rm]
+    for o_, a_ in case:
+        removed.remove(o_)
+        added.remove(a_)
+        if old[o_][2] != new[a_][1]:
+            changed.append(a_)
+        rep.say('files', 'case of the name changed: %s -> %s%s' % (o_, a_, '' if old[o_][2] == new[a_][1] else ' (content changed too)'))
+        # the game and the DLLs do not see the case; the port does wherever it opens a file by its exact name
+        how = EXACT_NAME_USERS.get(a_.lower())
+        if how:
+            txt = 'case-only rename %s -> %s: %s' % (o_, a_, how[1])
+            if how[0] == 'loud':
+                rep.shout(txt)
+            else:
+                rep.step(how[0], txt)
+    identical = not (added or removed or changed or eol or case)
+    rep.facts.update(added=len(added), removed=len(removed), changed=len(changed), eol=len(eol), case=len(case),
+                     pinned_files=len(old), files=len(new))
+    if identical:
+        return rep, True
+    # ---- which files are installed (mod.yml copy assets) in the new / the pinned version
+    Y = A.get('mod_yml')
+    new_assets = {norm_path(a['name']).lower(): a for a in (Y['assets'] if Y else [])}
+    old_assets = {r[0].lower() for r in fp['files']['list'] if r[4] == 'A'}
+    old_assets |= {norm_path(a['name']).lower() for a in fp.get('mod_yml', {}).get('irregular', [])}
+    by_kind = collections.defaultdict(lambda: collections.defaultdict(list))
+    for what, paths in (('added', added), ('removed', removed), ('changed', changed)):
+        for rel in paths:
+            by_kind[kind_of(rel)][what].append(rel)
+    for rel in eol:
+        by_kind[kind_of(rel)]['line endings only'].append(rel)
+    rep.by_kind = by_kind
+    if not (added or removed or changed or case):
+        return rep, False                  # line endings only: reported, no port step
+    installed_change = False
+    for k in sorted(by_kind):
+        for what, paths in by_kind[k].items():
+            for rel in paths:
+                inst = rel.lower() in (old_assets if what == 'removed' else new_assets) or rel.lower() in old_assets
+                if what == 'line endings only':
+                    continue
+                if inst and k not in ('mod.yml',):
+                    installed_change = True
+                if k in LOUD_KINDS:
+                    rep.shout('%s file %s: %s (%s). The port has no rule for it: find out what the PC does with it (a DLL in dll/ is '
+                              'loaded by Panacea; a LuaBackend script runs in the game) before anything else' %
+                              (k, what, rel, 'installed by mod.yml' if inst else 'not a mod.yml asset'))
+    # ---- per kind
+    KSTEP = {'dll:tweaks-data': ['tweaks-data'], 'hd': ['hd'], 'area': ['events', 'mechanics'], 'mission': ['mechanics'],
+             'object': ['mechanics'], 'progress': ['gummi', 'mechanics'], 'system-table': ['mechanics'], 'sound': ['events'],
+             'text': ['mechanics'], 'ini:moose': ['ini']}
+    for k, d in by_kind.items():
+        n = sum(len(v) for w, v in d.items() if w != 'line endings only')
+        if not n:
+            continue
+        for s in KSTEP.get(k, []):
+            rep.step(s, '%s: %s' % (k, ', '.join('%d %s' % (len(v), w) for w, v in d.items() if v and w != 'line endings only')))
+    if installed_change:
+        for s in ('bake', 'prune', 'subset'):
+            rep.step(s, 'installed files changed (mod.yml assets): %s' % ', '.join(
+                '%s %d' % (w, sum(len(d.get(w, [])) for d in by_kind.values())) for w in ('added', 'removed', 'changed')))
+    if 'mod.yml' in by_kind and any(by_kind['mod.yml'].get(w) for w in ('added', 'removed', 'changed')):
+        compare_modyml(fp, A, rep)
+    ini_changed = [rel for rel in changed + added + removed if re.match(r'^dll/[^/]+\.ini$', rel, re.I)]
+    if ini_changed:
+        compare_ini(fp, A, rep, ini_changed)
+    touched = {r.lower() for r in changed + added + removed}
+    for rel in (TWEAKS, MOOSE, NEVERLAND):                 # by name in any letter case (a case-only rename with new content too)
+        if rel.lower() in touched:
+            compare_dll(fp, A, rep, rel, mod)
+    for rel in changed + added:
+        if rel.lower() == 'dll/tweaks/command_menu_offsets.bin':
+            rep.step('tweaks-data', 'command_menu_offsets.bin changed: %s entries now (the selftest pins %s)' %
+                     (A.get('dll_data', {}).get('command_menu_offsets_entries'), fp.get('dll_data', {}).get('command_menu_offsets_entries')))
+    for rel in added:
+        if rel.lower() in ('dll/tweaks/special_command_menu.bin', 'dll/kh2_tweaks_specialcommandlist.ini'):
+            rep.shout('%s appeared: the port stops at start-up (mod-b-special-command-menu / -list); port the special-command vector '
+                      'of exe 0x4060e0 / 0x15aba0 (implementation notes rows 21, 25)' % rel)
+        if re.match(EXTRA_PROBE_RE, rel.split('/')[-1], re.I):
+            txt = ('%s appeared: the DLL\'s extra-file probes (01..05common.bdx, 01..20effect.bar through exe 0x3f95f0) would find it; the '
+                   'code that loads it is not ported (runtime/mod_hooks_b.c f_3a17f0 / f_3f6620 / f_3f65a0 / f_3f6510: named fatal '
+                   'mod-extra-file-not-ported): port DLL 0x33610 / 0x300a0 / 0x2fd20 / 0x30180 for it' % rel)
+            rep.shout(txt)
+            rep.step('hooks', txt)
+    # 03system.bin: the item-effect port covers the effect kinds the shipped item-use records have (implementation notes)
+    if '03system.bin' in touched:
+        compare_item_kinds(fp, A, rep)
+    # the gummi removal is a port edit on top of the baked tree: every bake from vanilla + mod puts back the mod's unedited
+    # 00progress.bin and the vanilla (or the mod's) wm00.ard, so it is redone after EVERY bake, and whenever the mod ships wm00.ard
+    for rel in changed + added + removed:
+        if re.match(r'^ard/[^/]+/wm00\.ard$', rel, re.I):
+            rep.step('gummi', '%s %s: the gummi edit of wm00.ard (no m_51 spawn) must be made from the file the tree gets; IN_WM00 of '
+                     'tools/apply_gummi_overlay.py follows it' % (rel, 'added' if rel in added else 'removed' if rel in removed else 'changed'))
+    if 'bake' in rep.steps:
+        rep.step('gummi', 'a re-bake puts back the mod\'s unedited 00progress.bin and the unedited wm00.ard in all five ard/{us,fr,gr,it,sp}: '
+                 'the gummi removal (Twilight Town unblock, no m_51 gummi spawn; owner decision) must be applied to the new tree')
+    if A.get('scripts') is not None:
+        compare_scripts(fp, A, rep)
+    rep.step('repin', 'the checkout differs from the pinned version')
+    rep.step('verify', 'after any port change')
+    return rep, False
+
+
+def compare_item_kinds(fp, A, rep):
+    """the effect kinds of 03system.bin's item records against the kinds the port has (counts by type and kind)"""
+    o, n = fp.get('item_kinds'), A.get('item_kinds')
+    if n is None:
+        rep.say('files', '03system.bin is no longer in the mod: the vanilla item table applies (re-check the item effects, step mechanics)')
+        return
+    if n.get('error'):
+        rep.shout('03system.bin item table: %s: the item-effect kinds cannot be checked (runtime/mod_difficulty.c ports kinds 0, 11, 12 and '
+                  'the no-op kinds only)' % n['error'])
+        return
+    if (o or {}).get('by_type') != n.get('by_type'):
+        rep.say('files', '03system.bin item records by type and effect kind: %s -> %s' % ((o or {}).get('by_type'), n.get('by_type')))
+    for t, k, c in unported_item_kinds(n):
+        rep.step('hooks', '03system.bin: %d item record(s) of type %d (an item the player uses) have effect kind %d, which the port '
+                 'does not have: runtime/mod_difficulty.c f_3c4b80 / f_3c3da0 stop with "unimplemented mod item effect"; port that '
+                 'kind from DLL 0x31260 (apply) / 0x30f60 (usability), statically, with selftest cases' % (c, t, k))
+
+
+def compare_modyml(fp, A, rep):
+    Y = A.get('mod_yml')
+    if not Y:
+        rep.shout('mod.yml is missing or unreadable in the checkout')
+        return
+    P = fp.get('mod_yml', {})
+    if asset_canon(Y['assets']) == P.get('asset_list_sha256'):
+        rep.say('mod.yml', 'mod.yml changed, its asset list did not (formatting, comments or top-level keys)')
+    newp = {norm_path(a['name']).lower(): a for a in Y['assets']}
+    oldp = {r[0].lower(): r[0] for r in fp['files']['list'] if r[4] == 'A'}
+    for a in P.get('irregular', []):
+        oldp[norm_path(a['name']).lower()] = norm_path(a['name'])
+    add = sorted(set(newp) - set(oldp))
+    rem = sorted(set(oldp) - set(newp))
+    rep.facts.update(assets=len(Y['assets']), assets_added=len(add), assets_removed=len(rem))
+    rep.say('mod.yml', 'assets: %d pinned, %d now: %d added, %d removed' % (P.get('assets', 0), len(Y['assets']), len(add), len(rem)))
+    for a in add[:200]:
+        rep.say('mod.yml', '  + %s' % norm_path(newp[a]['name']))
+    for a in rem[:200]:
+        rep.say('mod.yml', '  - %s' % oldp[a])
+    meth = collections.Counter(a['method'] for a in Y['assets'])
+    bad = {m: c for m, c in meth.items() if m != 'copy'}
+    if bad:
+        rep.shout('mod.yml uses methods other than copy: %s. tools/bake_nmc_tree.py refuses them; OpenKH\'s Patcher must build those '
+                  'files (docs/OPENKH-MOD-APPLICATION.md), then the bake takes them as copies' % bad)
+    irr = [a for a in Y['assets'] if not asset_is_plain(a)]
+    if irr or P.get('irregular'):
+        rep.say('mod.yml', '%d assets are not "copy the mod file of the same name" (pinned: %d): %s' %
+                (len(irr), len(P.get('irregular', [])), '; '.join('%s <- %s' % (a['name'], a['sources']) for a in irr[:10])))
+        rep.step('bake', 'mod.yml has assets with other sources (internal = the vanilla file, or a renamed source): check the bake plan')
+    if Y['top'] != P.get('top', {}):
+        rep.say('mod.yml', 'top-level keys: pinned %s, now %s' % (P.get('top'), Y['top']))
+    if Y['unparsed']:
+        rep.shout('mod.yml has %d lines this tool cannot read (first: %r): read them by hand' % (len(Y['unparsed']), Y['unparsed'][0]))
+    missing = [n for n, a in newp.items() if a['sources'] and not any(s.get('type') == 'internal' for s in a['sources'])
+               and norm_path(a['sources'][0]['name']).lower() not in {k.lower() for k in A['files']}]
+    if missing:
+        rep.shout('%d mod.yml assets name a source file the checkout does not have (first: %s): the bake would skip them' %
+                  (len(missing), missing[0]))
+    if add or rem:
+        rep.step('bake', 'mod.yml: %d assets added, %d removed' % (len(add), len(rem)))
+
+
+def compare_ini(fp, A, rep, rels):
+    tw = A['dll'].get(TWEAKS) or {}
+    dll_strings = tw['_dll'].data.lower() if '_dll' in tw else None
+    for rel in sorted(rels):
+        fname = rel.split('/')[-1]
+        oldrows = fp['ini'].get(rel) or next((v for k, v in fp['ini'].items() if k.lower() == rel.lower()), [])
+        o = {((s or '').lower(), k.lower()): (v, c) for s, k, v, c, first in oldrows if first}
+        n = ini_effective(A['ini'].get(rel, []))
+        if rel not in A['ini']:
+            rep.say('ini', '%s: removed (the DLL then uses its built-in defaults for every key)' % rel)
+        for key in sorted(set(o) | set(n)):
+            ov, cls = o.get(key, (None, None))
+            nv = n.get(key)
+            if ov == nv:
+                continue
+            sec, k = key
+            if cls is None:   # a key the pin does not have
+                live = dll_strings is None or (k.encode() + b'\0') in dll_strings
+                if fname.lower() == 'kh2moose.ini':
+                    cls = 'moose-runtime' if key in MOOSE_KEYS else 'moose-unknown'
+                elif k in GUARDED_OPTIONS:
+                    cls = 'detour-gate:guarded'
+                elif k in CONST_KEYS:
+                    cls = 'port-constant'
+                else:
+                    cls = 'new-key' + ('' if live else ':not-read')
+            what = '%s [%s] %s: %r -> %r (%s)' % (fname, sec, k, ov, nv, cls)
+            rep.say('ini', what)
+            if 'static-edit' in cls:
+                rep.step('edits', what + ': the DLL patches the exe from this key')
+                rep.step('gen', what)
+            if 'detour-gate:guarded' in cls:
+                if bool_on(nv):
+                    rep.shout(what + ': the option now reads as ON: its detours are NOT ported (the port stops with mod-option-not-ported); '
+                              'decode and port them (implementation notes section 2, the inactive attach sites)')
+            elif 'detour-gate' in cls:
+                rep.step('hooks', what + ': this key gates detours; check whether they are still attached')
+                rep.step('edits', what + ': the same initialiser may patch the exe')
+            if 'port-constant' in cls:
+                rep.step('ini', what + ': ' + CONST_KEYS.get(k, 'a constant in the port'))
+            if k in OUT_OF_SCOPE_OPTIONS and bool_on(nv):
+                rep.shout(what + ': an option the port left out as out of scope (no guard stops the port): decode what it switches on')
+            if cls.startswith('read-no-effect'):
+                rep.step('edits', what + ': the DLL reads this key; at the pinned value it changed nothing the port has: a new value may '
+                         'patch the exe or switch on code: re-derive the static edits and read its initialiser')
+            if cls.startswith('not-read'):
+                if dll_strings is not None and (k.encode() + b'\0') in dll_strings:
+                    rep.shout(what + ': the pinned DLL did not read this key, the new one names it: read its initialiser')
+                else:
+                    rep.say('ini', '  (not read by the DLL: no effect)')
+            if cls == 'moose-runtime':
+                rep.step('ini', what + ': runtime/moose.c reads it from the tree at start-up (takes effect with the re-baked tree)')
+                try:
+                    iv = int((nv or '0').split('#')[0].split(';')[0].strip(), 0)
+                except ValueError:
+                    iv = None
+                if (k == 'scd_priority' and iv is not None and iv & 2) or (k in ('no_death', 'test_crash') and iv):
+                    rep.shout(what + ': ' + MOOSE_NOT_PORTED)
+            if cls in ('moose-unknown',) or cls.startswith('new-key'):
+                if cls.endswith(':not-read'):
+                    rep.say('ini', '  (new key, but no DLL of the checkout names it)')
+                else:
+                    rep.shout(what + ': a key the port does not know: find what the DLL does with it')
+
+
+def compare_dll(fp, A, rep, rel, mod):
+    P = fp['dll'].get(rel)
+    N = A['dll'].get(rel)
+    sid = {TWEAKS: 'hooks', MOOSE: 'moose', NEVERLAND: 'neverland'}[rel]
+    if N is None:
+        rep.shout('%s was removed from the mod: the port still applies it (Makefile, runtime): remove that port only after reading why' % rel)
+        return
+    if P is None:
+        rep.shout('%s is new' % rel)
+        return
+    if N.get('sha256') == P.get('sha256'):
+        return
+    rep.say('dll', '%s: sha256 %s.. -> %s.., %d -> %d bytes, %d -> %d functions (.pdata), link time 0x%x -> 0x%x' %
+            (rel, P['sha256'][:16], N['sha256'][:16], P.get('size', 0), N.get('size', 0), P.get('functions', 0), N.get('functions', 0),
+             P.get('timestamp', 0), N.get('timestamp', 0)))
+    if N.get('error'):
+        rep.shout('%s: %s' % (rel, N['error']))
+        return
+    if not N.get('listing'):
+        rep.shout('%s: no disassembly (%s): nothing below the file hash could be compared; treat every port of this DLL as changed' %
+                  (rel, N.get('listing_error')))
+    if rel == TWEAKS:
+        rep.step('edits', 'KH2Tweaks_Refactor.dll changed: its static edits come from its DllMain (cannot be re-derived statically)')
+        rep.step('gen', 'KH2Tweaks_Refactor.dll changed')
+        rep.step('slots', 'KH2Tweaks_Refactor.dll changed: every slot address and scanner may have moved')
+        if N.get('detour_error'):
+            rep.shout('KH2Tweaks_Refactor.dll: %s' % N['detour_error'])
+        res = compare_detours(P.get('detours', []), N.get('detours', []), have_new_hashes=bool(N.get('listing')))
+        cnt = collections.Counter(r['status'] for r in res)
+        rep.facts['detours'] = dict(cnt)
+        rep.say('dll', 'detours: %s' % ', '.join('%s %d' % kv for kv in sorted(cnt.items())))
+        for r in res:
+            o, n = r['old'], r['new']
+            row = DETOUR_PORT.get((o or {}).get('exe'))
+            port = row[2] if row else (INACTIVE_PORT if o and (o.get('gate') or '').lower() in GUARDED_OPTIONS else 'no port')
+            tag = 'row %s' % (row[0] if row else '-')
+            if r['status'] == 'new':
+                txt = 'NEW detour: %s site %s slot %s -> exe %s, handler %s, gate %s' % (n['kind'], hx(n['site']), hx(n.get('slot')),
+                                                                                         hx(n.get('exe')), hx(n.get('handler')), n.get('gate'))
+                if (n.get('gate') or '').lower() in GUARDED_OPTIONS:
+                    rep.step('hooks', txt + ' (behind a guarded option: ported only if it reads as on)')
+                else:
+                    rep.shout(txt + ': port it')
+                continue
+            gate = ((o or {}).get('gate') or '').lower()
+            if gate in GUARDED_OPTIONS and not option_on(A, (o or {}).get('ini'), gate):
+                rep.say('dll', '  not ported, option %s off in the checkout: %s exe %s handler %s: %s' % (gate, tag, hx((o or {}).get('exe')),
+                        hx((o or {}).get('handler')), r['status']))
+                continue
+            if r['status'] == 'removed':
+                rep.step('hooks', 'REMOVED detour %s exe %s (handler %s, gate %s): %s must go or change' %
+                         (tag, hx(o.get('exe')), hx(o.get('handler')), o.get('gate'), port))
+                continue
+            line = '%s exe %s gate %s handler %s -> %s: %s' % (tag, hx(o.get('exe')), o.get('gate'), hx(o.get('handler')),
+                                                            hx(n.get('handler')), {'same': 'same bytes', 'moved': 'same code (moved)',
+                                                                                   'callee': 'own code the same, a DLL function it reaches CHANGED',
+                                                                                   'changed': 'CODE CHANGED', 'changed?': 'bytes differ (not normalised)'}[r['status']])
+            if r.get('gate_changed'):
+                line += '; gate %s -> %s' % r['gate_changed']
+            if (n.get('exe') is not None and o.get('exe') is not None and n['exe'] != o['exe']):
+                line += '; target exe %s -> %s' % (hx(o['exe']), hx(n['exe']))
+            if r['status'] in ('same', 'moved') and not r.get('gate_changed'):
+                rep.say('dll', '  ' + line)
+            else:
+                rep.step('hooks', line + ' -> re-audit ' + port)
+        # the script system call table
+        ps, ns = P.get('syscalls', []), N.get('syscalls', [])
+        if len(ps) != len(ns):
+            rep.step('syscall-table', 'table entries %d -> %d' % (len(ps), len(ns)))
+        impl = set(fp.get('port', {}).get('syscalls', {}).get('implemented', []))
+        used = set(fp['scripts']['traps_used']) | (traps_used(A['scripts']['uses']) if A.get('scripts') else set())
+        nch = 0
+        for i in range(max(len(ps), len(ns))):
+            a = ps[i] if i < len(ps) else None
+            b = ns[i] if i < len(ns) else None
+            if not a or not b:
+                rep.step('syscall-table', 'syscall %d: %s' % (i, 'new entry %s' % b['names'] if b else 'entry removed (%s)' % a['names']))
+                continue
+            if a.get('flags') != b.get('flags') or set(a.get('names') or []) != set(b.get('names') or []):
+                rep.step('syscall-table', 'syscall %d: names %s -> %s, flags 0x%x -> 0x%x' % (i, a.get('names'), b.get('names'),
+                                                                                          a.get('flags') or 0, b.get('flags') or 0))
+            if a.get('norm') and b.get('norm') and (a['norm'] != b['norm'] or a.get('deep') != b.get('deep')):
+                nch += 1
+                what = 'syscall %d %s: handler %s' % (i, (a.get('names') or ['?'])[0], 'CODE CHANGED' if a['norm'] != b['norm'] else 'a DLL function it reaches changed')
+                if i in impl or i in used:
+                    rep.step('scripts', what + (' -> re-audit runtime/mod_syscalls.c case %d' % i if i in impl else ' (used by scripts, not implemented)'))
+                else:
+                    rep.say('dll', '  ' + what + ' (not implemented, not used by any script)')
+        rep.facts['syscall_handlers_changed'] = nch
+        compare_ini_keys(fp, P, N, rep)
+    else:
+        rep.step(sid, '%s changed: the generator reads fixed DLL addresses and stops on another build' % rel)
+        rep.step('gen', '%s changed' % rel)
+        d = N.get('_dll')
+        bn = d.by_norm() if d else {}
+        for f in P.get('cited', []):
+            begin = f.get('begin')
+            nf = [x for x in N.get('cited', []) if x.get('begin') == begin]
+            if nf and nf[0].get('sha256') == f.get('sha256'):
+                st = 'same bytes' if (not f.get('deep') or nf[0].get('deep') == f.get('deep')) else \
+                    'own bytes the same, a DLL function it reaches CHANGED'
+            elif f.get('norm') and f['norm'] in bn:
+                at = bn[f['norm']][0]
+                st = 'same code at 0x%x' % at if (not f.get('deep') or d.deep(at)[0] == f.get('deep')) else \
+                    'same own code at 0x%x, a DLL function it reaches CHANGED' % at
+            else:
+                st = 'CHANGED or gone'
+            line = '%s function 0x%x (%d bytes): %s' % (rel.split('/')[-1], begin or 0, f.get('size', 0), st)
+            if 'CHANGED' in st:
+                rep.step(sid, line)
+            else:
+                rep.say('dll', '  ' + line)
+        for b in P.get('data', []):
+            nb = [x for x in N.get('data', []) if x['rva'] == b['rva']]
+            if not nb or nb[0]['sha256'] != b['sha256']:
+                rep.step(sid, '%s data at 0x%x (%s): differs or moved' % (rel.split('/')[-1], b['rva'], b['what']))
+
+
+FN_STATUS = {'same': 'same bytes', 'moved': 'same code once addresses are replaced (the global the value is stored to is not compared: '
+             'check it is the one the handler reads)', 'callee': 'own code the same, a DLL function it reaches CHANGED',
+             'changed': 'CODE CHANGED', 'gone': 'no such function in the new DLL'}
+
+
+def fn_status(o, n):
+    """status of a recorded function against its counterpart in a new DLL"""
+    if not o or not n or n.get('error'):
+        return 'gone'
+    if o.get('sha256') and o.get('sha256') == n.get('sha256') and o.get('begin') == n.get('begin') and o.get('deep') == n.get('deep'):
+        return 'same'
+    if o.get('norm') and o.get('norm') == n.get('norm'):
+        return 'moved' if o.get('deep') == n.get('deep') else 'callee'
+    if o.get('sha256') and o.get('sha256') == n.get('sha256'):
+        return 'callee'                 # own bytes the same (normalised text not comparable here), something it reaches is not
+    return 'changed'
+
+
+def key_where(k):
+    """where the port depends on an ini key the fingerprint watches"""
+    if k in CONST_KEYS:
+        return CONST_KEYS[k]
+    if k in GUARDED_OPTIONS:
+        return 'the option guard: ' + INACTIVE_PORT
+    if k in OUT_OF_SCOPE_OPTIONS:
+        return 'out of scope (docs/mod/MOD-HOOKS.md), no guard in the port: on = loud'
+    return 'the gate of detours the port has (Makefile hook lists, implementation notes section 2)'
+
+
+def key_is_gate(k):
+    """a detour gate (or a guarded option): a change in how it is read is also a [hooks] step"""
+    return (k not in CONST_KEYS and k not in OUT_OF_SCOPE_OPTIONS) or k in ('drive_add_mult', 'dualwield_forms')
+
+
+def compare_ini_keys(fp, P, N, rep):
+    """the ini keys the port depends on, as the new KH2Tweaks_Refactor.dll reads them: is each still named, by which code (raw /
+    normalised / deep hash of the reading function), with which default for an absent key.  Any difference is an [ini] step (and a
+    [hooks] step for a detour gate), even when every detour handler is byte-identical: the handlers only read the stored global."""
+    pk = P.get('ini_keys')
+    if pk is None:
+        rep.shout('the fingerprint has no ini-key records: re-pin with this tool before comparing')
+        return
+    nk = N.get('ini_keys') or {}
+    d = N.get('_dll')
+    pf = {f['begin']: f for f in P.get('ini_key_functions', []) if f.get('begin') is not None}
+    nf = {f['begin']: f for f in N.get('ini_key_functions', []) if f.get('begin') is not None}
+    groups = collections.OrderedDict()
+    cnt = collections.Counter()
+
+    def put(k, reason):
+        rep.step('ini', reason)
+        if key_is_gate(k):
+            rep.step('hooks', reason)
+    for k in sorted(pk):
+        o = pk[k]
+        n = nk.get(k)
+        if n is None and d is not None:
+            n = d.ini_key_record(k)
+        n = n or dict(named=False, functions=[], sites=[])
+        if o.get('named') and not n.get('named'):
+            cnt['no longer named'] += 1
+            put(k, 'the new DLL no longer names the ini key %s (the pinned DLL read it in %s): %s' %
+                (k, ', '.join('0x%x' % f for f in o.get('functions', [])), key_where(k)))
+            continue
+        if not o.get('named'):
+            if n.get('named'):
+                cnt['newly named'] += 1
+                put(k, 'the new DLL names the ini key %s, the pinned one did not: %s' % (k, key_where(k)))
+            continue
+        if (o.get('default_type'), o.get('default')) != (n.get('default_type'), n.get('default')):
+            cnt['default changed'] += 1
+            put(k, 'ini key %s: the DLL\'s default for an absent key %s %r -> %s %r (now: %s): %s' %
+                (k, o.get('default_type'), o.get('default'), n.get('default_type'), n.get('default'), n.get('default_how'), key_where(k)))
+        if len(o.get('sites', [])) != len(n.get('sites', [])) or len(o.get('functions', [])) != len(n.get('functions', [])):
+            cnt['read elsewhere'] += 1
+            put(k, 'ini key %s: named at %d places in %d functions, now %d in %d: %s' % (k, len(o.get('sites', [])), len(o.get('functions', [])),
+                len(n.get('sites', [])), len(n.get('functions', [])), key_where(k)))
+        for ob, nb in zip(o.get('functions', []), n.get('functions', [])):
+            nrec = nf.get(nb) or (d.func_record(nb) if d is not None else None)
+            st = fn_status(pf.get(ob), nrec)
+            cnt[st] += 1
+            if st != 'same':
+                groups.setdefault((ob, nb, st), []).append(k)
+    for (ob, nb, st), ks in groups.items():
+        locs = sorted({key_where(k) for k in ks})
+        reason = 'DLL 0x%x -> 0x%x, the code that reads the ini key(s) %s: %s -> re-check %s' % (ob, nb, ', '.join(ks), FN_STATUS[st],
+                                                                                             ' | '.join(locs))
+        rep.step('ini', reason)
+        if any(key_is_gate(k) for k in ks):
+            rep.step('hooks', reason)
+    rep.facts['ini_keys'] = dict(cnt)
+    rep.say('dll', 'ini keys the port depends on (%d): %s' % (len(pk), ', '.join('%s %d' % kv for kv in sorted(cnt.items()))))
+    # a key of the checkout's ini files that the pinned DLL did not read but the new DLL names: its value now takes effect
+    ks = d.key_sites() if d is not None else {}
+    for rel, rows in sorted(fp.get('ini', {}).items()):
+        for sec, k, v, c, first in rows:
+            if first and c.startswith('not-read') and k.lower() in ks:
+                rep.shout('%s [%s] %s=%r: the pinned DLL did not read this key, the new KH2Tweaks_Refactor.dll names it (DLL 0x%x): its value '
+                          'now takes effect; read the code that reads it' % (rel.split('/')[-1], sec, k, v, ks[k.lower()][0][1]))
+
+
+def option_on(A, ini, key):
+    """does the checkout's ini switch this boolean option on (the DLL's reader)?"""
+    for rel, ents in A.get('ini', {}).items():
+        if ini and rel.split('/')[-1].lower() != ini.lower():
+            continue
+        v = ini_effective(ents).get(('settings', key.lower()))
+        if v is not None and bool_on(v):
+            return True
+    return False
+
+
+def compare_scripts(fp, A, rep):
+    old = fp['scripts']['uses']
+    new = A['scripts']['uses']
+    impl = set(fp.get('port', {}).get('syscalls', {}).get('implemented', [])) or set(fp['scripts']['traps_used'])
+    ou, nu = traps_used(old), traps_used(new)
+    rep.facts['traps_used'] = sorted(nu)
+    for rel in sorted(set(old) | set(new)):
+        a = {int(t): sum(c[:3]) for t, c in old.get(rel, {}).items()}
+        b = {int(t): sum(c[:3]) for t, c in new.get(rel, {}).items()}
+        a = {k: v for k, v in a.items() if v}
+        b = {k: v for k, v in b.items() if v}
+        if a != b:
+            rep.say('scripts', '%s: table-3 calls %s -> %s' % (rel, a or '{}', b or '{}'))
+    for t in sorted(nu - impl):
+        rep.shout('scripts now use table-3 call %d, which the port does not implement (a named fatal at run time)' % t)
+        rep.step('scripts', 'implement table-3 call %d' % t)
+    for t in sorted(nu - ou):
+        if t in impl:
+            rep.say('scripts', 'table-3 call %d is used now (implemented already)' % t)
+    for t in sorted(ou - nu):
+        rep.say('scripts', 'table-3 call %d is no longer used by any script' % t)
+
+
+# =====================================================================================================================================
+# output
+# =====================================================================================================================================
+def render(fp, A, rep, identical, mod, all_files=False):
+    out = []
+    m = fp['mod']
+    out.append('mod_update_check: pinned %s %s (%s "%s"), %d files' % (m['repo'], (m.get('commit') or '?')[:7], m.get('date'), m.get('subject'),
+                                                                     fp['files']['count']))
+    gi = git_info(mod)
+    out.append('checkout: %s%s' % (os.path.abspath(mod), (' (git HEAD %s %s "%s", %s tracked files modified in the working tree)' %
+                                                           ((gi.get('commit') or '?')[:7], gi.get('date'), gi.get('subject'), gi.get('local_modifications'))) if gi else ' (not a git checkout)'))
+    if identical:
+        out.append('IDENTICAL: every file byte for byte as pinned. Nothing to do.')
+        return '\n'.join(out)
+    f = rep.facts
+    out.append('')
+    out.append('== FILES: %d pinned, %d in the checkout: %d added, %d removed, %d changed, %d line endings only, %d renamed by case' %
+               (f['pinned_files'], f['files'], f['added'], f['removed'], f['changed'], f['eol'], f['case']))
+    for k in sorted(rep.by_kind):
+        d = rep.by_kind[k]
+        out.append('  %-16s %s%s' % (k, ', '.join('%s %d' % (w, len(v)) for w, v in sorted(d.items()) if v), '   <-- LOUD' if k in LOUD_KINDS else ''))
+        for w, v in sorted(d.items()):
+            lim = len(v) if all_files else 12
+            for rel in v[:lim]:
+                out.append('      %-8s %s' % ({'added': '+', 'removed': '-', 'changed': '~', 'line endings only': 'eol'}[w], rel))
+            if len(v) > lim:
+                out.append('      ... %d more %s (--all-files lists them)' % (len(v) - lim, w))
+    for sec in ('files', 'mod.yml', 'ini', 'dll', 'scripts'):
+        ls = [t for s, t in rep.lines if s == sec]
+        if ls:
+            out.append('')
+            out.append('== %s' % sec.upper())
+            out += ['  ' + t for t in ls]
+    if rep.loud:
+        out.append('')
+        out.append('== LOUD: %d item(s) this tool cannot settle' % len(rep.loud))
+        out += ['  !! ' + t for t in rep.loud]
+    out.append('')
+    real = [s for s in rep.steps if s != 'decide' or rep.steps[s]]
+    if f['added'] + f['removed'] + f['changed'] + f['case'] == 0 and not rep.loud:
+        out.append('VERDICT: only line endings differ (%d text files); the content is the pinned version. No port step needed '
+                   '(re-pin only if this checkout replaces the pinned one).' % f['eol'])
+        return '\n'.join(out)
+    out.append('== STEPS TO REDO, IN ORDER (docs/MOD-UPDATES.md explains each)')
+    k = 0
+    for sid, title, cmds in STEPS:
+        if sid not in rep.steps:
+            continue
+        k += 1
+        out.append('%2d. [%s] %s' % (k, sid, title))
+        for r in rep.steps[sid][:60]:
+            out.append('      because: %s' % r)
+        if len(rep.steps[sid]) > 60:
+            out.append('      ... and %d more reasons' % (len(rep.steps[sid]) - 60))
+        for c in cmds:
+            out.append('      $ ' + c.replace('{NEW}', os.path.abspath(mod)))
+    out.append('')
+    out.append('VERDICT: CHANGED. %d step(s); %d loud item(s).' % (k, len(rep.loud)))
+    return '\n'.join(out)
+
+
+def remote_text(fp):
+    c = (fp or {}).get('mod', {}).get('commit') or '79a23a6d05b79553cac901345a6fe4ace1a60918'
+    return '\n'.join([
+        '# This tool never touches the network.  To see whether the public repository has commits after the pinned one, run:',
+        'git ls-remote %s refs/heads/main' % REMOTE,
+        '# pinned: %s  (any other hash = there are new commits)' % c,
+        '# To get the new version WITHOUT touching the pinned clone (~/projects/SillyBillyMod1 stays as it is):',
+        'git clone %s ~/projects/SillyBillyMod1-next' % REMOTE,
+        'python3 tools/mod_update_check.py ~/projects/SillyBillyMod1-next',
+        '# then follow docs/MOD-UPDATES.md'])
+
+
+# =====================================================================================================================================
+# selftest: the comparison logic on small synthetic mod trees (no game or mod data, no DLL)
+# =====================================================================================================================================
+def _bar(entries):
+    """a BAR container of (type, name4, data)"""
+    hdr = b'BAR\x01' + struct.pack('<I', len(entries)) + b'\0' * 8
+    off = 16 + 16 * len(entries)
+    tab, body = b'', b''
+    for t, nm, d in entries:
+        tab += struct.pack('<HH4sII', t, 0, nm.encode().ljust(4, b'\0')[:4], off + len(body), len(d))
+        body += d
+    return hdr + tab + body
+
+
+def _bdx(traps, name=b'test'):
+    """a minimal BDX script: one trigger, `syscall 3,<trap>` per trap, ret"""
+    head = name.ljust(16, b'\0') + struct.pack('<iii', 0, 0, 0) + struct.pack('<ii', 1, 14) + struct.pack('<ii', 0, 0)
+    code = b''.join(struct.pack('<HH', 0x00ca, t) for t in traps) + struct.pack('<H', 0x0049)
+    return head + code
+
+
+def _mk_tree(root, files):
+    for rel, data in files.items():
+        p = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, 'wb') as f:
+            f.write(data)
+
+
+def _items(recs):
+    """03system.bin with an `item` subfile: (id, type, percent, kind, command) per 24-byte record, then an empty second table"""
+    body = struct.pack('<ii', 6, len(recs)) + b''.join(struct.pack('<HBBBBHHHHHHHhBB', i, t, 0, p, k, 0, 0, 0, 0, 0, c, 0, 0, 0, 0)
+                                                      for i, t, p, k, c in recs) + struct.pack('<ii', 0, 0)
+    return _bar([(2, 'item', body)])
+
+
+SELFTEST_ITEMS = [(1, 0, 40, 0, 23), (2, 0, 60, 0, 20), (0x112, 1, 3, 0, 0), (0x500, 16, 0, 2, 0)]
+
+
+def _yml(names, extra=''):
+    s = 'assets:\r' + ''.join('- name: %s\r  method: copy\r  source:\r  - name: %s\r' % (n.replace('/', '\\'), n.replace('/', '\\')) for n in names)
+    return (s + extra).encode()
+
+
+BASE_TREE = {
+    '03system.bin': None,           # filled in selftest(): an `item` table (SELFTEST_ITEMS)
+    'dll/KH2Tweaks_Refactor.dll': b'MZ' + b'\0' * 62,     # not a PE: analysed as "cannot analyse" (the case-rename test needs the name)
+    'obj/X.mdlx': None,             # filled in selftest(): a BAR with a script using table-3 calls 13 and 46
+    'remastered/obj/X.mdlx/-0.dds': b'DDS ' + b'\1' * 60,
+    'dll/KH2_Tweaks_Combat.ini': b'[Settings]\r\nblow_gravity=0.81632656\r\nproud_enemy_dmg=200\r\nproud_party_dmg=125\r\n'
+                                 b'submenu_memory=on\r\nretry=off\r\n',
+    'dll/KH2_Tweaks_AntiForm.ini': b'[Settings]\r\nantiform_tweaks=on #Makes Antiform more closely resemble a regular form\r\n',
+    'dll/KH2Moose.ini': b'[kh2.cache]\r\nsize=524288\r\n[kh2.fixes]\r\nscd_priority=1\r\n',
+    'dll/KH2_Tweaks_Debug.ini': b'[Settings]\r\ndebug_on=off\r\n',
+    'icon.png': b'\x89PNG....',
+}
+SELFTEST_EDITS = {'exe_sha256': EXE_SHA256, 'summary': {}, 'nmc_buffer': {'size': 4096, 'nonzero_hex': '00'},
+                  'edits': [{'rva': '0x1', 'length': 1, 'old': '00', 'new': '01', 'cls': 'literal',
+                             'source_ini': [{'file': 'KH2_Tweaks_Combat.ini', 'key': 'blow_gravity'}]}],
+                  'inactive_edits': [{'rva': '0x2', 'length': 1, 'old': '00', 'new': '01', 'cls': 'literal',
+                                      'source_ini': [{'file': 'KH2_Tweaks_AntiForm.ini', 'key': 'antiform_tweaks'}]}]}
+
+
+def selftest():
+    fails, checks = [], [0]
+
+    def T(cond, what):
+        checks[0] += 1
+        if not cond:
+            fails.append(what)
+    tmp = tempfile.mkdtemp(prefix='mod_update_check_selftest_')
+    try:
+        base = dict(BASE_TREE)
+        base['obj/X.mdlx'] = _bar([(3, 'xscr', _bdx([13, 46]))])
+        base['03system.bin'] = _items(SELFTEST_ITEMS)
+        assets = [k for k in base if k not in ('icon.png',)]
+        base['mod.yml'] = _yml(assets)
+        el = os.path.join(tmp, 'edits.json')
+        json.dump(SELFTEST_EDITS, open(el, 'w'))
+        A0 = os.path.join(tmp, 'pinned')
+        _mk_tree(A0, base)
+        fp = make_fingerprint(A0, None, el, with_port=False)
+        fp['port'] = {'syscalls': {'implemented': [13, 46, 55]}}
+        fp = json.loads(json.dumps(fp))                 # exactly what a reader of the written file sees
+        T(fp['files']['count'] == len(base), 'file count')
+        T(fp['files']['assets'] == len(assets), 'asset flags')
+        T(fp['scripts']['traps_used'] == [13, 46], 'script scan of the synthetic BDX: %s' % fp['scripts']['traps_used'])
+        cls = {k: c for rel, rows in fp['ini'].items() for s, k, v, c, first in rows}
+        T(cls.get('blow_gravity') == 'static-edit', 'ini class static-edit: %s' % cls.get('blow_gravity'))
+        T(cls.get('antiform_tweaks') == 'static-edit', 'ini class of an inactive edit key')
+        T(cls.get('proud_enemy_dmg') == 'port-constant', 'ini class port-constant')
+        T(cls.get('retry') == 'detour-gate:guarded', 'ini class guarded gate: %s' % cls.get('retry'))
+        T(cls.get('submenu_memory') == 'not-read', 'ini class not-read: %s' % cls.get('submenu_memory'))
+        T(cls.get('size') == 'moose-runtime', 'ini class moose')
+
+        def run(name, mutate):
+            B = os.path.join(tmp, name)
+            files = dict(base)
+            mutate(files)
+            _mk_tree(B, {k: v for k, v in files.items() if v is not None})
+            A = analyse(B, None)
+            rep, same = compare(fp, A, B)
+            return rep, same, render(fp, A, rep, same, B)
+
+        def unchanged(f):
+            pass
+        rep, same, txt = run('same', unchanged)
+        T(same and not rep.steps and 'IDENTICAL' in txt, 'identical tree')
+
+        def data_change(f):
+            f['03system.bin'] = _items([(1, 0, 45, 0, 23)] + SELFTEST_ITEMS[1:])        # a percent byte: same effect kinds
+        rep, same, txt = run('data', data_change)
+        T(not same and rep.facts['changed'] == 1 and set(rep.steps) >= {'bake', 'prune', 'subset', 'repin', 'verify'} and 'decide' not in rep.steps
+          and 'hooks' not in rep.steps, 'one data file changed: %s' % list(rep.steps))
+        T('gummi' in rep.steps and 'bake' in rep.steps, 'every bake lists the gummi re-application: %s' % list(rep.steps))
+
+        def add_asset(f):
+            f['map/new.map'] = b'm'
+            f['mod.yml'] = _yml([k for k in f if k not in ('icon.png', 'mod.yml')])
+        rep, same, txt = run('add', add_asset)
+        T(rep.facts['added'] == 1 and rep.facts.get('assets_added') == 1 and 'bake' in rep.steps, 'asset added: %s' % rep.facts)
+
+        def rm_asset(f):
+            f['03system.bin'] = None
+            f['mod.yml'] = _yml([k for k in f if k not in ('icon.png', 'mod.yml', '03system.bin')])
+        rep, same, txt = run('rm', rm_asset)
+        T(rep.facts['removed'] == 1 and rep.facts.get('assets_removed') == 1 and 'bake' in rep.steps, 'asset removed: %s' % rep.facts)
+
+        def ini_const(f):
+            f['dll/KH2_Tweaks_Combat.ini'] = f['dll/KH2_Tweaks_Combat.ini'].replace(b'proud_enemy_dmg=200', b'proud_enemy_dmg=250')
+        rep, same, txt = run('const', ini_const)
+        T('ini' in rep.steps and 'mod_config.h' in ' '.join(rep.steps['ini']) and 'edits' not in rep.steps, 'port constant changed: %s' % dict(rep.steps))
+
+        def ini_edit(f):
+            f['dll/KH2_Tweaks_Combat.ini'] = f['dll/KH2_Tweaks_Combat.ini'].replace(b'0.81632656', b'0.5')
+        rep, same, txt = run('edit', ini_edit)
+        T('edits' in rep.steps and 'gen' in rep.steps, 'static-edit key changed')
+
+        def antiform(f):
+            f['dll/KH2_Tweaks_AntiForm.ini'] = b'[Settings]\r\nantiform_tweaks=on\r\n'
+        rep, same, txt = run('anti', antiform)
+        T('edits' in rep.steps, 'inline comment removed from an AntiForm key: the inactive edits become active')
+
+        def guarded(f):
+            f['dll/KH2_Tweaks_Combat.ini'] = f['dll/KH2_Tweaks_Combat.ini'].replace(b'retry=off', b'retry=TRUE')
+        rep, same, txt = run('guard', guarded)
+        T('decide' in rep.steps and any('retry' in x for x in rep.loud), 'guarded option switched on')
+
+        def guarded_off(f):
+            f['dll/KH2_Tweaks_Combat.ini'] = f['dll/KH2_Tweaks_Combat.ini'].replace(b'retry=off', b'retry=no')
+        rep, same, txt = run('guardoff', guarded_off)
+        T('decide' not in rep.steps, 'guarded option changed but still off (the DLL reads "no" as off)')
+
+        def newkey(f):
+            f['dll/KH2_Tweaks_Combat.ini'] += b'brand_new_option=on\r\n'
+        rep, same, txt = run('newkey', newkey)
+        T('decide' in rep.steps and any('brand_new_option' in x for x in rep.loud), 'unknown new ini key is loud')
+
+        def moose_bit2(f):
+            f['dll/KH2Moose.ini'] = f['dll/KH2Moose.ini'].replace(b'scd_priority=1', b'scd_priority=3')
+        rep, same, txt = run('moose', moose_bit2)
+        T('ini' in rep.steps and any('scd_priority' in x for x in rep.loud), 'KH2Moose scd_priority bit 2 is loud')
+
+        def debug_on(f):
+            f['dll/KH2_Tweaks_Debug.ini'] = b'[Settings]\r\ndebug_on=on\r\n'
+        rep, same, txt = run('debug', debug_on)
+        T(any('debug_on' in x for x in rep.loud), 'an out-of-scope option switched on is loud')
+
+        def eol(f):
+            f['dll/KH2_Tweaks_AntiForm.ini'] = f['dll/KH2_Tweaks_AntiForm.ini'].replace(b'\r\n', b'\n')
+        rep, same, txt = run('eol', eol)
+        T(not same and rep.facts['eol'] == 1 and rep.facts['changed'] == 0 and not rep.steps and 'only line endings' in txt,
+          'line endings only: %s %s' % (rep.facts, list(rep.steps)))
+
+        def unknown(f):
+            f['scripts/kingdom2/thing.lua'] = b'-- lua'
+        rep, same, txt = run('unknown', unknown)
+        T('decide' in rep.steps and any('thing.lua' in x for x in rep.loud) and 'LOUD' in txt, 'unknown kind is loud')
+
+        def newdll(f):
+            f['dll/Other.dll'] = b'MZ'
+            f['mod.yml'] = _yml([k for k in f if k not in ('icon.png', 'mod.yml')])
+        rep, same, txt = run('newdll', newdll)
+        T('decide' in rep.steps and any('Other.dll' in x for x in rep.loud), 'a new DLL is loud')
+
+        def newtrap(f):
+            f['obj/X.mdlx'] = _bar([(3, 'xscr', _bdx([13, 46, 99]))])
+        rep, same, txt = run('trap', newtrap)
+        T('scripts' in rep.steps and any('99' in x for x in rep.loud), 'a script uses a call the port lacks')
+
+        def movedtrap(f):
+            f['obj/X.mdlx'] = _bar([(3, 'xscr', _bdx([13]))])
+            f['obj/Y.mdlx'] = _bar([(3, 'yscr', _bdx([46, 55]))])
+            f['mod.yml'] = _yml([k for k in f if k not in ('icon.png', 'mod.yml')])
+        rep, same, txt = run('trapmove', movedtrap)
+        T('scripts' not in rep.steps and not rep.loud and 'obj/Y.mdlx' in txt, 'implemented calls moved between scripts: reported, no step')
+
+        def case(f):
+            f['03SYSTEM.BIN'] = f.pop('03system.bin')
+        rep, same, txt = run('case', case)
+        T(rep.facts['case'] == 1 and rep.facts['added'] == 0 and rep.facts['removed'] == 0, 'case-only rename: %s' % rep.facts)
+
+        def method(f):
+            f['mod.yml'] = f['mod.yml'].replace(b'- name: 03system.bin\r  method: copy', b'- name: 03system.bin\r  method: listpatch', 1)
+        rep, same, txt = run('method', method)
+        T('decide' in rep.steps and any('listpatch' in x for x in rep.loud), 'non-copy method is loud')
+
+        def artwork(f):
+            f['icon.png'] = b'\x89PNG new'
+        rep, same, txt = run('art', artwork)
+        T(not same and 'bake' not in rep.steps and 'decide' not in rep.steps, 'artwork (not an asset): no bake: %s' % list(rep.steps))
+
+        def hd(f):
+            f['remastered/obj/X.mdlx/-1.dds'] = b'DDS 2'
+            f['mod.yml'] = _yml([k for k in f if k not in ('icon.png', 'mod.yml')])
+        rep, same, txt = run('hd', hd)
+        T('hd' in rep.steps and 'bake' in rep.steps, 'HD file added')
+
+        # ---- detour matching (unit level, synthetic rows) ----------------------------------------------------------------------
+        def row(kind, exe, h, sh, nm, dp, gate='installer', slot=0x100):
+            return dict(kind=kind, exe=exe, handler=h, slot=slot, gate=gate, site=0x10,
+                        handler_fn=dict(sha256=sh, norm=nm, deep=dp))
+        old = [row('attach', 0x1000, 0x50, 's1', 'n1', 'd1'), row('attach', 0x2000, 0x60, 's2', 'n2', 'd2'),
+               row('attach', 0x3000, 0x70, 's3', 'n3', 'd3'), row('attach', 0x4000, 0x80, 's4', 'n4', 'd4'),
+               row('attach_ex', 0x5000, 0x90, 's5', 'n5', 'd5', gate='dualwield_forms'), row('attach', 0x6000, 0xa0, 's6', 'n6', 'd6')]
+        new = [row('attach', 0x1000, 0x50, 's1', 'n1', 'd1'),                 # same
+               row('attach', 0x2000, 0x68, 's2b', 'n2', 'd2'),                # moved
+               row('attach', 0x3000, 0x70, 's3b', 'n3b', 'd3b'),              # changed
+               row('attach', 0x4000, 0x80, 's4b', 'n4', 'd4b'),               # callee changed
+               row('attach_ex', None, 0x98, 's5b', 'n5', 'd5', gate='dualwield_forms'),   # inline, moved
+               row('attach', 0x7000, 0xb0, 's7', 'n7', 'd7'),                 # new
+               row('attach', None, 0xc8, 's6b', 'n6', 'd6', slot=0x999)]      # slot unresolved: matched by code
+        st = {(r['old'] or r['new'])['exe'] if (r['old'] or r['new'])['exe'] else -1: r['status'] for r in compare_detours(old, new)}
+        T(st.get(0x1000) == 'same', 'detour same')
+        T(st.get(0x2000) == 'moved', 'detour moved')
+        T(st.get(0x3000) == 'changed', 'detour changed')
+        T(st.get(0x4000) == 'callee', 'detour callee changed')
+        T(st.get(0x5000) == 'moved', 'inline detour matched by its option')
+        T(st.get(0x7000) == 'new', 'new detour')
+        T(st.get(0x6000) == 'moved', 'unresolved slot matched by handler code: %s' % st.get(0x6000))
+        res = compare_detours(old, new[:3] + new[4:5])
+        T(sum(1 for r in res if r['status'] == 'removed') == 2, 'removed detours')
+        g = compare_detours([row('attach', 0x1000, 0x50, 's1', 'n1', 'd1')], [row('attach', 0x1000, 0x50, 's1', 'n1', 'd1', gate='retry')])
+        T(g[0].get('gate_changed') == ('installer', 'retry'), 'gate change reported')
+        def rootfile(f):
+            f['14mission.bar'] = b'BAR\x01' + b'\0' * 12
+            f['.gitattributes'] = b'* text=auto'
+            f['mod.yml'] = _yml([k for k in f if k not in ('icon.png', 'mod.yml', '.gitattributes')])
+        rep, same, txt = run('root', rootfile)
+        T(not rep.loud and 'git-meta' in rep.by_kind and 'system-table' in rep.by_kind and 'bake' in rep.steps,
+          'a root-level game file and git metadata are known kinds: %s' % rep.loud)
+        # ---- the DLL comparison on synthetic records: a guarded (not ported) detour is only re-audited when its option is on
+        def drow(gate, exe, h, sh, nm, ini):
+            return dict(kind='attach', exe=exe, handler=h, slot=0x100, gate=gate, site=0x10, ini=ini, handler_fn=dict(sha256=sh, norm=nm, deep=nm))
+        fps = {'dll': {TWEAKS: dict(sha256='a' * 64, size=1, functions=1, timestamp=0, syscalls=[], ini_keys={},
+                                    detours=[drow('retry', 0x3fc2d0, 0x50, 's1', 'n1', 'KH2_Tweaks_Retry.ini'),
+                                             drow('installer', 0x3c12f0, 0x60, 's2', 'n2', None)])},
+               'port': {'syscalls': {'implemented': []}}, 'scripts': {'traps_used': []}}
+        for val, want in (('off', False), ('on', True)):
+            As = {'dll': {TWEAKS: dict(sha256='b' * 64, size=1, functions=1, timestamp=0, listing=True, syscalls=[], ini_keys={},
+                                       detours=[drow('retry', 0x3fc2d0, 0x58, 's1b', 'n1b', 'KH2_Tweaks_Retry.ini'),
+                                                drow('installer', 0x3c12f0, 0x68, 's2b', 'n2b', None)])},
+                  'ini': {'dll/KH2_Tweaks_Retry.ini': [['Settings', 'retry', val]]}, 'scripts': None}
+            r2 = Report()
+            compare_dll(fps, As, r2, TWEAKS, tmp)
+            hooks = ' '.join(r2.steps.get('hooks', []))
+            T(('0x3fc2d0' in hooks) == want and 'mod_difficulty.c f_3c12f0' in hooks and {'edits', 'gen', 'slots'} <= set(r2.steps),
+              'guarded detour with retry=%s: %s' % (val, hooks[:200]))
+        # ---- ini reader semantics
+        e = ini_effective(parse_ini(b'[Settings]\nk=1\nk=2\n[Other]\nk=3\n'))
+        T(e[('settings', 'k')] == '1' and e[('other', 'k')] == '3', 'ini: first occurrence wins per section')
+        T(not bool_on('on #comment') and bool_on(' TRUE ') and bool_on('"1"') and not bool_on('yes'), 'boolean reader')
+        T(asset_is_plain(dict(name='obj\\A.mdlx', method='copy', sources=[{'name': 'obj/a.mdlx'}], extra={})), 'plain asset, case and slash')
+        T(not asset_is_plain(dict(name='x', method='copy', sources=[{'name': 'x', 'type': 'internal'}], extra={})), 'internal source is not plain')
+        T(kind_of('dll/KH2Tweaks_Refactor.dll') == 'dll:tweaks' and kind_of('ard/us/tt01.ard') == 'area' and kind_of('zzz/q') == 'unknown',
+          'kinds')
+
+        # ==== task 34 review =========================================================================================================
+        # (1) a leaf callee (no .pdata entry) reached by a tail jump is hashed: its change is "a function it reaches changed"
+        def leafdll(variant):
+            pe = PE.__new__(PE)
+            pe.base, pe.img, pe.timestamp = 0x180000000, bytes(0x3000), 0
+            pe.secs = [('.text', 0x1000, 0x1100, 0x400, 0x1100, 0), ('.rdata', 0x2100, 0x100, 0x1500, 0x100, 0)]
+            pe._funcs = {0x1000: [(0x1000, 0x1010)]}
+            pe._starts = [(0x1000, 0x1010, 0x1000)]
+            ins = [(0x1000, 'push   rbx'), (0x1001, 'mov    eax,0x1'), (0x1006, 'pop    rbx'), (0x1007, 'jmp    0x180001080'),
+                   (0x100c, 'int3'), (0x1080, 'mov    r8d,0x%x' % variant), (0x1086, 'ret'), (0x1087, 'int3')]
+            L = Listing.__new__(Listing)
+            L.ok, L.ins, L.idx = True, ins, {a: i for i, (a, t) in enumerate(ins)}
+            d = DllInfo.__new__(DllInfo)
+            d.pe, d.lst, d.funcs, d.imports, d.exports, d.slots, d._norm, d.leaf = pe, L, pe._funcs, {}, {}, None, {}, {}
+            return d
+        la, lb = leafdll(2), leafdll(3)
+        T(la.norm(0x1000)[0] == lb.norm(0x1000)[0] and 0x1080 in la.norm(0x1000)[1], 'leaf callee: the handler\'s own code is the same '
+          'and names the leaf as a callee: %s' % sorted(la.norm(0x1000)[1]))
+        T(la.deep(0x1000)[0] != lb.deep(0x1000)[0] and la.deep(0x1000)[1] == 2, 'leaf callee: its change reaches the deep hash: %s' %
+          [la.deep(0x1000), lb.deep(0x1000)])
+        T(la.leaf.get(0x1080) == [(0x1080, 0x1087)], 'leaf callee bounds: to the first int3: %s' % la.leaf.get(0x1080))
+        T(la.raw_hash(0x1000) == lb.raw_hash(0x1000), 'leaf callee: the handler\'s own bytes are identical (as row 4\'s are)')
+        st = compare_detours([dict(kind='attach', exe=0x4014a0, handler=0x1000, slot=0x10, gate='installer', site=1,
+                                   handler_fn=dict(sha256=la.raw_hash(0x1000), norm=la.norm(0x1000)[0], deep=la.deep(0x1000)[0]))],
+                             [dict(kind='attach', exe=0x4014a0, handler=0x1000, slot=0x10, gate='installer', site=1,
+                                   handler_fn=dict(sha256=lb.raw_hash(0x1000), norm=lb.norm(0x1000)[0], deep=lb.deep(0x1000)[0]))])
+        T(st[0]['status'] == 'callee', 'leaf callee changed under identical handler bytes: re-audited (callee), not "same bytes": %s' %
+          st[0]['status'])
+        T(fn_status(dict(begin=1, sha256='s', norm='n', deep='d'), dict(begin=1, sha256='s', norm='n', deep='d2')) == 'callee' and
+          fn_status(dict(begin=1, sha256='s', norm='n', deep='d'), dict(begin=1, sha256='s', norm='n', deep='d')) == 'same',
+          'a reading function with identical bytes but a changed callee is not "same"')
+
+        # (2) the ini keys the port depends on: the code that reads them, the key name, the default
+        def keyrec(named=True, fn=0x100, dflt=0, typ='int'):
+            return dict(named=named, sites=[fn + 0x10] if named else [], functions=[fn] if named else [], reader=0x900, default=dflt,
+                        default_type=typ, default_how='x')
+
+        class _KD:
+            def __init__(s, names):
+                s.names = names
+
+            def key_sites(s):
+                return {k: [(0, 0x777)] for k in s.names}
+
+            def ini_key_record(s, k):
+                return keyrec(named=False)
+
+            def func_record(s, b):
+                return dict(begin=b, sha256='?', norm='?', deep='?')
+        PK = dict(ini_keys={'crit_enemy_dmg': keyrec(), 'patch_ability_categories': keyrec(fn=0x200, dflt=None, typ=None)},
+                  ini_key_functions=[dict(begin=0x100, sha256='a', norm='n', deep='d'), dict(begin=0x200, sha256='b', norm='m', deep='e')])
+        fpk = {'ini': {'dll/KH2_Tweaks_Combat.ini': [['Settings', 'submenu_memory', 'on', 'not-read', 1]]}}
+
+        def ik(newkeys, newfns, names=()):
+            r = Report()
+            compare_ini_keys(fpk, PK, dict(ini_keys=newkeys, ini_key_functions=newfns, _dll=_KD(names)), r)
+            return r
+        r = ik(PK['ini_keys'], PK['ini_key_functions'])
+        T('ini' not in r.steps and not r.loud, 'ini keys read as pinned: no step: %s' % dict(r.steps))
+        r = ik(PK['ini_keys'], [dict(begin=0x100, sha256='a2', norm='n2', deep='d2'), PK['ini_key_functions'][1]])
+        T(any('crit_enemy_dmg' in x and 'CODE CHANGED' in x for x in r.steps.get('ini', [])) and 'hooks' not in r.steps,
+          'the loader of a port constant changed: [ini]: %s' % dict(r.steps))
+        r = ik(dict(PK['ini_keys'], crit_enemy_dmg=keyrec(fn=0x180)), [dict(begin=0x180, sha256='a3', norm='n', deep='d'), PK['ini_key_functions'][1]])
+        T(any('crit_enemy_dmg' in x and 'is not compared' in x for x in r.steps.get('ini', [])),
+          'the loader only moved: still [ini] (the global is not compared): %s' % r.steps.get('ini'))
+        r = ik(dict(PK['ini_keys'], crit_enemy_dmg=keyrec(named=False)), PK['ini_key_functions'])
+        T(any('no longer names' in x and 'crit_enemy_dmg' in x for x in r.steps.get('ini', [])), 'a port key the new DLL no longer reads: [ini]')
+        r = ik(dict(PK['ini_keys'], crit_enemy_dmg=keyrec(dflt=100)), PK['ini_key_functions'])
+        T(any('default' in x and 'crit_enemy_dmg' in x for x in r.steps.get('ini', [])), 'a changed DLL default: [ini]')
+        r = ik(PK['ini_keys'], [PK['ini_key_functions'][0], dict(begin=0x200, sha256='b2', norm='m2', deep='e2')])
+        T('hooks' in r.steps and 'ini' in r.steps, 'a detour gate read by changed code: [ini] and [hooks]: %s' % list(r.steps))
+        r = ik(PK['ini_keys'], PK['ini_key_functions'], names=('submenu_memory',))
+        T(any('submenu_memory' in x for x in r.loud), 'an ini key the pinned DLL did not read, named by the new DLL: loud')
+
+        # (3) a DLL renamed by letter case only (content changed too) is still compared; KH2Moose.ini by case is loud
+        def dllcase(f):
+            f.pop('dll/KH2Tweaks_Refactor.dll')
+            f['dll/kh2tweaks_refactor.dll'] = b'MZ' + b'\1' * 62
+            f['mod.yml'] = _yml([k for k in f if k not in ('icon.png', 'mod.yml')])
+        rep, same, txt = run('dllcase', dllcase)
+        T(rep.facts['case'] == 1 and any('KH2Tweaks_Refactor.dll' in x for x in rep.loud + [t for s, t in rep.lines if s == 'dll'])
+          and 'repin' in rep.steps and any('MOD_TWEAKS_DLL' in x for x in rep.steps['repin']),
+          'a DLL renamed by case with new content is compared: %s %s' % (rep.loud, [t for s, t in rep.lines if s == 'dll']))
+        T(fp.get('case', {}).get(TWEAKS) == TWEAKS and fp.get('case', {}).get('03system.bin') == '03system.bin',
+          'the fingerprint records the names it read: %s' % fp.get('case'))
+
+        def moosecase(f):
+            f['dll/kh2moose.ini'] = f.pop('dll/KH2Moose.ini')
+        rep, same, txt = run('moosecase', moosecase)
+        T(any('moose.c' in x for x in rep.loud), 'KH2Moose.ini renamed by case is loud (runtime/moose.c opens it by exact name)')
+
+        # (4) the gummi removal follows every bake; a shipped wm00.ard is a gummi input
+        def wm00(f):
+            f['ard/us/wm00.ard'] = b'BAR\x01' + b'\0' * 12
+            f['mod.yml'] = _yml([k for k in f if k not in ('icon.png', 'mod.yml')])
+        rep, same, txt = run('wm00', wm00)
+        T(any(x.startswith('ard/us/wm00.ard added') for x in rep.steps.get('gummi', [])), 'the mod ships wm00.ard: [gummi] names it: %s' %
+          rep.steps.get('gummi'))
+
+        # (5) item-effect kinds: a kind the port does not have on an item the player uses is a [hooks] step; elsewhere not
+        def kind5(f):
+            f['03system.bin'] = _items([(1, 0, 40, 5, 23)] + SELFTEST_ITEMS[1:])
+        rep, same, txt = run('kind5', kind5)
+        T(any('f_3c4b80' in x and 'kind 5' in x for x in rep.steps.get('hooks', [])), 'an item of type 0 with effect kind 5: [hooks]')
+
+        def kind5b(f):
+            f['03system.bin'] = _items(SELFTEST_ITEMS[:3] + [(0x500, 16, 0, 5, 0)])
+        rep, same, txt = run('kind5b', kind5b)
+        T('hooks' not in rep.steps, 'effect kind 5 on a type the item functions do not take: no [hooks]: %s' % rep.steps.get('hooks'))
+
+        def probe(f):
+            f['01effect.bar'] = b'BAR\x01' + b'\0' * 12
+            f['mod.yml'] = _yml([k for k in f if k not in ('icon.png', 'mod.yml')])
+        rep, same, txt = run('probe', probe)
+        T(any('01effect.bar' in x for x in rep.loud) and 'hooks' in rep.steps, 'a file the extra-file probe finds: loud + [hooks]')
+
+        # (6) pin checks: every active slot compared, the expectation file named by the Makefile, absent keys need a DLL default,
+        #     Moose / Neverland functions found again, the gummi overlay inputs, the item kinds
+        pd = os.path.join(tmp, 'port')
+        _mk_tree(pd, {
+            'tools/slots.txt': b'10 3a7cb0\n20 3c3fe0\n',
+            'runtime/mod_syscalls.c': b'{"Foo", 0x1u, 0x100}, /* 0 */\nswitch(idx){ case 0: break; default: break; }\n',
+            'runtime/mod_config.h': b'kh_mod_difficulty_config[4] = {\n {50,150,1.0f,1.0f,1.0f},\n {100,100,1.0f,1.0f,1.0f},\n'
+                                    b' {200,125,1.5f,0.5f,0.5f},\n {200,125,1.5f,0.5f,0.5f},\n};\n'})
+        ckeys = {'%s_%s' % (d, w): keyrec(dflt=(1.0 if w.endswith('mult') else 0), typ=('float' if w.endswith('mult') else 'int'))
+                 for d in ('beginner', 'standard', 'proud', 'crit') for w in ('enemy_dmg', 'party_dmg', 'ap_mult', 'hp_mult', 'mp_mult')}
+        ckeys['drive_add_mult'] = keyrec(dflt=1.0, typ='float')
+        ini_rows = [['Settings', k, v, 'port-constant', 1] for k, v in (
+            ('beginner_enemy_dmg', '50'), ('beginner_party_dmg', '150'), ('beginner_ap_mult', '1.0'), ('standard_enemy_dmg', '100'),
+            ('standard_party_dmg', '100'), ('standard_ap_mult', '1.0'), ('standard_hp_mult', '1.0'), ('standard_mp_mult', '1.0'),
+            ('proud_enemy_dmg', '200'), ('proud_party_dmg', '125'), ('proud_ap_mult', '1.5'), ('proud_hp_mult', '0.5'),
+            ('proud_mp_mult', '0.5'), ('crit_enemy_dmg', '200'), ('crit_party_dmg', '125'), ('crit_ap_mult', '1.5'),
+            ('crit_hp_mult', '0.5'), ('crit_mp_mult', '0.5'), ('drive_add_mult', '1.0'))]
+
+        def pfp(rows, keys=None, slots='tools/slots.txt', mk=True, problems=(), prog='p' * 64, kinds=None):
+            return {'dll': {TWEAKS: dict(detours=rows, syscalls=[dict(index=0, handler=0x100, flags=1, names=['Foo'])],
+                                         ini_keys=ckeys if keys is None else keys),
+                            MOOSE: dict(problems=list(problems))},
+                    'ini': {'dll/KH2_Tweaks_Combat.ini': ini_rows}, 'scripts': {'traps_used': []},
+                    'files': {'list': [['00progress.bin', 1, prog, None, 'A']]},
+                    'item_kinds': kinds or {'by_type': {'0': {'0': 7}}},
+                    'port': {'slots': {'file': slots}, 'makefile_slots_expect': slots if mk else SLOTS_FILE_DEFAULT,
+                             'drive_multiplier': 1.0, 'command_menu_pin': [29, 'bb0'], 'gummi_overlay': {'IN_PROG': 'p' * 64, 'IN_WM00': 'w' * 64}}}
+        good = [dict(kind='attach', site=1, slot=0x10, exe=0x3a7cb0, handler=0x50, gate='installer'),
+                dict(kind='attach_ex', site=2, slot=0x20, site_add=0xc9, exe=0x3c40a9, handler=0x60, gate='dualwield_forms')]
+        def real(pc):          # the synthetic DLL has 2 of the 35 detours and no guarded site: those lines are expected
+            return [x for x in pc if 'found 0 times among the active attach sites' not in x and 'attach sites behind retry' not in x]
+        pc = pin_checks(pfp(good), pd)
+        T(not real(pc), 'pin checks pass on a consistent synthetic port: %s' % real(pc)[:4])
+        moved = [dict(good[0], slot=0x11), dict(good[1], slot=0x21)]
+        pc = pin_checks(pfp(moved), pd)
+        T(any('0 of 2 active detour slots were compared' in x for x in pc), 'slots of another build: nothing compared = a FAILED pin '
+          'check: %s' % [x for x in pc if 'slot' in x])
+        pc = pin_checks(pfp([good[0], dict(good[1], exe=0x3c40aa)]), pd)
+        T(any('inline site of dualwield_forms' in x for x in pc), 'an inline site that no longer lands on the spliced exe address fails')
+        pc = pin_checks(pfp(good, mk=False), pd)
+        T(any('mod-dll-slots rule checks --expect' in x for x in pc), 'the Makefile must check the same expectation file')
+        k2 = dict(ckeys, beginner_hp_mult=dict(ckeys['beginner_hp_mult'], default=None, default_how='not decoded'))
+        pc = pin_checks(pfp(good, keys=k2), pd)
+        T(any('beginner.hp' in x and 'no source' in x for x in pc), 'an absent ini key without a decoded DLL default fails the pin check')
+        k3 = dict(ckeys, crit_enemy_dmg=keyrec(named=False))
+        pc = pin_checks(pfp(good, keys=k3), pd)
+        T(any('crit.enemy' in x for x in pc), 'a port constant whose key the DLL does not read fails the pin check')
+        pc = pin_checks(pfp(good, problems=['dll/KH2Moose.dll function 0x1d60 of the previous pin ... not in this build']), pd)
+        T(any('KH2Moose.dll function 0x1d60' in x for x in pc), 'Moose functions not found again in a new build fail the pin check')
+        pc = pin_checks(pfp(good, prog='q' * 64), pd)
+        T(any('IN_PROG' in x for x in pc), 'a 00progress.bin other than the gummi overlay\'s input fails the pin check')
+        pc = pin_checks(pfp(good, kinds={'by_type': {'0': {'0': 6, '5': 1}}}), pd)
+        T(any('effect kind 5' in x for x in pc), 'a pinned item with an unported effect kind fails the pin check')
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print('mod_update_check selftest: %d checks, %d failures' % (checks[0], len(fails)))
+    for f in fails:
+        print('  FAIL: %s' % f)
+    return 0 if not fails else 1
+
+
+# =====================================================================================================================================
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('mod', nargs='?', help='the mod checkout to compare (NEW_MOD_DIR)')
+    ap.add_argument('--fingerprint', default=DEFAULT_FP)
+    ap.add_argument('--exe', default=DEFAULT_EXE, help='the pinned kh2fm.exe (read only; to resolve DLL slots)')
+    ap.add_argument('--edit-list', default=DEFAULT_EDITS, help='with --write-fingerprint: the static-edit list (Makefile MOD_EDITS)')
+    ap.add_argument('--write-fingerprint', metavar='MOD_DIR')
+    ap.add_argument('--slots-file', help='with --write-fingerprint: the slot expectation file of this build, relative to the port '
+                                         '(default: the one the fingerprint being replaced names, else %s)' % SLOTS_FILE_DEFAULT)
+    ap.add_argument('--json', help='also write the findings as JSON')
+    ap.add_argument('--all-files', action='store_true', help='list every changed file, not the first 12 per kind')
+    ap.add_argument('--remote', action='store_true')
+    ap.add_argument('--selftest', action='store_true')
+    a = ap.parse_args()
+    if a.selftest:
+        return selftest()
+    if a.remote:
+        fp = json.load(open(a.fingerprint)) if os.path.isfile(a.fingerprint) else None
+        print(remote_text(fp))
+        return 0
+    if a.write_fingerprint:
+        if not os.path.isfile(os.path.join(a.write_fingerprint, 'mod.yml')):
+            print('mod_update_check: %s has no mod.yml' % a.write_fingerprint, file=sys.stderr)
+            return 2
+        exe = a.exe if os.path.isfile(a.exe) else None
+        if exe is None:
+            print('mod_update_check: WARNING: no exe at %s: slots are not resolved, the pin checks will fail' % a.exe, file=sys.stderr)
+        prev = None
+        if os.path.isfile(a.fingerprint):
+            try:
+                prev = json.load(open(a.fingerprint))
+            except Exception as e:
+                print('mod_update_check: the fingerprint being replaced (%s) is unreadable: %s' % (a.fingerprint, e), file=sys.stderr)
+                return 2
+        fp = make_fingerprint(a.write_fingerprint, exe, a.edit_list, prev=prev, slots_file=a.slots_file)
+        cm = os.path.join(a.write_fingerprint, 'dll', 'tweaks', 'command_menu_offsets.bin')
+        write_fingerprint(fp, a.fingerprint)
+        print('mod_update_check: wrote %s: %d files, %d assets, %d DLLs, %d ini files, %d scripts scanned (table-3 calls %s)' %
+              (a.fingerprint, fp['files']['count'], fp['files']['assets'], len(fp['dll']), len(fp['ini']), fp['scripts']['scripts'],
+               fp['scripts']['traps_used']))
+        for k, v in fp.get('port', {}).get('pinned_counts', {}).items():
+            print('  %s: %s' % (k, v))
+        if fp['pin_checks']:
+            print('mod_update_check: %d PIN CHECK(S) FAILED (the fingerprint disagrees with the port\'s records):' % len(fp['pin_checks']))
+            for c in fp['pin_checks']:
+                print('  !! ' + c)
+            return 1
+        print('mod_update_check: pin checks: the fingerprint agrees with the port\'s records (detours and inline sites, every active slot '
+              'compared with %s, syscall table, difficulty constants and drive multiplier from the values the DLL reads (ini or its '
+              'decoded default), gen/ sources, Moose / Neverland functions found, scripts, gummi overlay inputs, item effect kinds)' %
+              fp['port']['slots']['file'])
+        return 0
+    if not a.mod:
+        ap.print_usage(sys.stderr)
+        return 2
+    if not os.path.isdir(a.mod) or not os.path.isfile(os.path.join(a.mod, 'mod.yml')):
+        print('mod_update_check: %s is not a mod checkout (no mod.yml)' % a.mod, file=sys.stderr)
+        return 2
+    try:
+        fp = json.load(open(a.fingerprint))
+    except Exception as e:
+        print('mod_update_check: cannot read the fingerprint %s: %s' % (a.fingerprint, e), file=sys.stderr)
+        return 2
+    if fp.get('schema') != SCHEMA:
+        print('mod_update_check: fingerprint schema %s, this tool reads %s' % (fp.get('schema'), SCHEMA), file=sys.stderr)
+        return 2
+    exe = a.exe if os.path.isfile(a.exe) else None
+    files = walk_tree(a.mod)
+    quick = {r[0]: r for r in fp['files']['list']}
+    if set(files) == set(quick) and all(files[k][0] == quick[k][1] and files[k][1] == quick[k][2] for k in files):
+        rep = Report()
+        print(render(fp, None, rep, True, a.mod))
+        if a.json:
+            json.dump(dict(identical=True), open(a.json, 'w'))
+        return 0
+    A = analyse(a.mod, exe, prev=fp)
+    rep, same = compare(fp, A, a.mod)
+    print(render(fp, A, rep, same, a.mod, a.all_files))
+    if a.json:
+        json.dump(dict(identical=same, facts=rep.facts, loud=rep.loud, steps=rep.steps, lines=rep.lines,
+                       by_kind={k: dict(v) for k, v in getattr(rep, 'by_kind', {}).items()}), open(a.json, 'w'), indent=1, default=str)
+    return 0 if same else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
