@@ -157,11 +157,18 @@ int  h_kind(u64 h);
 
 /* sync objects (waitable) */
 typedef struct KWaitObj {
-    int kind; pthread_mutex_t m; pthread_cond_t cv;
+    int kind; pthread_mutex_t m; pthread_cond_t cv;   /* cv uses CLOCK_MONOTONIC */
     int signaled, manual; long count, maxcount;       /* event: signaled/manual; semaphore: count/maxcount; mutex: owner/recursion */
     u64 owner; int recurse; KThread *thread;         /* mutex / thread */
+    _Atomic int refs;                                 /* the handle + every thread currently inside a wait/signal on the object */
+    u64 gen;                                          /* manual-reset event: bumped by SetEvent / pulse, releases every thread waiting at that moment */
+    int waiters, pulse_tokens;                        /* threads blocked on the object; auto-reset pulses granted to them */
 } KWaitObj;
 u32 kh_wait(KCtx *g, u64 handle, u32 ms);
+void *h_get_ref(u64 h, int *kind_out);               /* wait objects only (event, semaphore, mutex, thread): +1 reference, NULL otherwise */
+void kh_wobj_unref(KWaitObj *w);                     /* frees the object with its last reference */
+int  kh_event_set(u64 h);                            /* SetEvent / PulseEvent semantics for runtime-side signallers (timers, fences); 0 = bad handle */
+int  kh_event_pulse(u64 h);
 extern u32 kh_wait_timeout_ms_max;                   /* debug: clamp infinite waits to detect hangs (0 = off) */
 
 /* last error */

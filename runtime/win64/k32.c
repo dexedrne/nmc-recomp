@@ -132,9 +132,21 @@ IMP(winmm,timeGetDevCaps){ if(A0(g)){ wr32(g,A0(g),1); wr32(g,A0(g)+4,1000000); 
 static u64 t0ms; IMP(winmm,timeGetTime){ u64 n=kh_now_ns()/1000000; if(!t0ms) t0ms=n; SET_RAX(g,(u32)(n-t0ms+1000)); }
 typedef struct Timer { u32 id; u32 delay; u64 cb, user; u32 flags; volatile int killed; struct Timer *next; } Timer;
 static Timer *timers; static u32 next_timer=1; static pthread_mutex_t tmm=PTHREAD_MUTEX_INITIALIZER;
+/* A multimedia timer fires on a fixed grid (start + n*period), it does not drift by the time its handler takes: absolute deadlines.
+ * A timer that fell behind by more than a period drops the missed periods, as Windows does.  TIME_CALLBACK_EVENT_SET (0x10) is
+ * SetEvent, TIME_CALLBACK_EVENT_PULSE (0x20) is PulseEvent (the GX frame timer: period timer pulsing an auto-reset event). */
 static void timer_proc(KCtx *g){ Timer *t=(Timer*)(uintptr_t)A0(g);
-    for(;;){ struct timespec ts={t->delay/1000,(long)(t->delay%1000)*1000000L}; nanosleep(&ts,0); if(t->killed) break;
-        if(t->flags&0x30){ KWaitObj *w=h_get(t->cb,HK_EVENT); if(w){ pthread_mutex_lock(&w->m); w->signaled=1; pthread_cond_broadcast(&w->cv); if(t->flags&0x20) w->signaled=0; pthread_mutex_unlock(&w->m); } }   /* TIME_CALLBACK_EVENT_SET / EVENT_PULSE */
+    struct timespec next; clock_gettime(CLOCK_MONOTONIC,&next);
+    for(;;){
+        if(ga_deterministic){ struct timespec ts={t->delay/1000,(long)(t->delay%1000)*1000000L}; nanosleep(&ts,0); }
+        else { next.tv_sec+=t->delay/1000; next.tv_nsec+=(long)(t->delay%1000)*1000000L; if(next.tv_nsec>=1000000000L){ next.tv_sec++; next.tv_nsec-=1000000000L; }
+            struct timespec now; clock_gettime(CLOCK_MONOTONIC,&now);
+            s64 late=((s64)now.tv_sec-next.tv_sec)*1000000000ll+((s64)now.tv_nsec-next.tv_nsec);
+            if(late>(s64)t->delay*1000000ll) next=now;                                      /* more than one period behind: resynchronise */
+            else while(clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&next,0)==EINTR){} }
+        if(t->killed) break;
+        if(t->flags&0x20){ if(!kh_event_pulse(t->cb)) kh_warn("winmm timer %u: pulse of a closed or invalid event handle %llx",t->id,(unsigned long long)t->cb); }
+        else if(t->flags&0x10){ if(!kh_event_set(t->cb)) kh_warn("winmm timer %u: set of a closed or invalid event handle %llx",t->id,(unsigned long long)t->cb); }
         else kh_call5(g,t->cb,t->id,0,t->user,0,0);
         if(!(t->flags&1)) break; }
     KH_RET(g); }

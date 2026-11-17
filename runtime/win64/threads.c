@@ -15,6 +15,20 @@ void kh_set_cur_g(KCtx *g); void kh_install_sigaltstack(void); void kh_guest_bt(
 #define KH_CPU_RELAX() __asm__ __volatile__("yield")
 #endif
 
+/* ---- stress knob ----------------------------------------------------------------------------------------------------- */
+/* KH_SYNC_CHAOS=n : at the entry of every sync primitive (critical section, wait, event, semaphore, fiber switch), with probability
+ * 1/n, yield or sleep up to 200 us.  Any delay there is a schedule a preemptive OS may produce, so a run that only fails with the
+ * knob has found a real ordering bug, not an artefact. */
+static u32 sync_chaos; static _Atomic u64 sync_chaos_hits;
+static __attribute__((noinline)) void sync_chaos_slow(void){
+    static __thread u32 rs; u32 x=rs; if(!x) x=0x9e3779b9u^(u32)(uintptr_t)&rs^(u32)kh_now_ns(); if(!x) x=1;
+    x^=x<<13; x^=x>>17; x^=x<<5; rs=x;
+    if(x%sync_chaos) return; atomic_fetch_add(&sync_chaos_hits,1);
+    if(x&0x10000u) sched_yield(); else { struct timespec ts={0,(long)((x>>8)%200u)*1000L}; nanosleep(&ts,0); }
+}
+#define SYNC_CHAOS() do{ if(__builtin_expect(sync_chaos,0)) sync_chaos_slow(); }while(0)
+static _Atomic u64 cnt_self_suspend, cnt_foreign_suspend, cnt_fiber_create, cnt_fiber_switch, cnt_fiber_below;
+
 /* ---- host context switch --------------------------------------------------------------------------------------------- */
 void kh_ctx_switch(void **save_sp, void *new_sp);
 void kh_fiber_tramp(void);
@@ -79,49 +93,68 @@ void kh_run_tls_callbacks(KCtx *g,u32 reason){
 }
 static KThread *thread_new(void){
     KThread *t=calloc(1,sizeof *t); t->g=kh_new_ctx(); t->tid=atomic_fetch_add(&next_tid,4); t->prio=0;
-    pthread_mutex_init(&t->m,0); pthread_cond_init(&t->cv,0);
+    pthread_mutex_init(&t->m,0); { pthread_condattr_t a; pthread_condattr_init(&a); pthread_condattr_setclock(&a,CLOCK_MONOTONIC); pthread_cond_init(&t->cv,&a); pthread_condattr_destroy(&a); }
     pthread_mutex_lock(&tlist_m); if(ntlist<4096) tlist[ntlist++]=t; pthread_mutex_unlock(&tlist_m); return t;
 }
 static void thread_bind(KThread *t){ tl_thread=t; t->g->rt=t; kh_install_sigaltstack(); kh_set_cur_g(t->g); }
 void kh_thread_init_main(void){
+    { const char *e=getenv("KH_SYNC_CHAOS"); if(e&&*e){ sync_chaos=(u32)strtoul(e,0,0); if(sync_chaos) fprintf(stderr,"kh: sync chaos: a random yield or sleep at 1 of %u sync primitive calls\n",sync_chaos); } }
     KThread *t=thread_new(); t->is_main=1; u64 top=kh_new_guest_stack(8ull<<20,&t->stack_lo); t->stack_hi=t->stack_lo+(8ull<<20);
     kh_ctx_set_stack(t->g,top); kh_make_teb(t); thread_bind(t); snprintf(t->name,sizeof t->name,"main");
 }
 
 /* ---- wait objects ---------------------------------------------------------------------------------------------------- */
-static KWaitObj *wobj_new(int kind){ KWaitObj *w=calloc(1,sizeof *w); w->kind=kind; pthread_mutex_init(&w->m,0); pthread_cond_init(&w->cv,0); return w; }
-static void abs_deadline(struct timespec *ts,u32 ms){ clock_gettime(CLOCK_REALTIME,ts); ts->tv_sec+=ms/1000; ts->tv_nsec+=(long)(ms%1000)*1000000L; if(ts->tv_nsec>=1000000000L){ ts->tv_sec++; ts->tv_nsec-=1000000000L; } }
+/* Win32 behaviour reproduced here (each line has a check in kh_sync_selftest):
+ *  - manual-reset event: SetEvent releases EVERY thread waiting at that moment, even when ResetEvent follows at once (the CRT's
+ *    thread-safe-static fallback does exactly SetEvent + ResetEvent); the event stays set until reset.
+ *  - auto-reset event: SetEvent releases one waiter and resets, or stays set until one wait consumes it.
+ *  - PulseEvent (only reached through timeSetEvent TIME_CALLBACK_EVENT_PULSE): manual = all current waiters, auto = one current
+ *    waiter; the event is left reset, a pulse with nobody waiting is lost.
+ *  - a thread handle is signalled when the thread ends; the wait returns then, not at the next poll.
+ *  - an object lives while a thread waits on it, also when its last handle is closed meanwhile.
+ *  - timeouts are relative and immune to wall-clock steps (CLOCK_MONOTONIC). */
+static KWaitObj *wobj_new(int kind){ KWaitObj *w=calloc(1,sizeof *w); w->kind=kind; w->refs=1; pthread_mutex_init(&w->m,0);
+    pthread_condattr_t a; pthread_condattr_init(&a); pthread_condattr_setclock(&a,CLOCK_MONOTONIC); pthread_cond_init(&w->cv,&a); pthread_condattr_destroy(&a); return w; }
+static void abs_deadline(struct timespec *ts,u32 ms){ clock_gettime(CLOCK_MONOTONIC,ts); ts->tv_sec+=ms/1000; ts->tv_nsec+=(long)(ms%1000)*1000000L; if(ts->tv_nsec>=1000000000L){ ts->tv_sec++; ts->tv_nsec-=1000000000L; } }
 u32 kh_wait_timeout_ms_max;
-u32 kh_wait(KCtx *g,u64 h,u32 ms){
-    KThread *me=cur_thread(); int k=h_kind(h);
-    if(h==PSEUDO_THREAD||h==PSEUDO_PROCESS) return 0x102;
-    KWaitObj *w=h_get(h,0); if(!w){ kh_set_last_error(6); return 0xFFFFFFFFu; }
-    pthread_mutex_lock(&w->m);
-    struct timespec dl; if(ms!=0xFFFFFFFFu) abs_deadline(&dl,ms);
-    u32 res=0; u64 waited=0;
-    for(;;){
-        int got=0;
-        if(k==HK_EVENT){ if(w->signaled){ if(!w->manual) w->signaled=0; got=1; } }
-        else if(k==HK_SEM){ if(w->count>0){ w->count--; got=1; } }
-        else if(k==HK_MUTEX){ if(w->recurse==0||w->owner==me->tid){ w->owner=me->tid; w->recurse++; got=1; } }
-        else if(k==HK_THREAD){ if(w->thread->done) got=1; }
-        else if(k==HK_PROCESS){ got=0; }
-        else { pthread_mutex_unlock(&w->m); return 0xFFFFFFFFu; }
-        if(got) break;
-        if(ms==0){ res=0x102; break; }
-        int rc;
-        if(ms==0xFFFFFFFFu){ struct timespec d2; abs_deadline(&d2,10000); rc=pthread_cond_timedwait(&w->cv,&w->m,&d2);
-            if(rc==ETIMEDOUT){ waited+=10; if(kh_verbose||(waited%60==0)) fprintf(stderr,"kh: thread %u ('%s') waiting %llus on handle %llx kind %d (site rva %llx)\n",me->tid,me->name,(unsigned long long)waited,(unsigned long long)h,k,(unsigned long long)(rd64(g,KH_RSP(g))-GS_BASE)); } }
-        else { rc=pthread_cond_timedwait(&w->cv,&w->m,&dl); if(rc==ETIMEDOUT){ res=0x102; /* re-test once */ int g2=0; if(k==HK_EVENT&&w->signaled){ if(!w->manual) w->signaled=0; g2=1; } else if(k==HK_SEM&&w->count>0){ w->count--; g2=1; } else if(k==HK_MUTEX&&(w->recurse==0||w->owner==me->tid)){ w->owner=me->tid; w->recurse++; g2=1; } else if(k==HK_THREAD&&w->thread->done) g2=1; if(g2) res=0; break; } }
-    }
-    pthread_mutex_unlock(&w->m); return res;
+/* one test of the object for the calling thread; takes what a satisfied wait takes.  blocked = the thread has been waiting already
+ * (only such a thread can be released by a pulse). */
+static int wobj_try(KWaitObj *w,int k,KThread *me,u64 gen0,int blocked){
+    if(k==HK_EVENT){
+        if(w->signaled){ if(!w->manual) w->signaled=0; return 1; }
+        if(w->manual) return w->gen!=gen0;
+        if(blocked && w->pulse_tokens>0){ w->pulse_tokens--; return 1; }
+        return 0; }
+    if(k==HK_SEM){ if(w->count>0){ w->count--; return 1; } return 0; }
+    if(k==HK_MUTEX){ if(w->recurse==0||w->owner==me->tid){ w->owner=me->tid; w->recurse++; return 1; } return 0; }
+    return 0;
 }
-/* thread-object wait uses the thread's own cv (done flag changes there) */
-static void thread_done_broadcast(KThread *t){ pthread_mutex_lock(&tlist_m); /* wake all waiters: they poll with timed waits on their own wobj cv; broadcast through handles */ pthread_mutex_unlock(&tlist_m); }
+u32 kh_wait(KCtx *g,u64 h,u32 ms){
+    KThread *me=cur_thread(); SYNC_CHAOS();
+    if(h==PSEUDO_THREAD||h==PSEUDO_PROCESS) return 0x102;
+    int k=0; KWaitObj *w=h_get_ref(h,&k); if(!w){ kh_set_last_error(6); return 0xFFFFFFFFu; }
+    struct timespec dl; if(ms!=0xFFFFFFFFu) abs_deadline(&dl,ms);
+    pthread_mutex_t *m=&w->m; pthread_cond_t *cv=&w->cv; KThread *th=NULL;
+    if(k==HK_THREAD){ th=w->thread; m=&th->m; cv=&th->cv; }                 /* signalled by the thread's own exit notification */
+    pthread_mutex_lock(m);
+    u32 res=0; u64 waited=0, gen0=w->gen; int blocked=0;
+    for(;;){
+        if(th?th->done:wobj_try(w,k,me,gen0,blocked)) break;
+        if(ms==0){ res=0x102; break; }
+        if(!blocked){ blocked=1; if(!th) w->waiters++; }
+        int rc;
+        if(ms==0xFFFFFFFFu){ struct timespec d2; abs_deadline(&d2,10000); rc=pthread_cond_timedwait(cv,m,&d2);
+            if(rc==ETIMEDOUT){ waited+=10; if(kh_verbose||(waited%60==0)) fprintf(stderr,"kh: thread %u ('%s') waiting %llus on handle %llx kind %d (site rva %llx)\n",me->tid,me->name,(unsigned long long)waited,(unsigned long long)h,k,(unsigned long long)(rd64(g,KH_RSP(g))-GS_BASE)); } }
+        else { rc=pthread_cond_timedwait(cv,m,&dl); if(rc==ETIMEDOUT){ if(!(th?th->done:wobj_try(w,k,me,gen0,blocked))) res=0x102; break; } }
+    }
+    if(blocked&&!th){ w->waiters--; if(w->pulse_tokens>w->waiters) w->pulse_tokens=w->waiters; }
+    pthread_mutex_unlock(m); kh_wobj_unref(w); return res;
+}
 
 /* ---- critical sections (state lives in the guest CRITICAL_SECTION: +0xC recursion, +0x10 owner) ---------------------------- */
 static inline u64 cs_owner(KCtx *g,u64 cs){ return __atomic_load_n((u64*)XL(g,cs+0x10),__ATOMIC_ACQUIRE); }
 static void cs_enter(KCtx *g,u64 cs){
+    SYNC_CHAOS();
     u64 me=cur_thread()->tid; u64 *own=(u64*)XL(g,cs+0x10);
     if(__atomic_load_n(own,__ATOMIC_RELAXED)==me){ wr32(g,cs+0xC,rd32(g,cs+0xC)+1); return; }
     int spins=0;
@@ -134,6 +167,7 @@ static void cs_leave(KCtx *g,u64 cs){
     if(__atomic_load_n(own,__ATOMIC_RELAXED)!=cur_thread()->tid){ kh_fatal(g,"LeaveCriticalSection(%llx) by non-owner (owner=%llx me=%u)",(unsigned long long)cs,(unsigned long long)*own,cur_thread()->tid); }
     if(r>1){ wr32(g,cs+0xC,r-1); return; }
     wr32(g,cs+0xC,0); __atomic_store_n(own,0,__ATOMIC_RELEASE);
+    SYNC_CHAOS();
 }
 IMP(K32,InitializeCriticalSection){ u64 cs=A0(g); memset(hp(g,cs),0,0x28); SET_RAX(g,0); }
 IMP(K32,InitializeCriticalSectionAndSpinCount){ u64 cs=A0(g); memset(hp(g,cs),0,0x28); SET_RAX(g,1); }
@@ -155,21 +189,41 @@ IMP(MSVCP,_Xtime_get_ticks){ struct timespec ts; clock_gettime(CLOCK_REALTIME,&t
 
 /* ---- events / semaphores / mutexes ------------------------------------------------------------------------------------ */
 static u64 mk_event(int manual,int initial){ KWaitObj *w=wobj_new(HK_EVENT); w->manual=manual; w->signaled=initial; return h_new(HK_EVENT,w); }
+static int event_signal(u64 h,int pulse){
+    int k; KWaitObj *w=h_get_ref(h,&k); if(!w) return 0; if(k!=HK_EVENT){ kh_wobj_unref(w); return 0; }
+    SYNC_CHAOS();
+    pthread_mutex_lock(&w->m);
+    if(w->manual){ w->gen++; w->signaled=!pulse; }                                        /* every thread waiting now is released, whatever the state becomes next */
+    else if(pulse){ if(w->pulse_tokens<w->waiters) w->pulse_tokens++; w->signaled=0; }     /* one waiting thread, if there is one */
+    else w->signaled=1;                                                                   /* one waiter takes it, or it stays set */
+    pthread_cond_broadcast(&w->cv); pthread_mutex_unlock(&w->m); kh_wobj_unref(w); return 1;
+}
+int kh_event_set(u64 h){ return event_signal(h,0); }
+int kh_event_pulse(u64 h){ return event_signal(h,1); }
+static int event_reset(u64 h){ int k; KWaitObj *w=h_get_ref(h,&k); if(!w) return 0; if(k!=HK_EVENT){ kh_wobj_unref(w); return 0; } pthread_mutex_lock(&w->m); w->signaled=0; pthread_mutex_unlock(&w->m); kh_wobj_unref(w); return 1; }
 IMP(K32,CreateEventA){ SET_RAX(g,mk_event((int)(A1(g)&0xff),(int)(A2(g)&0xff))); }
 IMP(K32,CreateEventW){ SET_RAX(g,mk_event((int)(A1(g)&0xff),(int)(A2(g)&0xff))); }
 IMP(K32,CreateEventExA){ u32 fl=(u32)A2(g); SET_RAX(g,mk_event((fl&1)?1:0,(fl&2)?1:0)); }   /* CREATE_EVENT_MANUAL_RESET=1 INITIAL_SET=2 */
-IMP(K32,SetEvent){ KWaitObj *w=h_get(A0(g),HK_EVENT); if(!w){ SET_RAX(g,0); return; } pthread_mutex_lock(&w->m); w->signaled=1; pthread_cond_broadcast(&w->cv); pthread_mutex_unlock(&w->m); SET_RAX(g,1); }
-IMP(K32,ResetEvent){ KWaitObj *w=h_get(A0(g),HK_EVENT); if(!w){ SET_RAX(g,0); return; } pthread_mutex_lock(&w->m); w->signaled=0; pthread_mutex_unlock(&w->m); SET_RAX(g,1); }
-static u64 mk_sem(s32 init,s32 max){ KWaitObj *w=wobj_new(HK_SEM); w->count=init; w->maxcount=max; return h_new(HK_SEM,w); }
+IMP(K32,SetEvent){ int ok=kh_event_set(A0(g)); if(!ok) kh_set_last_error(6); SET_RAX(g,ok); }
+IMP(K32,ResetEvent){ int ok=event_reset(A0(g)); if(!ok) kh_set_last_error(6); SET_RAX(g,ok); }
+/* CreateSemaphore rejects initial<0, maximum<=0, initial>maximum (ERROR_INVALID_PARAMETER).  ReleaseSemaphore fails without changing
+ * the count when the release count is <=0 (87) or would exceed the maximum (ERROR_TOO_MANY_POSTS 298); the previous count is
+ * written only on success. */
+static u64 mk_sem(s32 init,s32 max){ if(init<0||max<=0||init>max){ kh_set_last_error(87); return 0; } KWaitObj *w=wobj_new(HK_SEM); w->count=init; w->maxcount=max; return h_new(HK_SEM,w); }
+static int sem_release(u64 h,long n,u32 *prev,u32 *err){
+    int k; KWaitObj *w=h_get_ref(h,&k); if(!w){ *err=6; return 0; } if(k!=HK_SEM){ kh_wobj_unref(w); *err=6; return 0; }
+    SYNC_CHAOS();
+    pthread_mutex_lock(&w->m); int ok=0;
+    if(n<=0) *err=87; else if(w->count+n>w->maxcount) *err=298; else { *prev=(u32)w->count; w->count+=n; pthread_cond_broadcast(&w->cv); ok=1; }
+    pthread_mutex_unlock(&w->m); kh_wobj_unref(w); return ok;
+}
 IMP(K32,CreateSemaphoreA){ SET_RAX(g,mk_sem((s32)A1(g),(s32)A2(g))); }
 IMP(K32,CreateSemaphoreW){ SET_RAX(g,mk_sem((s32)A1(g),(s32)A2(g))); }
-IMP(K32,ReleaseSemaphore){ KWaitObj *w=h_get(A0(g),HK_SEM); if(!w){ SET_RAX(g,0); return; } pthread_mutex_lock(&w->m);
-    if(A2(g)) wr32(g,A2(g),(u32)w->count); long n=(long)(s32)A1(g); if(w->count+n>w->maxcount){ pthread_mutex_unlock(&w->m); kh_set_last_error(298); SET_RAX(g,0); return; }
-    w->count+=n; pthread_cond_broadcast(&w->cv); pthread_mutex_unlock(&w->m); SET_RAX(g,1); }
+IMP(K32,ReleaseSemaphore){ u32 prev=0,err=0; int ok=sem_release(A0(g),(long)(s32)A1(g),&prev,&err); if(ok){ if(A2(g)) wr32(g,A2(g),prev); } else kh_set_last_error(err); SET_RAX(g,ok); }
 IMP(K32,CreateMutexA){ KWaitObj *w=wobj_new(HK_MUTEX); u64 h=h_new(HK_MUTEX,w); if(A1(g)&0xff){ w->owner=cur_thread()->tid; w->recurse=1; } SET_RAX(g,h); }
-IMP(K32,ReleaseMutex){ KWaitObj *w=h_get(A0(g),HK_MUTEX); if(!w){ SET_RAX(g,0); return; } pthread_mutex_lock(&w->m);
-    if(w->recurse==0||w->owner!=cur_thread()->tid){ pthread_mutex_unlock(&w->m); kh_set_last_error(288); SET_RAX(g,0); return; }
-    if(--w->recurse==0){ w->owner=0; pthread_cond_broadcast(&w->cv); } pthread_mutex_unlock(&w->m); SET_RAX(g,1); }
+IMP(K32,ReleaseMutex){ int k; KWaitObj *w=h_get_ref(A0(g),&k); if(!w||k!=HK_MUTEX){ if(w) kh_wobj_unref(w); kh_set_last_error(6); SET_RAX(g,0); return; } pthread_mutex_lock(&w->m);
+    if(w->recurse==0||w->owner!=cur_thread()->tid){ pthread_mutex_unlock(&w->m); kh_wobj_unref(w); kh_set_last_error(288); SET_RAX(g,0); return; }
+    if(--w->recurse==0){ w->owner=0; pthread_cond_broadcast(&w->cv); } pthread_mutex_unlock(&w->m); kh_wobj_unref(w); SET_RAX(g,1); }
 IMP(K32,WaitForSingleObject){ SET_RAX(g,kh_wait(g,A0(g),(u32)A1(g))); }
 IMP(K32,WaitForSingleObjectEx){ SET_RAX(g,kh_wait(g,A0(g),(u32)A1(g))); }
 IMP(K32,CloseHandle){ u64 h=A0(g); if(h==PSEUDO_THREAD||h==PSEUDO_PROCESS){ SET_RAX(g,1); return; } int ok=h_close(h); if(!ok) kh_set_last_error(6); SET_RAX(g,ok); }
@@ -206,8 +260,22 @@ static u64 thread_create(KCtx *g,u64 stack_size,u64 start,u64 param,int suspende
 IMP(K32,CreateThread){ u32 tid=0; u64 h=thread_create(g,A1(g),A2(g),A3(g),(rd32(g,KH_RSP(g)+8+0x20)&4)?1:0,&tid); u64 ptid=rd64(g,KH_RSP(g)+8+0x28); if(h&&ptid) wr32(g,ptid,tid); SET_RAX(g,h); }
 IMP(CRTR,_beginthreadex){ u32 tid=0; u64 h=thread_create(g,A1(g),A2(g),A3(g),(rd32(g,KH_RSP(g)+8+0x20)&4)?1:0,&tid); u64 ptid=rd64(g,KH_RSP(g)+8+0x28); if(h&&ptid) wr32(g,ptid,tid); SET_RAX(g,h); }
 IMP(CRTR,_beginthread){ u64 h=thread_create(g,A1(g),A0(g),A2(g),0,NULL); SET_RAX(g,h?h:(u64)-1); }   /* _beginthread(start, stack, arg) */
-IMP(K32,ResumeThread){ KWaitObj *w=h_get(A0(g),HK_THREAD); if(!w){ SET_RAX(g,(u64)-1); return; } KThread *t=w->thread; pthread_mutex_lock(&t->m); int was=t->suspended; t->suspended=0; pthread_cond_broadcast(&t->cv); pthread_mutex_unlock(&t->m); SET_RAX(g,was); }
-IMP(K32,SuspendThread){ kh_warn("SuspendThread ignored (handle %llx)",(unsigned long long)A0(g)); SET_RAX(g,0); }
+/* Suspend counts as on Windows: SuspendThread +1, ResumeThread -1, both return the previous count, the thread runs at 0.
+ * A thread suspending ITSELF (the only use in the game: the service thread 0xfe930 parks itself at 0xfead9 when its queue is empty
+ * and is resumed at 0xfef04 / 0xfec40) blocks here until it is resumed.  Suspending another running thread cannot be done with
+ * pthreads; that call fails loudly (-1, ERROR_ACCESS_DENIED) instead of pretending. */
+static u32 thread_resume(u64 h){ int k; KWaitObj *w=h_get_ref(h,&k); if(!w||k!=HK_THREAD){ if(w) kh_wobj_unref(w); kh_set_last_error(6); return (u32)-1; }
+    KThread *t=w->thread; pthread_mutex_lock(&t->m); int was=t->suspended; if(was>0) t->suspended=was-1; pthread_cond_broadcast(&t->cv); pthread_mutex_unlock(&t->m); kh_wobj_unref(w); return (u32)was; }
+static u32 thread_suspend(KCtx *g,u64 h){
+    KThread *me=cur_thread(), *t=me; KWaitObj *w=NULL; (void)g;
+    if(h!=PSEUDO_THREAD){ int k; w=h_get_ref(h,&k); if(!w||k!=HK_THREAD){ if(w) kh_wobj_unref(w); kh_set_last_error(6); return (u32)-1; } t=w->thread; kh_wobj_unref(w); }
+    if(t!=me){ atomic_fetch_add(&cnt_foreign_suspend,1); kh_warn("SuspendThread of ANOTHER thread (target %u, caller %u, handle %llx) is not implemented: the target keeps running, the call returns failure",t->tid,me->tid,(unsigned long long)h); kh_set_last_error(5); return (u32)-1; }
+    atomic_fetch_add(&cnt_self_suspend,1);
+    pthread_mutex_lock(&t->m); int was=t->suspended; t->suspended=was+1; while(t->suspended>0) pthread_cond_wait(&t->cv,&t->m); pthread_mutex_unlock(&t->m);
+    return (u32)was;
+}
+IMP(K32,ResumeThread){ SET_RAX(g,thread_resume(A0(g))); }
+IMP(K32,SuspendThread){ SET_RAX(g,thread_suspend(g,A0(g))); }
 IMP(K32,GetCurrentThreadId){ SET_RAX(g,cur_thread()->tid); }
 IMP(K32,GetCurrentThread){ SET_RAX(g,PSEUDO_THREAD); }
 IMP(K32,GetCurrentProcess){ SET_RAX(g,PSEUDO_PROCESS); }
@@ -230,6 +298,7 @@ IMPN(K32,ExitProcess){ extern void kh_exit_process(int); kh_exit_process((int)A0
 u64 kh_fiber_host_stack=2ull<<20;            /* host stack of a fiber (lazily committed); the vkd3d backend raises it because native graphics code runs on it */
 struct KFiber { KCtx *g; void *hstack; size_t hsize; void *sp; u64 start, param, handle, gstack_lo, gstack_sz; KThread *owner; int is_thread_fiber, finished; };
 #define FIBER_MAGIC 0x46494245ull
+static int fiber_teb_swap=1;                          /* 0 only inside the selftest's demonstration of the hazard */
 static KFiber *fiber_of(KCtx *g,u64 h){ if(!GA_OK(h)||rd64(g,h+8)!=FIBER_MAGIC){ kh_fatal(g,"bad fiber handle %llx",(unsigned long long)h); } return (KFiber*)rd64(g,h); }
 static u64 fiber_handle(KCtx *g,KFiber *f){ u64 h=ga_alloc(64,16); wr64(g,h,(u64)(uintptr_t)f); wr64(g,h+8,FIBER_MAGIC); f->handle=h; return h; }
 void kh_fiber_main(KFiber *f){
@@ -240,6 +309,7 @@ u64 kh_fiber_create(KCtx *g,u64 stack_size,u64 start,u64 param){
     KFiber *f=calloc(1,sizeof *f); f->g=kh_new_ctx(); f->start=start; f->param=param;
     u64 gs=stack_size<(1ull<<20)?(1ull<<20):stack_size; f->gstack_sz=gs; u64 top=kh_new_guest_stack(gs,&f->gstack_lo); kh_ctx_set_stack(f->g,top);
     f->hsize=kh_fiber_host_stack; f->hstack=mmap(0,f->hsize,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0); if(f->hstack==MAP_FAILED) kh_fatal(g,"fiber host stack mmap failed");
+    atomic_fetch_add(&cnt_fiber_create,1);
     f->sp=make_frame((char*)f->hstack+f->hsize,f); return fiber_handle(g,f);
 }
 u64 kh_fiber_convert(KCtx *g,u64 param){
@@ -251,7 +321,17 @@ __attribute__((noinline)) void kh_fiber_switch(KCtx *g,u64 target){
     KThread *t=cur_thread(); KFiber *to=fiber_of(g,target); KFiber *from=t->cur_fiber;
     if(!from) kh_fatal(g,"SwitchToFiber from a thread that was not converted to a fiber");
     if(to==from) return;
+    SYNC_CHAOS();
     u64 gs=KH_GS(from->g); (void)gs; KH_GS(to->g)=t->teb; to->g->rt=t; to->owner=t; t->cur_fiber=to; from->owner=NULL;
+    /* Windows SwitchToFiber swaps the TEB's StackBase / StackLimit to the fiber's stack.  The exe's __chkstk (0x43a460) probes from
+     * gs:[0x10] downwards one page at a time (a zero byte per page) whenever the new stack pointer is below that limit: with the
+     * THREAD's limit left in the TEB, a fiber whose stack lies below the thread's stack would have every page in between written. */
+    atomic_fetch_add(&cnt_fiber_switch,1);
+    if(fiber_teb_swap){
+        u64 lo=to->is_thread_fiber?t->stack_lo:to->gstack_lo, hi=to->is_thread_fiber?t->stack_hi:to->gstack_lo+to->gstack_sz;
+        if(!to->is_thread_fiber && hi<=t->stack_lo) atomic_fetch_add(&cnt_fiber_below,1);
+        wr64(g,t->teb+0x08,hi); wr64(g,t->teb+0x10,lo);
+    }
     kh_set_cur_g(to->g);
     kh_ctx_switch(&from->sp,to->sp);
     /* resumed here, possibly on another host thread: whoever switched to us already set cur_fiber and gs */
@@ -266,6 +346,7 @@ void kh_fiber_delete(KCtx *g,u64 h){
 }
 int kh_fiber_convert_to_thread(KCtx *g){
     KThread *t=cur_thread(); KFiber *f=t->thread_fiber; if(!f) return 0; if(t->cur_fiber!=f){ kh_fatal(g,"ConvertFiberToThread while a non-thread fiber is running"); }
+    wr64(g,t->teb+0x08,t->stack_hi); wr64(g,t->teb+0x10,t->stack_lo);
     wr64(g,f->handle+8,0); ga_free(f->handle); free(f); t->thread_fiber=NULL; t->cur_fiber=NULL; return 1;
 }
 IMP(K32,ConvertThreadToFiber){ SET_RAX(g,kh_fiber_convert(g,A0(g))); }
@@ -296,7 +377,130 @@ u64 kh_spawn_hostfn_thread(KCtx *g,const char *name,KhFn fn,u64 param){ u64 a=kh
 u64 kh_mk_event_h(int manual,int initial){ return mk_event(manual,initial); }
 
 void kh_dump_threads(FILE *f){
-    pthread_mutex_lock(&tlist_m);
-    for(u32 i=0;i<ntlist;i++){ KThread *t=tlist[i]; fprintf(f,"kh: thread %u '%s' done=%d cur_fiber=%p\n",t->tid,t->name,t->done,(void*)t->cur_fiber); kh_guest_bt(t->cur_fiber&&!t->cur_fiber->is_thread_fiber?t->cur_fiber->g:t->g,f); }
-    pthread_mutex_unlock(&tlist_m);
+    /* also called from the fault paths: never block there (the list only grows, entries are never freed) */
+    int locked=(pthread_mutex_trylock(&tlist_m)==0);
+    for(u32 i=0;i<ntlist;i++){ KThread *t=tlist[i]; fprintf(f,"kh: thread %u '%s' done=%d cur_fiber=%p start=%llx\n",t->tid,t->name,t->done,(void*)t->cur_fiber,(unsigned long long)(t->start>=GS_BASE&&t->start<GS_BASE+IMG_SIZE?t->start-GS_BASE:t->start)); kh_guest_bt(t->cur_fiber&&!t->cur_fiber->is_thread_fiber?t->cur_fiber->g:t->g,f); }
+    if(locked) pthread_mutex_unlock(&tlist_m);
+}
+
+void kh_sync_report(FILE *f){
+    fprintf(f,"kh: sync report: self-suspends=%llu refused-suspends-of-other-threads=%llu fibers-created=%llu fiber-switches=%llu switches-to-a-fiber-below-the-thread-stack=%llu sync-chaos=%u hits=%llu\n",
+            (unsigned long long)cnt_self_suspend,(unsigned long long)cnt_foreign_suspend,(unsigned long long)cnt_fiber_create,(unsigned long long)cnt_fiber_switch,(unsigned long long)cnt_fiber_below,
+            sync_chaos,(unsigned long long)sync_chaos_hits);
+}
+
+/* ==============================================================================================================================
+ * selftest of the sync primitives against the Win32 behaviour listed above the wait objects
+ * ============================================================================================================================ */
+#define SCHECK(c) do{ checks++; if(!(c)){ fails++; fprintf(stderr,"sync selftest FAIL: %s (line %d)\n",#c,__LINE__); } }while(0)
+typedef struct { u64 h; u32 ms; _Atomic u32 res; _Atomic int done; _Atomic u64 dt_ms; } StW;
+static void st_msleep(int ms){ struct timespec ts={ms/1000,(long)(ms%1000)*1000000L}; nanosleep(&ts,0); }
+static void st_waiter(KCtx *g){ StW *a=(StW*)(uintptr_t)A0(g); u64 t0=kh_now_ns(); u32 r=kh_wait(g,a->h,a->ms); atomic_store(&a->dt_ms,(kh_now_ns()-t0)/1000000); atomic_store(&a->res,r); atomic_store(&a->done,1); KH_RET(g); }
+static void st_spawn_waiters(KCtx *g,StW *a,int n,u64 h,u32 ms){ for(int i=0;i<n;i++){ a[i].h=h; a[i].ms=ms; atomic_store(&a[i].done,0); atomic_store(&a[i].res,0xdeadu); kh_spawn_hostfn_thread(g,"sync_selftest_waiter",st_waiter,(u64)(uintptr_t)&a[i]); } }
+static int st_blocked(u64 h,int n,int ms){ KWaitObj *w=h_get(h,0); for(int i=0;i<ms*5;i++){ pthread_mutex_lock(&w->m); int c=w->waiters; pthread_mutex_unlock(&w->m); if(c>=n) return 1; struct timespec ts={0,200000}; nanosleep(&ts,0); } return 0; }
+static int st_all_done(StW *a,int n,int ms){ for(int i=0;i<ms*5;i++){ int d=0; for(int k=0;k<n;k++) d+=atomic_load(&a[k].done); if(d==n) return 1; struct timespec ts={0,200000}; nanosleep(&ts,0); } return 0; }
+static int st_count(StW *a,int n,u32 res){ int c=0; for(int k=0;k<n;k++) c+=(atomic_load(&a[k].res)==res); return c; }
+static void st_sleeper(KCtx *g){ st_msleep((int)A0(g)); SET_RAX(g,7); KH_RET(g); }
+static struct { _Atomic int stage; _Atomic u32 prev; } st_susp;
+static void st_suspender(KCtx *g){ atomic_store(&st_susp.stage,1); u32 p=thread_suspend(g,PSEUDO_THREAD); atomic_store(&st_susp.prev,p); atomic_store(&st_susp.stage,2); KH_RET(g); }
+static struct { _Atomic int n; _Atomic u64 id, user; } st_tm;
+static void st_timer_cb(KCtx *g){ atomic_store(&st_tm.id,A0(g)); atomic_store(&st_tm.user,A2(g)); atomic_fetch_add(&st_tm.n,1); KH_RET(g); }
+static u64 st_import(const char *name){ extern u64 kh_import_addr_base; for(u32 i=0;i<kh_import_count;i++) if(!strcmp(kh_import_table[i].name,name)) return kh_import_addr_base+16ull*i; return 0; }
+/* fiber part: the lifted __chkstk (0x43a460; frame size in rax) run inside a fiber, once with the TEB as the switch left it and once
+ * with the limit a thread stack above the fiber would have left there (what the runtime did before) */
+void f_43a460(KCtx *g);
+static struct { u64 main_h, canary, canary_sz; u64 seen_lo, seen_hi; int probed_fixed, probed_legacy, pages_between; } st_fb;
+static int st_count_probed(KCtx *g){ int c=0; for(u64 a=st_fb.canary;a<st_fb.canary+st_fb.canary_sz;a+=4096) c+=(rd8(g,a)!=0xAA); return c; }
+static void st_chkstk(KCtx *g,u64 size){ u64 save=KH_RSP(g), sv_rax=KH_RAX(g); u64 sp=((save-0x100)&~0xFull)-8; wr64(g,sp,0x7ff7ffff0000ull); KH_RSP(g)=sp; KH_RAX(g)=size; f_43a460(g); KH_RSP(g)=save; KH_RAX(g)=sv_rax; }
+static void st_fiber_body(KCtx *g){
+    KThread *t=cur_thread(); u64 teb=t->teb;
+    st_fb.seen_hi=rd64(g,teb+0x08); st_fb.seen_lo=rd64(g,teb+0x10);
+    st_chkstk(g,0x3000); st_fb.probed_fixed=st_count_probed(g);
+    /* the hazard, contained: limit = top of the canary, as if the running thread's stack began right above it.  Every page start
+     * between this fiber's stack pointer and that limit is saved and restored. */
+    u64 lim=st_fb.canary+st_fb.canary_sz, lowpg=(KH_RSP(g)-0x4000)&~0xfffull; int n=(int)((lim-lowpg)/4096); u8 *sv=malloc((size_t)n);
+    for(int i=0;i<n;i++) sv[i]=rd8(g,lowpg+4096ull*(u64)i);
+    wr64(g,teb+0x10,lim); st_chkstk(g,0x3000); wr64(g,teb+0x10,st_fb.seen_lo);
+    st_fb.probed_legacy=st_count_probed(g); st_fb.pages_between=n;
+    for(int i=0;i<n;i++) wr8(g,lowpg+4096ull*(u64)i,sv[i]); free(sv);
+    kh_fiber_switch(g,st_fb.main_h);
+    kh_fatal(g,"sync selftest: fiber resumed after its last switch");
+}
+int kh_sync_selftest(KCtx *g){
+    int checks=0,fails=0; StW a[3];
+    /* 1. manual-reset event: SetEvent immediately followed by ResetEvent releases every thread that was waiting */
+    u64 ev=mk_event(1,0); st_spawn_waiters(g,a,3,ev,5000); SCHECK(st_blocked(ev,3,3000));
+    kh_event_set(ev); event_reset(ev);
+    SCHECK(st_all_done(a,3,3000)); SCHECK(st_count(a,3,0)==3); SCHECK(kh_wait(g,ev,30)==0x102);
+    kh_event_set(ev); SCHECK(kh_wait(g,ev,0)==0 && kh_wait(g,ev,0)==0);                       /* stays set */
+    event_reset(ev);
+    /* 2. auto-reset event: one waiter per SetEvent; with nobody waiting it stays set for exactly one wait */
+    u64 ae=mk_event(0,0); st_spawn_waiters(g,a,3,ae,400); SCHECK(st_blocked(ae,3,3000));
+    kh_event_set(ae); SCHECK(st_all_done(a,3,3000)); SCHECK(st_count(a,3,0)==1 && st_count(a,3,0x102)==2);
+    kh_event_set(ae); SCHECK(kh_wait(g,ae,0)==0); SCHECK(kh_wait(g,ae,0)==0x102);
+    /* 3. pulses: auto = one current waiter, manual = all current waiters, nobody waiting = lost */
+    st_spawn_waiters(g,a,2,ae,400); SCHECK(st_blocked(ae,2,3000)); kh_event_pulse(ae);
+    SCHECK(st_all_done(a,2,3000)); SCHECK(st_count(a,2,0)==1 && st_count(a,2,0x102)==1);
+    kh_event_pulse(ae); SCHECK(kh_wait(g,ae,20)==0x102);
+    st_spawn_waiters(g,a,3,ev,5000); SCHECK(st_blocked(ev,3,3000)); kh_event_pulse(ev);
+    SCHECK(st_all_done(a,3,3000)); SCHECK(st_count(a,3,0)==3); SCHECK(kh_wait(g,ev,0)==0x102);
+    /* 4. the GX frame timer: timeSetEvent(period, TIME_PERIODIC|TIME_CALLBACK_EVENT_PULSE) on an auto-reset event, waited with a 1 s timeout */
+    u64 tse=st_import("timeSetEvent"), tke=st_import("timeKillEvent"); SCHECK(tse && tke);
+    if(tse&&tke){
+        u64 te=mk_event(0,0); u32 id=(u32)kh_call5(g,tse,10,1,te,0,0x21); SCHECK(id!=0);
+        u64 t0=kh_now_ns(); int ok=0; for(int i=0;i<20;i++) ok+=(kh_wait(g,te,1000)==0); u64 dt=(kh_now_ns()-t0)/1000000;
+        SCHECK(ok==20); SCHECK(dt>=150 && dt<1500);                                            /* 20 periods of 10 ms */
+        SCHECK((u32)kh_call(g,tke,id,0,0,0)==0); h_close(te);
+        atomic_store(&st_tm.n,0); u32 id2=(u32)kh_call5(g,tse,5,1,kh_host_fn("sync_selftest_timer_cb",st_timer_cb),0x1234,1);
+        st_msleep(120); SCHECK((u32)kh_call(g,tke,id2,0,0,0)==0); st_msleep(20); int n1=atomic_load(&st_tm.n); st_msleep(40);
+        SCHECK(n1>=10 && n1<=27 && atomic_load(&st_tm.n)==n1 && atomic_load(&st_tm.id)==id2 && atomic_load(&st_tm.user)==0x1234);
+    }
+    /* 5. a thread handle is signalled when the thread ends (infinite and finite waits return then) */
+    u64 sl=kh_host_fn("sync_selftest_sleeper",st_sleeper);
+    u64 th=thread_create(g,0,sl,120,0,NULL); u64 t0=kh_now_ns(); u32 r=kh_wait(g,th,0xFFFFFFFFu); u64 dt=(kh_now_ns()-t0)/1000000;
+    SCHECK(th && r==0 && dt>=100 && dt<3000); { KWaitObj *w=h_get(th,HK_THREAD); SCHECK(w && w->thread->done && w->thread->exit_code==7); } SCHECK(kh_wait(g,th,0)==0); h_close(th);
+    th=thread_create(g,0,sl,120,0,NULL); t0=kh_now_ns(); r=kh_wait(g,th,8000); dt=(kh_now_ns()-t0)/1000000; SCHECK(r==0 && dt>=100 && dt<3000);
+    SCHECK(kh_wait(g,th,0)==0); h_close(th); SCHECK(kh_wait(g,th,0)==0xFFFFFFFFu);
+    th=thread_create(g,0,sl,300,0,NULL); SCHECK(kh_wait(g,th,20)==0x102);                     /* still running */
+    /* 6. suspending another thread is refused loudly; a self-suspend blocks until ResumeThread, counts as on Windows */
+    SCHECK(thread_suspend(g,th)==(u32)-1 && kh_get_last_error()==5); SCHECK(kh_wait(g,th,5000)==0); h_close(th);
+    atomic_store(&st_susp.stage,0); u64 sh=thread_create(g,0,kh_host_fn("sync_selftest_suspender",st_suspender),0,0,NULL); KWaitObj *sw=h_get(sh,HK_THREAD); int parked=0;
+    for(int i=0;i<15000&&!parked;i++){ pthread_mutex_lock(&sw->thread->m); parked=sw->thread->suspended>0; pthread_mutex_unlock(&sw->thread->m); if(!parked){ struct timespec ts={0,200000}; nanosleep(&ts,0); } }
+    SCHECK(parked); st_msleep(60); SCHECK(atomic_load(&st_susp.stage)==1);                   /* it really is blocked */
+    SCHECK(thread_resume(sh)==1); SCHECK(kh_wait(g,sh,5000)==0); SCHECK(atomic_load(&st_susp.stage)==2 && atomic_load(&st_susp.prev)==0);
+    SCHECK(thread_resume(sh)==0); h_close(sh);
+    /* a thread created suspended starts at the first resume */
+    th=thread_create(g,0,sl,10,1,NULL); SCHECK(kh_wait(g,th,80)==0x102); SCHECK(thread_resume(th)==1); SCHECK(kh_wait(g,th,5000)==0); h_close(th);
+    /* 7. "SetEvent then CloseHandle" while a thread waits: the wait is satisfied and the object is freed only after the waiter left */
+    { extern long kh_wobj_frees(void); u64 ce=mk_event(1,0); st_spawn_waiters(g,a,1,ce,5000); SCHECK(st_blocked(ce,1,3000)); long f0=kh_wobj_frees();
+      kh_event_set(ce); SCHECK(h_close(ce)==1); SCHECK(st_all_done(a,1,3000)); SCHECK(atomic_load(&a[0].res)==0);
+      int freed=0; for(int i=0;i<5000&&!freed;i++){ freed=(kh_wobj_frees()>f0); if(!freed) st_msleep(1); } SCHECK(freed); SCHECK(kh_wait(g,ce,0)==0xFFFFFFFFu && !kh_event_set(ce)); }
+    /* 8. semaphore counts */
+    { u64 sm=mk_sem(0,1); u32 prev=9,err=0; SCHECK(sm && sem_release(sm,1,&prev,&err)==1 && prev==0);
+      prev=9; SCHECK(sem_release(sm,1,&prev,&err)==0 && err==298 && prev==9); SCHECK(sem_release(sm,0,&prev,&err)==0 && err==87); SCHECK(sem_release(sm,-1,&prev,&err)==0 && err==87);
+      SCHECK(kh_wait(g,sm,0)==0); SCHECK(kh_wait(g,sm,0)==0x102); SCHECK(sem_release(ev,1,&prev,&err)==0 && err==6); h_close(sm);
+      SCHECK(mk_sem(2,1)==0 && kh_get_last_error()==87); SCHECK(mk_sem(-1,1)==0); SCHECK(mk_sem(0,0)==0);
+      u64 s3=mk_sem(1,3); prev=9; SCHECK(sem_release(s3,2,&prev,&err)==1 && prev==1); SCHECK(kh_wait(g,s3,0)==0 && kh_wait(g,s3,0)==0 && kh_wait(g,s3,0)==0 && kh_wait(g,s3,0)==0x102); h_close(s3); }
+    /* 9. a wait on something that is not a waitable object fails instead of touching it */
+    SCHECK(kh_wait(g,0x100+4ull*60000,0)==0xFFFFFFFFu && kh_get_last_error()==6);
+    /* 10. fibers: the TEB stack bounds follow the running fiber, and the lifted __chkstk leaves memory outside the fiber's stack alone */
+    { u64 ga_bump_ptr(void); KThread *t=cur_thread(); static u64 drained[4096]; int nd=0;
+      for(;nd<4096;nd++){ u64 b0=ga_bump_ptr(); drained[nd]=ga_pages(1ull<<20); if(ga_bump_ptr()!=b0){ nd++; break; } }     /* use up every reusable run of 1 MiB or more: the next 1 MiB runs are consecutive */
+      u64 fib=kh_fiber_create(g,1ull<<20,kh_host_fn("sync_selftest_fiber",st_fiber_body),0); KFiber *F=fiber_of(g,fib);
+      st_fb.canary_sz=1ull<<20; st_fb.canary=ga_pages(st_fb.canary_sz); memset(hp(g,st_fb.canary),0xAA,st_fb.canary_sz);
+      u64 ftop=F->gstack_lo+F->gstack_sz; SCHECK(st_fb.canary>=ftop && st_fb.canary-ftop<=0x10000);                           /* layout the test needs */
+      if(st_fb.canary>=ftop && st_fb.canary-ftop<=0x10000){
+          SCHECK(rd64(g,t->teb+0x10)==t->stack_lo && rd64(g,t->teb+0x08)==t->stack_hi);
+          st_fb.main_h=kh_fiber_convert(g,0); st_fb.probed_fixed=st_fb.probed_legacy=-1; kh_fiber_switch(g,fib);
+          SCHECK(st_fb.seen_lo==F->gstack_lo && st_fb.seen_hi==ftop);                           /* inside the fiber: the fiber's bounds */
+          SCHECK(st_fb.probed_fixed==0);                                                         /* nothing outside the fiber's stack was written */
+          SCHECK(st_fb.probed_legacy==256);                                                      /* with the thread's limit every canary page got the probe byte: the check has teeth */
+          SCHECK(st_count_probed(g)==0 && st_fb.pages_between>=256 && st_fb.pages_between<300);  /* and the demonstration cleaned up after itself */
+          SCHECK(rd64(g,t->teb+0x10)==t->stack_lo && rd64(g,t->teb+0x08)==t->stack_hi);         /* back on the thread: the thread's bounds */
+          kh_fiber_delete(g,fib); SCHECK(kh_fiber_convert_to_thread(g)==1);
+      }
+      ga_pages_free(st_fb.canary,st_fb.canary_sz); for(int i=0;i<nd;i++) if(drained[i]) ga_pages_free(drained[i],1ull<<20); }
+    h_close(ev); h_close(ae);
+    fprintf(stderr,"kh: sync selftest: %d checks, %d failures\n",checks,fails);
+    return fails;
 }

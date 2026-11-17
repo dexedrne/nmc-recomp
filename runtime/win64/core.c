@@ -189,6 +189,10 @@ void kh_guest_bt(KCtx *g,FILE *f);
 static void guest_bt(KCtx *g,FILE *f){ kh_guest_bt(g,f); }
 void kh_guest_bt(KCtx *g,FILE *f){
     if(!g) return; u64 rsp=KH_RSP(g); fprintf(f,"---- guest: rsp=%llx rip(state)=%llx rax=%llx rcx=%llx rdx=%llx ----\n",(unsigned long long)rsp,(unsigned long long)KH_R64(g,KO_RIP),(unsigned long long)KH_RAX(g),(unsigned long long)KH_RCX(g),(unsigned long long)KH_RDX(g));
+    /* the remaining general registers (state as last stored by the lifted code: a value still held in a host register is not visible) */
+    fprintf(f,"  rbx=%llx rbp=%llx rsi=%llx rdi=%llx r8=%llx r9=%llx r10=%llx r11=%llx r12=%llx r13=%llx r14=%llx r15=%llx\n",
+            (unsigned long long)KH_RBX(g),(unsigned long long)KH_RBP(g),(unsigned long long)KH_RSI(g),(unsigned long long)KH_RDI(g),(unsigned long long)KH_R8(g),(unsigned long long)KH_R9(g),
+            (unsigned long long)KH_R64(g,KO_R8+16),(unsigned long long)KH_R64(g,KO_R8+24),(unsigned long long)KH_R64(g,KO_R8+32),(unsigned long long)KH_R64(g,KO_R8+40),(unsigned long long)KH_R64(g,KO_R8+48),(unsigned long long)KH_R64(g,KO_R8+56));
     if(!GA_OK(rsp)) return; int n=0;
     for(u64 p=rsp;p<rsp+0x4000&&GA_OK(p+8)&&n<24;p+=8){ u64 v=rd64(g,p); if(v<GS_BASE+0x1000||v>=GS_BASE+0x5784f3) continue;
         const u8 *c=(const u8*)XL(g,v); int ok=(c[-5]==0xE8)||(c[-6]==0xFF&&c[-5]==0x15)||(c[-2]==0xFF&&(c[-1]&0xF8)==0xD0)||(c[-3]==0xFF&&(c[-2]&0xF8)==0x50)||(c[-2]==0xFF&&(c[-1]&0xF8)==0x10);
@@ -196,19 +200,33 @@ void kh_guest_bt(KCtx *g,FILE *f){
 }
 static __thread KCtx *tl_cur_g;
 void kh_set_cur_g(KCtx *g){ tl_cur_g=g; }
+/* fault-time diagnostics of other modules (bgload.c: the background-load list).  Called once from the fatal / signal / fault paths,
+ * after the generic report; a callback only reads guest memory it has validated and prints. */
+#define MAXDIAG 8
+static void (*diag_fn[MAXDIAG])(FILE*); static int ndiag; static _Atomic int diag_ran;
+void kh_register_fault_diag(void (*fn)(FILE*)){ for(int i=0;i<ndiag;i++) if(diag_fn[i]==fn) return; if(ndiag<MAXDIAG) diag_fn[ndiag++]=fn; }
+void kh_dump_threads(FILE *f);
+static void fault_extras(FILE *f){
+    if(atomic_exchange(&diag_ran,1)) return;
+    for(int i=0;i<ndiag;i++) diag_fn[i](f);
+    fprintf(f,"---- all threads at the fault ----\n"); kh_dump_threads(f);
+}
+static void fault_who(FILE *f){ KThread *t=cur_thread(); if(t) fprintf(f,"kh: faulting thread %u ('%s')\n",t->tid,t->name); else fprintf(f,"kh: faulting thread is not a guest thread\n"); }
 void kh_fatal(KCtx *g,const char *fmt,...){
     va_list ap; fprintf(stderr,"\nkh: FATAL: "); va_start(ap,fmt); vfprintf(stderr,fmt,ap); va_end(ap); fputc('\n',stderr);
     if(g){ u64 ra=0; if(GA_OK(KH_RSP(g))) ra=rd64(g,KH_RSP(g)); fprintf(stderr,"kh: call-site (return address at rsp) = 0x%llx (rva 0x%llx)\n",(unsigned long long)ra,(unsigned long long)(ra-GS_BASE)); }
-    dump_last(stderr,30); guest_bt(g?g:tl_cur_g,stderr);
+    fault_who(stderr); dump_last(stderr,30); guest_bt(g?g:tl_cur_g,stderr);
     void *bt[40]; int n=backtrace(bt,40); fprintf(stderr,"---- host backtrace ----\n"); backtrace_symbols_fd(bt,n,2);
+    fault_extras(stderr);
     fflush(stderr); if(trf) fflush(trf); _exit(3);
 }
 void kh_warn(const char *fmt,...){ va_list ap; fprintf(stderr,"kh: warn: "); va_start(ap,fmt); vfprintf(stderr,fmt,ap); va_end(ap); fputc('\n',stderr); }
 void kh_log(const char *fmt,...){ if(!kh_verbose) return; va_list ap; va_start(ap,fmt); vfprintf(stderr,fmt,ap); va_end(ap); fputc('\n',stderr); }
 static void on_sig(int sig,siginfo_t *si,void *uc){
     (void)uc; fprintf(stderr,"\nkh: SIGNAL %d (%s) addr=%p\n",sig,strsignal(sig),si->si_addr);
-    dump_last(stderr,30); guest_bt(tl_cur_g,stderr);
-    void *bt[48]; int n=backtrace(bt,48); fprintf(stderr,"---- host backtrace ----\n"); backtrace_symbols_fd(bt,n,2); fflush(stderr); if(trf) fflush(trf); _exit(4);
+    fault_who(stderr); dump_last(stderr,30); guest_bt(tl_cur_g,stderr);
+    void *bt[48]; int n=backtrace(bt,48); fprintf(stderr,"---- host backtrace ----\n"); backtrace_symbols_fd(bt,n,2);
+    fault_extras(stderr); fflush(stderr); if(trf) fflush(trf); _exit(4);
 }
 static __thread char *altstack_mem;
 void kh_install_sigaltstack(void){
@@ -262,8 +280,9 @@ void kh_dispatch(KCtx *g,u64 target){
 void kh_fault(KCtx *g,u64 va,const char *kind){
     fprintf(stderr,"\nkh_fault: %s at guest 0x%llx (rva 0x%llx)\n",kind,(unsigned long long)va,(unsigned long long)(va-GS_BASE));
     if(g&&GA_OK(KH_RSP(g))) fprintf(stderr,"kh: top of guest stack (return addr) = 0x%llx\n",(unsigned long long)rd64(g,KH_RSP(g)));
-    dump_last(stderr,30); guest_bt(g,stderr);
-    void *bt[40]; int n=backtrace(bt,40); fprintf(stderr,"---- host backtrace ----\n"); backtrace_symbols_fd(bt,n,2); fflush(stderr); if(trf) fflush(trf); _exit(5);
+    fault_who(stderr); dump_last(stderr,30); guest_bt(g,stderr);
+    void *bt[40]; int n=backtrace(bt,40); fprintf(stderr,"---- host backtrace ----\n"); backtrace_symbols_fd(bt,n,2);
+    fault_extras(stderr); fflush(stderr); if(trf) fflush(trf); _exit(5);
 }
 void kh_unimplemented_import(KCtx *g,const char *dll,const char *name){
     u64 ra=GA_OK(KH_RSP(g))?rd64(g,KH_RSP(g)):0;
@@ -303,10 +322,22 @@ void *h_get(u64 h,int kind){
     if(htab[i].kind!=HK_NONE && (kind==0||htab[i].kind==kind)) o=htab[i].obj; pthread_mutex_unlock(&hm); return o;
 }
 int h_kind(u64 h){ if(h<0x100||h>=0x100+4ull*MAXH||(h&3)) return 0; return htab[(h-0x100)>>2].kind; }
+/* Windows keeps a kernel object alive while a thread waits on it, even when its last handle is closed meanwhile ("SetEvent then
+ * CloseHandle" is a legal pattern).  A waiter or signaller therefore takes a reference under the table lock. */
+static _Atomic long wobj_frees;
+long kh_wobj_frees(void){ return wobj_frees; }
+void *h_get_ref(u64 h,int *kind_out){
+    if(kind_out) *kind_out=HK_NONE;
+    if(h<0x100||h>=0x100+4ull*MAXH||(h&3)) return NULL; u32 i=(u32)((h-0x100)>>2); KWaitObj *w=NULL;
+    pthread_mutex_lock(&hm); int k=htab[i].kind; if(kind_out) *kind_out=k;
+    if(k==HK_EVENT||k==HK_SEM||k==HK_MUTEX||k==HK_THREAD){ w=htab[i].obj; atomic_fetch_add(&w->refs,1); }
+    pthread_mutex_unlock(&hm); return w;
+}
+void kh_wobj_unref(KWaitObj *w){ if(atomic_fetch_sub(&w->refs,1)==1){ pthread_mutex_destroy(&w->m); pthread_cond_destroy(&w->cv); free(w); atomic_fetch_add(&wobj_frees,1); } }
 int h_close(u64 h){
     if(h<0x100||h>=0x100+4ull*MAXH||(h&3)) return 0; u32 i=(u32)((h-0x100)>>2); pthread_mutex_lock(&hm); int k=htab[i].kind; void *o=htab[i].obj; htab[i].kind=HK_NONE; htab[i].obj=NULL; pthread_mutex_unlock(&hm);
     if(k==HK_NONE) return 0;
-    if(k==HK_EVENT||k==HK_SEM||k==HK_MUTEX){ KWaitObj *w=o; pthread_mutex_destroy(&w->m); pthread_cond_destroy(&w->cv); free(w); }
+    if(k==HK_EVENT||k==HK_SEM||k==HK_MUTEX||k==HK_THREAD){ kh_wobj_unref((KWaitObj*)o); }
     else if(k==HK_FIND||k==HK_FILE||k==HK_MAPPING||k==HK_SNAPSHOT){ extern void kh_handle_free(int kind,void *o); kh_handle_free(k,o); }
     return 1;
 }

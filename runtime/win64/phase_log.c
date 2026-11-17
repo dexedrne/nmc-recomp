@@ -11,11 +11,16 @@ void kh_phase_mode_entry(void){ entries[0]++; }
 PHASE(5111d0,1)
 void orig_f_5122e0(KCtx *);
 static _Atomic int initial_state=-1,initial_choice=-1;
+/* present number at which each Initial Settings state was first observed (-1 = not yet): the scripted input's `@hold` uses it */
+static _Atomic long long initial_first[64];
+long long kh_phase_initial_first(int state){ if(state<0||state>=64) return -1; return atomic_load(&initial_first[state])-1; }
+void kh_phase_test_set_initial_first(int state,long long present){ if(state>=0&&state<64) atomic_store(&initial_first[state],present+1); }   /* selftest only; -1 = unseen */
 void f_5122e0(KCtx *g){
     entries[2]++;
     initial_state=rd32(g,A0(g)+0x48); initial_choice=rd16(g,A0(g)+0x2ce);
     static int previous=-1;
     if(previous!=initial_state){ extern _Atomic u64 gfx_presents;
+        int st=initial_state; if(st>=0&&st<64){ long long z=0; atomic_compare_exchange_strong(&initial_first[st],&z,(long long)gfx_presents+1); }
         fprintf(stderr,"kh: InitialSetting frame=%llu state=%d choice=%d\n",(unsigned long long)gfx_presents,(int)initial_state,(int)initial_choice); previous=initial_state;
     }
     orig_f_5122e0(g);

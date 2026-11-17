@@ -160,7 +160,7 @@ static int h_fence(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 
     switch(s){
     case 8: SET_RAX(g,rd64(g,o+32)); return 1;                                                              /* GetCompletedValue */
     case 9: { u64 v=A1(g),ev=A2(g); if(rd64(g,o+32)<v) kh_fatal(g,"null d3d12: SetEventOnCompletion(%llu) but the fence only reached %llu (no GPU to complete it)",(unsigned long long)v,(unsigned long long)rd64(g,o+32));
-        if(ev){ KWaitObj *w=h_get(ev,HK_EVENT); if(w){ pthread_mutex_lock(&w->m); w->signaled=1; pthread_cond_broadcast(&w->cv); pthread_mutex_unlock(&w->m); } } SET_RAX(g,0); return 1; }
+        if(ev) kh_event_set(ev); SET_RAX(g,0); return 1; }
     case 10: wr64(g,o+32,A1(g)); SET_RAX(g,0); return 1;                                                    /* Signal */
     default: return 0; } }
 static int h_alloc(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)o;(void)c; if(s==8){ SET_RAX(g,0); return 1; } return 0; }

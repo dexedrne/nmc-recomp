@@ -66,6 +66,9 @@ void kh_exit_process(int code){
     { u64 lb,ac; extern void ga_stats(u64*,u64*); ga_stats(&lb,&ac); fprintf(stderr,"kh: process exit(%d) after %llu import calls; init tables run: %d __xi + %d __xc entries; guest heap live %llu bytes in %llu allocations\n",code,(unsigned long long)kh_trace_count(),kh_cnt_init_xi,kh_cnt_init_xc,(unsigned long long)lb,(unsigned long long)ac); }
     { extern void kh_mod_difficulty_dump(void); kh_mod_difficulty_dump(); }
     { extern void kh_mod_hooks_dump(void); kh_mod_hooks_dump(); }
+    { extern void kh_bgload_report(FILE*); kh_bgload_report(stderr); }
+    { extern void kh_sync_report(FILE*); kh_sync_report(stderr); }
+    { extern void kh_input_report(FILE*); kh_input_report(stderr); }
     kh_report_seams(stderr); { extern void kh_dump_threads(FILE*); if(getenv("KH_DUMP_THREADS")) kh_dump_threads(stderr); } fflush(stderr); fflush(stdout); _exit(code);
 }
 
@@ -126,6 +129,7 @@ int main(int argc,char **argv){
     }
     mkdir(kh_docs,0755);
     kh_trace_init(); kh_install_signals();
+    { extern void kh_bgload_init(void); kh_bgload_init(); }
     if(load_image()) return 1;
     kh_seam_steam_init(); kh_seam_gfx_init(); kh_seam_audio_init(); kh_seam_input_init(); kh_seam_window_init(); kh_seam_mf_init();
     pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at,128ull<<20); pthread_t th;
