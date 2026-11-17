@@ -707,6 +707,10 @@ static __thread char *altstack_mem;
 void kh_install_sigaltstack(void){
     if(altstack_mem) return; size_t sz=1<<18; altstack_mem=malloc(sz); stack_t ss={.ss_sp=altstack_mem,.ss_size=sz,.ss_flags=0}; sigaltstack(&ss,0);
 }
+/* end of a guest thread: give the signal stack back (it is per host thread, and guest threads come and go) */
+void kh_release_sigaltstack(void){
+    if(!altstack_mem) return; stack_t ss; memset(&ss,0,sizeof ss); ss.ss_flags=SS_DISABLE; sigaltstack(&ss,0); free(altstack_mem); altstack_mem=NULL;
+}
 void kh_install_signals(void){
     struct sigaction sa; memset(&sa,0,sizeof sa); sa.sa_sigaction=on_sig; sa.sa_flags=SA_SIGINFO|SA_ONSTACK|SA_NODEFER; sigemptyset(&sa.sa_mask);
     int sigs[]={SIGSEGV,SIGBUS,SIGILL,SIGFPE,SIGABRT,SIGTRAP}; for(unsigned i=0;i<sizeof sigs/sizeof*sigs;i++) sigaction(sigs[i],&sa,0);

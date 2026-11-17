@@ -8,7 +8,7 @@
 #include <unistd.h>
 #include <errno.h>
 
-void kh_set_cur_g(KCtx *g); void kh_install_sigaltstack(void); void kh_guest_bt(KCtx *g,FILE *f);
+void kh_set_cur_g(KCtx *g); void kh_install_sigaltstack(void); void kh_release_sigaltstack(void); void kh_guest_bt(KCtx *g,FILE *f);
 #if defined(__x86_64__)
 #define KH_CPU_RELAX() __asm__ __volatile__("pause")
 #else
@@ -260,6 +260,7 @@ static void *thread_main(void *arg){
     kh_run_tls_callbacks(g,3);
     thread_exit_notify(t);
     thread_release_memory(t);
+    kh_release_sigaltstack();          /* last: the 256 KiB signal stack of this host thread */
     return NULL;
 }
 static u64 thread_create(KCtx *g,u64 stack_size,u64 start,u64 param,int suspended,u32 *tid_out){
@@ -267,7 +268,10 @@ static u64 thread_create(KCtx *g,u64 stack_size,u64 start,u64 param,int suspende
     u64 ss=stack_size<(2ull<<20)?(2ull<<20):stack_size; u64 top=kh_new_guest_stack(ss,&t->stack_lo); t->stack_hi=t->stack_lo+ss; kh_ctx_set_stack(t->g,top); kh_make_teb(t);
     snprintf(t->name,sizeof t->name,"thr%u",t->tid);
     KWaitObj *w=wobj_new(HK_THREAD); w->thread=t; t->handle=(u32)h_new(HK_THREAD,w);
-    pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at,48ull<<20);
+    /* Detached: Windows frees a thread's stack and kernel object when it ends, and nothing here ever joins a guest thread.  A joinable
+     * pthread that is never joined keeps its 48 MiB host stack mapping for good (review 2026-11-16: address space and VMA count grew with
+     * every worker the engine ended).  t->pt is therefore only valid while !t->done (see TerminateThread). */
+    pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at,48ull<<20); pthread_attr_setdetachstate(&at,PTHREAD_CREATE_DETACHED);
     int rc=pthread_create(&t->pt,&at,thread_main,t); pthread_attr_destroy(&at);
     if(rc){ kh_warn("pthread_create failed: %d",rc); h_close(t->handle); return 0; }
     t->started=1; if(tid_out) *tid_out=t->tid; (void)g;
@@ -304,7 +308,8 @@ IMP(K32,GetThreadPriority){ SET_RAX(g,0); }
 IMP(K32,SetThreadPriority){ SET_RAX(g,1); }
 IMP(K32,SetThreadIdealProcessor){ SET_RAX(g,0); }
 IMP(K32,GetProcessAffinityMask){ long n=sysconf(_SC_NPROCESSORS_ONLN); u64 m=n>=64?~0ull:((1ull<<n)-1); if(A1(g)) wr64(g,A1(g),m); if(A2(g)) wr64(g,A2(g),m); SET_RAX(g,1); }
-IMP(K32,TerminateThread){ KWaitObj *w=h_get(A0(g),HK_THREAD); if(w&&w->thread!=cur_thread()){ KThread *t=w->thread; pthread_cancel(t->pt); t->exit_code=(u32)A1(g); thread_exit_notify(t); kh_warn("TerminateThread: thread %u cancelled",t->tid); SET_RAX(g,1); return; } kh_fatal(g,"TerminateThread on self or bad handle"); }
+IMP(K32,TerminateThread){ KWaitObj *w=h_get(A0(g),HK_THREAD); if(w&&w->thread!=cur_thread()){ KThread *t=w->thread; pthread_mutex_lock(&t->m); int live=!t->done; if(live) pthread_cancel(t->pt); pthread_mutex_unlock(&t->m);   /* done is set under t->m before the detached thread returns: pt is live here */
+    t->exit_code=(u32)A1(g); thread_exit_notify(t); kh_warn("TerminateThread: thread %u cancelled",t->tid); SET_RAX(g,1); return; } kh_fatal(g,"TerminateThread on self or bad handle"); }
 static void thread_end(KCtx *g,u32 code){ KThread *t=cur_thread(); t->exit_code=code; if(!tl_exit_jb) kh_fatal(g,"thread exit with no exit frame"); longjmp(*tl_exit_jb,1); }
 IMPN(CRTR,_endthreadex){ thread_end(g,(u32)A0(g)); }
 IMPN(CRTR,_endthread){ thread_end(g,0); }
