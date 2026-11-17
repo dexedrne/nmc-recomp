@@ -1,5 +1,6 @@
 /* Loose-first entry points; real packages use the untouched lifted implementation. */
 #include "khnmc_rt.h"
+#include "khnmc_hd.h"
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
@@ -87,9 +88,14 @@ static FILE *open_loose(KCtx *g,const char *path,int *size){
     return f;
 }
 static int register_resource(KCtx *g,u64 path,int n,u64 dst){
-    /* shortcut: loose HD sidecars retain the previous policy; wire separate sidecar hooks when needed. */
+    /* HD sidecars: the lifted ResourceEntry constructor runs inside SetResourceItem on this thread and pulls GetRemasteredCount/Entry/Asset (hd_assets.c). */
+    char rel[2048]; const char *root=getenv("KHNMC_DATA"); if(!root) root="data";
+    if(!relative(g,gstr(g,path),rel,sizeof rel)) kh_fatal(g,"hd assets: cannot derive a tree-relative path from %s",gstr(g,path));
     wr32(g,GS_BASE+0x79cfd4,0);
-    return (s32)kh_call(g,GS_BASE+0x12f070,path,n,dst,0)!=-1;
+    HdTable *prev=kh_hd_begin(g,root,rel,(const unsigned char*)hp(g,dst),n);
+    int ok=(s32)kh_call(g,GS_BASE+0x12f070,path,n,dst,0)!=-1;
+    kh_hd_end(prev);
+    return ok;
 }
 void f_1063d0(KCtx *g){
     pthread_mutex_lock(&files_lock);

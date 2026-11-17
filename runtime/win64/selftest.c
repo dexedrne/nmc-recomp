@@ -225,6 +225,8 @@ int kh_selftest(KCtx *g){
     fails+=kh_mod_exp_selftest(g);
     extern int kh_mod_hooks_selftest(KCtx *);
     fails+=kh_mod_hooks_selftest(g);
+    extern int kh_mod_hooks_a_selftest(KCtx *);
+    fails+=kh_mod_hooks_a_selftest(g);
     input_selftest(g);
     /* allocator */
     u64 p[64]; for(int i=0;i<64;i++){ p[i]=ga_alloc((u64)(i*37+1),(i%5==0)?64:16); CHECK(p[i]&&!(p[i]&15)); if(i%5==0) CHECK(!(p[i]&63)); memset(hp(g,p[i]),0xA5,(size_t)(i*37+1)); }
@@ -264,6 +266,6 @@ int kh_selftest(KCtx *g){
     float c; u32 cu=rd32(g,GS_BASE+0x717480); memcpy(&c,&cu,4); float x1=2.5f; memcpy(&KH_XMM(g,1),&x1,4); do_call(g,rt_hook_fiber_yield_150080,task,0,0,0,0,0); float r; u32 ru=rd32(g,P+0x20); memcpy(&r,&ru,4); CHECK(r==2.5f-c);
     fprintf(stderr,"kh: selftest: %d checks, %d failures\n",checks,fails);
     if(getenv("KH_SELFTEST_FATAL")){ extern void rt_imp_gdi32__MoveToEx(KCtx*); do_call(g,rt_imp_gdi32__MoveToEx,1,2,3,4,0,0); }   /* demonstrates the loud failure of an unimplemented import */
-    extern int kh_gfx_selftest(KCtx *);
-    return fails + io_selftest(g) + audio_selftest(g) + kh_file_selftest(g) + kh_gfx_selftest(g);
+    extern int kh_gfx_selftest(KCtx *); extern int kh_hd_selftest(KCtx *);
+    return fails + io_selftest(g) + audio_selftest(g) + kh_file_selftest(g) + kh_hd_selftest(g) + kh_gfx_selftest(g);
 }

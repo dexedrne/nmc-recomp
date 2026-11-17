@@ -14,8 +14,15 @@ static u64 o_adapter,o_output;
 static _Atomic u64 res_ids=1, heap_ids=1;
 _Atomic u64 gfx_draws, gfx_clears, gfx_barriers, gfx_execs, gfx_presents, gfx_copies, gfx_psos, gfx_resources, gfx_buffers_bytes;
 void kh_gfx_report(FILE *f);
+void kh_gfx_tex_report(FILE *f);
 static int log_gfx;
 static _Atomic u64 gfx_bundles, gfx_pso_binds;
+/* texture recorder: sampled textures (no RT/DS flag) by DXGI format and by size class, and the footprint uploads that fill them (CopyTextureRegion) */
+static _Atomic u64 tx_res[128], tx_res_bytes[128], tx_up[128], tx_up_bytes[128], tx_distinct_up, tx_rtds, tx_sized[8], tx_up_sized[8], tx_up_total_bytes, tx_up_calls, tx_other_up;
+static const char *size_names[8]={"<=64","128","256","512","1024","2048",">2048","1D/3D"};
+static const char *fmt_name(u32 f){ static __thread char b[16]; switch(f){ case 71: return "BC1_UNORM"; case 72: return "BC1_SRGB"; case 74: return "BC2_UNORM"; case 75: return "BC2_SRGB"; case 77: return "BC3_UNORM"; case 78: return "BC3_SRGB";
+    case 87: return "B8G8R8A8_UNORM"; case 91: return "B8G8R8A8_SRGB"; case 28: return "R8G8B8A8_UNORM"; case 49: return "R8G8_UNORM"; case 61: return "R8_UNORM"; case 103: return "NV12"; case 98: return "BC7_UNORM"; default: snprintf(b,sizeof b,"fmt%u",f); return b; } }
+static int size_class(u64 w,u32 h){ u64 m=w>h?w:h; return m<=64?0:m<=128?1:m<=256?2:m<=512?3:m<=1024?4:m<=2048?5:6; }
 
 #define OBJ_EX 32
 static u64 new_obj(int c,u64 extra){ return kh_com_obj(c,extra); }
@@ -35,10 +42,17 @@ static void fmt_info(u32 f,u32 *bw,u32 *bytes){
 #define R_DIM 56
 #define R_FMT 60
 #define R_DESC 64
+#define R_UP 120
 static u64 new_resource(KCtx *g,u64 desc,int placed_dim_hint){
     u64 r=new_obj(C_res,128); u32 dim=desc?rd32(g,desc):placed_dim_hint; u64 w=desc?rd64(g,desc+16):0; u32 fmt=desc?rd32(g,desc+32):0;
     wr32(g,r+R_DIM,dim); wr32(g,r+R_FMT,fmt); if(desc) memcpy(hp(g,r+R_DESC),hp(g,desc),56);
     wr64(g,r+R_VA,(atomic_fetch_add(&res_ids,1))<<32); gfx_resources++;
+    if(desc&&dim>=2&&dim<=4){
+        u32 h=rd32(g,desc+24); u32 mips=rd16(g,desc+30),arr=rd16(g,desc+28),flags=rd32(g,desc+48); if(!mips) mips=1; if(!arr) arr=1;
+        if(flags&3) tx_rtds++;
+        else { u32 bw,bpb; fmt_info(fmt,&bw,&bpb); u64 sz=0; for(u32 m=0;m<mips;m++){ u64 W=w>>m; if(!W) W=1; u32 H=h>>m; if(!H) H=1; sz+=((W+bw-1)/bw)*bpb*((H+bw-1)/bw); }
+               sz*=(dim==2||dim==3)?arr:1; if(fmt<128){ tx_res[fmt]++; tx_res_bytes[fmt]+=sz; } tx_sized[dim==3?size_class(w,h):7]++; }
+    }
     if(dim==1&&w){ u64 d=ga_alloc(w<16?16:w,256); if(!d) kh_fatal(g,"null d3d12: guest arena exhausted for a %llu-byte buffer",(unsigned long long)w); memset(hp(g,d),0,w); wr64(g,r+R_DATA,d); wr64(g,r+R_SIZE,w); gfx_buffers_bytes+=w; }
     return r;
 }
@@ -78,6 +92,7 @@ static int h_swap(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1
         kh_phase_present(g,gfx_presents,gfx_draws,gfx_clears,gfx_pso_binds);
         fprintf(stderr,"kh: gfx frame=%llu bundles=%llu pso-binds=%llu ",(unsigned long long)gfx_presents,(unsigned long long)gfx_bundles,(unsigned long long)gfx_pso_binds);
         kh_gfx_report(stderr);
+        if(gfx_presents%300==0) kh_gfx_tex_report(stderr);
         wr32(g,o+40,rd32(g,o+40)+1); SET_RAX(g,0); return 1;                 /* Present / Present1 */
     case 9: { u32 i=(u32)A1(g)%3; u64 b=rd64(g,o+56+8*i); if(!b){ u64 desc=ga_alloc(56,16); memset(hp(g,desc),0,56); wr32(g,desc,3); wr64(g,desc+16,rd32(g,o+32)); wr32(g,desc+24,rd32(g,o+36)); wr16(g,desc+28,1); wr16(g,desc+30,1); wr32(g,desc+32,0x57); wr32(g,desc+36,1);
             b=new_resource(g,desc,3); ga_free(desc); wr64(g,o+56+8*i,b); } out_obj(g,A3(g),b); SET_RAX(g,0); return 1; }   /* GetBuffer(idx, riid, **pp) */
@@ -145,7 +160,21 @@ static int h_list(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1
     case 9: case 10: SET_RAX(g,0); return 1;                                                                /* Close / Reset */
     case 11: return 1;                                                                                      /* ClearState */
     case 12: case 13: gfx_draws++; return 1;                                                                /* Draw(Indexed)Instanced */
-    case 15: case 16: case 17: gfx_copies++; return 1;                                                      /* CopyBufferRegion / CopyTextureRegion / CopyResource */
+    case 16: gfx_copies++; { /* CopyTextureRegion(this, pDst, x, y, z, pSrc, pSrcBox) */
+        u64 dl=A1(g),sl=ARG(g,5);
+        if(!GA_OK(dl)||!GA_OK(sl)) kh_fatal(g,"null d3d12: CopyTextureRegion with invalid location pointers (dst=%llx src=%llx)",(unsigned long long)dl,(unsigned long long)sl);
+        u64 dr=rd64(g,dl); u32 dt=rd32(g,dl+8),st=rd32(g,sl+8);
+        if(dt==0&&st==1){                                                                                    /* upload-heap footprint -> texture subresource */
+            if(!GA_OK(dr)||kh_com_cls_of(g,dr)!=C_res) kh_fatal(g,"null d3d12: CopyTextureRegion destination %llx is not a resource",(unsigned long long)dr);
+            u32 fmt=rd32(g,dr+R_FMT),dim=rd32(g,dr+R_DIM); u32 bw,bpb; u32 ffmt=rd32(g,sl+24),fw=rd32(g,sl+28),fh=rd32(g,sl+32),fd=rd32(g,sl+36),pitch=rd32(g,sl+40);
+            fmt_info(ffmt,&bw,&bpb); u64 bytes=(u64)pitch*(((u64)fh+bw-1)/bw)*(fd?fd:1);
+            tx_up_calls++; tx_up_total_bytes+=bytes;
+            if(fmt<128){ tx_up[fmt]++; tx_up_bytes[fmt]+=bytes; }
+            { u64 w=rd64(g,dr+R_DESC+16); u32 h=rd32(g,dr+R_DESC+24); tx_up_sized[dim==3?size_class(w,h):7]++; }
+            if(!rd32(g,dr+R_UP)){ wr32(g,dr+R_UP,1); tx_distinct_up++; }
+        } else tx_other_up++;
+        return 1; }
+    case 15: case 17: gfx_copies++; return 1;                                                               /* CopyBufferRegion / CopyResource */
     case 19: gfx_copies++; return 1;                                                                        /* ResolveSubresource */
     case 27:
         if(!A1(g)||kh_com_cls_of(g,A1(g))!=C_list) kh_fatal(g,"null d3d12: ExecuteBundle requires a command list");
@@ -187,6 +216,16 @@ void kh_seam_gfx_init(void){
     o_adapter=kh_com_obj(C_adapter,0); o_output=kh_com_obj(C_output,0);
 }
 void kh_gfx_report(FILE *f){ fprintf(f,"kh: gfx: draws=%llu clears=%llu barriers=%llu execs=%llu presents=%llu copies=%llu psos=%llu resources=%llu upload/buffer bytes=%llu\n",(unsigned long long)gfx_draws,(unsigned long long)gfx_clears,(unsigned long long)gfx_barriers,(unsigned long long)gfx_execs,(unsigned long long)gfx_presents,(unsigned long long)gfx_copies,(unsigned long long)gfx_psos,(unsigned long long)gfx_resources,(unsigned long long)gfx_buffers_bytes); }
+
+void kh_gfx_tex_report(FILE *f){
+    u64 tr=0,trb=0,tu=0,tub=0; for(int i=0;i<128;i++){ tr+=tx_res[i]; trb+=tx_res_bytes[i]; tu+=tx_up[i]; tub+=tx_up_bytes[i]; }
+    fprintf(f,"kh: gfx tex: sampled-textures-created=%llu (%llu GPU bytes) rt/ds-created=%llu; footprint uploads=%llu (%llu bytes) into %llu distinct textures; other texture copies=%llu\n",(unsigned long long)tr,(unsigned long long)trb,(unsigned long long)tx_rtds,(unsigned long long)tu,(unsigned long long)tub,(unsigned long long)tx_distinct_up,(unsigned long long)tx_other_up);
+    fprintf(f,"kh: gfx tex: created by format:"); for(int i=0;i<128;i++) if(tx_res[i]) fprintf(f," %s=%llu(%llu B)",fmt_name((u32)i),(unsigned long long)tx_res[i],(unsigned long long)tx_res_bytes[i]);
+    fprintf(f,"\nkh: gfx tex: uploaded by format:"); for(int i=0;i<128;i++) if(tx_up[i]) fprintf(f," %s=%llu(%llu B)",fmt_name((u32)i),(unsigned long long)tx_up[i],(unsigned long long)tx_up_bytes[i]);
+    fprintf(f,"\nkh: gfx tex: created by size (max edge):"); for(int i=0;i<8;i++) if(tx_sized[i]) fprintf(f," %s=%llu",size_names[i],(unsigned long long)tx_sized[i]);
+    fprintf(f,"\nkh: gfx tex: uploaded by size (max edge):"); for(int i=0;i<8;i++) if(tx_up_sized[i]) fprintf(f," %s=%llu",size_names[i],(unsigned long long)tx_up_sized[i]);
+    fprintf(f,"\n");
+}
 
 /* ---- free functions (imports) ------------------------------------------------------------------------------------------- */
 IMP(dxgi,CreateDXGIFactory1){ kh_cnt_gfx_calls++; u64 fct=kh_com_obj(C_factory,0); wr64(g,A1(g),fct); SET_RAX(g,0); }

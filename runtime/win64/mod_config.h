@@ -13,3 +13,6 @@ static const struct kh_mod_difficulty_config {
 
 /* GAME_MODE descriptor, not a DLL option. */
 #define KH_MOD_GUMMI_TASK 0x716c10u
+
+void kh_mod_hooks_a_dump(void);
+int kh_mod_hooks_a_selftest(KCtx *g);
