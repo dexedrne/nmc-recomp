@@ -51,6 +51,7 @@ Platform services: the target has no Steam client, so the runtime answers the ga
 - `tools/apple/` building vkd3d against MoltenVK
 - `tools/publish/` the scrubbed export of this repository
 - `docs/` plans, format and graphics notes, the lift policy, review records
+- `docs/FOR-COLLABORATORS.md` where to start if you work on KH2 with other tools (OpenKH, Unity), and NMC's combat in short
 
 ## Building
 
