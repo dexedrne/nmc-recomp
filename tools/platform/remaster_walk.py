@@ -84,9 +84,14 @@ def get_raw(b,a,end,base,ent):
         for p in range(gsc):
             key=b[a+offdata+p]; key=key-256 if key>127 else key   # char
             tex0=i64(b,a+gsinfo+0x70+p*0xA0); psm=(tex0>>20)&0x3f
-            fo=s32(base+pic[key]+0x20000000)
-            if psm==20: fo+=p4+mod*0x10; p4+=1
-            else: fo+=p8*0x10; p8+=1
+            if key<0 or key>=tic:   # Panacea reads PicOffsets[key] out of its array here (signed char index): never-matching offset, as runtime/remaster.c
+                fo=0x3fffffff
+                if psm==20: p4+=1
+                else: p8+=1
+            else:
+                fo=s32(base+pic[key]+0x20000000)
+                if psm==20: fo+=p4+mod*0x10; p4+=1
+                else: fo+=p8*0x10; p8+=1
             basetex.append(s32(fo))
         texa={}
         pos=b.find(b'TEXA',a,end)

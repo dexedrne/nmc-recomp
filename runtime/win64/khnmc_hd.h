@@ -13,3 +13,7 @@ HdTable *kh_hd_begin(KCtx *g, const char *root, const char *rel, const unsigned 
 void kh_hd_end(HdTable *previous);
 void kh_hd_report(FILE *f);
 int kh_hd_selftest(KCtx *g);
+/* `khnmc --hd-check [report.tsv]`: builds the table of every game file of the tree KHNMC_DATA with the code a run uses and prints the totals
+ * (files by rule, entries by source, the container walker against the package tables).  Host only: no guest image, nothing runs.
+ * Returns the exit status: 0, 1 when a table could not be built, 2 on set-up errors. */
+int kh_hd_check(const char *report);

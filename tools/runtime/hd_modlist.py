@@ -17,6 +17,11 @@ OpenKH Panacea pairs a game file with the HD files of the MOD's remastered folde
                 vanilla offsets; a texture that moved is not found by them, the game uses the image inside the mod's file.
                 Files without language siblings (obj/*.mdlx ...) get no line: nothing in the tree says where vanilla had them.
 
+OBSOLETE since TASK22: `nohd`.  The runtime now has the packages' own entry tables (KHNMC_HD_PACKAGES, tools/hd_packages.py) and pairs
+as the PC does: a mod game file without mod HD files keeps the package's table with the vanilla offsets, so a texture that moved is
+simply not found, exactly as on the PC.  The runtime reads `nohd` lines, ignores them and says so at start-up; this tool still writes
+them (the language-sibling evidence is cheap and the per-file report stays useful), but only the `mod` lines matter.
+
 Nothing is written into the tree.  Exit status 0, or 2 on usage / verification errors."""
 import argparse, json, os, struct, sys, time
 

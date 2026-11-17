@@ -10,6 +10,8 @@
 #include <ctype.h>
 #include <strings.h>
 #include "khnmc_remaster.h"
+#include <stdatomic.h>
+_Atomic unsigned long long kh_rm_oob_keys;   /* texture-info indexes Panacea would read out of its array (see get_raw) */
 
 typedef int32_t s32; typedef int16_t s16; typedef int64_t s64; typedef uint8_t u8;
 typedef struct { const u8 *b; int64_t n; int err; } Buf;
@@ -72,9 +74,15 @@ static void get_raw(Buf *B, int64_t a, int64_t end, int64_t base, Vec *E){
     int p4=0,p8=0; s32 *basetex=calloc((size_t)gsc+1,4);
     for(int p=0;p<gsc;p++){ int64_t ko=a+offdata+p; if(ko<0||ko>=B->n){ B->err=1; break; } int key=(int8_t)B->b[ko];
         s64 tex0=I64(B,a+gsinfo+0x70+(int64_t)p*0xA0); int psm=(int)((tex0>>20)&0x3f);
-        if(key<0||key>=tic){ B->err=1; break; }
-        s32 fo=W32(base+pic[key]+0x20000000LL);
-        if(psm==20){ fo+=p4+mod*0x10; p4++; } else { fo+=p8*0x10; p8++; }
+        /* Panacea: `int CurrentKey = *((char*)addr + OffsetDataOff + p); ... PicOffsets[CurrentKey]` with `new int[TextureInfoCount]`.
+         * A texture-info index >= 128 is therefore NEGATIVE there and reads memory in front of the array; an index >= the count reads
+         * behind it.  Undefined on the PC: in practice a garbage offset that matches no image, so that texture keeps its embedded
+         * picture while the slot still consumes one HD file.  Four of the mod's maps have more than 128 texture infos (map/lm04,
+         * lm05, lm07, po02).  Substitute an offset that can never match (low 29 bits all ones; the game matches on the low 29 bits),
+         * keep Panacea's counters running, and count the case. */
+        s32 fo;
+        if(key<0||key>=tic){ fo=(s32)0x3fffffff; atomic_fetch_add(&kh_rm_oob_keys,1); if(psm==20) p4++; else p8++; }
+        else { fo=W32(base+pic[key]+0x20000000LL); if(psm==20){ fo+=p4+mod*0x10; p4++; } else { fo+=p8*0x10; p8++; } }
         basetex[p]=fo; }
     if(!B->err){
         /* TEXA blocks: img -> list of entries, in file order */
