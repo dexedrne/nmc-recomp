@@ -23,7 +23,7 @@ void f_5122e0(KCtx *g){
 PHASE(511300,3)
 PHASE(13da10,4)
 PHASE(13d260,5)
-PHASE(405440,6)
+void kh_phase_mapevent_entry(void){ entries[6]++; } /* f_405440 itself lives in mod_hooks_a.c (Task 9) */
 PHASE(3f29e0,7)
 void kh_phase_damage_entry(void){ entries[8]++; }
 PHASE(2b4590,9)

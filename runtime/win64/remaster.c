@@ -31,7 +31,7 @@ static void get_imz(Buf *B, int64_t a, int64_t base, Vec *E){
 }
 static void get_tm2(Buf *B, int64_t a, int64_t base, Vec *E){
     if(MAGIC(B,a,"TIM2",4)){ s32 cnt=I16(B,a+6); int64_t off=a+0x10; base+=0x10;
-        while(cnt>0 && !B->err){ cnt--; s32 nxt=I32(B,off); push(E,W32(I16(B,off+12)+base+0x20000000LL)); if(nxt<=0){ B->err=1; break; } off+=nxt; base+=nxt; } }
+        while(cnt>0 && !B->err){ cnt--; s32 nxt=I32(B,off); push(E,W32(I16(B,off+12)+base+0x20000000LL)); off+=nxt; base+=nxt; } }   /* as Panacea: no check on nxt (a 0 size with cnt==1 is valid shipped data, e.g. NMC map/eh02.map 'rada'); the loop is bounded by cnt and every read is bounds-checked */
 }
 typedef struct { s32 texoff; s16 tbp0, shx, shy; int unique; } Tex;
 static int tex_cmp(const void *x, const void *y){ const Tex *a=x,*b=y; return (int)a->tbp0-(int)b->tbp0; }
