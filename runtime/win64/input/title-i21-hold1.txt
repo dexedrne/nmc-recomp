@@ -1,0 +1,11 @@
+# Task 21: the TITLE route of title-i21.txt with the script anchored to the Initial Settings page (KHNMC_CLOCK=frames).
+# title-i21.txt holds at script frame 165: the page comes up near present 70..100, the hold does not delay anything, and the three
+# presses fall on fixed game frames whatever the present at which the page first appeared.  The page's own animation then is at
+# another phase in every run (load time), and the pictures of that minute cannot be compared between runs.
+# Here the hold is at script frame 1: the script clock stands still until the page is up, so every press comes the same number of
+# game frames after the page appeared, in every run.  Same presses otherwise.
+@hold 1 until initial-state 3
+@clock game-frames
+120 122 A
+180 182 DPAD_UP+DPAD_LEFT
+210 212 A

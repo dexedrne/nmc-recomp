@@ -1,0 +1,9 @@
+# Task 21: the TITLE route on the frames clock (KHNMC_CLOCK=frames), any backend, any address mode.
+# Same first three presses as field-battle-d18.txt (accept the Initial Settings page: A, cursor to Yes, A), then NOTHING: the logos,
+# the copyright page, the mod's credits page and the title intro play at their own pace and the title menu stays up.
+# Clocked by game frames after the hold, so two runs press at the same game frames whatever the host load is.
+@hold 165 until initial-state 3
+@clock game-frames
+180 182 A
+240 242 DPAD_UP+DPAD_LEFT
+270 272 A

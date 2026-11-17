@@ -18,8 +18,10 @@ void kh_gfx_report(FILE *f);
 void kh_gfx_tex_report(FILE *f);
 static int log_gfx;
 _Atomic u64 gfx_bundles, gfx_pso_binds;
-/* KHNMC_GFX=vkd3d (gfx_vkd3d.c): the device is a host vkd3d device; only the DXGI objects below stay ours, and the swap chain gets real back buffers */
+/* KHNMC_GFX=vkd3d (gfx_vkd3d.c): the device is a host vkd3d device; only the DXGI objects below stay ours, and the swap chain gets real back buffers.
+ * KHNMC_GFX=vkd3dw (gfx_wrap.c): the same vkd3d device behind guest-side wrapper objects (any address model, no Windows-ABI call). */
 extern int kh_gfx_vkd3d_on;
+void kh_gfx_wrap_init(void); int kh_wrap_selftest_pure(KCtx *g);
 void kh_gfx_vkd3d_init(void); void kh_vkd3d_create_device(KCtx *g); void kh_vkd3d_serialize_rootsig(KCtx *g); void kh_vkd3d_swap_attach(KCtx *g,u64 sc,u64 queue,u64 desc);
 void kh_vkd3d_swap_getbuffer(KCtx *g,u64 o); void kh_vkd3d_swap_resize(KCtx *g,u64 o,u32 w,u32 h); void kh_vkd3d_present(KCtx *g,u64 o,u64 n); void kh_gfx_vkd3d_report(FILE *f); int kh_gfx_vkd3d_selftest(KCtx *g);
 /* texture recorder: sampled textures (no RT/DS flag) by DXGI format and by size class, and the footprint uploads that fill them (CopyTextureRegion) */
@@ -243,9 +245,10 @@ void kh_seam_gfx_init(void){
     e=getenv("KHNMC_GFX_PSOLOG"); log_pso=e&&*e=='1';
     e=getenv("KHNMC_NULL_VBLANK_NS"); if(e&&*e){ long v=strtol(e,0,10); if(v<1000000||v>100000000) kh_fatal(NULL,"KHNMC_NULL_VBLANK_NS=%s: expected 1000000..100000000 nanoseconds",e);
         vblank_ns=v; fprintf(stderr,"kh: gfx: null backend frame sleep %ld ns instead of 16666667 (KHNMC_NULL_VBLANK_NS)\n",v); }
-    e=getenv("KHNMC_GFX");                                                    /* graphics backend: unset / "null" = this recorder, "vkd3d" = gfx_vkd3d.c */
+    e=getenv("KHNMC_GFX");                                                    /* graphics backend: unset / "null" = this recorder, "vkd3d" = gfx_vkd3d.c, "vkd3dw" = gfx_wrap.c */
     if(e&&!strcmp(e,"vkd3d")) kh_gfx_vkd3d_init();
-    else if(e&&*e&&strcmp(e,"null")) kh_fatal(NULL,"gfx-backend-unknown: KHNMC_GFX=%s (known backends: null, vkd3d)",e);
+    else if(e&&!strcmp(e,"vkd3dw")) kh_gfx_wrap_init();
+    else if(e&&*e&&strcmp(e,"null")) kh_fatal(NULL,"gfx-backend-unknown: KHNMC_GFX=%s (known backends: null, vkd3d, vkd3dw)",e);
     C_factory=kh_com_class("dxgi:IDXGIFactory4",44,STRICT,h_factory); C_adapter=kh_com_class("dxgi:IDXGIAdapter3",24,STRICT,h_adapter); C_output=kh_com_class("dxgi:IDXGIOutput",24,STRICT,h_output);
     C_swap=kh_com_class("dxgi:IDXGISwapChain3",44,STRICT,h_swap); C_dev=kh_com_class("d3d12:ID3D12Device",48,STRICT,h_dev); C_queue=kh_com_class("d3d12:ID3D12CommandQueue",20,STRICT,h_queue);
     /* the game creates and releases about 27 allocator + list pairs per frame (bundles): they are freed at their last Release, the other classes are few and kept */
@@ -286,6 +289,7 @@ int kh_gfx_selftest(KCtx *g){
     fail+=rd32(g,out+16)!=1 || rd32(g,out+20)!=0xa5a5a5a5u || rd64(g,out+24)!=0xa5a5a5a5a5a5a5a5ull;
     ga_free(out);
     fprintf(stderr,"kh: gfx selftest: 2 checks, %d failures\n",fail);
-    if(kh_gfx_vkd3d_on) fail+=kh_gfx_vkd3d_selftest(g);                       /* KHNMC_GFX=vkd3d ./khnmc --selftest: device, clear, present, image dump */
+    fail+=kh_wrap_selftest_pure(g);                                           /* the wrapped bridge's translation layer: needs no device, runs with every backend */
+    if(kh_gfx_vkd3d_on) fail+=kh_gfx_vkd3d_selftest(g);                       /* KHNMC_GFX=vkd3d / vkd3dw ./khnmc --selftest: device, clear, present, image dump */
     return fail;
 }

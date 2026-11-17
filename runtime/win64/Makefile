@@ -88,10 +88,9 @@ LIFTLIB = $(OL)/libkh2lifted.a
 XFLAGS = -DKH_XLATE_MODE=$(XLATE)
 endif
 O ?= $(OL)$(IOSSFX)
-ifneq ($(XLATE),0)
-# the vkd3d backend hands guest pointers to vkd3d as host pointers: identity mode on x86-64 only (KHNMC_GFX=vkd3d is a named fatal here)
-GFX_VKD3D = 0
-endif
+# vkd3d graphics in a bias build (XLATE != 0): only the WRAPPED bridge (KHNMC_GFX=vkd3dw, runtime/gfx_wrap.c) exists there.  The trampoline
+# bridge (KHNMC_GFX=vkd3d) hands guest pointers to vkd3d as host pointers and is compiled only for x86-64 identity builds: in every other
+# build it is the named fatal gfx-vkd3d-needs-identity.  Darwin has no vkd3d yet (GFX_VKD3D = 0 above).
 ifeq ($(filter $(HOOKMODE),objcopy rename),)
 $(error HOOKMODE must be objcopy or rename)
 endif
@@ -184,8 +183,9 @@ MOD_TWEAKS_DLL ?= /home/user/projects/SillyBillyMod1/dll/KH2Tweaks_Refactor.dll
 # FILE_HOOKS can name an RVA twice (a runtime hook that forwards to a re-lifted body is in two sub-lists): the hook tools get each RVA once
 HOOKS_UNIQ = $(sort $(FILE_HOOKS))
 all: $(BIN)
-# Optional vkd3d graphics backend (KHNMC_GFX=vkd3d, runtime/gfx_vkd3d.c): compiled in when the vkd3d libraries exist under VKD3D_PREFIX
-# (make GFX_VKD3D=0 compiles it out: KHNMC_GFX=vkd3d is then a named fatal).  Only gfx_vkd3d.o depends on the switch; the stamp relinks.
+# Optional vkd3d graphics backend (KHNMC_GFX=vkd3d: runtime/gfx_vkd3d.c, KHNMC_GFX=vkd3dw: runtime/gfx_wrap.c on the shared part of
+# gfx_vkd3d.c): compiled in when the vkd3d libraries exist under VKD3D_PREFIX (make GFX_VKD3D=0 compiles it out: both are then named
+# fatals).  Only gfx_vkd3d.o and gfx_wrap.o depend on the switch; the stamp relinks.
 VKD3D_PREFIX ?= /home/user/work/khnmc-deps/vkd3d/usr
 VKHEADERS_PREFIX ?= /home/user/work/khnmc-deps/vkheaders/usr
 ifneq ($(wildcard $(VKD3D_PREFIX)/lib/libvkd3d.so),)
@@ -194,12 +194,12 @@ else
 GFX_VKD3D ?= 0
 endif
 ifeq ($(GFX_VKD3D),1)
-$(O)/gfx_vkd3d.o: CFLAGS += -DKH_GFX_VKD3D=1 -DWIDL_C_INLINE_WRAPPERS -I$(VKD3D_PREFIX)/include/vkd3d -I$(VKHEADERS_PREFIX)/include
+$(O)/gfx_vkd3d.o $(O)/gfx_wrap.o: CFLAGS += -DKH_GFX_VKD3D=1 -DWIDL_C_INLINE_WRAPPERS -I$(VKD3D_PREFIX)/include/vkd3d -I$(VKHEADERS_PREFIX)/include
 GFX_LDFLAGS = -L$(VKD3D_PREFIX)/lib -lvkd3d-utils -lvkd3d -ldl -Wl,--disable-new-dtags -Wl,-rpath,$(VKD3D_PREFIX)/lib
 endif
 $(O)/.gfx-vkd3d-$(GFX_VKD3D):
 	@mkdir -p $(O) && rm -f $(O)/.gfx-vkd3d-* && touch $@
-$(O)/gfx_vkd3d.o $(BIN): $(O)/.gfx-vkd3d-$(GFX_VKD3D)
+$(O)/gfx_vkd3d.o $(O)/gfx_wrap.o $(BIN): $(O)/.gfx-vkd3d-$(GFX_VKD3D)
 # ---- lifted shards compiled here (every variant except the default one, which links the prebuilt archive) ----
 SHARDS_DIR ?= $(LIFTED)/shards
 SHARD_NAMES := $(patsubst %.c,%,$(notdir $(wildcard $(SHARDS_DIR)/shard_*.c)))
