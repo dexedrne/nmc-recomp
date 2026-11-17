@@ -218,6 +218,8 @@ static void input_selftest(KCtx *g){
 
 int kh_selftest(KCtx *g){
     CHECK(rd64(g,GS_BASE+0x7534a8)!=0); /* Task 6: table 3 must exist before scripts run. */
+    extern int kh_mod_static_selftest(KCtx *);
+    fails+=kh_mod_static_selftest(g);    /* Task 12: first, before any other test can touch the edited tables or the mod buffer */
     fails+=kh_mod_syscalls_selftest(g);
     extern int kh_mod_caps_selftest(KCtx *);
     fails+=kh_mod_caps_selftest(g);

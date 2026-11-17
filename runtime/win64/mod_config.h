@@ -98,3 +98,17 @@ void kh_mod_item_writebyte(KCtx *g, u64 p, u8 value);          /* observer calle
 void kh_mod_items_dump(void);
 int kh_mod_items_selftest(KCtx *g, u64 sheet);                 /* runs inside the caps fixture (character-2 sheet registry) */
 u64 kh_mod_items_test_cmds(KCtx *g);                           /* synthetic sorted cmd table for exe 0x3b68b0 (test only) */
+/* ---- Task 12: the mod's static edits (mod_static.c applies the data half and the buffer; the code half is the re-lifted functions
+ * in gen/mod_static_lifted.c; mod_static_sites.c holds the two inline detour-site handlers; mod_static_test.c the selftest). */
+void kh_mod_static_init(KCtx *g);                                  /* verify every old byte, then write; named fatals */
+int  kh_mod_static_check(KCtx *g,u64 base);                        /* first edit whose old bytes are not at base+rva, or -1 */
+void kh_mod_static_apply(KCtx *g,u64 base,u64 nmc);                /* check, then write the edits at base and the buffer at nmc */
+int  kh_mod_static_nedits(void);
+int  kh_mod_static_edit(int i,u32 *rva,u32 *len,int *kind,int *rel32,const u8 **oldb,const u8 **newb);   /* kind 0 code, 1 .rdata, 2 .data */
+void kh_mod_static_counts(int *code,int *rdata,int *data);
+u32  kh_mod_static_nmc(u32 *size,const u8 **init,u32 *init_len);   /* returns the buffer RVA */
+int  kh_mod_site_3c40a9(KCtx *g);                                  /* 1 = continue at 0x3c40bf, 0 = 0x3c41a5 */
+int  kh_mod_site_360a5a(KCtx *g);                                  /* 1 = continue at 0x360a6d, 0 = 0x360ba5 */
+extern u64 kh_mod_dual_slots_va;
+void kh_mod_static_dump(void);                                     /* exit report: which edits the running game rewrote, buffer use */
+int kh_mod_static_selftest(KCtx *g);

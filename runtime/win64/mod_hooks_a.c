@@ -22,10 +22,11 @@ static const char *const hook_names[H_N]={"2fc860","2fc4e0","4014a0","3a7cb0","2
 /* one stderr line on the first call of each hook, so a fault dump shows which detours had run */
 static void enter(int h){ if(atomic_fetch_add(&hits[h],1)==0) fprintf(stderr,"kh: mod A %s first call\n",hook_names[h]); }
 
-void orig_f_405440(KCtx *); void orig_f_3a89a0(KCtx *); void orig_f_3d61d0(KCtx *);
+void orig_f_405440(KCtx *); void orig_f_3d61d0(KCtx *);
+void mod_f_3a89a0(KCtx *);   /* Task 12: static edit 0x3a8a4b; the Detours trampoline of the DLL runs the PATCHED body */
 void orig_f_3d60c0(KCtx *); void orig_f_3a7cb0(KCtx *);
 static KhFn fwd_override[KHF_N];
-static KhFn fwd_default[KHF_N]={orig_f_405440,orig_f_3a89a0,orig_f_3d61d0,orig_f_3d60c0,orig_f_3a7cb0};
+static KhFn fwd_default[KHF_N]={orig_f_405440,mod_f_3a89a0,orig_f_3d61d0,orig_f_3d60c0,orig_f_3a7cb0};
 static void forward(KCtx *g,int which){ (fwd_override[which]?fwd_override[which]:fwd_default[which])(g); }
 
 static const u32 ext_rva[KHA_N]={

@@ -28,6 +28,25 @@ FILE_HOOKS += $(IDTABLE_HOOKS)
 # KH2Moose pool sizes (runtime/moose.c): cache layout, cache free bytes, data heap release / reset (the four functions whose pool-start instruction the DLL re-encodes), reserved block sizes
 MOOSE_HOOKS = 39d590 39dab0 3e5f30 3e5f90 39e260 39e270
 FILE_HOOKS += $(MOOSE_HOOKS)
+# ---- Task 12: mod static edits ---------------------------------------------------------------------------------------------------
+# The mod DLL patches code bytes in 28 exe functions and attaches two INLINE detours (inside 3c3fe0 and 360920).  Those 30 functions
+# are re-lifted from the patched image into $(GEN)/mod_static_lifted.c and replace the vanilla lifted bodies through the alias list
+# (vanilla bodies stay reachable as orig_f_<rva>).  MOD_STATIC_CHAINED = functions a runtime hook already owns: the hook keeps
+# f_<rva> and forwards to mod_f_<rva>.  $(GEN) holds mod/game-derived generated files: local only, never committed.
+MOD_STATIC_FUNCS = 165110 2fb7e0 2fc500 2fd940 2fdd40 2fe010 360920 390150 3a89a0 3a9950 3b11e0 3b1780 3c1190 3c2f00 3c3fe0 3c5170 \
+                   3c5440 3c5750 3c5900 3c5a90 3c5ce0 3d8b40 3de460 3e37f0 3e8380 3f29e0 3f3110 400b20 401d60 422780
+MOD_STATIC_INLINE = 3c3fe0 360920
+MOD_STATIC_CHAINED = 3a89a0 3f29e0
+GEN ?= $(ROOT)/gen
+MOD_EDITS ?= /home/user/projects/kh2-nmc-analysis/scratch/mod-gummi/edit_list.json
+MOD_EXE ?= $(ROOT)/pc/kh2fm.exe
+KH_UNIVERSE ?= /home/user/projects/kh2-nmc-analysis/scratch/universe
+KHLIFT ?= /home/user/projects/khnmc-decomp-edition/tools/khlift
+KHLIFT_PY ?= /home/user/projects/kh2-nmc-analysis/scratch/S2-lifter/venv/bin/python
+FILE_HOOKS += $(MOD_STATIC_FUNCS)
+CFLAGS += -I$(GEN)
+LIFTOBJ += obj/mod_static_lifted.o
+LIFT_CFLAGS = -std=gnu11 -O1 -w -fno-strict-aliasing -fwrapv -fno-delete-null-pointer-checks -fno-math-errno -ffp-contract=off -I$(ROOT)/lifter-rt -I$(LIFTED)/gen
 all: khnmc
 # Optional vkd3d graphics backend (KHNMC_GFX=vkd3d, runtime/gfx_vkd3d.c): compiled in when the vkd3d libraries exist under VKD3D_PREFIX
 # (make GFX_VKD3D=0 compiles it out: KHNMC_GFX=vkd3d is then a named fatal).  Only gfx_vkd3d.o depends on the switch; the stamp relinks.
@@ -69,7 +88,27 @@ khnmc: $(RTOBJ) $(LIFTOBJ) obj/libkh2loose.a
 	$(CC) -o $@ $(RTOBJ) $(LIFTOBJ) obj/libkh2loose.a -lm -lpthread -rdynamic $(WRAP) $(GFX_LDFLAGS)
 # arm64 compile check of the hand-written runtime only (no lifted shards): clang -arch arm64 on macOS
 arm64check:
-	@for f in $(RTSRC) $(ROOT)/lifter-rt/khrt_cpu.c $(ROOT)/lifter-rt/rt_libm.c; do echo CC $$f; clang -arch arm64 -std=gnu11 -O1 -w -fno-strict-aliasing -fwrapv -fno-math-errno -ffp-contract=off -I$(ROOT)/lifter-rt -I$(ROOT)/runtime -I$(LIFTED)/gen -DKH_XLATE_MODE=2 -c $$f -o /tmp/khnmc_arm_chk.o || exit 1; done
+	@for f in $(RTSRC) $(ROOT)/lifter-rt/khrt_cpu.c $(ROOT)/lifter-rt/rt_libm.c; do echo CC $$f; clang -arch arm64 -std=gnu11 -O1 -w -fno-strict-aliasing -fwrapv -fno-math-errno -ffp-contract=off -I$(ROOT)/lifter-rt -I$(ROOT)/runtime -I$(LIFTED)/gen -I$(GEN) -DKH_XLATE_MODE=2 -c $$f -o /tmp/khnmc_arm_chk.o || exit 1; done
+# ---- Task 12 rules: generated table (python3 stdlib), re-lift (needs the lifter environment: KHLIFT, KHLIFT_PY, KH_UNIVERSE), link check
+$(GEN)/mod_static_table.h: tools/gen_mod_static.py $(MOD_EDITS) Makefile
+	python3 tools/gen_mod_static.py --edits $(MOD_EDITS) --exe $(MOD_EXE) --universe $(KH_UNIVERSE) --funcs "$(MOD_STATIC_FUNCS)" \
+	    --inline "$(MOD_STATIC_INLINE)" --chained "$(MOD_STATIC_CHAINED)" --out $@ --report $(GEN)/mod_static_classify.json
+$(GEN)/mod_static_lifted.c: tools/mod_static_lift.py $(MOD_EDITS) $(LIFTED)/shards.json Makefile
+	KH_UNIVERSE=$(KH_UNIVERSE) $(KHLIFT_PY) tools/mod_static_lift.py --khlift $(KHLIFT) --edits $(MOD_EDITS) --exe $(MOD_EXE) \
+	    --funcs "$(MOD_STATIC_FUNCS)" --chained "$(MOD_STATIC_CHAINED)" --vanilla-shards $(LIFTED)/shards --out $@ --report $(GEN)/mod_static_lift.json
+obj/mod_static.o: $(GEN)/mod_static_table.h
+obj/mod_static_lifted.o: $(GEN)/mod_static_lifted.c
+	@mkdir -p obj && $(CC) $(LIFT_CFLAGS) -c $< -o $@
+all: obj/mod_static_link.ok
+obj/mod_static_link.ok: khnmc tools/check_mod_static_link.py
+	python3 tools/check_mod_static_link.py --bin khnmc --obj obj --funcs "$(MOD_STATIC_FUNCS)" --chained "$(MOD_STATIC_CHAINED)" && touch $@
+# native-oracle differential of the re-lifted functions against the patched bytes (x86-64 Linux dev host; not part of `all`).
+# CPU-heavy: runs niced, MOD_STATIC_DIFFTEST_JOBS processes at a time (keep it low on a shared desktop).
+MOD_STATIC_DIFFTEST_JOBS ?= 4
+mod-static-difftest:
+	KH_UNIVERSE=$(KH_UNIVERSE) nice -n 10 $(KHLIFT_PY) tools/mod_static_difftest.py --jobs $(MOD_STATIC_DIFFTEST_JOBS) --khlift $(KHLIFT) --edits $(MOD_EDITS) --exe $(MOD_EXE) \
+	    --funcs "$(MOD_STATIC_FUNCS)" --chained "$(MOD_STATIC_CHAINED)" --vanilla-shards $(LIFTED)/shards --lifted $(GEN)/mod_static_lifted.c \
+	    --sites $(ROOT)/runtime/mod_static_sites.c --work obj/mod_static_difftest --out $(GEN)/mod_static_difftest.json
 clean:
 	rm -rf obj khnmc
-.PHONY: all clean arm64check
+.PHONY: all clean arm64check mod-static-difftest

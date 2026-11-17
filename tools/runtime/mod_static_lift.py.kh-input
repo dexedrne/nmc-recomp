@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""Re-lift ONLY the functions the mod's static edits change, from the PATCHED image.
+
+  mod_static_lift.py --khlift DIR --edits edit_list.json --exe kh2fm.exe --funcs "RVA ..." --chained "RVA ..."
+                     --vanilla-shards lifted/shards --out gen/mod_static_lifted.c [--report gen/mod_static_lift.json]
+                     [--check-image kh2fm.nmc.exe]
+
+Needs the lifter's Python environment (pyvex, archinfo, pefile) and the function universe (KH_UNIVERSE, read by khlift).
+The lifter itself (tools/khlift) is used unmodified; this file only drives it.
+
+What it does
+  1. builds the patched memory image in memory: vanilla image + the 87 file-backed edits (old bytes verified) + the 4 KiB `.nmc`
+     buffer at RVA SizeOfImage (the eight rel32 edits point into it).  --check-image compares it with an existing patched PE.
+  2. finds the universe functions whose extent bytes differ (28) and adds the functions holding the two INLINE detour sites.
+     The set must equal --funcs.
+  3. lifts each of them from the vanilla image first and requires the text to be byte-identical to the function in the shipped
+     vanilla shards (proves this driver = the lifter run that built lifted/), then lifts it from the patched image.
+  4. inline detour sites: the DLL attached Detours in the MIDDLE of two functions.  The lifted replacement gets one spliced block at
+     the site address that calls a small hand-written C handler (runtime/mod_static_sites.c) and continues at one of the two
+     addresses the DLL handler jumps back to; the instructions Detours overwrote are not lifted (the handler replaces them), and
+     nothing else in the function changes.  No call instruction, no return address on the guest stack, no synthetic address.
+  5. writes one C file: `f_<rva>` (or `mod_f_<rva>` for --chained functions, whose runtime hook forwards to it) plus a table
+     {rva, replacement, original} for the runtime selftest.  The file is game-derived: gen/ only, never committed.
+"""
+import sys, os, re, json, struct, hashlib, argparse, bisect, types
+
+# Inline Detours sites (KH2Tweaks_Refactor.dll, sha256 84b43f08...ca92), all read from the DLL disassembly:
+#   installer 0x1bdd7..0x1be42: target = sig + 0xc9 (exe 0x3c40a9), handler DLL 0x34490, continue at pbRemain+0x10 / pbRemain+0xf6
+#   installer 0x1ee9d..0x1eeff: target = sig + 0x13a (exe 0x360a5a), handler DLL 0x34460, continue at pbRemain+0x9 / pbRemain+0x141
+# pbRemain = site + moved (Detours moves whole instructions until it has 5 bytes).
+SITES = {
+    0x3c3fe0: dict(site=0x3c40a9, moved=6, moved_bytes='@KHINPUT(hex,pc/kh2fm.exe,1430783,6,bb0162aa2677e81f5561bb04a16976721bc4f733ac0680f2d8faf047dfdc96fa)@', ok=0x3c40a9 + 6 + 0x10, skip=0x3c40a9 + 6 + 0xf6, handler='kh_mod_site_3c40a9',
+                   dll_handler=0x34490, what='dualwield_forms: form id in r8d against the six ini slots'),
+    0x360920: dict(site=0x360a5a, moved=10, moved_bytes='@KHINPUT(hex,pc/kh2fm.exe,3538522,10,4293dd45f7f2de0e43ecef95c31c5d43bc60b8d4d71f7d9e9d054b432347a497)@', ok=0x360a5a + 10 + 0x9, skip=0x360a5a + 10 + 0x141, handler='kh_mod_site_360a5a',
+                   dll_handler=0x34460, what='patch_ability_categories: category byte or table word == 1'),
+}
+
+def die(msg):
+    sys.stderr.write('mod_static_lift: ERROR: %s\n' % msg); sys.exit(1)
+
+def setup(khlift, exe):
+    """import the lifter with KH_EXE pointing at the vanilla exe; returns the modules."""
+    os.environ['KH_EXE'] = os.path.abspath(exe)
+    sys.dont_write_bytecode = True
+    sys.path.insert(0, os.path.abspath(khlift))
+    import pyvex, archinfo                              # noqa: F401  (fail early when the environment is wrong)
+    from khlift import BASE, universe as U, imports as IM
+    from khlift import emit as EM
+    import lift_all as LA
+    return types.SimpleNamespace(BASE=BASE, U=U, IM=IM, EM=EM, LA=LA, pyvex=pyvex)
+
+def patched_image(K, edits_path, exe):
+    """-> (vanilla image, patched image, nmc_rva, applied edits).  Both images padded to the patched SizeOfImage."""
+    import pefile
+    E = json.load(open(edits_path))
+    raw = open(exe, 'rb').read()
+    if hashlib.sha256(raw).hexdigest() != E['exe_sha256']: die('exe is not the pinned build')
+    pe = pefile.PE(data=raw, fast_load=True)
+    nmc_rva = pe.OPTIONAL_HEADER.SizeOfImage; nmc_size = E['nmc_buffer']['size']
+    van = bytearray(pe.get_memory_mapped_image()); van += bytes(nmc_rva + nmc_size - len(van))
+    pat = bytearray(van)
+    applied = []
+    for e in E['edits']:
+        if e['cls'] == 'runtime_only_bss': continue
+        rva = int(e['rva'], 16); old = bytes.fromhex(e['old'])
+        if bytes(van[rva:rva + len(old)]) != old: die('edit at 0x%x: vanilla bytes differ from the edit list' % rva)
+        if e['cls'] == 'rel32_to_new_section': new = struct.pack('<i', nmc_rva + int(e['buffer_offset'], 16) - (rva + 4))
+        else: new = bytes.fromhex(e['new'])
+        if len(new) != len(old): die('edit at 0x%x: length' % rva)
+        pat[rva:rva + len(new)] = new; applied.append((rva, len(new)))
+    nb = bytes.fromhex(E['nmc_buffer']['nonzero_hex']); pat[nmc_rva:nmc_rva + len(nb)] = nb
+    return bytes(van), bytes(pat), nmc_rva, applied, E
+
+def make_lifter_class(K):
+    BASE = K.BASE; EM = K.EM; pyvex = K.pyvex
+    class SiteLifter(EM.FnLifter):
+        """FnLifter with an optional inline-site splice (see module doc, item 4)."""
+        def __init__(self, env, fn, name=None, trace=False, site=None):
+            super().__init__(env, fn, name=name, trace=trace)
+            self.site = None; self.extents = {}                      # extents: block start va -> end va (emit pass)
+            if site:
+                self.site = dict(site, va=BASE + site['site'], ok_va=BASE + site['ok'], skip_va=BASE + site['skip'])
+                for k in ('va', 'ok_va', 'skip_va'):
+                    a = self.site[k]
+                    if not self.infunc(a) or self.indata(a): raise RuntimeError('site address %x outside the function code' % a)
+        def lift_block(self, addr):
+            s = self.site
+            if s and addr == s['va']: return types.SimpleNamespace(statements=[])      # spliced block: nothing to decode
+            end = self.fn.hi
+            for d in self.data_starts:
+                if d > addr: end = min(end, d); break
+            if self.leaders:
+                k = bisect.bisect_right(self.leaders, addr)
+                if k < len(self.leaders): end = min(end, self.leaders[k])
+            if s and addr < s['va']: end = min(end, s['va'])                           # a block never runs into the site
+            data = self.env.image[addr - BASE:end - BASE]
+            return pyvex.lift(data, addr, EM.ARCH, max_bytes=len(data), opt_level=1)
+        def block_c(self, a, irsb):
+            s = self.site
+            if s and a == s['va']:
+                self.work.append(s['ok_va']); self.work.append(s['skip_va'])
+                self.extents[a] = a + s['moved']
+                return ('%s:{ /* inline detour site 0x%x (%d bytes moved by Detours): DLL handler 0x%x as %s() */\n'
+                        'if(%s(g)) goto %s;\ngoto %s;\n}') % (self.label(a), s['site'], s['moved'], s['dll_handler'], s['handler'], s['handler'],
+                                                           self.label(s['ok_va']), self.label(s['skip_va']))
+            self.extents[a] = EM.last_insn_end(irsb)
+            return super().block_c(a, irsb)
+        def _emit(self):
+            self.extents = {}                                         # drop the unbounded blocks of the discovery pass
+            return super()._emit()
+    return SiteLifter
+
+def lift_one(K, SiteLifter, env, fn, name, site=None, trace=False):
+    L = SiteLifter(env, fn, name=name, trace=trace, site=site); r = L.lift()
+    if r.err: die('lift of 0x%x failed: %s' % (fn.rva, r.err))
+    return r, L
+
+def make_env(K, image):
+    """LiftEnv over `image` with the universe/hooks/imports exactly as lift_all.build_env does."""
+    U = K.U; LA = K.LA; BASE = K.BASE
+    U._img = image
+    fs = U.load(); hooks = LA.load_hooks(); imps = K.IM.load_imports()
+    iat = {im.slot: im.sym for im in imps}
+    starts = {f.va: f for f in fs if not f.nep}; nep = {f.va for f in fs if f.nep}
+    return K.EM.LiftEnv(image, starts, hooks, iat, nep), fs, hooks, imps
+
+def changed_functions(K, fs, van, pat, applied):
+    """universe functions (non-nep) with a differing byte in their extent -> {rva: [edit rvas]}"""
+    BASE = K.BASE; out = {}
+    los = [f.lo - BASE for f in fs]
+    for rva, ln in applied:
+        i = bisect.bisect_right(los, rva) - 1; own = []
+        while i >= 0 and rva - los[i] < 0x100000:
+            f = fs[i]
+            if f.lo - BASE <= rva < f.hi - BASE: own.append(f)
+            i -= 1
+        for f in own:
+            if f.nep: die('edit at 0x%x lies in a .nep unit' % rva)
+            if any(a - BASE <= rva < b - BASE for a, b, k in f.data): die('edit at 0x%x lies in a data range of function 0x%x' % (rva, f.rva))
+            out.setdefault(f.rva, []).append(rva)
+    for rva, ed in out.items():
+        f = next(x for x in fs if x.rva == rva)
+        if van[f.lo - BASE:f.hi - BASE] == pat[f.lo - BASE:f.hi - BASE]: die('function 0x%x listed as changed but bytes are equal' % rva)
+    return out
+
+def vanilla_shard_texts(shard_dir, rvas):
+    """function text of each rva from the shipped vanilla shards (as written by lift_all.write_shards)."""
+    want = set(rvas); out = {}
+    for name in sorted(os.listdir(shard_dir)):
+        if not name.endswith('.c'): continue
+        body = open(os.path.join(shard_dir, name)).read()
+        m = list(re.finditer(r'^void f_([0-9a-f]+)\(KCtx \*g\)\{$', body, re.M))
+        for i, x in enumerate(m):
+            rva = int(x.group(1), 16)
+            if rva in want:
+                e = m[i + 1].start() - 1 if i + 1 < len(m) else len(body)
+                out[rva] = body[x.start():e]
+    return out
+
+def site_checks(K, van, pat, E):
+    """the bytes Detours moved are the vanilla bytes, untouched by static edits, and match the mod's own diff regions."""
+    regs = {int(r['rva'], 16): r for r in E['detour_hook_regions']}
+    for frva, s in SITES.items():
+        b = bytes.fromhex(s['moved_bytes'])
+        if len(b) != s['moved'] or van[s['site']:s['site'] + s['moved']] != b: die('site 0x%x: vanilla bytes are not %s' % (s['site'], s['moved_bytes']))
+        if pat[s['site']:s['site'] + s['moved']] != b: die('site 0x%x: a static edit touches the moved bytes' % s['site'])
+        r = regs.get(s['site'])
+        if not r or r['old'] != s['moved_bytes'] or r['new'][:2] != 'e9': die('site 0x%x: not a jmp region of the mod diff with these bytes' % s['site'])
+
+def generate(K, a):
+    BASE = K.BASE
+    van, pat, nmc_rva, applied, E = patched_image(K, a.edits, a.exe)
+    if a.check_image:
+        import pefile
+        p = pefile.PE(a.check_image, fast_load=True); ref = bytearray(p.get_memory_mapped_image()); ref += bytes(len(pat) - len(ref))
+        d = [i for i in range(0x1000, len(pat)) if ref[i] != pat[i]]
+        if d: die('patched image differs from %s at %d bytes (first 0x%x)' % (a.check_image, len(d), d[0]))
+    site_checks(K, van, pat, E)
+    SiteLifter = make_lifter_class(K)
+    env_v, fs, hooks, imps = make_env(K, van)
+    by_rva = {f.rva: f for f in fs}
+    ch = changed_functions(K, fs, van, pat, applied)
+    for frva in SITES:
+        if frva in ch: die('inline-site function 0x%x also has static edits' % frva)
+    want = sorted(int(x, 16) for x in a.funcs.replace(',', ' ').split())
+    got = sorted(set(ch) | set(SITES))
+    if got != want: die('changed-function set differs from --funcs:\n  computed: %s\n  --funcs:  %s' % (' '.join('%x' % x for x in got), ' '.join('%x' % x for x in want)))
+    chained = sorted(int(x, 16) for x in a.chained.replace(',', ' ').split())
+    for c in chained:
+        if c not in want: die('--chained 0x%x is not in --funcs' % c)
+    for rva in want:
+        if BASE + rva in hooks: die('0x%x is a lifter hook (hooks.tsv), not a lifted function' % rva)
+    # 3. vanilla lift == shipped shard text
+    vtext = vanilla_shard_texts(a.vanilla_shards, want)
+    vres = {}; vextents = {}
+    for rva in want:
+        r, Lv = lift_one(K, SiteLifter, env_v, by_rva[rva], 'f_%x' % rva); vextents[rva] = dict(Lv.extents)
+        if rva not in vtext: die('function 0x%x not found in the vanilla shards' % rva)
+        if r.text.rstrip('\n') != vtext[rva].rstrip('\n'): die('vanilla lift of 0x%x differs from the shipped shard text: lifter/universe mismatch' % rva)
+        vres[rva] = r
+    # patched lift
+    env_p, _, _, _ = make_env(K, pat)
+    out = {}; rep = []; extents = {}
+    for rva in want:
+        name = ('mod_f_%x' if rva in chained else 'f_%x') % rva
+        site = SITES.get(rva)
+        r, L = lift_one(K, SiteLifter, env_p, by_rva[rva], name, site=site)
+        if r.text == vres[rva].text.replace('void f_%x(' % rva, 'void %s(' % name, 1): die('patched lift of 0x%x is identical to the vanilla lift' % rva)
+        if site:
+            for lab in ('L%x:' % site['site'], 'L%x:' % site['ok'], 'L%x:' % site['skip']):
+                if lab not in r.text: die('site function 0x%x: label %s missing' % (rva, lab))
+            dead = [x for x in range(site['site'] + 1, site['ok']) if 'L%x:' % x in r.text]
+            if dead: die('site function 0x%x: code between the site and its ok target is still reachable: %s' % (rva, [hex(x) for x in dead]))
+        vb = set(re.findall(r'^L([0-9a-f]+):\{', vres[rva].text, re.M)); pb = set(re.findall(r'^L([0-9a-f]+):\{', r.text, re.M))
+        out[rva] = (name, r); extents[rva] = dict(L.extents)
+        rep.append(dict(rva='%x' % rva, symbol=name, edits=['%x' % x for x in ch.get(rva, [])], inline_site=('%x' % site['site']) if site else None,
+                        insns=r.insns, blocks=r.blocks, vanilla_insns=vres[rva].insns, vanilla_blocks=vres[rva].blocks,
+                        blocks_added=sorted(pb - vb), blocks_removed=sorted(vb - pb), callees=sorted('%x' % (c - BASE) for c in r.callees),
+                        callees_removed=sorted('%x' % (c - BASE) for c in vres[rva].callees - r.callees), callees_added=sorted('%x' % (c - BASE) for c in r.callees - vres[rva].callees),
+                        imports=sorted(r.imports), dispatch_calls=r.n_dispatch_call, dispatch_jmps=r.n_dispatch_jmp, jump_tables=r.n_jt,
+                        text_sha256=hashlib.sha256(r.text.encode()).hexdigest(), vanilla_text_matches_shard=True))
+    return types.SimpleNamespace(van=van, pat=pat, nmc_rva=nmc_rva, applied=applied, E=E, env_p=env_p, env_v=env_v, fs=fs, by_rva=by_rva, hooks=hooks,
+                                 imps=imps, want=want, chained=chained, changed=ch, out=out, report=rep, SiteLifter=SiteLifter, vres=vres, extents=extents, vextents=vextents)
+
+def write_c(K, G, path):
+    BASE = K.BASE
+    ext = set(); imps = set()
+    for rva, (name, r) in G.out.items(): ext |= r.callees; imps |= r.imports
+    own = {'f_%x' % rva for rva, (name, r) in G.out.items() if name.startswith('f_')}
+    decl = []
+    for c in sorted(ext):
+        sym = G.hooks.get(c, 'f_%x' % (c - BASE))
+        decl.append('void %s(KCtx *g);' % sym)
+    for s in sorted(imps): decl.append('void %s(KCtx *g);' % s)
+    o = ['/* GENERATED by tools/mod_static_lift.py: %d functions re-lifted from the PATCHED image (mod static edits + 2 inline detour sites).'
+         % len(G.out), ' * Game-derived: never commit.  Compile with the shard flags (-O1 ...). */', '#include "khrt.h"', '#include "khrt_tables.h"']
+    o.append('/* inline detour-site handlers: runtime/mod_static_sites.c (1 = continue at the "ok" address, 0 = the "skip" address) */')
+    for frva, s in sorted(SITES.items()): o.append('int %s(KCtx *g);' % s['handler'])
+    for rva in G.want:
+        name = G.out[rva][0]; o.append('void %s(KCtx *g); void orig_f_%x(KCtx *g);' % (name, rva))
+    o += decl; o.append('')
+    for rva in G.want: o.append(G.out[rva][1].text)
+    o.append('/* {rva, replacement, vanilla lifted body, chained (1 = a runtime hook owns f_<rva> and forwards to the replacement)} */')
+    o.append('const struct kh_mod_static_fn { u32 rva; KhFn mod, orig; int chained; } kh_mod_static_fn_table[] = {')
+    for rva in G.want:
+        o.append('  {0x%x, %s, orig_f_%x, %d},' % (rva, G.out[rva][0], rva, 1 if rva in G.chained else 0))
+    o.append('};')
+    o.append('const u32 kh_mod_static_fn_count = %d;' % len(G.want))
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    data = '\n'.join(o) + '\n'
+    open(path, 'w').write(data)
+    return hashlib.sha256(data.encode()).hexdigest(), len(data)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--khlift', required=True); ap.add_argument('--edits', required=True); ap.add_argument('--exe', required=True)
+    ap.add_argument('--funcs', required=True); ap.add_argument('--chained', default=''); ap.add_argument('--vanilla-shards', required=True)
+    ap.add_argument('--out', required=True); ap.add_argument('--report'); ap.add_argument('--check-image')
+    a = ap.parse_args()
+    K = setup(a.khlift, a.exe)
+    G = generate(K, a)
+    sha, n = write_c(K, G, a.out)
+    if a.report:
+        json.dump(dict(out_sha256=sha, out_bytes=n, functions=G.report, sites={('%x' % k): dict(site='%x' % v['site'], moved=v['moved'], ok='%x' % v['ok'], skip='%x' % v['skip'],
+                  handler=v['handler'], dll_handler='%x' % v['dll_handler']) for k, v in SITES.items()}, checked_against=a.check_image), open(a.report, 'w'), indent=1)
+    print('mod_static_lift: %d functions re-lifted (%d with static edits, %d inline sites; %d chained), all %d vanilla lifts identical to the shipped shards; wrote %s (%d bytes, sha256 %s)'
+          % (len(G.want), len(G.changed), len(SITES), len(G.chained), len(G.want), a.out, n, sha[:16]))
+
+if __name__ == '__main__':
+    main()

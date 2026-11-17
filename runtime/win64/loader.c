@@ -99,6 +99,9 @@ static void *guest_main(void *arg){
     { extern u64 ga_bump_ptr(void); fprintf(stderr,"kh: boot-state rsp=0x%llx teb=0x%llx tlsarr=0x%llx tlsblk=0x%llx bump=0x%llx det=%d\n",(unsigned long long)KH_RSP(g),(unsigned long long)t->teb,(unsigned long long)t->tlsarr,(unsigned long long)t->tlsblk,(unsigned long long)ga_bump_ptr(),ga_deterministic); }
     if(getenv("KH_SNAPSHOT")) write_snapshot(g,t,getenv("KH_SNAPSHOT"));
     /* Windows runs the TLS callbacks with DLL_PROCESS_ATTACH before the entry point */
+    /* Task 12: mod static edits + buffer.  PC order: the mod DLL patches the image from its DllMain, loaded by Panacea's DllMain (a static
+     * import of the exe), i.e. before the exe's TLS callbacks, CRT initialisers and entry point. */
+    { extern void kh_mod_static_init(KCtx *); kh_mod_static_init(g); }
     kh_run_tls_callbacks(g,1);
     kh_mod_syscalls_init(g);
     { extern void kh_mod_difficulty_init(KCtx *); kh_mod_difficulty_init(g); }

@@ -29,7 +29,9 @@ PHASE(511300,3)
 PHASE(13da10,4)
 PHASE(13d260,5)
 void kh_phase_mapevent_entry(void){ entries[6]++; } /* f_405440 itself lives in mod_hooks_a.c (Task 9) */
-PHASE(3f29e0,7)
+/* Task 12: 3f29e0 has two static edits (0x3f2d2e, 0x3f2d4a); the probe forwards to the body re-lifted from the patched image. */
+void mod_f_3f29e0(KCtx *);
+void f_3f29e0(KCtx *g){ entries[7]++; mod_f_3f29e0(g); }
 void kh_phase_damage_entry(void){ entries[8]++; }
 PHASE(2b4590,9)
 void orig_f_4f94b0(KCtx *);
