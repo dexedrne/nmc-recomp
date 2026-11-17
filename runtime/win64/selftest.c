@@ -233,6 +233,7 @@ int kh_selftest(KCtx *g){
     fails+=kh_mod_hooks_selftest(g);
     extern int kh_mod_hooks_a_selftest(KCtx *);
     fails+=kh_mod_hooks_a_selftest(g);
+    { extern int kh_mod_hooks_b_selftest(KCtx *); fails+=kh_mod_hooks_b_selftest(g); }   /* Task 23: the remaining DLL detours */
     extern int kh_mod_params_selftest(KCtx *);
     fails+=kh_mod_params_selftest(g);
     extern int kh_bgload_selftest(KCtx *);

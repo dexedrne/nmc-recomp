@@ -1,0 +1,120 @@
+# KH2Tweaks_Refactor.dll pointer slot -> exe RVA, as tools/mod_dll_slots.py must resolve them (Task 23).
+# `make mod-dll-slots` checks every line: pattern read from the DLL's scanner, scanned over the exe image, one match (or hits=N).
+#
+# ---- the 35 detours of the shipped configuration: the slot each one is attached to (33 function entries + 2 inline sites) ----
+82300 3c3fe0   # inline site 0x3c40a9 = this + 0xc9 (DetourAttachEx at DLL 0x1be1b), handler 0x34490
+81e20 360920   # inline site 0x360a5a = this + 0x13a (DetourAttachEx at DLL 0x1eed8), handler 0x34460
+82640 3a7cb0   # handler 0x32780
+81dd0 29efa0   # handler 0x2d190
+81fe8 4014a0   # handler 0x2de50
+82638 3a9cf0   # handler 0x327e0
+82310 3c4b80   # handler 0x31260
+82318 3c3da0   # handler 0x30f60
+82308 3c4780   # handler 0x31c60
+81e68 351390   # handler 0x2d5c0
+81fa0 368820   # handler 0x2da70
+81f88 2fc860   # handler 0x2da30
+81f80 2fc4e0   # handler 0x2d8f0
+828c0 405440   # handler 0x333b0
+82390 3ed7d0   # handler 0x31ee0
+82830 3c12f0   # handler 0x32d30
+82648 3a89a0   # handler 0x32710
+82050 40dd70   # handler 0x2ec30
+82058 40d810   # handler 0x2df50
+81d90 1f9a80   # handler 0x2d110
+81e98 31dd70   # handler 0x2d670
+828e0 4060e0   # handler 0x33550
+82260 3f29e0   # handler 0x306c0
+82258 3f27d0   # handler 0x30a80
+82088 3d1730   # handler 0x2f970
+81ab0 15aba0   # handler 0x10100
+81aa8 15aab0   # handler 0x10590
+81ac8 153850   # handler 0x10340
+825d0 3d61d0   # handler 0x32580
+82210 3f6620   # handler 0x300a0
+82208 3f65a0   # handler 0x2fd20
+82220 3f6510   # handler 0x30180
+82a08 3a17f0   # handler 0x33610
+820f8 3edf90   # handler 0x2f9b0
+825e8 3d60c0   # handler 0x32680
+#
+# ---- engine functions and data the Task 23 hooks call (runtime/mod_hooks_b.c, mod_syscalls.c) ----
+# 0x3f29e0 / 0x3f27d0 (DLL 0x306c0, 0x30290, 0x30510, 0x30a80)
+82178 3b19b0
+82190 3b11d0
+82170 3b1840
+82188 3b0f20
+825b8 3d5c50
+82518 3ba720
+82560 3dfeb0
+82580 3e60f0
+82268 3f3000
+82250 3f3300
+82270 3f3110
+823f8 3e7b30
+82508 3bfb30
+82960 3e6d10
+81a70 152380
+82150 3b68b0
+825b0 3d74c0
+82670 3b27e0
+82668 3b2660
+82708 39a7e0
+817a0 717008   # data: current world / room bytes
+825e0 3d7820
+82678 3b27c0
+82628 3aa4f0
+828f8 3abb20
+82940 3de250
+82930 3de130
+82248 3f3230
+81960 749804   # data: flag dword
+82718 39a800
+82710 39a870
+82680 3b2080
+82168 3b1b70 hits=2
+82688 3b20b0
+82420 3c5900 hits=2
+# 0x1f9a80 (DLL 0x2d110)
+829c8 3e1620
+81a08 753490   # data: script syscall table directory
+# 0x3c4780 / 0x351390 / 0x368820 (DLL 0x31c60, 0x2d5c0, 0x2da70)
+82358 3e39a0
+81eb8 304df0
+81f00 34bc50
+81ee8 34bc40
+# 0x3d1730 (DLL 0x2f970)
+826a8 4ad240
+# the extra-file chain (DLL 0x33610, 0x300a0, 0x2fd20, 0x30180)
+82290 3f95f0
+818b8 2a0f688  # data: primary common script
+829c0 3e1730
+829e0 3e1840
+829d0 3e1410
+829d8 3e1510
+# the command-menu icon hooks (DLL 0x10340, 0x10590, 0x10100)
+817d0 9babb0   # data: name of the loaded command-menu layout file
+82488 3ad9a0
+82490 3ae260
+# 0x31dd70 (DLL 0x2d670)
+81f30 2f5f30
+81f58 2f6230
+81a30 151730
+819a0 bef528   # data: menu cursor (pointer to a pointer)
+819a8 bef538   # data: menu row ids (pointer to a pointer)
+82598 39b760
+81f70 2eb790
+81d70 1dd170
+81f38 2f6500
+827d8 3ad500
+81a10 152990
+81e90 31d850
+82890 3aabe0
+# the five script syscalls of Task 23 (DLL 0x115c0, 0x118b0 [uses 81a10 above], 0x128f0, 0x12a40, 0x14a90)
+826b0 4ad270
+82510 3b4da0
+82038 3cb9f0
+82530 3b3e80
+81898 5c9030   # data: form growth table (GetGrowthTable)
+81870 718ca8   # data: camera mode byte (SetCameraMode); the pointer is set by the DLL's worker thread 0x342a0
+819f8 2ae5768  # data: the game global that worker thread waits for (non-zero = it goes on and sets its pointers)

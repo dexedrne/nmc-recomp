@@ -269,19 +269,25 @@ int kh_mod_items_selftest(KCtx *g,u64 sheet){
             T(rd32(g,sheet+0x264)==100);
         }
     }
-    /* ---- (2c) an invalid difficulty still enters the complete original (existing gate), reversed byte or not */
+    /* ---- (2c) a difficulty dword outside 0..3 (the game never writes one): DLL 31260 has no path to the original and its kind-0
+     * path does not read the dword at all, so the command byte decides exactly as for a legal value (the vanilla function would
+     * heal here whatever the byte is); DLL 30f60 acquires the sheet and tail-jumps to the original, keeping its reference.
+     * Counted in slot 4. */
     {
-        static const s32 invalid[]={-1,4,INT32_MAX}; u64 cmd=cmd_record(g,23);
-        memset(hp(g,rec),0,0x18); wr16(g,rec,1); wr8(g,rec+4,40); wr16(g,rec+0x10,23); wr8(g,cmd+0x2f,2);
+        static const s32 invalid[]={-1,4,INT32_MAX,INT32_MIN}; u64 cmd=cmd_record(g,23);
+        memset(hp(g,rec),0,0x18); wr16(g,rec,1); wr8(g,rec+4,40); wr16(g,rec+0x10,23);
         kh_mod_items_counts(&before);
-        for(unsigned i=0;i<3;i++){
-            reset_sheet(g,sheet); wr32(g,sheet,30); wr32(g,sheet+4,60); wr32(g,GS_BASE+0x9abd48,(u32)invalid[i]);
+        for(unsigned i=0;i<4;i++) for(int reversed=0;reversed<2;reversed++){
+            reset_sheet(g,sheet); wr32(g,sheet,30); wr32(g,sheet+4,60); wr32(g,GS_BASE+0x9abd48,(u32)invalid[i]); wr8(g,cmd+0x2f,reversed?2:0);
             kh_call(g,GS_BASE+0x3c4b80,rec,2,0,100);
-            T(rd32(g,sheet)==54); T(rd32(g,sheet+0x264)==100);
-            T((kh_call(g,GS_BASE+0x3c3da0,rec,2,0,0)&255)==1); T(rd32(g,sheet+0x264)==100);
+            T(rd32(g,sheet)==(reversed?6u:54u)); T(rd32(g,sheet+0x264)==100);
+            T((kh_call(g,GS_BASE+0x3c3da0,rec,2,0,0)&255)==1); T(rd32(g,sheet+0x264)==101);
         }
         kh_mod_items_counts(&after);
-        T(!memcmp(&before,&after,sizeof before));
+        T(after.apply[4][0]==before.apply[4][0]+8 && after.reversed[4]==before.reversed[4]+4 && after.usable[4]==before.usable[4]+8);
+        memcpy(after.apply[4],before.apply[4],sizeof before.apply[4]); after.reversed[4]=before.reversed[4]; after.usable[4]=before.usable[4];
+        after.hp_calls=before.hp_calls; after.mp_calls=before.mp_calls;
+        T(!memcmp(&before,&after,sizeof before));                 /* nothing in the slots 0..3 */
         wr8(g,cmd+0x2f,0);
     }
     /* ---- (2d) DLL no-op apply kinds 25..29 and >31: nothing happens even for a stock id (the vanilla switch would heal) */

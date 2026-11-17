@@ -10,6 +10,11 @@ static const struct kh_mod_difficulty_config {
     {200,125,1.5f,0.5f,0.5f},
     {200,125,1.5f,0.5f,0.5f},
 };
+/* The difficulty dword [save+0x2498] = [0x1409abd48].  The game writes 0..3.  The DLL's handlers that read it (0x32d30, 0x31ee0,
+ * 0x2f9b0, 0x31260, 0x30f60) are attached for every value and none of the first four reaches its trampoline, so no value of the
+ * dword runs the vanilla body on the PC.  Per-difficulty counters have one more slot for "any other value". */
+enum { KH_DIFF_SLOTS = 5 };
+static inline unsigned kh_diff_slot(u32 d){ return d>3?4u:d; }
 
 /* GAME_MODE descriptor, not a DLL option. */
 #define KH_MOD_GUMMI_TASK 0x716c10u
@@ -86,9 +91,9 @@ struct kh_item_mock {
 extern struct kh_item_mock *kh_item_mock_sink;
 enum { KH_ITEM_SLOTS = 15 };                                    /* ids 1..7, 0x83, 0x112..0x117, any other id */
 struct kh_item_counts {
-    u64 apply[4][KH_ITEM_SLOTS];      /* kind-0 applications per difficulty and id slot (one per target of a party-wide item) */
-    u64 reversed[4];                  /* of those, ids 1..7 whose command Reserve byte was 2 */
-    u64 noop[4], usable[4];           /* DLL no-op apply kinds (25..29, >31); usability fall-throughs to the original */
+    u64 apply[KH_DIFF_SLOTS][KH_ITEM_SLOTS];   /* kind-0 applications per difficulty slot (kh_diff_slot) and id slot (one per target of a party-wide item) */
+    u64 reversed[KH_DIFF_SLOTS];      /* of those, ids 1..7 whose command Reserve byte was 2 */
+    u64 noop[KH_DIFF_SLOTS], usable[KH_DIFF_SLOTS];   /* DLL no-op apply kinds (25..29, >31); usability fall-throughs to the original */
     u64 hp_calls, mp_calls;           /* calls of exe 0x3c0c30 / 0x3c0cd0 made by the kind-0 path */
     u64 cmd2f_writes, cmd2f_two, cmd2f_zero, cmd2f_other;   /* WriteByte stores that hit +0x2f of a cmd record, by value */
 };
@@ -132,3 +137,27 @@ int  kh_mod_neverland_s1_agrees(KCtx *g,u32 save_flags,u8 *al_guest,u8 *al_direc
 int  kh_mod_site_15b960(KCtx *g);                                  /* add ebp,<image byte 0x15b962>; continue at 0x15b963 */
 void kh_mod_neverland_dump(void);
 int  kh_mod_neverland_selftest(KCtx *g);
+
+/* ---- Task 23: the remaining function detours of KH2Tweaks_Refactor.dll (mod_hooks_b.c; mod_hooks_b_test.c is the selftest).
+ * Every outgoing guest call of these hooks goes through one sink, so a test can record {rva, arguments, tail-jump flag} instead and
+ * choose the value the handler sees; NULL in normal runs. */
+#define KH_MODB_MAXCALLS 128
+struct kh_modb_call { u32 rva; int tail; u64 a[5]; u8 mem[16]; int memok; };   /* tail: 1 = tail jump, 2 = forward to the original (rva = the hooked function) */
+struct kh_modb_mock {
+    int ncalls, overflow;
+    struct kh_modb_call c[KH_MODB_MAXCALLS];
+    u64 (*fake)(void *user, const struct kh_modb_call *call, int index);   /* value returned to the handler for a recorded call */
+    void *user;
+};
+extern struct kh_modb_mock *kh_modb_sink;
+void kh_mod_hooks_b_init(KCtx *g);                                 /* allocates the guest copy of the DLL's two command word lists */
+u64  kh_mod_b_lists(void);                                         /* +0 = DLL 0x1800819d8 (extra commands), +0x10 = DLL 0x1800819e8 (limit commands) */
+int  kh_mod_b_counts(int hook,u64 *calls);                         /* hook index in dump order; 0 when out of range */
+u64  kh_mod_b_names(void);                                         /* 25 probe names, 16 bytes each: 01..05common.bdx, 01..20effect.bar */
+int  kh_mod_b_load_command_menu(const char *path,char *err,size_t cap);   /* 1 loaded, 0 no file / no header, -1 err */
+u32  kh_mod_b_command_menu(const u8 **entries);                     /* entry count and the 16-byte entries of tweaks/command_menu_offsets.bin */
+int  kh_mod_b_option_on(const char *root,const char *ini,const char *key);   /* <root>/dll/<ini> [Settings] key: 1 on, 0 not on, -1 no file / key */
+void kh_mod_b_check_options(KCtx *g,const char *root);             /* named fatal when an option whose detours are not ported is on */
+void kh_mod_b_icons(u8 *c8,u8 *c9,u8 *ca,int set);                  /* the DLL's three icon bytes 0x1800817c8..ca: read (set = 0) or write */
+void kh_mod_hooks_b_dump(void);
+int  kh_mod_hooks_b_selftest(KCtx *g);

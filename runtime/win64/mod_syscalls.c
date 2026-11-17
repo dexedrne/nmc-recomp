@@ -174,6 +174,13 @@ static void ability_count(KCtx *g,u64 args){
     }
     wr32(g,args,count);
 }
+/* Task 23: the engine calls of the five syscalls added there (set action, map jump, party jump) need a live game behind them, so
+ * they go through one seam that the selftest can replace by a recorder; NULL in normal runs. */
+u64 (*kh_mod_syscalls_call_hook)(KCtx *g,u32 rva,const u64 *a5);
+static u64 ecall5(KCtx *g,u32 rva,u64 a0,u64 a1,u64 a2,u64 a3,u64 a4){
+    if(kh_mod_syscalls_call_hook){ u64 a[5]={a0,a1,a2,a3,a4}; u64 r=kh_mod_syscalls_call_hook(g,rva,a); KH_RAX(g)=r; return r; }
+    return kh_call5(g,GS_BASE+rva,a0,a1,a2,a3,a4);
+}
 static void syscall_handler(KCtx *g){
     u64 target=g->aux[0]; int idx;
     for(idx=0;idx<114 && targets[idx]!=target;idx++);
@@ -185,6 +192,30 @@ static void syscall_handler(KCtx *g){
     require_mem(g,args,8ull*((entries[idx].flags&0xffff)?(entries[idx].flags&0xffff):1));
     a=rd32(g,args); b=(entries[idx].flags&0xffff)>1?rd32(g,args+8):0;
     switch(idx){
+    case 0: /* 115c0 Set_Action: 0x3b4da0(0x4ad270(arg0), arg1), a tail jump in the DLL (the VM gets 0x3b4da0's return). 0x3b4da0 reads
+             * [object+0xc] at once, so a handle that decodes to no object faults on the PC: named fatal. */
+        p=decode(g,a); require_mem(g,p,0xbac); ecall5(g,0x3b4da0,p,b,0,0,0); break;
+    case 8: { /* 118b0 MapJump: nine arguments.  A 10-byte record in the handler's stack frame: the low BYTE of arguments 0..2, a zero
+               * byte, the low WORD of arguments 3..5; then exe 0x152990(record, arg6, arg7, 0, arg8) (edx, r8d, r9 = 0, 5th = a dword). */
+        u64 sp=KH_RSP(g), rec=sp-0x80+0x30;            /* scratch below the handler's stack pointer, clear of kh_call's frame */
+        wr8(g,rec,rd8(g,args)); wr8(g,rec+1,rd8(g,args+8)); wr8(g,rec+2,rd8(g,args+0x10)); wr8(g,rec+3,0);
+        wr16(g,rec+4,rd16(g,args+0x18)); wr16(g,rec+6,rd16(g,args+0x20)); wr16(g,rec+8,rd16(g,args+0x28));
+        KH_RSP(g)=sp-0x80;
+        ecall5(g,0x152990,rec,rd32(g,args+0x30),rd32(g,args+0x38),0,rd32(g,args+0x40));
+        KH_RSP(g)=sp; break; }
+    case 47: /* 128f0 GetGrowthTable: the handle (0x4ad240) of the exe's form-growth table.  The DLL's pointer 0x180081898 is the
+              * rip-relative operand at exe 0x3e8380+0x1a2 = 0x1405c9030 (the table the mod's form_growth edits rewrite). */
+        wr32(g,args,encode(g,GS_BASE+0x5c9030)); break;
+    case 55: /* 12a40 SetCameraMode: `*p = (u8)arg0` with p = [0x180081870] = exe 0x140718ca8 (the low byte of the camera mode dword).
+              * That pointer is computed by the DLL's worker thread (0x342a0) only once the game global [0x142ae5768] (the pointer
+              * exe 0x3e9300 reads) is non-zero, polled every 50 ms; until then it is NULL and the store faults on the PC. */
+        if(!rd64(g,GS_BASE+0x2ae5768))
+            kh_fatal(g,"mod syscall SetCameraMode (table 3 index 55, DLL 0x12a40) before the DLL's worker thread can have set its pointer: the game global "
+                       "[0x142ae5768] is still 0, the DLL's pointer 0x180081870 is NULL and the store faults on the PC (call-site RVA=0x%llx)",
+                     (unsigned long long)(guest_return_addr(g)-GS_BASE-2));
+        wr8(g,GS_BASE+0x718ca8,(u8)a); break;
+    case 93: /* 14a90 PartyJump: exe 0x3cb9f0(0, 0x3b3e80(), 1) as a tail jump (r8b = 1). */
+        p=ecall5(g,0x3b3e80,0,0,0,0,0); ecall5(g,0x3cb9f0,0,p,1,0,0); break;
     case 1: { extern void kh_mod_add_exp(KCtx *,u64); kh_mod_add_exp(g,args); break; }
     case 3: /* 11760: both halves are sign extended before OR, including the low half. */
         p=((u64)(s64)(s32)a<<32)|(u64)(s64)(s32)b;
@@ -214,6 +245,15 @@ static void syscall_handler(KCtx *g){
     KH_RET(g);
 }
 
+static _Atomic u64 reset_calls;                  /* calls of the 0x1f9a80 hook below */
+/* exit report (kh_mod_hooks_dump): every table-3 syscall the run called, and the five added by Task 23 even when they were not */
+void kh_mod_syscalls_dump(void){
+    fprintf(stderr,"kh: mod syscalls (table 3): calls by index:");
+    int any=0; for(int i=0;i<114;i++){ unsigned n=atomic_load(&hits[i]); if(n){ fprintf(stderr," %d %s=%u",i,entries[i].name,n); any=1; } }
+    if(!any) fprintf(stderr," none");
+    fprintf(stderr,"; Task 23 additions: 0 Set_Action=%u, 8 MapJump=%u, 47 GetGrowthTable=%u, 55 SetCameraMode=%u, 93 PartyJump=%u; 1f9a80 (DLL 0x2d110) resets=%llu\n",
+            atomic_load(&hits[0]),atomic_load(&hits[8]),atomic_load(&hits[47]),atomic_load(&hits[55]),atomic_load(&hits[93]),(unsigned long long)atomic_load(&reset_calls));
+}
 void kh_mod_syscalls_init(KCtx *g){
     if(table) kh_fatal(g,"mod syscall table initialized twice");
     if(rd64(g,GS_BASE+0x7534a8)) kh_fatal(g,"expected empty vanilla syscall table 3");
@@ -227,14 +267,21 @@ void kh_mod_syscalls_init(KCtx *g){
     }
     /* The two four-byte static edits are halves of this one pointer. No count field exists. */
     wr64(g,GS_BASE+0x7534a8,table);
-    fprintf(stderr,"kh: mod syscall table 3 installed: 114 descriptors at 0x%llx (13 implemented, 101 named fatals)\n",(unsigned long long)table);
+    fprintf(stderr,"kh: mod syscall table 3 installed: 114 descriptors at 0x%llx (18 implemented, 96 named fatals)\n",(unsigned long long)table);
 }
 
-extern void orig_f_1f9a80(KCtx *g);
+/* DLL 0x2d110 -> exe 0x1f9a80.  FULL REPLACEMENT (Task 23 audit: the handler never reaches its trampoline slot 0x81d90): it stores the
+ * DLL's table pointer into directory slot 3 (`[[0x180081a08]+0x18] = [0x1800817f8]`, 0x180081a08 = exe 0x140753490) and tail-jumps
+ * to exe 0x3e1620 (slot 0x829c8), the function the exe body tail-jumps to after its `0x3e1710(0)`.  The earlier port called the
+ * original first and restored the pointer afterwards: 0x3e1620 (which resets every live script through 0x3e1410, i.e. can run
+ * script code) then ran with slot 3 = NULL.  Now the order is the DLL's: the table is in place while 0x3e1620 runs. */
+u64 kh_mod_syscalls_reset_calls(void){ return atomic_load(&reset_calls); }
+KhFn kh_mod_syscalls_reset_tail;              /* test only: stands in for exe 0x3e1620 */
 void f_1f9a80(KCtx *g){
-    orig_f_1f9a80(g);
-    /* The original resets slot 3 to null; retain the extension after script teardown. */
+    atomic_fetch_add(&reset_calls,1);
     wr64(g,GS_BASE+0x7534a8,table);
+    if(kh_mod_syscalls_reset_tail){ kh_mod_syscalls_reset_tail(g); return; }
+    kh_dispatch(g,GS_BASE+0x3e1620);          /* tail jump: its ret pops our caller's return address */
 }
 
 /* DLL 327e0: the sole game consumer of SetDriveMultiplier's private float. */

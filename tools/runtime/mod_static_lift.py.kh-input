@@ -3,7 +3,7 @@
 
   mod_static_lift.py --khlift DIR --edits edit_list.json --exe kh2fm.exe --funcs "RVA ..." --chained "RVA ..."
                      --vanilla-shards lifted/shards --out gen/mod_static_lifted.c [--report gen/mod_static_lift.json]
-                     [--check-image kh2fm.nmc.exe] [--extra-edits gen/mod_neverland_edits.json]
+                     [--check-image kh2fm.nmc.exe] [--extra-edits gen/mod_neverland_edits.json] [--extra-edits gen/mod_moose_edits.json]
 
 Needs the lifter's Python environment (pyvex, archinfo, pefile) and the function universe (KH_UNIVERSE, read by khlift).
 The lifter itself (tools/khlift) is used unmodified; this file only drives it.
@@ -31,6 +31,10 @@ Task 19, --extra-edits (NeverlandFly.dll, decoded by tools/gen_mod_neverland.py;
   * SELF-MODIFIED IMMEDIATE: the DLL's thread rewrites the imm8 of one `add ebp,imm8` at run time.  That instruction becomes a site
     (kind 'imm') whose handler fetches the immediate from the image byte, exactly like the CPU does: one continuation address,
     `handler(g); goto L<next>;`.  Unlike a Detours site it is not a jump the mod wrote: the bytes at the site stay vanilla.
+
+Task 23: --extra-edits may be given more than once.  Each list names its own function table (`table`, default "neverland":
+kh_mod_<table>_fn_table) and may come without caves and without a thread site (KH2Moose.dll's two ini-switched code patches,
+decoded by tools/gen_mod_moose.py: table "moose").  The lists must not touch a function another list or the main DLL changes.
 """
 import sys, os, re, json, struct, hashlib, argparse, bisect, types
 
@@ -60,15 +64,28 @@ def setup(khlift, exe):
     return types.SimpleNamespace(BASE=BASE, U=U, IM=IM, EM=EM, LA=LA, pyvex=pyvex)
 
 def load_extra(path):
-    """the NeverlandFly edit list of tools/gen_mod_neverland.py -> namespace (edits [(rva, old, new, func, pad)], caves {func: (lo, hi)}, funcs, site)"""
+    """an extra edit list (tools/gen_mod_neverland.py, tools/gen_mod_moose.py) -> namespace (edits [(rva, old, new, func, pad)],
+    caves {func: (lo, hi)}, funcs, site or None, table = name of its function table in the generated C)"""
     J = json.load(open(path)); h = lambda x: int(x, 16)
-    ed = [(h(e['rva']), bytes.fromhex(e['old']), bytes.fromhex(e['new']), h(e['func']), e['pad']) for e in J['edits']]
-    caves = {h(c['func']): (h(c['lo']), h(c['hi'])) for c in J['caves']}
-    t = J['thread']; ins = h(t['insn_rva'])
-    site = dict(site=ins, moved=3, moved_bytes='83c5%02x' % t['eq'], ok=ins + 3, skip=ins + 3, handler='kh_mod_site_%x' % ins, dll_handler=0x1290, kind='imm',
-                imm_rva=h(t['imm_rva']), imm_values=(t['eq'], t['ne']),
-                what='add ebp,imm8 whose immediate the DLL thread rewrites every %d ms (0x%x / 0x%x)' % (t['period_ms'], t['eq'], t['ne']))
-    return types.SimpleNamespace(J=J, edits=ed, caves=caves, funcs=sorted(h(x) for x in J['functions']), site=site, site_func=h(t['func']), exe_sha256=J['exe_sha256'])
+    ed = [(h(e['rva']), bytes.fromhex(e['old']), bytes.fromhex(e['new']), h(e['func']), e.get('pad', 0)) for e in J['edits']]
+    caves = {h(c['func']): (h(c['lo']), h(c['hi'])) for c in J.get('caves', [])}
+    site = None; site_func = None
+    if J.get('thread'):
+        t = J['thread']; ins = h(t['insn_rva']); site_func = h(t['func'])
+        site = dict(site=ins, moved=3, moved_bytes='83c5%02x' % t['eq'], ok=ins + 3, skip=ins + 3, handler='kh_mod_site_%x' % ins, dll_handler=0x1290, kind='imm',
+                    imm_rva=h(t['imm_rva']), imm_values=(t['eq'], t['ne']),
+                    what='add ebp,imm8 whose immediate the DLL thread rewrites every %d ms (0x%x / 0x%x)' % (t['period_ms'], t['eq'], t['ne']))
+    table = J.get('table', 'neverland'); dll = J.get('dll_name', 'NeverlandFly.dll')
+    if not re.fullmatch(r'[a-z][a-z0-9_]*', table): die('%s: bad table name %r' % (path, table))
+    return types.SimpleNamespace(J=J, path=path, edits=ed, caves=caves, funcs=sorted(h(x) for x in J['functions']), site=site, site_func=site_func, exe_sha256=J['exe_sha256'],
+                                 table=table, dll=dll)
+
+def load_extras(arg):
+    """--extra-edits may be given several times (Task 23: KH2Moose.dll's two ini-switched patches besides NeverlandFly.dll)"""
+    paths = arg if isinstance(arg, (list, tuple)) else ([arg] if arg else [])
+    Xs = [load_extra(p) for p in paths]
+    if len({x.table for x in Xs}) != len(Xs): die('--extra-edits: two edit lists use the same table name')
+    return Xs
 
 def patched_image(K, edits_path, exe, extra=None):
     """-> (vanilla image, patched image, nmc_rva, applied edits).  Both images padded to the patched SizeOfImage."""
@@ -90,9 +107,9 @@ def patched_image(K, edits_path, exe, extra=None):
         if len(new) != len(old): die('edit at 0x%x: length' % rva)
         pat[rva:rva + len(new)] = new; applied.append((rva, len(new)))
     nb = bytes.fromhex(E['nmc_buffer']['nonzero_hex']); pat[nmc_rva:nmc_rva + len(nb)] = nb
-    if extra:                                              # NeverlandFly.dll: loaded after the main mod DLL, so on top of its edits
-        if extra.exe_sha256 != E['exe_sha256']: die('--extra-edits was generated for another exe')
-        for rva, old, new, func, pad in extra.edits:
+    for X in (extra or []):                                # the other DLLs' edits on top (none of them overlaps another: checked by the old bytes)
+        if X.exe_sha256 != E['exe_sha256']: die('--extra-edits %s was generated for another exe' % X.path)
+        for rva, old, new, func, pad in X.edits:
             if bytes(pat[rva:rva + len(old)]) != old or len(new) != len(old): die('extra edit at 0x%x: the patched image does not hold its old bytes' % rva)
             pat[rva:rva + len(new)] = new
     return bytes(van), bytes(pat), nmc_rva, applied, E
@@ -202,10 +219,11 @@ def site_checks(K, van, pat, E):
 
 def generate(K, a):
     BASE = K.BASE
-    X = load_extra(a.extra_edits) if getattr(a, 'extra_edits', None) else None
-    van, pat, nmc_rva, applied, E = patched_image(K, a.edits, a.exe, X)
-    if X: SITES[X.site_func] = X.site                         # the function that holds the self-modified immediate
-    if a.check_image and X: die('--check-image compares with the main mod DLL image only: not with --extra-edits')
+    Xs = load_extras(getattr(a, 'extra_edits', None))
+    van, pat, nmc_rva, applied, E = patched_image(K, a.edits, a.exe, Xs)
+    for X in Xs:
+        if X.site: SITES[X.site_func] = X.site                # the function that holds the self-modified immediate
+    if a.check_image and Xs: die('--check-image compares with the main mod DLL image only: not with --extra-edits')
     if a.check_image:
         import pefile
         p = pefile.PE(a.check_image, fast_load=True); ref = bytearray(p.get_memory_mapped_image()); ref += bytes(len(pat) - len(ref))
@@ -217,11 +235,11 @@ def generate(K, a):
     by_rva = {f.rva: f for f in fs}
     ch = changed_functions(K, fs, van, pat, applied)
     by_rva_p = dict(by_rva)                                    # the functions as the PATCHED lift sees them (cave extents)
-    extra_funcs = []
-    if X:
+    extra_funcs = []; all_caves = {}; table_of = {}
+    for X in Xs:
         import copy
         for f in X.funcs:
-            if f in ch: die('extra-edit function 0x%x is also changed by the main mod DLL' % f)
+            if f in ch: die('extra-edit function 0x%x is also changed by the main mod DLL or by another extra edit list' % f)
             if f not in by_rva: die('extra-edit function 0x%x is not a universe function' % f)
         for rva, old, new, func, pad in X.edits:
             f = by_rva[func]
@@ -236,7 +254,10 @@ def generate(K, a):
             if lo != f.hi - BASE or hi <= lo or (nxt is not None and BASE + hi > nxt): die('cave of 0x%x: 0x%x..0x%x is not directly behind the function and before the next one' % (func, lo, hi))
             if any(b != 0xcc for b in van[lo:hi]): die('cave of 0x%x: the vanilla bytes are not 0xCC padding' % func)
             g2 = copy.copy(f); g2.hi = BASE + hi; by_rva_p[func] = g2
-        extra_funcs = list(X.funcs)
+        for f in X.funcs:
+            if f not in ch and f != X.site_func: die('extra-edit function 0x%x of %s has neither a code edit nor a site' % (f, X.path))
+            table_of[f] = X.table
+        extra_funcs += list(X.funcs); all_caves.update(X.caves)
     for frva in SITES:
         if frva in ch: die('inline-site function 0x%x also has static edits' % frva)
     want = sorted(int(x, 16) for x in a.funcs.replace(',', ' ').split())
@@ -262,8 +283,8 @@ def generate(K, a):
         name = ('mod_f_%x' if rva in chained else 'f_%x') % rva
         site = SITES.get(rva)
         r, L = lift_one(K, SiteLifter, env_p, by_rva_p[rva], name, site=site)
-        if rva in (X.caves if X else ()):
-            lo, hi = X.caves[rva]
+        if rva in all_caves:
+            lo, hi = all_caves[rva]
             if 'L%x:' % lo not in r.text or 'goto L%x;' % lo not in r.text: die('cave of 0x%x: no lifted block at 0x%x' % (rva, lo))
             if L.extents.get(BASE + lo) != BASE + hi: die('cave of 0x%x: the lifted block does not cover exactly 0x%x..0x%x' % (rva, lo, hi))
         if r.text == vres[rva].text.replace('void f_%x(' % rva, 'void %s(' % name, 1): die('patched lift of 0x%x is identical to the vanilla lift' % rva)
@@ -281,7 +302,7 @@ def generate(K, a):
                         imports=sorted(r.imports), dispatch_calls=r.n_dispatch_call, dispatch_jmps=r.n_dispatch_jmp, jump_tables=r.n_jt,
                         text_sha256=hashlib.sha256(r.text.encode()).hexdigest(), vanilla_text_matches_shard=True))
     return types.SimpleNamespace(van=van, pat=pat, nmc_rva=nmc_rva, applied=applied, E=E, env_p=env_p, env_v=env_v, fs=fs, by_rva=by_rva, by_rva_p=by_rva_p, hooks=hooks,
-                                 extra=X, extra_funcs=extra_funcs,
+                                 extra=(Xs[0] if Xs else None), extras=Xs, extra_funcs=extra_funcs, table_of=table_of, all_caves=all_caves,
                                  imps=imps, want=want, chained=chained, changed=ch, out=out, report=rep, SiteLifter=SiteLifter, vres=vres, extents=extents, vextents=vextents)
 
 def write_c(K, G, path):
@@ -295,7 +316,7 @@ def write_c(K, G, path):
         decl.append('void %s(KCtx *g);' % sym)
     for s in sorted(imps): decl.append('void %s(KCtx *g);' % s)
     o = ['/* GENERATED by tools/mod_static_lift.py: %d functions re-lifted from the PATCHED image (mod static edits + 2 inline detour sites%s).'
-         % (len(G.out), '; %d of them changed by NeverlandFly.dll' % len(G.extra_funcs) if G.extra_funcs else ''),
+         % (len(G.out), ''.join('; %d of them changed by %s' % (len(X.funcs), X.dll) for X in G.extras)),
          ' * Game-derived: never commit.  Compile with the shard flags (-O1 ...). */', '#include "khrt.h"', '#include "khrt_tables.h"']
     o.append('/* site handlers: runtime/mod_static_sites.c (Detours sites: 1 = continue at the "ok" address, 0 = the "skip" address; the result of an imm site is not used) */')
     for frva, s in sorted(SITES.items()): o.append('int %s(KCtx *g);' % s['handler'])
@@ -310,12 +331,13 @@ def write_c(K, G, path):
         o.append('  {0x%x, %s, orig_f_%x, %d},' % (rva, G.out[rva][0], rva, 1 if rva in G.chained else 0))
     o.append('};')
     o.append('const u32 kh_mod_static_fn_count = %d;' % len(main))
-    if G.extra_funcs:
-        o.append('/* the functions NeverlandFly.dll changes (Task 19, runtime/mod_neverland.c), same record */')
-        o.append('const struct kh_mod_static_fn kh_mod_neverland_fn_table[] = {')
-        for rva in G.extra_funcs: o.append('  {0x%x, %s, orig_f_%x, %d},' % (rva, G.out[rva][0], rva, 1 if rva in G.chained else 0))
+    for X in G.extras:
+        if X.table == 'neverland': o.append('/* the functions NeverlandFly.dll changes (Task 19, runtime/mod_neverland.c), same record */')
+        else: o.append('/* the functions %s changes (%s), same record */' % (X.dll, X.J.get('note', 'table %s' % X.table)))
+        o.append('const struct kh_mod_static_fn kh_mod_%s_fn_table[] = {' % X.table)
+        for rva in X.funcs: o.append('  {0x%x, %s, orig_f_%x, %d},' % (rva, G.out[rva][0], rva, 1 if rva in G.chained else 0))
         o.append('};')
-        o.append('const u32 kh_mod_neverland_fn_count = %d;' % len(G.extra_funcs))
+        o.append('const u32 kh_mod_%s_fn_count = %d;' % (X.table, len(X.funcs)))
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     data = '\n'.join(o) + '\n'
     open(path, 'w').write(data)
@@ -325,7 +347,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--khlift', required=True); ap.add_argument('--edits', required=True); ap.add_argument('--exe', required=True)
     ap.add_argument('--funcs', required=True); ap.add_argument('--chained', default=''); ap.add_argument('--vanilla-shards', required=True)
-    ap.add_argument('--out', required=True); ap.add_argument('--report'); ap.add_argument('--check-image'); ap.add_argument('--extra-edits')
+    ap.add_argument('--out', required=True); ap.add_argument('--report'); ap.add_argument('--check-image'); ap.add_argument('--extra-edits', action='append', default=[])
     a = ap.parse_args()
     K = setup(a.khlift, a.exe)
     G = generate(K, a)
@@ -333,10 +355,11 @@ def main():
     if a.report:
         json.dump(dict(out_sha256=sha, out_bytes=n, functions=G.report, sites={('%x' % k): dict(site='%x' % v['site'], moved=v['moved'], ok='%x' % v['ok'], skip='%x' % v['skip'],
                   handler=v['handler'], dll_handler='%x' % v['dll_handler'], kind=v.get('kind', 'detours')) for k, v in SITES.items()}, checked_against=a.check_image,
-                  extra=dict(source=a.extra_edits, functions=['%x' % f for f in G.extra_funcs], caves={('%x' % k): ['%x' % v[0], '%x' % v[1]] for k, v in G.extra.caves.items()},
-                             edits=[dict(rva='%x' % e[0], len=len(e[2]), func='%x' % e[3], pad=e[4]) for e in G.extra.edits]) if G.extra else None), open(a.report, 'w'), indent=1)
-    print('mod_static_lift: %d functions re-lifted (%d with static edits, %d sites; %d chained; %d of them for NeverlandFly.dll, %d code caves), all %d vanilla lifts identical to the shipped shards; wrote %s (%d bytes, sha256 %s)'
-          % (len(G.want), len(G.changed), len(SITES), len(G.chained), len(G.extra_funcs), len(G.extra.caves) if G.extra else 0, len(G.want), a.out, n, sha[:16]))
+                  extra=[dict(source=X.path, table=X.table, dll=X.dll, functions=['%x' % f for f in X.funcs], caves={('%x' % k): ['%x' % v[0], '%x' % v[1]] for k, v in X.caves.items()},
+                              edits=[dict(rva='%x' % e[0], len=len(e[2]), func='%x' % e[3], pad=e[4]) for e in X.edits]) for X in G.extras] or None), open(a.report, 'w'), indent=1)
+    print('mod_static_lift: %d functions re-lifted (%d with static edits, %d sites; %d chained; %s; %d code caves), all %d vanilla lifts identical to the shipped shards; wrote %s (%d bytes, sha256 %s)'
+          % (len(G.want), len(G.changed), len(SITES), len(G.chained), ', '.join('%d of them for %s' % (len(X.funcs), X.dll) for X in G.extras) or 'no extra edit lists',
+             len(G.all_caves), len(G.want), a.out, n, sha[:16]))
 
 if __name__ == '__main__':
     main()

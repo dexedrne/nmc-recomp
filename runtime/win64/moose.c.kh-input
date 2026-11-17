@@ -25,10 +25,50 @@
  *   [kh2.cache] magic / player / friend / drive / menu  ("reserved block size increases", each at most 0x1fffff KiB): inline hooks
  *                      at the entry of 0x39e260 (size += increase of that index: 1 magic, 2 player, 3 and 4 friend, 5 drive,
  *                      6 menu) and of 0x39e270 (player += player increase, friend += friend increase); signed saturating adds.
- *   Not handled here, left as the original: [kh2.fixes] scd_priority (bit 1: the 5-byte call at 0x927e2, the lookup in the sound
- *   priority table for voices, becomes `xor eax,eax`; bit 2: a patch at 0x92758 for sound effects), [kh2.hacks] fast_title (0x2b46eb
- *   `lea edi,[r12-0xc]` becomes `mov edi,0`), attempt_continue_after_exception_... (a vectored exception handler), no_death,
- *   test_crash.
+ *   [kh2.fixes] scd_priority  (Task 23; DLL 0x180003050; a missing key means 1, value 0 = nothing.)  Bit 1 "Voice": the 5-byte
+ *                      `call 0x1400ae1e0` at exe 0x927e2 (the lookup in the sound priority table; `test rax,rax / je` follows) is
+ *                      re-encoded as `xor eax,eax` and a 3-byte NOP (31 c0 0f 1f 00): the lookup always "finds nothing".  Bit 2
+ *                      "Sound effects" is a second patch at exe 0x92758 (not set in the shipped ini: a named fatal here).
+ *   [kh2.hacks] fast_title    (Task 23; DLL 0x180001fba; a missing key means OFF.)  exe 0x2b46eb `lea edi,[r12-0xc]` (edi = 8)
+ *                      becomes `mov edi,0x11` (bf 11 00 00 00), the value the other branch loads at 0x1402b46fc.  (An earlier
+ *                      version of this comment and implementation notes said `mov edi,0`: wrong, the request's immediate is 0x11.)
+ *                      Both patches go through the DLL's 0x18000b640: VirtualProtect, the encoder library writes the instruction,
+ *                      the rest of the 5 bytes is filled from the DLL's NOP table.  tools/gen_mod_moose.py reads the request
+ *                      fields, the patterns and the NOP bytes from the DLL file and writes gen/mod_moose_table.h; the two
+ *                      functions (0x92680, 0x2b4590) are re-lifted from the patched image by the Task 12 mechanism, and the hooks
+ *                      below run the patched body only when the ini turns the patch on (kh_moose_init), the vanilla body otherwise.
+ *   [kh2.hacks] no_death (a missing key means off; a patch at exe 0x404d60) and test_crash (a deliberate write to address 0):
+ *                      not set in the shipped ini, a named fatal here if someone sets them.
+ *   [kh2.hacks] attempt_continue_after_exception_but_probably_make_things_worse  (DLL 0x180002144; a missing key means ON, as does
+ *                      the shipped value 1.)  The DLL registers a FIRST-CHANCE vectored exception handler (0x18000c670:
+ *                      AddVectoredExceptionHandler(1, 0x18000bbf0)).  NOT emulated here (see kh_moose_fault_note); what it does,
+ *                      decoded from the listing and its four jump tables (0xc360 / 0xc36c by exception code, 0xc3fc / 0xc510 by
+ *                      register id):
+ *                        1. It logs the exception, then gives up (returns 0 = EXCEPTION_CONTINUE_SEARCH, the game dies as without
+ *                           the DLL) when there is no record, when ExceptionFlags has EXCEPTION_NONCONTINUABLE, or when the code is
+ *                           not one of:
+ *                             0xC0000005 access violation, 0x80000002 datatype misalignment, 0xC0000006 in-page error,
+ *                             0xC000008C array bounds exceeded      -- these four only with NumberParameters >= 1 and
+ *                                                                     ExceptionInformation[0] <= 1, i.e. a READ or a WRITE (not 8,
+ *                                                                     an instruction fetch: a call / jump to a bad address);
+ *                             0xC000008D..0xC0000091 and 0xC0000093..0xC0000095 (the floating-point codes except stack check, integer
+ *                             divide by zero, integer overflow) -- without a parameter test.
+ *                        2. It decodes the instruction at ExceptionAddress (64-bit mode, the DLL's disassembler library); decode
+ *                           failure = give up.
+ *                        3. For every operand that is a REGISTER and is WRITTEN by the instruction it changes the thread context:
+ *                           64- and 32-bit general registers = 0; 16-bit ones: `Rxx &= 0xffff0000`, low 8-bit ones `&= 0xffffff00`,
+ *                           AH/CH/DH/BH `&= 0xffff00ff` (the masks are 32-bit constants and-ed as qwords, so bits 32..63 are cleared
+ *                           as well); x87 / MMX registers and XMM0..15 = 0; the x87 control, status and tag words = 0; segment
+ *                           registers = 0; DR0..DR3 = 0 with their enable bits in DR7 cleared; a write of the flags register is
+ *                           ignored.  It GIVES UP (the game dies) when a written register is IP / EIP / RIP (so a call, jmp or
+ *                           ret is never skipped), XMM16+ / YMM / ZMM / TMM, or any id from 204 on other than DR0..DR3 (table,
+ *                           control, test, bound, mask registers ...).  Memory operands are not touched: a faulting store is
+ *                           simply lost, a faulting load leaves 0 in its destination register.
+ *                        4. EFlags: the flags the instruction modifies or sets to 0 are cleared, the ones it sets to 1 are set.
+ *                        5. Rip += the instruction's length; it returns -1 = EXCEPTION_CONTINUE_EXECUTION.  (The first time it also
+ *                           marks the game's window title.)
+ *                      So with this ini the modded PC game runs on through null / wild reads and writes and divisions by zero
+ *                      in game or DLL code, where the unmodded game (and this port) stops.
  *
  * What this file does: the same data writes at start-up, with the buffers taken from the id zone as 32 MiB-aligned page runs
  * (ga_pages_aligned: committed on demand, deterministic addresses).  A lifted function cannot have one instruction re-encoded, so
@@ -40,6 +80,10 @@
 #include "khnmc_rt.h"
 #include <errno.h>
 #include <unistd.h>
+#include <signal.h>
+#include <ucontext.h>
+#include <sys/wait.h>
+#include "mod_moose_table.h"                      /* generated by tools/gen_mod_moose.py: the two ini-switched code patches */
 
 #define CACHE_STATIC  (GS_BASE+0xbf33c0ull)       /* start of the static cache pool; with Moose: holds the pointer to the new one */
 #define CACHE_STATIC_SIZE 0x1e00000ull
@@ -61,12 +105,17 @@
 #define F_BAR_RELEASE (GS_BASE+0x3a6a10ull)
 void orig_f_39d590(KCtx *g); void orig_f_39dab0(KCtx *g); void orig_f_3e5f30(KCtx *g); void orig_f_3e5f90(KCtx *g); void orig_f_39e260(KCtx *g); void orig_f_39e270(KCtx *g);
 
-typedef struct { s64 cache_kib, data_kib, add_kib[5]; int has_cache, has_data; char err[160]; } MooseCfg;   /* add_kib: magic, player, friend, drive, menu */
+typedef struct { s64 cache_kib, data_kib, add_kib[5]; int has_cache, has_data; char err[160];              /* add_kib: magic, player, friend, drive, menu */
+                 s64 scd_priority, fast_title, cont, no_death, test_crash; int has_scd, has_fast, has_cont, has_no_death, has_test_crash; } MooseCfg;
 static int cache_moved, data_moved, blocks_on;          /* which parts are applied */
 static int force_static;                                 /* selftest: run the replacements on the vanilla pools */
 static u64 cache_base, cache_size, data_base, data_size;
 static s32 add_bytes[5];
 static char ini_path[1024]; static const char *state="not initialised";
+static int continue_on, continue_default;                /* [kh2.hacks] attempt_continue_after_exception_...: the DLL's exception handler is installed (default: key missing) */
+int kh_moose_continue_on(void){ return continue_on; }
+static int patch_on[KH_MOOSE_NPATCH];                    /* the ini turns the code patch on: its function runs the body re-lifted from the patched image */
+static _Atomic u64 c_patch[KH_MOOSE_NPATCH][2];          /* calls of the function with the patch off / on */
 static _Atomic u64 c_layout, c_free_q, c_data_reset, c_data_release, c_blk_set, c_party_set, c_evict;
 static u64 hw_cache_bottom, hw_cache_top_used, hw_data, hw_entries;     /* high-water marks (bytes), sampled once per game frame and at every layout */
 
@@ -150,6 +199,16 @@ void f_3e5f90(KCtx *g){ atomic_fetch_add(&c_data_reset,1); u64 b=cur_data_base(g
 void f_39e260(KCtx *g){ atomic_fetch_add(&c_blk_set,1); if(blocks_on) KH_RDX(g)=(u64)(u32)sat_add((s32)KH_RDX(g),blk_add_for((int)(s32)KH_RCX(g))); orig_f_39e260(g); }
 void f_39e270(KCtx *g){ atomic_fetch_add(&c_party_set,1); if(blocks_on){ KH_RDX(g)=(u64)(u32)sat_add((s32)KH_RDX(g),add_bytes[2]); KH_RCX(g)=(u64)(u32)sat_add((s32)KH_RCX(g),add_bytes[1]); } orig_f_39e270(g); }
 
+/* ---- the two ini-switched code patches (Task 23): exe 0x92680 (scd_priority bit 1) and exe 0x2b4590 (fast_title) ------------------ */
+void orig_f_92680(KCtx *g); void mod_f_92680(KCtx *g); void orig_f_2b4590(KCtx *g); void mod_f_2b4590(KCtx *g);
+static KhFn patch_body[KH_MOOSE_NPATCH][2]={{orig_f_92680,mod_f_92680},{orig_f_2b4590,mod_f_2b4590}};   /* [patch][off / on]; replaced by recorders in the selftest */
+void kh_phase_title_entry(void);                         /* phase_log.c: the title.Layout.task counter stays in front */
+void f_92680(KCtx *g){ int on=patch_on[0]; atomic_fetch_add(&c_patch[0][on],1); patch_body[0][on](g); }
+void f_2b4590(KCtx *g){ kh_phase_title_entry(); int on=patch_on[1]; atomic_fetch_add(&c_patch[1][on],1); patch_body[1][on](g); }
+struct kh_mod_static_fn { u32 rva; KhFn mod, orig; int chained; };
+extern const struct kh_mod_static_fn kh_mod_moose_fn_table[]; extern const u32 kh_mod_moose_fn_count;
+extern KhFn kh_lookup(u64 target);
+
 /* ---- usage statistics (both modes): how much of the pools the game really uses --------------------------------------------------- */
 static u64 tab_id2p(u32 id){ if(!id) return 0; u64 b; u32 v=id&0x7fffffffu; memcpy(&b,(void*)((uintptr_t)(GS_BASE+0x2b0d720ull+8ull*(v>>25))+gs_bias),8); return b|(v&0x1ffffffu); }   /* read-only decode: no guest call from a statistics path */
 static void sample(KCtx *g){
@@ -175,6 +234,13 @@ static int ini_parse(const char *path,MooseCfg *c){     /* 1 = read; 0 = no such
         static const char *const blk[5]={"magic","player","friend","drive","menu"}; s64 *dst=NULL; int *flag=NULL;
         if(!strcmp(sec,"kh2.cache")){ if(!strcmp(key,"size")){ dst=&c->cache_kib; flag=&c->has_cache; } else for(int i=0;i<5;i++) if(!strcmp(key,blk[i])) dst=&c->add_kib[i]; }
         else if(!strcmp(sec,"kh2.data")&&!strcmp(key,"size")){ dst=&c->data_kib; flag=&c->has_data; }
+        else if(!strcmp(sec,"kh2.fixes")&&!strcmp(key,"scd_priority")){ dst=&c->scd_priority; flag=&c->has_scd; }
+        else if(!strcmp(sec,"kh2.hacks")){
+            if(!strcmp(key,"fast_title")){ dst=&c->fast_title; flag=&c->has_fast; }
+            else if(!strcmp(key,"attempt_continue_after_exception_but_probably_make_things_worse")){ dst=&c->cont; flag=&c->has_cont; }
+            else if(!strcmp(key,"no_death")){ dst=&c->no_death; flag=&c->has_no_death; }
+            else if(!strcmp(key,"test_crash")){ dst=&c->test_crash; flag=&c->has_test_crash; }
+        }
         if(!dst) continue;
         char *end; errno=0; long long v=strtoll(val,&end,0);
         if(end==val||errno){ snprintf(c->err,sizeof c->err,"[%s] %s=%s is not a number",sec,key,val); rc=-1; break; }
@@ -212,26 +278,102 @@ static void apply(KCtx *g,const MooseCfg *c){
     }
     for(int i=0;i<5;i++){ add_bytes[i]=(s32)((u32)c->add_kib[i]<<10); if(add_bytes[i]) blocks_on=1; }
 }
+/* the value the DLL works with for a key: the ini's, or the DLL's default when the key is missing */
+static s64 patch_value(const MooseCfg *c,int i){
+    if(!strcmp(kh_moose_patches[i].key,"scd_priority")) return c->has_scd?c->scd_priority:kh_moose_patches[i].dflt;
+    if(!strcmp(kh_moose_patches[i].key,"fast_title")) return c->has_fast?c->fast_title:kh_moose_patches[i].dflt;
+    return 0;
+}
+static int patch_wanted(const MooseCfg *c,int i){ s64 v=patch_value(c,i); return kh_moose_patches[i].bit?(v&kh_moose_patches[i].bit)!=0:v!=0; }
+/* the code patches and the exception-handler switch; `write` = also put the patch bytes into the image, as the DLL does */
+static void apply_hacks(KCtx *g,const MooseCfg *c,int write){
+    if(c->has_test_crash&&c->test_crash) kh_fatal(g,"moose: [kh2.hacks] test_crash=%lld: the DLL writes to address 0 on purpose here (its crash test)",(long long)c->test_crash);
+    if(c->has_no_death&&c->no_death) kh_fatal(g,"moose: [kh2.hacks] no_death=%lld: the DLL would patch exe 0x404d60 (not set in the shipped ini, not ported)",(long long)c->no_death);
+    if(((c->has_scd?c->scd_priority:1)&2)) kh_fatal(g,"moose: [kh2.fixes] scd_priority=%lld has bit 2 (sound effects): the DLL would patch exe 0x92758 (not set in the shipped ini, not ported)",(long long)c->scd_priority);
+    for(int i=0;i<KH_MOOSE_NPATCH;i++){
+        const struct kh_moose_patch *p=&kh_moose_patches[i]; patch_on[i]=0;
+        if(!patch_wanted(c,i)) continue;
+        if(memcmp(hp(g,GS_BASE+p->rva),p->old_,5)&&memcmp(hp(g,GS_BASE+p->rva),p->new_,5))
+            kh_fatal(g,"moose: [%s] %s: the exe does not have the expected bytes at rva 0x%x (the DLL's \"Pattern not found.\")",p->section,p->key,p->rva);
+        if(write) memcpy(hp(g,GS_BASE+p->rva),p->new_,5);
+        patch_on[i]=1;
+    }
+    continue_default=!c->has_cont; continue_on=c->has_cont?c->cont!=0:1;
+}
+static void unapply_hacks(KCtx *g){                       /* selftest only */
+    for(int i=0;i<KH_MOOSE_NPATCH;i++){ if(patch_on[i]&&!memcmp(hp(g,GS_BASE+kh_moose_patches[i].rva),kh_moose_patches[i].new_,5)) memcpy(hp(g,GS_BASE+kh_moose_patches[i].rva),kh_moose_patches[i].old_,5); patch_on[i]=0; }
+    continue_on=continue_default=0;
+}
+/* the re-lifted bodies must be linked behind the two hooks (Makefile MOD_MOOSE_FUNCS; tools/check_mod_static_link.py --choice) */
+static void check_link(KCtx *g){
+    if(kh_mod_moose_fn_count!=KH_MOOSE_NPATCH) kh_fatal(g,"moose-link: gen/mod_static_lifted.c has %u KH2Moose functions, gen/mod_moose_table.h lists %d",kh_mod_moose_fn_count,KH_MOOSE_NPATCH);
+    static const KhFn own[KH_MOOSE_NPATCH]={f_92680,f_2b4590};
+    for(int i=0;i<KH_MOOSE_NPATCH;i++){ const struct kh_mod_static_fn *f=NULL;
+        for(u32 k=0;k<kh_mod_moose_fn_count;k++) if(kh_mod_moose_fn_table[k].rva==kh_moose_patches[i].func) f=&kh_mod_moose_fn_table[k];
+        if(!f||!f->chained||f->mod==f->orig||!f->mod||kh_lookup(GS_BASE+kh_moose_patches[i].func)!=own[i])
+            kh_fatal(g,"moose-link: f_%x is not the runtime hook in front of a distinct re-lifted body",kh_moose_patches[i].func); }
+}
 static void unapply(KCtx *g){                             /* selftest only: back to the vanilla image state */
     if(cache_moved){ wr64(g,CACHE_STATIC,0); wr64(g,CACHE_TOP,CACHE_STATIC+CACHE_STATIC_SIZE); ga_pages_free_src(cache_base,cache_size,GA_SRC_POOL); }
     if(data_moved){ wr64(g,DATA_STATIC,0); ga_pages_free_src(data_base,data_size,GA_SRC_POOL); }
     cache_moved=data_moved=blocks_on=0; cache_base=cache_size=data_base=data_size=0; memset(add_bytes,0,sizeof add_bytes);
 }
+static void hacks_line(void){
+    fprintf(stderr,"kh: moose: code patches: scd_priority voice (exe 0x927e2 call -> xor eax,eax) %s, fast_title (exe 0x2b46eb -> mov edi,0x11) %s; "
+                   "exception handler (attempt_continue_after_exception_...) on the PC: %s%s\n",patch_on[0]?"ON":"off",patch_on[1]?"ON":"off",
+            continue_on?"ON":"off",continue_on?(continue_default?" (key missing: the DLL's default); not emulated, see the fault report":"; not emulated, see the fault report"):"");
+}
 void kh_moose_init(KCtx *g){
-    const char *e=getenv("KHNMC_MOOSE_HEAPS");
-    if(e&&*e=='0'){ state="off (KHNMC_MOOSE_HEAPS=0): vanilla pool sizes"; fprintf(stderr,"kh: moose: %s\n",state); return; }
+    check_link(g);
+    const char *e=getenv("KHNMC_MOOSE_HEAPS"); int heaps=!(e&&*e=='0');
+    const char *pe=getenv("KHNMC_MOOSE_PATCHES"); int patches=!(pe&&*pe=='0');                 /* A/B switch for the two code patches only */
     if((e=getenv("KHNMC_MOOSE_INI"))&&*e) snprintf(ini_path,sizeof ini_path,"%s",e);
     else { const char *root=getenv("KHNMC_DATA"); snprintf(ini_path,sizeof ini_path,"%s/dll/KH2Moose.ini",root?root:"data"); }
     MooseCfg c; int rc=ini_parse(ini_path,&c);
-    if(rc==0){ state="off (no KH2Moose.ini): vanilla pool sizes"; fprintf(stderr,"kh: moose: no ini at %s: vanilla pool sizes (cache 30 MiB, data 768 KiB)\n",ini_path); return; }
+    if(rc==0){ state="off (no KH2Moose.ini): vanilla pool sizes"; fprintf(stderr,"kh: moose: no ini at %s: vanilla pool sizes (cache 30 MiB, data 768 KiB), no code patch, no exception handler on the PC either\n",ini_path); return; }
     if(rc<0) kh_fatal(g,"moose: %s: %s",ini_path,c.err);
+    if(patches) apply_hacks(g,&c,1);
+    else { continue_default=!c.has_cont; continue_on=c.has_cont?c.cont!=0:1; fprintf(stderr,"kh: moose: KHNMC_MOOSE_PATCHES=0: the ini's code patches are NOT applied\n"); }
+    hacks_line();
+    if(!heaps){ state="off (KHNMC_MOOSE_HEAPS=0): vanilla pool sizes"; fprintf(stderr,"kh: moose: %s\n",state); return; }
     u32 bad=0; if(!sites_ok(g,&bad)) kh_fatal(g,"moose: the exe does not have the expected bytes at rva 0x%x (the DLL's \"Pattern not found.\"): pool sizes cannot be applied to this build",bad);
     apply(g,&c); state="on";
     fprintf(stderr,"kh: moose: %s: cache %llu MiB at 0x%llx..0x%llx (was 30 MiB static at 0x140bf33c0), data heap %llu MiB at 0x%llx (was 768 KiB static at 0x142a254c0), "
                    "reserved block increases (KiB): magic %lld player %lld friend %lld drive %lld menu %lld\n",ini_path,(unsigned long long)(cache_size>>20),(unsigned long long)cache_base,(unsigned long long)(cache_base+cache_size),
             (unsigned long long)(data_size>>20),(unsigned long long)data_base,(long long)c.add_kib[0],(long long)c.add_kib[1],(long long)c.add_kib[2],(long long)c.add_kib[3],(long long)c.add_kib[4]);
 }
+/* Called from the runtime's signal handler (core.c on_sig) right after the "SIGNAL" line.  The DLL's exception handler is NOT
+ * emulated; this says what it would have done on the modded PC, and why the port cannot do the same. */
+void kh_moose_fault_note(FILE *f,int sig,void *addr,void *uctx){
+    if(!continue_on) return;
+    const char *access="";
+#if defined(__x86_64__) && defined(__linux__)
+    if(uctx&&(sig==SIGSEGV||sig==SIGBUS)){ const ucontext_t *uc=uctx; unsigned long long err=(unsigned long long)uc->uc_mcontext.gregs[REG_ERR];
+        access=(err&0x10)?" (this one was an INSTRUCTION FETCH: the handler does not take those, the PC game stops as well)":(err&2)?" (this one was a WRITE)":" (this one was a READ)"; }
+#else
+    (void)uctx;
+#endif
+    (void)addr;
+    if(sig!=SIGSEGV&&sig!=SIGBUS&&sig!=SIGFPE){
+        fprintf(f,"kh: moose: KH2Moose's exception handler (on in the ini) does not take this kind of fault (it takes access violations on a read or write, in-page errors, "
+                  "integer divide / overflow and the floating-point codes): the modded PC game stops here as well.\n");
+        return; }
+    fprintf(f,"kh: moose: NOTE: KH2Moose.ini has [kh2.hacks] attempt_continue_after_exception_but_probably_make_things_worse on%s.  If this fault is a guest instruction\n"
+              "kh: moose:   %s%s, the MODDED PC GAME WOULD NOT HAVE STOPPED HERE: the DLL's first-chance exception handler\n"
+              "kh: moose:   (0x18000bbf0) decodes the faulting instruction, sets every register that instruction writes to 0 (16- and 8-bit registers: that part, plus bits 32..63),\n"
+              "kh: moose:   clears the flags it modifies, drops a faulting store, adds the instruction's length to RIP and continues.  It gives up (and the PC game dies too) for a\n"
+              "kh: moose:   call / jmp / ret through a bad pointer or any other instruction that writes RIP, for an instruction fetch from a bad address, for an instruction it\n"
+              "kh: moose:   cannot decode, for writes of XMM16+/YMM/ZMM or system registers, and for non-continuable exceptions.\n"
+              "kh: moose:   This port cannot continue the same way: the fault is in host code compiled from lifted C (or in the runtime), where one guest instruction is many host\n"
+              "kh: moose:   instructions and guest registers live in host registers, in KCtx and in temporaries; there is no host address that means \"the next guest instruction\" and\n"
+              "kh: moose:   no host register set that means \"the registers this guest instruction writes\", so the handler's skip cannot be reproduced exactly.\n",
+            continue_default?" (the key is missing: the DLL's default)":"",
+            sig==SIGFPE?"dividing by zero (or another arithmetic exception)":"reading or writing a bad address",access);
+}
 void kh_moose_report(FILE *f){
+    fprintf(f,"kh: moose report: code patches: scd_priority voice %s (0x92680 calls: %llu patched body, %llu vanilla body), fast_title %s (0x2b4590 calls: %llu patched, %llu vanilla); "
+              "PC exception handler %s (not emulated)\n",patch_on[0]?"on":"off",(unsigned long long)c_patch[0][1],(unsigned long long)c_patch[0][0],
+            patch_on[1]?"on":"off",(unsigned long long)c_patch[1][1],(unsigned long long)c_patch[1][0],continue_on?"on":"off");
     u64 csz=cache_moved?cache_size:CACHE_STATIC_SIZE, dsz=data_moved?data_size:DATA_STATIC_SIZE;
     fprintf(f,"kh: moose report: heaps=%s; cache %llu KiB (%s): most used from the bottom %llu KiB, from the top %llu KiB, most entries %llu, layouts=%llu evictions=%llu free-queries=%llu; "
               "data heap %llu KiB (%s): most used %llu KiB%s; block-size calls: set=%llu party=%llu, data resets=%llu releases=%llu\n",
@@ -252,6 +394,24 @@ void kh_moose_report(FILE *f){
 static u32 rs=0x2545f491u; static u32 mrnd(void){ rs^=rs<<13; rs^=rs>>17; rs^=rs<<5; return rs; }
 static struct { int n; u64 obj[64], ent[64]; } evlog;
 static void st_evict(KCtx *g){ if(evlog.n<64){ evlog.obj[evlog.n]=A0(g); evlog.ent[evlog.n]=A1(g); } evlog.n++; KH_RET(g); }
+static struct { int n; int which[8]; u64 rcx[8], rsp[8], ret[8]; } pl;                      /* which body a patched function's hook ran */
+static void st_body(KCtx *g,int which){ if(pl.n<8){ pl.which[pl.n]=which; pl.rcx[pl.n]=KH_RCX(g); pl.rsp[pl.n]=KH_RSP(g); pl.ret[pl.n]=rd64(g,KH_RSP(g)); } pl.n++; KH_RAX(g)=0xb0d70000u+(u32)which; KH_RET(g); }
+static void st_b00(KCtx *g){ st_body(g,0); } static void st_b01(KCtx *g){ st_body(g,1); } static void st_b10(KCtx *g){ st_body(g,2); } static void st_b11(KCtx *g){ st_body(g,3); }
+static int st_child(void (*body)(void),char *out,size_t cap){                              /* run body in a child, stderr captured; returns its exit status */
+    FILE *log=tmpfile(); if(!log) return -1; fflush(stderr);
+    pid_t c=fork(); if(c<0){ fclose(log); return -1; }
+    if(!c){ dup2(fileno(log),2); body(); _exit(99); }
+    int st=0; waitpid(c,&st,0); rewind(log); size_t n=fread(out,1,cap-1,log); out[n]=0; fclose(log);
+    return WIFEXITED(st)?WEXITSTATUS(st):-1;
+}
+static volatile uintptr_t st_bad=0x10;
+static void st_fault_write(void){ continue_on=1; continue_default=0; *(volatile char *)st_bad=1; }
+static void st_fault_read(void){ continue_on=1; continue_default=1; volatile char c=*(volatile char *)st_bad; (void)c; }
+static void st_fault_exec(void){ continue_on=1; ((void (*)(void))st_bad)(); }
+static void st_fault_div(void){ continue_on=1; volatile int z=0; volatile int r=7/z; (void)r; }
+static void st_fault_off(void){ continue_on=0; *(volatile char *)st_bad=1; }
+static KCtx *st_g; static MooseCfg st_cfg;
+static void st_fatal_cfg(void){ apply_hacks(st_g,&st_cfg,0); }
 typedef struct { u8 glob[0x30], blk[28]; u64 top, dataptr; } Globals;
 static void glob_get(KCtx *g,Globals *s){ memset(s,0,sizeof *s); memcpy(s->glob,hp(g,LIST_HEAD),sizeof s->glob); memcpy(s->blk,hp(g,BLK),sizeof s->blk); s->top=rd64(g,CACHE_TOP); s->dataptr=rd64(g,DATA_PTR); }
 static void glob_put(KCtx *g,const Globals *s){ memcpy(hp(g,LIST_HEAD),s->glob,sizeof s->glob); memcpy(hp(g,BLK),s->blk,sizeof s->blk); wr64(g,CACHE_TOP,s->top); wr64(g,DATA_PTR,s->dataptr); }
@@ -260,13 +420,84 @@ int kh_moose_selftest(KCtx *g){
     /* 0. the ini as shipped (CRLF, comments, commented-out keys) and the DLL's rules */
     { char p[]="/tmp/khnmc-moose-XXXXXX"; int fd=mkstemp(p); FILE *f=fd>=0?fdopen(fd,"w"):NULL; CHECK(f!=NULL);
       if(f){ fputs("; All sizes are KiB.\r\n\r\n[kh2.cache]\r\n; Game default: 30720; 0 to skip replacement\r\nsize=524288\r\n; Reserved block size increases\r\nplayer=32768\r\n;menu=0\r\n;magic=0\r\nfriend=32768\r\n;drive=0\r\n\r\n"
-                   "[kh2.data]\r\n;size=0\r\nsize=131072\r\n\r\n[kh2.fixes]\r\nscd_priority=1\r\n\r\n[kh2.hacks]\r\nfast_title=1\r\n",f); fclose(f);
+                   "[kh2.data]\r\n;size=0\r\nsize=131072\r\n\r\n[kh2.fixes]\r\n; Bitfield:\r\n;  1: Voice\r\n;  2: Sound effects (may cause deafening sound levels)\r\nscd_priority=1\r\n\r\n[kh2.hacks]\r\nfast_title=1\r\n"
+                   "attempt_continue_after_exception_but_probably_make_things_worse=1",f); fclose(f);          /* the shipped file: no newline behind the last key */
         MooseCfg c; CHECK(ini_parse(p,&c)==1 && c.cache_kib==524288 && c.data_kib==131072 && c.add_kib[0]==0 && c.add_kib[1]==32768 && c.add_kib[2]==32768 && c.add_kib[3]==0 && c.add_kib[4]==0 && c.has_cache && c.has_data);
+        CHECK(c.has_scd && c.scd_priority==1 && c.has_fast && c.fast_title==1 && c.has_cont && c.cont==1 && !c.has_no_death && !c.has_test_crash);
+        CHECK(patch_wanted(&c,0) && patch_wanted(&c,1));                                                         /* as shipped: both code patches on */
+        /* Task 23: the DLL's rules for the three switches.  scd_priority: missing = 1, bit 1 = the voice patch; fast_title: missing = off,
+         * any non-zero value = on; the exception handler: missing = ON, 0 = off */
+        static const struct { const char *ini; int scd, fast, cont; } sw[]={
+            {"[kh2.cache]\nsize=0\n",1,0,1},{"[kh2.fixes]\nscd_priority=0\n[kh2.hacks]\nfast_title=0\nattempt_continue_after_exception_but_probably_make_things_worse=0\n",0,0,0},
+            {"[kh2.fixes]\nscd_priority=1\n",1,0,1},{"[kh2.hacks]\nfast_title=5\n",1,1,1},{"[kh2.hacks]\nfast_title=-1\nattempt_continue_after_exception_but_probably_make_things_worse=7\n",1,1,1},
+            {"[kh2.fixes]\nfast_title=1\n[kh2.hacks]\nscd_priority=0\n",1,0,1},                                 /* keys in the wrong section are not the DLL's keys */
+            {"[kh2.fixes]\nscd_priority = 0x1\n[kh2.hacks]\nno_death=0\ntest_crash=0\n",1,0,1},
+            {"[kh2.fixes]\nscd_priority=4\n",0,0,1},{"[kh2.fixes]\nscd_priority=5\n",1,0,1}};                       /* a bitfield: only bit 1 is the voice patch */
+        int sv_on[KH_MOOSE_NPATCH], sv_c=continue_on, sv_d=continue_default; memcpy(sv_on,patch_on,sizeof sv_on);
+        for(unsigned i=0;i<sizeof sw/sizeof *sw;i++){ f=fopen(p,"w"); fputs(sw[i].ini,f); fclose(f); MooseCfg k; CHECK(ini_parse(p,&k)==1);
+            apply_hacks(g,&k,0); CHECK(patch_on[0]==sw[i].scd && patch_on[1]==sw[i].fast && continue_on==sw[i].cont); CHECK(continue_default==!k.has_cont); }
+        /* what is not ported stops loudly: bit 2 of scd_priority, no_death, test_crash */
+        static const struct { const char *ini, *msg; } bad[]={{"[kh2.fixes]\nscd_priority=2\n","scd_priority=2 has bit 2"},{"[kh2.fixes]\nscd_priority=3\n","scd_priority=3 has bit 2"},
+            {"[kh2.hacks]\nno_death=1\n","no_death=1"},{"[kh2.hacks]\ntest_crash=1\n","test_crash=1"}};
+        for(unsigned i=0;i<sizeof bad/sizeof *bad;i++){ char out[4096]; f=fopen(p,"w"); fputs(bad[i].ini,f); fclose(f); st_g=g; CHECK(ini_parse(p,&st_cfg)==1);
+            CHECK(st_child(st_fatal_cfg,out,sizeof out)==3 && strstr(out,bad[i].msg)!=NULL); }
+        memcpy(patch_on,sv_on,sizeof sv_on); continue_on=sv_c; continue_default=sv_d;
         f=fopen(p,"w"); fputs("[kh2.cache]\nplayer = 0x100\n[kh2.data]\n",f); fclose(f); CHECK(ini_parse(p,&c)==1 && c.cache_kib==122880 && !c.has_data && c.data_kib==0 && c.add_kib[1]==256);   /* missing cache size: the DLL's 120 MiB */
         f=fopen(p,"w"); fputs("[kh2.cache]\nsize=0\nmenu=2097151\n",f); fclose(f); CHECK(ini_parse(p,&c)==1 && c.cache_kib==0 && c.add_kib[4]==0x1fffff);                                     /* 0 = leave the pool alone */
         f=fopen(p,"w"); fputs("[kh2.cache]\nfriend=2097152\n",f); fclose(f); CHECK(ini_parse(p,&c)==-1 && strstr(c.err,"invalid block size"));
         f=fopen(p,"w"); fputs("[kh2.data]\nsize=lots\n",f); fclose(f); CHECK(ini_parse(p,&c)==-1 && strstr(c.err,"not a number"));
         unlink(p); CHECK(ini_parse(p,&c)==0); } }
+    /* ---- Task 23: the two code patches.  Image bytes, the hook's choice of body, the link behind it ---- */
+    { int sv_on[KH_MOOSE_NPATCH], sv_c=continue_on, sv_d=continue_default; memcpy(sv_on,patch_on,sizeof sv_on); u8 sv_b[KH_MOOSE_NPATCH][5];
+      for(int i=0;i<KH_MOOSE_NPATCH;i++) memcpy(sv_b[i],hp(g,GS_BASE+kh_moose_patches[i].rva),5);
+      static const u8 old0[5]={0xe8,0xf9,0xb9,0x01,0x00}, new0[5]={0x31,0xc0,0x0f,0x1f,0x00}, old1[5]={0x41,0x8d,0x7c,0x24,0xf4}, new1[5]={0xbf,0x11,0x00,0x00,0x00};   /* from the DLL listing, not from the generated table */
+      CHECK(KH_MOOSE_NPATCH==2 && kh_moose_patches[0].rva==0x927e2 && kh_moose_patches[0].func==0x92680 && kh_moose_patches[1].rva==0x2b46eb && kh_moose_patches[1].func==0x2b4590);
+      CHECK(!memcmp(kh_moose_patches[0].old_,old0,5) && !memcmp(kh_moose_patches[0].new_,new0,5) && !memcmp(kh_moose_patches[1].old_,old1,5) && !memcmp(kh_moose_patches[1].new_,new1,5));
+      CHECK(kh_moose_patches[0].bit==1 && kh_moose_patches[0].dflt==1 && kh_moose_patches[1].bit==0 && kh_moose_patches[1].dflt==0);
+      CHECK(kh_mod_moose_fn_count==2); check_link(g);
+      for(int i=0;i<KH_MOOSE_NPATCH;i++) memcpy(hp(g,GS_BASE+kh_moose_patches[i].rva),kh_moose_patches[i].old_,5);      /* vanilla bytes for the walk below */
+      MooseCfg k; memset(&k,0,sizeof k);
+      KhFn sv_body[KH_MOOSE_NPATCH][2]; memcpy(sv_body,patch_body,sizeof sv_body);
+      patch_body[0][0]=st_b00; patch_body[0][1]=st_b01; patch_body[1][0]=st_b10; patch_body[1][1]=st_b11;
+      u64 c0[2][2]; for(int i=0;i<2;i++) for(int j=0;j<2;j++) c0[i][j]=c_patch[i][j];
+      for(int m=0;m<4;m++){                                                                    /* every combination of the two switches */
+          k.has_scd=1; k.scd_priority=(m&1)?1:0; k.has_fast=1; k.fast_title=(m&2)?1:0;
+          apply_hacks(g,&k,1);
+          CHECK(!memcmp(hp(g,GS_BASE+0x927e2),(m&1)?new0:old0,5) && !memcmp(hp(g,GS_BASE+0x2b46eb),(m&2)?new1:old1,5));   /* the image holds the patch exactly when it is on */
+          CHECK(rd8(g,GS_BASE+0x927e1)!=0x31 && rd8(g,GS_BASE+0x927e7)==0x48 && rd8(g,GS_BASE+0x2b46f0)!=0x11);       /* nothing next to the 5 bytes is touched */
+          memset(&pl,0,sizeof pl); u64 sp=KH_RSP(g);
+          u64 r0=kh_call(g,GS_BASE+0x92680,0x1111,0,0,0), r1=kh_call(g,GS_BASE+0x2b4590,0x2222,0,0,0);
+          CHECK(pl.n==2 && pl.which[0]==((m&1)?1:0) && pl.which[1]==((m&2)?3:2) && pl.rcx[0]==0x1111 && pl.rcx[1]==0x2222 && KH_RSP(g)==sp);
+          CHECK(r0==0xb0d70000u+(u32)pl.which[0] && r1==0xb0d70000u+(u32)pl.which[1] && pl.ret[0]==pl.ret[1]);      /* a tail call: the body sees the caller's return address */
+          unapply_hacks(g);
+          CHECK(!memcmp(hp(g,GS_BASE+0x927e2),old0,5) && !memcmp(hp(g,GS_BASE+0x2b46eb),old1,5)); }
+      CHECK(c_patch[0][0]==c0[0][0]+2 && c_patch[0][1]==c0[0][1]+2 && c_patch[1][0]==c0[1][0]+2 && c_patch[1][1]==c0[1][1]+2);
+      for(int i=0;i<2;i++) for(int j=0;j<2;j++) c_patch[i][j]=c0[i][j];
+      memcpy(patch_body,sv_body,sizeof sv_body);
+      CHECK(patch_body[0][0]==orig_f_92680 && patch_body[0][1]==mod_f_92680 && patch_body[1][0]==orig_f_2b4590 && patch_body[1][1]==mod_f_2b4590 && mod_f_92680!=orig_f_92680 && mod_f_2b4590!=orig_f_2b4590);
+      /* a build whose bytes at a patch site are neither the old nor the new ones: the DLL's "Pattern not found." */
+      { char out[4096]; wr8(g,GS_BASE+0x2b46eb,0x90); memset(&st_cfg,0,sizeof st_cfg); st_cfg.has_fast=1; st_cfg.fast_title=1; st_g=g;
+        CHECK(st_child(st_fatal_cfg,out,sizeof out)==3 && strstr(out,"[kh2.hacks] fast_title: the exe does not have the expected bytes at rva 0x2b46eb")!=NULL); }
+      for(int i=0;i<KH_MOOSE_NPATCH;i++) memcpy(hp(g,GS_BASE+kh_moose_patches[i].rva),sv_b[i],5);
+      memcpy(patch_on,sv_on,sizeof sv_on); continue_on=sv_c; continue_default=sv_d;
+      /* ---- the fault report: what the modded PC game would have done (the DLL's handler is not emulated) ---- */
+      char out[8192];
+      { FILE *t=tmpfile(); continue_on=1; continue_default=1; kh_moose_fault_note(t,SIGSEGV,NULL,NULL); kh_moose_fault_note(t,SIGFPE,NULL,NULL); continue_default=0; kh_moose_fault_note(t,SIGILL,NULL,NULL);
+        continue_on=0; long before=ftell(t); kh_moose_fault_note(t,SIGSEGV,NULL,NULL); long after=ftell(t); rewind(t); size_t n=fread(out,1,sizeof out-1,t); out[n]=0; fclose(t);
+        CHECK(before==after);                                                                  /* handler off in the ini: no note */
+        CHECK(strstr(out,"WOULD NOT HAVE STOPPED HERE")&&strstr(out,"reading or writing a bad address")&&strstr(out,"dividing by zero")&&strstr(out,"(the key is missing: the DLL's default)"));
+        CHECK(strstr(out,"call / jmp / ret")&&strstr(out,"cannot continue the same way")&&strstr(out,"does not take this kind of fault"));
+        continue_on=sv_c; continue_default=sv_d; }
+      CHECK(st_child(st_fault_write,out,sizeof out)==4 && strstr(out,"kh: SIGNAL 11")&&strstr(out,"WOULD NOT HAVE STOPPED HERE")&&strstr(out,"reading or writing a bad address")&&!strstr(out,"the key is missing"));
+      CHECK(st_child(st_fault_read,out,sizeof out)==4 && strstr(out,"WOULD NOT HAVE STOPPED HERE")&&strstr(out,"the key is missing"));
+      CHECK(st_child(st_fault_div,out,sizeof out)==4 && strstr(out,"kh: SIGNAL 8")&&strstr(out,"dividing by zero")&&strstr(out,"WOULD NOT HAVE STOPPED HERE"));
+      CHECK(st_child(st_fault_off,out,sizeof out)==4 && strstr(out,"kh: SIGNAL 11")&&!strstr(out,"kh: moose:"));
+#if defined(__x86_64__) && defined(__linux__)
+      CHECK(st_child(st_fault_write,out,sizeof out)==4 && strstr(out,"(this one was a WRITE)"));
+      CHECK(st_child(st_fault_read,out,sizeof out)==4 && strstr(out,"(this one was a READ)"));
+      CHECK(st_child(st_fault_exec,out,sizeof out)==4 && strstr(out,"INSTRUCTION FETCH"));
+#endif
+    }
     CHECK(sat_add(5,7)==12 && sat_add(0x7ffffff0,0x100)==0x7fffffff && sat_add(-5,3)==-2 && sat_add(-0x7ffffff0,-0x100)==(s32)0x80000000u && sat_add(0xc0000,32768<<10)==0x20c0000 && sat_add(0,0)==0);
     { u32 bad=0; CHECK(sites_ok(g,&bad) && bad==0); }                                  /* this exe is the build the DLL's patterns match */
     if(cache_moved||data_moved){ fprintf(stderr,"kh: moose selftest: the mod's pools are applied in this process: the comparison with the vanilla originals is skipped (%d checks, %d failures)\n",checks,fails); return fails; }

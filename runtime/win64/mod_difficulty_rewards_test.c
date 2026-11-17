@@ -1,6 +1,19 @@
 #include "khnmc_rt.h"
+#include <unistd.h>
+#include <sys/wait.h>
 static int checks, failures;
 #define T(x) do { checks++; if(!(x)){ failures++; fprintf(stderr,"difficulty rewards FAIL line %d: %s\n",__LINE__,#x); } } while(0)
+/* One hook call in a child with stderr captured: 1 when it ended in kh_fatal (exit status 3) and printed every needle. */
+static int fatal_child(KCtx *g,u32 rva,u64 a0,u64 a1,u64 a2,const char *n1,const char *n2,const char *n3){
+    FILE *log=tmpfile(); if(!log) kh_fatal(g,"rewards selftest cannot open a fatal log");
+    pid_t child=fork(); if(child<0) kh_fatal(g,"rewards selftest fork failed");
+    if(!child){ if(dup2(fileno(log),2)<0) _exit(98); kh_call(g,GS_BASE+rva,a0,a1,a2,0); _exit(99); }
+    int status=0; if(waitpid(child,&status,0)!=child) kh_fatal(g,"rewards selftest waitpid failed");
+    rewind(log); char out[4096]; size_t len=fread(out,1,sizeof out-1,log); out[len]=0; fclose(log);
+    int ok=WIFEXITED(status)&&WEXITSTATUS(status)==3&&strstr(out,n1)&&strstr(out,n2)&&strstr(out,n3);
+    if(!ok) fprintf(stderr,"  rewards fatal child status=0x%x output: %.300s\n",status,out);
+    return ok;
+}
 /* Called inside the caps fixture, which provides the real character-2 sheet registry. */
 int kh_mod_rewards_selftest(KCtx *g,u64 sheet){
     u32 old=rd32(g,GS_BASE+0x9abd48);
@@ -51,17 +64,18 @@ int kh_mod_rewards_selftest(KCtx *g,u64 sheet){
         T(rd32(g,sheet+4)==1000+(mask?0:scaled?1:3));
         T(rd32(g,sheet+0x184)==1000+(mask?0:scaled?3:7));
     }
-    /* Invalid difficulty falls through to each complete vanilla original. */
-    extern void orig_f_3edf90(KCtx *),orig_f_3ed7d0(KCtx *);
-    u64 originals[]={kh_host_fn("rewards-original-bons",orig_f_3edf90),kh_host_fn("rewards-original-popup",orig_f_3ed7d0)};
-    const int invalid[]={-1,4,INT32_MAX};
-    for(int d=0;d<3;d++){
-        wr32(g,GS_BASE+0x9abd48,invalid[d]); memset(hp(g,rec-16),0,48); wr8(g,rec+1,2); wr8(g,rec+2,255);
-        wr32(g,sheet+4,1000); kh_call(g,originals[0],rec,sheet,0,0); u32 expected=rd32(g,sheet+4);
-        wr32(g,sheet+4,1000); kh_call(g,GS_BASE+0x3edf90,rec,sheet,0,0); T(rd32(g,sheet+4)==expected);
-        wr32(g,sheet+4,1000); wr8(g,rec+14,3); wr8(g,rec+15,255);
-        kh_call(g,originals[1],rec,2,1,0); expected=rd32(g,sheet+4);
-        wr32(g,sheet+4,1000); kh_call(g,GS_BASE+0x3ed7d0,rec,2,1,0); T(rd32(g,sheet+4)==expected);
+    /* A dword outside 0..3: neither DLL handler has a path to the original (no reference to its trampoline), and both then take
+     * their multipliers from a stack slot nothing wrote (31f66 / 31f6c, 2f9fe / 2fa04).  A named fatal that says so; the vanilla
+     * body is not an answer. */
+    static const s32 invalid[]={-1,4,INT32_MAX,INT32_MIN};
+    static const char *const shown[]={"= 0xffffffff ","= 0x4 ","= 0x7fffffff ","= 0x80000000 "};
+    for(int d=0;d<4;d++){
+        wr32(g,GS_BASE+0x9abd48,(u32)invalid[d]); memset(hp(g,rec-16),0,48); wr8(g,rec+1,2); wr8(g,rec+2,255);
+        wr32(g,sheet+4,1000); wr32(g,sheet+0x184,1000);
+        T(fatal_child(g,0x3edf90,rec,sheet,0,"mod-difficulty-out-of-range:",shown[d],"exe 0x3edf90 = DLL 0x2f9b0"));
+        wr8(g,rec+14,3); wr8(g,rec+15,255);
+        T(fatal_child(g,0x3ed7d0,rec,2,1,"mod-difficulty-out-of-range:",shown[d],"exe 0x3ed7d0 = DLL 0x31ee0"));
+        T(rd32(g,sheet+4)==1000 && rd32(g,sheet+0x184)==1000);
     }
     /* Stat-sheet AP stays the vanilla unsigned-byte, character-1/14-only rule. */
     for(int d=0;d<4;d++) for(int c=1;c<=3;c++) for(int i=0;i<6;i++){

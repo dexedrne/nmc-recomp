@@ -161,7 +161,8 @@ def main():
     ap.add_argument('--jobs', type=int, default=4); ap.add_argument('--seed', type=int, default=1234); ap.add_argument('--only')
     ap.add_argument('--native-ms', type=int, default=20, help='CPU-time limit of one oracle run (a useful run takes microseconds; long loops over random data are cut here)')
     ap.add_argument('--mutate-vanilla', action='store_true', help='sensitivity check: test the VANILLA lifted text against the patched oracle; mismatches are expected')
-    ap.add_argument('--extra-edits', help='NeverlandFly edit list (tools/gen_mod_neverland.py), applied on top of the main mod DLL edits')
+    ap.add_argument('--extra-edits', action='append', default=[], help='extra edit list applied on top of the main mod DLL edits (tools/gen_mod_neverland.py, '
+                    'tools/gen_mod_moose.py); may be given more than once')
     a = ap.parse_args()
     os.makedirs(a.work, exist_ok=True)
     K = MSL.setup(a.khlift, a.exe); BASE = K.BASE

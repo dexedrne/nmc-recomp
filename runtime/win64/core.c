@@ -699,6 +699,7 @@ static void on_sig(int sig,siginfo_t *si,void *uc){
         else if(gs_bias) fprintf(stderr,"kh: the address is outside guest space (host 0x%llx..0x%llx, bias 0x%llx); as a guest address it would be 0x%llx: a host pointer used as a guest pointer, or a guest pointer used without the bias\n",
                                  (unsigned long long)gs_host_base,(unsigned long long)(gs_host_base+gs_size),(unsigned long long)gs_bias,(unsigned long long)ga);
     }
+    { extern void kh_moose_fault_note(FILE *,int,void *,void *); kh_moose_fault_note(stderr,sig,si->si_addr,uc); }   /* Task 23: what the modded PC game would have done here */
     fault_who(stderr); dump_last(stderr,30); guest_bt(tl_cur_g,stderr);
     void *bt[48]; int n=backtrace(bt,48); fprintf(stderr,"---- host backtrace ----\n"); backtrace_symbols_fd(bt,n,2);
     fault_extras(stderr); fflush(stderr); if(trf) fflush(trf); _exit(4);

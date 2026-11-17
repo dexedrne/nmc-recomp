@@ -33,19 +33,19 @@ void kh_phase_mapevent_entry(void){ entries[6]++; } /* f_405440 itself lives in 
 static _Atomic u64 field_cmds_total;
 u64 kh_phase_field_cmds(void){ return atomic_load(&field_cmds_total); }
 u64 kh_input_game_frames(void);
-/* Task 12: 3f29e0 has two static edits (0x3f2d2e, 0x3f2d4a); the probe forwards to the body re-lifted from the patched image. */
-void mod_f_3f29e0(KCtx *);
-void f_3f29e0(KCtx *g){ entries[7]++;
+/* Task 23: f_3f29e0 itself lives in mod_hooks_b.c.  On the PC the mod DLL's detour 0x306c0 REPLACES this function (it never calls
+ * the trampoline), so neither the vanilla body nor the body re-lifted from the patched image (mod_f_3f29e0, Task 12) runs; the hook
+ * calls this probe first. */
+void kh_phase_field_cmd_entry(void){ entries[7]++;
     if(atomic_fetch_add(&field_cmds_total,1)==0){ extern _Atomic u64 gfx_presents;
-        fprintf(stderr,"kh: phase: first FIELD_COMMAND.execute at present %llu, game frame %llu, virtual vblank %llu\n",(unsigned long long)gfx_presents,(unsigned long long)kh_input_game_frames(),(unsigned long long)(kh_vclock_on?kh_vclock_vblanks():0)); }
-    mod_f_3f29e0(g); }
+        fprintf(stderr,"kh: phase: first FIELD_COMMAND.execute at present %llu, game frame %llu, virtual vblank %llu\n",(unsigned long long)gfx_presents,(unsigned long long)kh_input_game_frames(),(unsigned long long)(kh_vclock_on?kh_vclock_vblanks():0)); } }
 /* BATTLE.calc_damage: one line per call with every clock, so that a hit can be found in the picture stream and in the sound */
 void kh_phase_damage_entry(void){ entries[8]++; extern _Atomic u64 gfx_presents; static _Atomic u64 n;
     if(!gfx_presents) return;                                       /* not while nothing is on screen (selftests) */
     u64 k=atomic_fetch_add(&n,1)+1;
     fprintf(stderr,"kh: event damage #%llu present=%llu game-frame=%llu vblank=%llu virtual-ns=%llu\n",(unsigned long long)k,(unsigned long long)gfx_presents,(unsigned long long)kh_input_game_frames(),
             (unsigned long long)(kh_vclock_on?kh_vclock_vblanks():0),(unsigned long long)(kh_vclock_on?kh_vclock_now_ns():0)); }
-PHASE(2b4590,9)
+void kh_phase_title_entry(void){ entries[9]++; } /* f_2b4590 itself lives in moose.c (Task 23: KH2Moose fast_title picks the patched or the vanilla body) */
 void orig_f_4f94b0(KCtx *);
 void f_4f94b0(KCtx *g){
     entries[10]++;

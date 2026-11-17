@@ -1,12 +1,13 @@
-/* DLL 32d30..33388, a full replacement of exe 3c12f0 (not a block detour). */
+/* DLL 32d30..33388, a full replacement of exe 3c12f0 (not a block detour).  The handler never reaches its trampoline 0x82830 (the
+ * only use of that slot is the CalcDamage syscall, DLL 0x14aff), so no state runs the vanilla body: tools/check_mod_static_link.py
+ * --dll-replaces fails the build if this object references orig_f_3c12f0 (or the original of any other full replacement). */
 #include "mod_config.h"
 #include <math.h>
 #include <limits.h>
 #include <unistd.h>
 #include <sys/wait.h>
-void orig_f_3c12f0(KCtx *g);
-static _Atomic u64 damage_calls[4], damage_zero[4], damage_results[4];
-static _Atomic s32 damage_last[4];
+static _Atomic u64 damage_calls[KH_DIFF_SLOTS], damage_zero[KH_DIFF_SLOTS], damage_results[KH_DIFF_SLOTS];
+static _Atomic s32 damage_last[KH_DIFF_SLOTS];
 static float damage_rf(KCtx *g,u64 p){ u32 v=rd32(g,p); float f; memcpy(&f,&v,4); return f; }
 static s32 damage_cvtt(float f){ return !isfinite(f) || f>=2147483648.0f || f< -2147483648.0f ? INT32_MIN : (s32)f; }
 static u64 damage_call(KCtx *g,u32 f,u64 a,u64 b,u64 c,u64 d){ return kh_call(g,GS_BASE+f,a,b,c,d); }
@@ -21,9 +22,8 @@ static u64 damage_sstm(KCtx *g){
     return damage_call(g,0x3e9300,2,name,0,0);
 }
 void f_3c12f0(KCtx *g){
-    s32 difficulty=rd32(g,GS_BASE+0x9abd48);
-    if((u32)difficulty>3){ orig_f_3c12f0(g); return; }
-    damage_calls[difficulty]++;
+    u32 difficulty=rd32(g,GS_BASE+0x9abd48); unsigned slot=kh_diff_slot(difficulty);
+    damage_calls[slot]++;
     extern void kh_phase_damage_entry(void); kh_phase_damage_entry();
     u64 victim=A0(g), packet=A1(g), attack=A2(g);
     s32 lane=A3(g), home=(s32)rd32(g,KH_RSP(g)+0x10);
@@ -70,9 +70,12 @@ void f_3c12f0(KCtx *g){
     if(save){
         u64 victim_actor=damage_decode(g,rd32(g,victim+0x268));
         if(damage_actor(g,victim_actor)){
-            const struct kh_mod_difficulty_config *cfg=&kh_mod_difficulty_config[difficulty];
-            if(rd8(g,victim_actor+0x6c8)&4) result=damage_add(damage_mul(result,cfg->enemy_damage),99)/100;
-            else if(damage_actor(g,attacker) && (rd8(g,attacker+0x6c8)&4)) result=damage_add(damage_mul(result,cfg->party_damage),99)/100;
+            /* DLL 330d1..33151: the values 0, 1, 2, 3 of [save+2498] load the ini pairs; every other value takes 100 / 100
+             * (330ea `mov r14d,0x64; mov esi,r14d`) and the scaling below still runs. */
+            s32 enemy=100,party=100;
+            if(difficulty<=3){ enemy=kh_mod_difficulty_config[difficulty].enemy_damage; party=kh_mod_difficulty_config[difficulty].party_damage; }
+            if(rd8(g,victim_actor+0x6c8)&4) result=damage_add(damage_mul(result,enemy),99)/100;
+            else if(damage_actor(g,attacker) && (rd8(g,attacker+0x6c8)&4)) result=damage_add(damage_mul(result,party),99)/100;
         }
     }
     result=damage_call(g,0x3c10e0,victim,(u32)result,0,0);
@@ -88,9 +91,9 @@ void f_3c12f0(KCtx *g){
     if((s32)rd32(g,stat)<=damage_cvtt((float)(s32)rd32(g,stat+4)*damage_rf(g,victim+0x248)))
         result=damage_add(damage_mul(result,(s32)rd32(g,damage_sstm(g)+0x180)),99)/100;
 done:
-    damage_last[difficulty]=result;
-    damage_results[difficulty]+=(u32)result;
-    if(!result) damage_zero[difficulty]++;
+    damage_last[slot]=result;
+    damage_results[slot]+=(u32)result;
+    if(!result) damage_zero[slot]++;
     KH_RAX(g)=(u32)result;
     KH_RET(g);
 }
@@ -100,16 +103,25 @@ void kh_mod_difficulty_damage_dump(void){
         (unsigned long long)damage_results[i],(int)damage_last[i]);
 }
 
-/* DLL 31ee0 and 2f9b0: full replacements, including signed field reads and dormant flags. */
+/* DLL 31ee0 and 2f9b0: full replacements, including signed field reads and dormant flags.
+ * Neither handler references its trampoline (0x82390, 0x820f8).  Both compare [save+2498] with 0, 1, 2, 3 in turn (31f4c..31fbd,
+ * 2f9e3..2fa55); for any other value the two multipliers stay what `movss xmm7,[rsp+20]; movss xmm6,[rsp+20]` loaded at
+ * 31f66 / 31f6c (2f9fe / 2fa04): a slot of the handler's own frame that nothing has written, i.e. residue of earlier calls.
+ * 2f9b0 also indexes its 4-byte mask table 0x1800749e4 with the value (2fa9c..2faaa).  What the PC game does with such a value is
+ * therefore not determined by the DLL's code (and it is not the vanilla body): a named fatal, for the whole hook. */
 static _Atomic u64 reward_hits[2][4];
-void orig_f_3ed7d0(KCtx *); void orig_f_3edf90(KCtx *);
+static void reward_range(KCtx *g,u32 d,u32 exe,u32 dll,const char *what){
+    if(d>3) kh_fatal(g,"mod-difficulty-out-of-range: difficulty dword [0x1409abd48] = 0x%x (the game writes 0..3) in the hook on exe 0x%x = DLL 0x%x, "
+                       "a full replacement (the vanilla body never runs on the PC): %s; what the PC game does here is not defined by the DLL's code, not ported",
+                     (unsigned)d,(unsigned)exe,(unsigned)dll,what);
+}
 static u64 reward_call(KCtx *g,u32 r,u64 a,u64 b,u64 c){ return kh_call(g,GS_BASE+r,a,b,c,0); }
 static void reward_message(KCtx *g,u64 list,int *n,u32 id){
     wr64(g,list+8*(*n)++,reward_call(g,0x3ad9a0,id,0,0));
 }
 void f_3ed7d0(KCtx *g){
     u32 d=rd32(g,GS_BASE+0x9abd48);
-    if(d>3){ orig_f_3ed7d0(g); return; }
+    reward_range(g,d,0x3ed7d0,0x31ee0,"the DLL takes its HP and AP multipliers from an unwritten slot of its own stack frame (movss xmm7 / xmm6,[rsp+0x20] at 0x31f66 / 0x31f6c)");
     reward_hits[0][d]++;
     u64 row=A0(g); u32 character=A1(g),level=A2(g); s32 path=(s32)A3(g);
     u64 stack=KH_RSP(g); KH_RSP(g)=(stack-0x180)&~15ull;
@@ -153,7 +165,8 @@ void f_3ed7d0(KCtx *g){
 }
 void f_3edf90(KCtx *g){
     u32 d=rd32(g,GS_BASE+0x9abd48);
-    if(d>3){ orig_f_3edf90(g); return; }
+    reward_range(g,d,0x3edf90,0x2f9b0,"the DLL takes its HP and MP multipliers from an unwritten slot of its own stack frame (movss xmm6 / xmm7,[rsp+0x20] at 0x2f9fe / 0x2fa04) "
+                                       "and indexes its 4-byte mask table 0x1800749e4 with the value (0x2faaa)");
     reward_hits[1][d]++;
     u64 row=A0(g),sheet=A1(g); s32 param=(s8)rd8(g,row+13);
     if(param) reward_call(g,0x3edca0,(u32)param,0,0);
@@ -197,9 +210,8 @@ void f_3edf90(KCtx *g){
  * path with the command-byte reversal, Task 16), the DLL's no-op apply kinds and its usability fall-through.  Every other
  * active kind is a named fatal.  DLL 31569 is an internal item-0x83 branch, not another detour. */
 #include "khnmc_rt.h"
-void orig_f_3c4b80(KCtx *g);
-void orig_f_3c3da0(KCtx *g);
-static _Atomic u64 caps_apply[4],caps_usable[4];
+void orig_f_3c3da0(KCtx *g);      /* DLL 30f60 chains for kind 0, 22, > 24, a null sheet and a reached cap (310b9); DLL 31260 never does */
+static _Atomic u64 caps_apply[KH_DIFF_SLOTS],caps_usable[KH_DIFF_SLOTS];
 /* A nonzero kind makes the DLL skip the id switch for every id (31433 jne 31618), stock ids included, so the vanilla function
  * is never an answer for an active kind: no silent success, whatever the id. */
 static void caps_require_scope(KCtx *g,u64 effect,unsigned kind,int apply){
@@ -220,7 +232,7 @@ static void caps_require_scope(KCtx *g,u64 effect,unsigned kind,int apply){
  *   - a null sheet is passed to 3c07e0 (31367 -> 31bb6), which faults; vanilla returns.
  * The DLL's console output (RATIO, TEST! Battle Type Item, CureRate, Effect, ACTOR FAKE/REAL POINTER) is dropped. */
 struct kh_item_mock *kh_item_mock_sink;
-static _Atomic u64 item_apply[4][KH_ITEM_SLOTS],item_reversed[4],item_noop[4],item_usable[4],item_hp_calls,item_mp_calls;
+static _Atomic u64 item_apply[KH_DIFF_SLOTS][KH_ITEM_SLOTS],item_reversed[KH_DIFF_SLOTS],item_noop[KH_DIFF_SLOTS],item_usable[KH_DIFF_SLOTS],item_hp_calls,item_mp_calls;
 static _Atomic s32 item_last_hp,item_last_mp;
 static _Atomic u64 cmd2f_writes,cmd2f_two,cmd2f_zero,cmd2f_other,cmd2f_unlisted;
 static struct { _Atomic u32 id_plus1,last; _Atomic u64 n; } cmd2f_seen[16];
@@ -297,7 +309,7 @@ void kh_mod_item_writebyte(KCtx *g,u64 p,u8 value){
     cmd2f_unlisted++;
 }
 void kh_mod_items_counts(struct kh_item_counts *out){
-    for(int d=0;d<4;d++){
+    for(int d=0;d<KH_DIFF_SLOTS;d++){
         for(int s=0;s<KH_ITEM_SLOTS;s++) out->apply[d][s]=item_apply[d][s];
         out->reversed[d]=item_reversed[d]; out->noop[d]=item_noop[d]; out->usable[d]=item_usable[d];
     }
@@ -305,7 +317,7 @@ void kh_mod_items_counts(struct kh_item_counts *out){
     out->cmd2f_writes=cmd2f_writes; out->cmd2f_two=cmd2f_two; out->cmd2f_zero=cmd2f_zero; out->cmd2f_other=cmd2f_other;
 }
 void kh_mod_items_reset(void){
-    for(int d=0;d<4;d++){
+    for(int d=0;d<KH_DIFF_SLOTS;d++){
         for(int s=0;s<KH_ITEM_SLOTS;s++) item_apply[d][s]=0;
         item_reversed[d]=item_noop[d]=item_usable[d]=0;
     }
@@ -332,10 +344,12 @@ void kh_mod_items_dump(void){
     fprintf(stderr,"\n");
 }
 
+/* The difficulty dword only picks the counter slot in these two hooks.  DLL 31260 and 30f60 read [save+2498] in their kind 11 / 12
+ * cap tests alone (317a2 / 317d7, 310e0 / 310fa: `cmp ...,3`), so every value other than 3, legal or not, is the cap 240 there and
+ * plays no part anywhere else; neither handler has a path that depends on the dword being 0..3. */
 void f_3c4b80(KCtx *g){
-    int difficulty=(int)rd32(g,GS_BASE+0x9abd48);
+    int difficulty=(int)kh_diff_slot(rd32(g,GS_BASE+0x9abd48));
     u64 effect=A0(g); unsigned kind=rd8(g,effect+5);
-    if((unsigned)difficulty>3){ orig_f_3c4b80(g); return; }
     if(!kind){ item_stock_apply(g,difficulty); return; }
     if(kind!=11 && kind!=12){
         caps_require_scope(g,effect,kind,1);
@@ -359,9 +373,8 @@ void f_3c4b80(KCtx *g){
     KH_RET(g);
 }
 void f_3c3da0(KCtx *g){
-    int difficulty=(int)rd32(g,GS_BASE+0x9abd48);
+    int difficulty=(int)kh_diff_slot(rd32(g,GS_BASE+0x9abd48));
     u64 effect=A0(g); unsigned kind=rd8(g,effect+5);
-    if((unsigned)difficulty>3){ orig_f_3c3da0(g); return; }
     if(kind!=11 && kind!=12){
         caps_require_scope(g,effect,kind,0);
         /* Task 16.  DLL 30f60 never calls the command lookup 3b68b0 (slot 82150) and has no +2f test: usability of a reversed
@@ -400,9 +413,12 @@ int kh_mod_caps_selftest(KCtx *g){
     /* Task 16: every kind-0 apply now performs the DLL's command lookup, so the fixture needs a cmd table. */
     u64 oldcmds=rd64(g,GS_BASE+0x2a161e8),cmds=kh_mod_items_test_cmds(g); wr64(g,GS_BASE+0x2a161e8,cmds);
     u64 effect=ga_calloc(1,0x18),sp=KH_RSP(g);
-    u64 orig_apply=kh_host_fn("caps-test-original-apply",orig_f_3c4b80);
-    u64 orig_usable=kh_host_fn("caps-test-original-usable",orig_f_3c3da0);
-    for(int d=0;d<4;d++) for(int kind=11;kind<=12;kind++){
+    /* The dword is compared with 3 and nothing else (DLL 317a2 / 317d7, 310e0 / 310fa): the values the game never writes take the
+     * cap 240 like 0, 1, 2 do, in the DLL's own body (there is no path to the vanilla function for them). */
+    static const s32 diffs[]={0,1,2,3,-1,4,INT32_MAX,INT32_MIN};
+    u64 apply0[KH_DIFF_SLOTS],usable0[KH_DIFF_SLOTS]; for(int s=0;s<KH_DIFF_SLOTS;s++){ apply0[s]=caps_apply[s]; usable0[s]=caps_usable[s]; }
+    for(unsigned di=0;di<sizeof diffs/sizeof *diffs;di++) for(int kind=11;kind<=12;kind++){
+        s32 d=diffs[di];
         int cap=d==3?(kind==11?120:220):240;
         const int values[]={0,1,cap-1,cap,cap+1,255};
         const int grants[]={0,1,255};
@@ -422,17 +438,13 @@ int kh_mod_caps_selftest(KCtx *g){
         wr32(g,sheet+4,cap); wr32(g,sheet+0x184,cap); wr16(g,effect,1);
         CAP_T((kh_call(g,GS_BASE+0x3c3da0,effect,2,0,0)&255)==1);
     }
-    /* Invalid difficulty and unrelated kinds use the original entry with its normal reference balance. */
-    const int modes[]={-1,4,INT32_MAX};
-    for(unsigned i=0;i<sizeof modes/sizeof *modes;i++){
-        wr32(g,GS_BASE+0x9abd48,modes[i]); wr16(g,effect,0); wr8(g,effect+5,11);
-        memset(hp(g,sheet),0,sizeof backup); wr32(g,count,0); wr32(g,sheet+0x260,2); wr32(g,sheet+0x264,100); wr32(g,sheet+4,119);
-        kh_call(g,GS_BASE+0x3c4b80,effect,2,0,100); CAP_T(rd32(g,sheet+4)==119); CAP_T(rd32(g,sheet+0x264)==100);
-        u64 r=kh_call(g,GS_BASE+0x3c3da0,effect,2,0,0),o=kh_call(g,orig_usable,effect,2,0,0);
-        CAP_T((r&255)==(o&255)); CAP_T(rd32(g,sheet+0x264)==100);
-    }
+    /* The counters of those calls: per kind and value of the dword 18 applications and 19 usability questions; the four values
+     * outside 0..3 share slot 4. */
+    for(int s=0;s<KH_DIFF_SLOTS;s++){ CAP_T(caps_apply[s]-apply0[s]==(s==4?4u:1u)*36u); CAP_T(caps_usable[s]-usable0[s]==(s==4?4u:1u)*38u); }
+    /* Kind 0 with an id the stock path only looks the command up for: nothing is granted. */
     wr32(g,GS_BASE+0x9abd48,1); wr8(g,effect+5,0); wr16(g,effect,0);
-    kh_call(g,GS_BASE+0x3c4b80,effect,2,0,100); kh_call(g,orig_apply,effect,2,0,100); CAP_T(rd32(g,sheet+4)==119);
+    memset(hp(g,sheet),0,sizeof backup); wr32(g,count,0); wr32(g,sheet+0x260,2); wr32(g,sheet+0x264,100); wr32(g,sheet+4,119);
+    kh_call(g,GS_BASE+0x3c4b80,effect,2,0,100); CAP_T(rd32(g,sheet+4)==119); CAP_T(rd32(g,sheet+0x264)==100);
     wr16(g,effect,0x777); wr8(g,effect+5,13);
     for(int apply=0;apply<2;apply++){
         FILE *log=tmpfile(); if(!log) kh_fatal(g,"caps selftest cannot open fatal log");
@@ -449,7 +461,7 @@ int kh_mod_caps_selftest(KCtx *g){
     memcpy(hp(g,sheet),backup,sizeof backup); wr32(g,count,oldcount); wr32(g,GS_BASE+0x9abd48,olddiff);
     memcpy(hp(g,GS_BASE+0x2b0d720),codec,512); wr32(g,GS_BASE+0x2b0d920,guard); ga_free(effect);
     wr64(g,GS_BASE+0x2a161e8,oldcmds); ga_free(cmds);
-    for(int d=0;d<4;d++) caps_apply[d]=caps_usable[d]=0;
+    for(int d=0;d<KH_DIFF_SLOTS;d++) caps_apply[d]=caps_usable[d]=0;
     kh_mod_items_reset();
     fprintf(stderr,"kh: difficulty caps selftest: %d checks, %d failures\n",checks,failures);
 #undef CAP_T
@@ -496,6 +508,13 @@ void kh_mod_add_exp(KCtx *g,u64 args){
 }
 void kh_mod_difficulty_dump(void){
     kh_mod_difficulty_damage_dump(); kh_mod_caps_dump(); kh_mod_items_dump();
+    /* Slot 4 of the counters above: calls made while the dword was not 0..3.  The damage and item hooks run the DLL's code for such
+     * a value (100 % / 100 %, cap 240); the two reward hooks stop with mod-difficulty-out-of-range instead. */
+    { u64 items=0; for(int s=0;s<KH_ITEM_SLOTS;s++) items+=item_apply[4][s];
+      fprintf(stderr,"kh: difficulty out-of-range (dword [0x1409abd48] not 0..3) damage calls=%llu zero=%llu result_sum_u32=%llu last=%d item uses=%llu reversed=%llu noop_kinds=%llu usable_fallthrough=%llu caps apply=%llu usable=%llu\n",
+        (unsigned long long)damage_calls[4],(unsigned long long)damage_zero[4],(unsigned long long)damage_results[4],(int)damage_last[4],
+        (unsigned long long)items,(unsigned long long)item_reversed[4],(unsigned long long)item_noop[4],(unsigned long long)item_usable[4],
+        (unsigned long long)caps_apply[4],(unsigned long long)caps_usable[4]); }
     for(int d=0;d<4;d++) fprintf(stderr,"kh: difficulty rewards slot=%d popup=%llu bons=%llu AddExp=%llu\n",d,
         (unsigned long long)reward_hits[0][d],(unsigned long long)reward_hits[1][d],(unsigned long long)exp_hits[d]);
 }

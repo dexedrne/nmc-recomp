@@ -2,7 +2,6 @@
 #include "khnmc_rt.h"
 #include <limits.h>
 #include <math.h>
-void orig_f_3c12f0(KCtx *);
 static int checks,failures;
 #define T(c) do { checks++; if(!(c)){ failures++; fprintf(stderr,"damage selftest FAIL line %d: %s\n",__LINE__,#c); } } while(0)
 static void wf(KCtx *g,u64 p,float f){ u32 n; memcpy(&n,&f,4); wr32(g,p,n); }
@@ -96,16 +95,40 @@ int kh_mod_damage_selftest(KCtx *g){
         T((s32)kh_call(g,GS_BASE+0x3c12f0,victim,packet,attack,0)==expected); T(KH_RSP(g)==sp);
     }
     wr32(g,victim,1000); wr32(g,victim+4,1000); wf(g,victim+0x248,0);
-    /* Invalid indices retain the complete vanilla function. */
-    wr8(g,attack+5,0); wr8(g,attack+4,0); wr16(g,attack+6,100); wr16(g,sheet+0x188,101);
-    u64 original=kh_host_fn("difficulty-test-damage-original",orig_f_3c12f0);
+    /* A dword outside 0..3 (the game never writes one) still runs the DLL's body: 330d1..330f3 fall through the four compares to
+     * `mov r14d,0x64; mov esi,r14d`, i.e. 100 % in both directions, and the handler has no path to the original.  The same
+     * formulas as above, with the quirks that tell the DLL's body from the vanilla one (the +99 before the element multiply, the
+     * signed defence word, the low-HP multiplier after the float compare). */
+    wr8(g,attack+5,0); wr8(g,attack+4,0); wr16(g,attack+6,100);
     const s32 invalid[]={-1,4,INT32_MIN,INT32_MAX};
-    for(int direction=0;direction<3;direction++) for(unsigned i=0;i<sizeof invalid/sizeof *invalid;i++){
+    for(int direction=0;direction<3;direction++) for(unsigned k=0;k<sizeof invalid/sizeof *invalid;k++){
         wr32(g,target+0x6c8,direction==0?4:0); wr32(g,actor+0x6c8,direction==1?4:0);
-        wr32(g,GS_BASE+0x9abd48,invalid[i]);
-        u32 expected=kh_call(g,original,victim,packet,attack,0);
-        T((u32)kh_call(g,GS_BASE+0x3c12f0,victim,packet,attack,0)==expected);
-        T(KH_RSP(g)==sp);
+        wr32(g,GS_BASE+0x9abd48,invalid[k]);
+        for(unsigned i=0;i<sizeof values/sizeof *values;i++){
+            wr16(g,sheet+0x188,values[i]);
+            s32 expected=wrapped((s64)values[i]*1000000+999999)/1000000;
+            if(direction<2) expected=wrapped((s64)expected*100+99)/100;
+            T((s32)kh_call(g,GS_BASE+0x3c12f0,victim,packet,attack,0)==expected); T(KH_RSP(g)==sp);
+        }
+        wr16(g,sheet+0x188,101); wr8(g,attack+9,1);
+        const s16 bonuses[]={0,1,50,100,-100,32767,-32768};
+        for(unsigned i=0;i<sizeof bonuses/sizeof *bonuses;i++){
+            wr16(g,sheet+0x218,bonuses[i]);
+            T((s32)kh_call(g,GS_BASE+0x3c12f0,victim,packet,attack,0)==wrapped((s64)(bonuses[i]+99)*101)/100);
+        }
+        wr8(g,attack+9,0); wr16(g,sheet+0x218,0);
+        /* The 100 % step is still executed (33199..331b5 / 331d1..: imul, +99, signed /100), which shows on a negative result. */
+        static const struct { s16 base; s32 plain,scaled; } neg[]={{-2,-1,0},{-150,-149,-148}};
+        for(unsigned i=0;i<2;i++){
+            wr16(g,sheet+0x188,(u16)neg[i].base);
+            T((s32)kh_call(g,GS_BASE+0x3c12f0,victim,packet,attack,0)==(direction<2?neg[i].scaled:neg[i].plain));
+        }
+        wr16(g,sheet+0x188,1); wr16(g,victim+0x18c,0xffff);
+        T((s32)kh_call(g,GS_BASE+0x3c12f0,victim,packet,attack,0)==2);
+        wr16(g,victim+0x18c,0); wr16(g,sheet+0x188,101);
+        wr32(g,victim,50); wr32(g,victim+4,100); wf(g,victim+0x248,0.5f); wr32(g,sstm+0x180,125);
+        T((s32)kh_call(g,GS_BASE+0x3c12f0,victim,packet,attack,0)==(101*125+99)/100);
+        wr32(g,victim,1000); wr32(g,victim+4,1000); wf(g,victim+0x248,0);
     }
     wr32(g,GS_BASE+0x9abd48,olddiff); wr32(g,GS_BASE+0x2a11400,oldflags); wr64(g,GS_BASE+0x2a171c8,oldactors); wr64(g,GS_BASE+0x2ae5768,oldbar);
     memcpy(hp(g,GS_BASE+0x2b0d720),codec,512); wr32(g,GS_BASE+0x2b0d920,guard);

@@ -116,6 +116,7 @@ static void *guest_main(void *arg){
     kh_run_tls_callbacks(g,1);
     kh_mod_syscalls_init(g);
     { extern void kh_mod_difficulty_init(KCtx *); kh_mod_difficulty_init(g); }
+    { extern void kh_mod_hooks_b_init(KCtx *); kh_mod_hooks_b_init(g); }     /* Task 23: the DLL's command word lists (its .bss), before any game code */
     { extern void kh_moose_init(KCtx *); kh_moose_init(g); }            /* the mod's pool sizes: before the game's own initialisation, like the DLL */
     if(selftest){ extern int kh_selftest(KCtx*); int f=kh_selftest(g); kh_exit_process(f?1:0); }
     u64 entry;

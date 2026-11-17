@@ -59,6 +59,8 @@ WRAP = $(patsubst %,-Wl$(comma)--wrap=f_%,$(WRAP_FNS))
 PHASE_HOOKS = 1505a0 5111d0 5122e0 511300 13da10 13d260 405440 3f29e0 3c12f0 2b4590 4f94b0
 DIFFICULTY_HOOKS = 1523a0 152370 3ed7d0 3edf90 3c4b80 3c3da0
 MOD_A_HOOKS = 2fc860 2fc4e0 4014a0 3a7cb0 29efa0 3a89a0 3d61d0 3d60c0   # 405440 is already in PHASE_HOOKS
+# Task 23 (runtime/mod_hooks_b.c): the mod DLL detours that were still missing.  3f29e0 is already in PHASE_HOOKS (the phase counter runs first).
+MOD_B_HOOKS = 3f27d0 3c4780 351390 368820 4060e0 3d1730 3f65a0 3f6620 3f6510 3a17f0 153850 15aab0 15aba0 31dd70
 HD_HOOKS = 106440 106460 106480
 MOD_PARAMS_HOOKS = 40d810 40dd70
 STREAM_HOOKS = 106da0 106fa0 106b40      # OpenStream / ReadStream / CloseStream on the loose tree (runtime/stream_layer.c)
@@ -66,7 +68,7 @@ STREAM_HOOKS = 106da0 106fa0 106b40      # OpenStream / ReadStream / CloseStream
 BGLOAD_HOOKS = 3a0c60 15edd0 3f99e0 3f9850 3a64f0 3a0aa0 3a0b30 3a0bd0 19c470 4ad270
 # scripted input clock (runtime/null_input.c): 0x105e10 is called once per game frame (end-of-frame task and the settings menu loop)
 INPUT_HOOKS = 105e10
-FILE_HOOKS = 1f9a80 3a9cf0 131ef0 106000 1063d0 106700 106790 106870 $(HD_HOOKS) $(PHASE_HOOKS) $(DIFFICULTY_HOOKS) $(MOD_A_HOOKS) $(MOD_PARAMS_HOOKS) $(STREAM_HOOKS) $(BGLOAD_HOOKS) $(INPUT_HOOKS)
+FILE_HOOKS = 1f9a80 3a9cf0 131ef0 106000 1063d0 106700 106790 106870 $(HD_HOOKS) $(PHASE_HOOKS) $(DIFFICULTY_HOOKS) $(MOD_A_HOOKS) $(MOD_B_HOOKS) $(MOD_PARAMS_HOOKS) $(STREAM_HOOKS) $(BGLOAD_HOOKS) $(INPUT_HOOKS)
 # object-id table guard (runtime/idtable.c): 0x4ad390 registers a 32 MiB window in the game's 64-slot id table and encodes the pointer
 IDTABLE_HOOKS = 4ad390
 FILE_HOOKS += $(IDTABLE_HOOKS)
@@ -77,11 +79,21 @@ FILE_HOOKS += $(MOOSE_HOOKS)
 # The mod DLL patches code bytes in 28 exe functions and attaches two INLINE detours (inside 3c3fe0 and 360920).  Those 30 functions
 # are re-lifted from the patched image into $(GEN)/mod_static_lifted.c and replace the vanilla lifted bodies through the alias list
 # (vanilla bodies stay reachable as orig_f_<rva>).  MOD_STATIC_CHAINED = functions a runtime hook already owns: the hook keeps
-# f_<rva> and forwards to mod_f_<rva>.  $(GEN) holds mod/game-derived generated files: local only, never committed.
+# f_<rva> and forwards to mod_f_<rva> (the DLL's Detours trampoline runs the patched body: true for 3a89a0).
+# MOD_STATIC_REPLACED (Task 23) = functions whose DLL detour never calls the trampoline: the runtime hook (3f29e0: DLL 0x306c0 in
+# runtime/mod_hooks_b.c) replaces the function outright, the re-lifted body mod_f_<rva> is linked but dead, exactly like the patched
+# bytes on the PC; tools/check_mod_static_link.py fails the build if any runtime object references it.
+# $(GEN) holds mod/game-derived generated files: local only, never committed.
 MOD_STATIC_FUNCS = 165110 2fb7e0 2fc500 2fd940 2fdd40 2fe010 360920 390150 3a89a0 3a9950 3b11e0 3b1780 3c1190 3c2f00 3c3fe0 3c5170 \
                    3c5440 3c5750 3c5900 3c5a90 3c5ce0 3d8b40 3de460 3e37f0 3e8380 3f29e0 3f3110 400b20 401d60 422780
 MOD_STATIC_INLINE = 3c3fe0 360920
-MOD_STATIC_CHAINED = 3a89a0 3f29e0
+MOD_STATIC_CHAINED = 3a89a0
+MOD_STATIC_REPLACED = 3f29e0
+# Review of Task 23: every function detour of KH2Tweaks_Refactor.dll whose handler never reaches its trampoline (the 16 REPLACES rows
+# of the table in implementation notes section 2; re-derived from the DLL: no reference to the slot between the handler's start and its
+# INT3 padding).  The runtime object that defines f_<rva> must not reference orig_f_<rva>: a forward to the vanilla body is a path
+# the PC game does not have (tools/check_mod_static_link.py --dll-replaces fails the build).
+MOD_DLL_REPLACES = 29efa0 4014a0 3a9cf0 3c4b80 351390 2fc860 2fc4e0 3ed7d0 3c12f0 1f9a80 3f29e0 3f27d0 15aba0 15aab0 153850 3edf90
 GEN ?= $(ROOT)/gen
 MOD_EDITS ?= /home/user/projects/kh2-nmc-analysis/scratch/mod-gummi/edit_list.json
 MOD_EXE ?= $(ROOT)/pc/kh2fm.exe
@@ -105,8 +117,22 @@ MOD_NEVERLAND_DLL ?= /home/user/projects/SillyBillyMod1/dll/NeverlandFly.dll
 MOD_NEVERLAND_EDITS = $(GEN)/mod_neverland_edits.json
 MOD_LIFT_FUNCS = $(MOD_STATIC_FUNCS) $(MOD_NEVERLAND_HOOKS)
 # runtime/mod_neverland.c owns f_<rva> of all three (call counters) and forwards to the re-lifted mod_f_<rva>
-MOD_LIFT_CHAINED = $(MOD_STATIC_CHAINED) $(MOD_NEVERLAND_HOOKS)
+MOD_LIFT_CHAINED = $(MOD_STATIC_CHAINED) $(MOD_STATIC_REPLACED) $(MOD_NEVERLAND_HOOKS)
 FILE_HOOKS += $(MOD_NEVERLAND_HOOKS)
+# ---- Task 23: KH2Moose.dll's two ini-switched CODE patches (runtime/moose.c) ---------------------------------------------------------
+#   92680   [kh2.fixes] scd_priority bit 1: the call at exe 0x927e2 becomes `xor eax,eax` + a 3-byte NOP
+#   2b4590  [kh2.hacks] fast_title:         exe 0x2b46eb `lea edi,[r12-0xc]` becomes `mov edi,0x11`   (2b4590 is already in PHASE_HOOKS)
+# Decoded statically from the DLL by tools/gen_mod_moose.py ($(GEN)/mod_moose_edits.json, mod_moose_table.h) and re-lifted by the Task 12
+# mechanism (a third function table, kh_mod_moose_fn_table).  runtime/moose.c owns f_<rva> of both and runs mod_f_<rva> when the ini
+# turns the patch on, orig_f_<rva> when it does not (the link check's --choice class).
+MOD_MOOSE_FUNCS = 92680 2b4590
+MOD_MOOSE_DLL ?= /home/user/projects/SillyBillyMod1/dll/KH2Moose.dll
+MOD_MOOSE_EDITS = $(GEN)/mod_moose_edits.json
+MOD_LIFT_FUNCS += $(MOD_MOOSE_FUNCS)
+MOD_LIFT_CHAINED += $(MOD_MOOSE_FUNCS)
+FILE_HOOKS += 92680
+MOD_EXTRA_EDITS = --extra-edits $(MOD_NEVERLAND_EDITS) --extra-edits $(MOD_MOOSE_EDITS)
+MOD_TWEAKS_DLL ?= /home/user/projects/SillyBillyMod1/dll/KH2Tweaks_Refactor.dll
 # FILE_HOOKS can name an RVA twice (a runtime hook that forwards to a re-lifted body is in two sub-lists): the hook tools get each RVA once
 HOOKS_UNIQ = $(sort $(FILE_HOOKS))
 all: $(BIN)
@@ -201,7 +227,7 @@ arm64check:
 # ---- Task 12 rules: generated table (python3 stdlib), re-lift (needs the lifter environment: KHLIFT, KHLIFT_PY, KH_UNIVERSE), link check
 $(GEN)/mod_static_table.h: tools/gen_mod_static.py $(MOD_EDITS) Makefile
 	python3 tools/gen_mod_static.py --edits $(MOD_EDITS) --exe $(MOD_EXE) --universe $(KH_UNIVERSE) --funcs "$(MOD_STATIC_FUNCS)" \
-	    --inline "$(MOD_STATIC_INLINE)" --chained "$(MOD_STATIC_CHAINED)" --out $@ --report $(GEN)/mod_static_classify.json
+	    --inline "$(MOD_STATIC_INLINE)" --chained "$(MOD_STATIC_CHAINED) $(MOD_STATIC_REPLACED)" --out $@ --report $(GEN)/mod_static_classify.json
 GEN_MOD_NEVERLAND = python3 tools/gen_mod_neverland.py --dll $(MOD_NEVERLAND_DLL) --exe $(MOD_EXE) --universe $(KH_UNIVERSE) --edits $(MOD_EDITS) \
 	    --out-json $(MOD_NEVERLAND_EDITS) --out-h $(GEN)/mod_neverland_table.h
 $(MOD_NEVERLAND_EDITS): tools/gen_mod_neverland.py tools/gen_mod_static.py $(MOD_NEVERLAND_DLL) $(MOD_EDITS) Makefile
@@ -210,30 +236,46 @@ $(MOD_NEVERLAND_EDITS): tools/gen_mod_neverland.py tools/gen_mod_static.py $(MOD
 $(GEN)/mod_neverland_table.h: $(MOD_NEVERLAND_EDITS)
 	@test -f $@ || $(GEN_MOD_NEVERLAND)
 $(O)/mod_neverland.o $(O)/mod_neverland_test.o: $(GEN)/mod_neverland_table.h
-$(GEN)/mod_static_lifted.c: tools/mod_static_lift.py $(MOD_EDITS) $(MOD_NEVERLAND_EDITS) $(LIFTED)/shards.json Makefile
-	KH_UNIVERSE=$(KH_UNIVERSE) $(KHLIFT_PY) tools/mod_static_lift.py --khlift $(KHLIFT) --edits $(MOD_EDITS) --exe $(MOD_EXE) --extra-edits $(MOD_NEVERLAND_EDITS) \
+GEN_MOD_MOOSE = python3 tools/gen_mod_moose.py --dll $(MOD_MOOSE_DLL) --exe $(MOD_EXE) --universe $(KH_UNIVERSE) --edits $(MOD_EDITS) \
+	    --out-json $(MOD_MOOSE_EDITS) --out-h $(GEN)/mod_moose_table.h
+$(MOD_MOOSE_EDITS): tools/gen_mod_moose.py tools/gen_mod_static.py $(MOD_MOOSE_DLL) $(MOD_EDITS) Makefile
+	$(GEN_MOD_MOOSE)
+$(GEN)/mod_moose_table.h: $(MOD_MOOSE_EDITS)
+	@test -f $@ || $(GEN_MOD_MOOSE)
+$(O)/moose.o: $(GEN)/mod_moose_table.h
+$(GEN)/mod_static_lifted.c: tools/mod_static_lift.py $(MOD_EDITS) $(MOD_NEVERLAND_EDITS) $(MOD_MOOSE_EDITS) $(LIFTED)/shards.json Makefile
+	KH_UNIVERSE=$(KH_UNIVERSE) $(KHLIFT_PY) tools/mod_static_lift.py --khlift $(KHLIFT) --edits $(MOD_EDITS) --exe $(MOD_EXE) $(MOD_EXTRA_EDITS) \
 	    --funcs "$(MOD_LIFT_FUNCS)" --chained "$(MOD_LIFT_CHAINED)" --vanilla-shards $(LIFTED)/shards --out $@ --report $(GEN)/mod_static_lift.json
 $(O)/mod_static.o: $(GEN)/mod_static_table.h
 $(O)/mod_static_lifted.o: $(GEN)/mod_static_lifted.c
 	@mkdir -p $(O) && $(CC) $(LIFT_CFLAGS) -c $< -o $@
 all: $(O)/mod_static_link.ok
 $(O)/mod_static_link.ok: $(BIN) tools/check_mod_static_link.py
-	python3 tools/check_mod_static_link.py --bin $(BIN) --obj $(O) --funcs "$(MOD_LIFT_FUNCS)" --chained "$(MOD_LIFT_CHAINED)" && touch $@
+	python3 tools/check_mod_static_link.py --bin $(BIN) --obj $(O) --funcs "$(MOD_LIFT_FUNCS)" --chained "$(MOD_STATIC_CHAINED) $(MOD_NEVERLAND_HOOKS)" --replaced "$(MOD_STATIC_REPLACED)" --choice "$(MOD_MOOSE_FUNCS)" --dll-replaces "$(MOD_DLL_REPLACES)" && touch $@
 # native-oracle differential of the re-lifted functions against the patched bytes (x86-64 Linux dev host; not part of `all`).
 # CPU-heavy: runs niced, MOD_STATIC_DIFFTEST_JOBS processes at a time (keep it low on a shared desktop).
 MOD_STATIC_DIFFTEST_JOBS ?= 4
 mod-static-difftest:
 	KH_UNIVERSE=$(KH_UNIVERSE) nice -n 10 $(KHLIFT_PY) tools/mod_static_difftest.py --jobs $(MOD_STATIC_DIFFTEST_JOBS) --khlift $(KHLIFT) --edits $(MOD_EDITS) --exe $(MOD_EXE) \
-	    --extra-edits $(MOD_NEVERLAND_EDITS) --funcs "$(MOD_LIFT_FUNCS)" --chained "$(MOD_LIFT_CHAINED)" --vanilla-shards $(LIFTED)/shards --lifted $(GEN)/mod_static_lifted.c \
+	    $(MOD_EXTRA_EDITS) --funcs "$(MOD_LIFT_FUNCS)" --chained "$(MOD_LIFT_CHAINED)" --vanilla-shards $(LIFTED)/shards --lifted $(GEN)/mod_static_lifted.c \
 	    --sites $(ROOT)/runtime/mod_static_sites.c --work $(O)/mod_static_difftest --out $(GEN)/mod_static_difftest.json $(MOD_STATIC_DIFFTEST_ARGS)
 # the three NeverlandFly functions only (Task 19): same tool, own result file
 mod-neverland-difftest: $(MOD_NEVERLAND_EDITS)
 	KH_UNIVERSE=$(KH_UNIVERSE) nice -n 10 $(KHLIFT_PY) tools/mod_static_difftest.py --jobs $(MOD_STATIC_DIFFTEST_JOBS) --khlift $(KHLIFT) --edits $(MOD_EDITS) --exe $(MOD_EXE) \
-	    --extra-edits $(MOD_NEVERLAND_EDITS) --funcs "$(MOD_LIFT_FUNCS)" --chained "$(MOD_LIFT_CHAINED)" --vanilla-shards $(LIFTED)/shards --lifted $(GEN)/mod_static_lifted.c \
+	    $(MOD_EXTRA_EDITS) --funcs "$(MOD_LIFT_FUNCS)" --chained "$(MOD_LIFT_CHAINED)" --vanilla-shards $(LIFTED)/shards --lifted $(GEN)/mod_static_lifted.c \
 	    --sites $(ROOT)/runtime/mod_static_sites.c --work $(O)/mod_static_difftest --only "$(shell echo $(MOD_NEVERLAND_HOOKS) | tr ' ' ',')" \
 	    --out $(GEN)/mod_neverland_difftest.json $(MOD_STATIC_DIFFTEST_ARGS)
+# the two KH2Moose functions only (Task 23): same tool, own result file
+mod-moose-difftest: $(MOD_NEVERLAND_EDITS) $(MOD_MOOSE_EDITS)
+	KH_UNIVERSE=$(KH_UNIVERSE) nice -n 10 $(KHLIFT_PY) tools/mod_static_difftest.py --jobs $(MOD_STATIC_DIFFTEST_JOBS) --khlift $(KHLIFT) --edits $(MOD_EDITS) --exe $(MOD_EXE) \
+	    $(MOD_EXTRA_EDITS) --funcs "$(MOD_LIFT_FUNCS)" --chained "$(MOD_LIFT_CHAINED)" --vanilla-shards $(LIFTED)/shards --lifted $(GEN)/mod_static_lifted.c \
+	    --sites $(ROOT)/runtime/mod_static_sites.c --work $(O)/mod_static_difftest --only "$(shell echo $(MOD_MOOSE_FUNCS) | tr ' ' ',')" \
+	    --out $(GEN)/mod_moose_difftest.json $(MOD_STATIC_DIFFTEST_ARGS)
+# Task 23: every KH2Tweaks_Refactor.dll pointer slot the hand ports rely on, resolved statically from the DLL's scanners against the exe
+mod-dll-slots:
+	python3 tools/mod_dll_slots.py --dll $(MOD_TWEAKS_DLL) --exe $(MOD_EXE) --expect tools/mod_dll_slots_h23.txt --json $(GEN)/mod_dll_slots.json
 # compile every hand-written and lifter-rt object of the variant without the shards and without linking (`make -k rtobjs`: all errors of a port)
 rtobjs: $(RTOBJ) $(LIFTOBJ)
 clean:
 	rm -rf $(O) $(BIN)
-.PHONY: all clean arm64check rtobjs FORCE mod-static-difftest mod-neverland-difftest
+.PHONY: all clean arm64check rtobjs FORCE mod-static-difftest mod-neverland-difftest mod-moose-difftest mod-dll-slots
