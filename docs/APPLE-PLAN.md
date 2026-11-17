@@ -72,3 +72,15 @@ mod's `icon.png`), chosen by the owner from three candidates. It is derived from
 `~/Documents/khnmc/app-icon/AppIcon-1024.png` (opaque RGB, as iOS requires). The app shell step adds it at build time as a
 single-size `AppIcon` set in an asset catalog (one 1024x1024 image; Xcode derives the other sizes).
 
+## Memory on the iPhone (2026-11-17)
+- What the port reserves (bias mode): 12 GiB of guest space (image and main heap 1.8 GiB, second heap zone 10.4 GiB) plus a 5 GiB
+  guard below the image: 17 GiB of ADDRESS SPACE, no access, committed only where used. What it uses: on the longest route (to the
+  first camp menu, 22,000 game frames) the main heap reaches about 1.5 GiB, the second zone under 0.1 GiB, peak resident memory
+  0.9 GB on Linux and 0.76 GB on the Mac mini with the GPU renderer.
+- iOS limits these separately: the address space an app may reserve (`com.apple.developer.kernel.extended-virtual-addressing`) and
+  the memory it may use before the system ends it (`com.apple.developer.kernel.increased-memory-limit`). The owner's paid developer
+  team can have both; the app and the probe (`tools/runtime/ios/probe/probe.entitlements.example`) ask for both. The probe on the
+  signed phone is the first iPhone step: reserve the real layout, touch what the routes touch, and read `os_proc_available_memory()`.
+- If a layout without extended addressing is ever needed: the second zone is almost empty, so an iOS layout of 2-4 GiB (and a
+  smaller guard) is possible; the object-id windows of the main heap must keep their place (docs: implementation notes).
+
