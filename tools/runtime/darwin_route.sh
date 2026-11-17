@@ -90,7 +90,7 @@ selftest)
     case "$kv" in *[!A-Za-z0-9_=./:@%+,-]*) echo "darwin_route: '$kv': only letters, digits and _ = . / : @ % + , - can be passed" >&2; exit 2;; esac; XENV="$XENV $kv"; done
   busy && exit 3
   mkdir -p "$RUN"; push_tools
-  "${SSH[@]}" "$MAC" "cd ~/$RDIR && mkdir -p run/tmp && $GATE && rm -rf run/docs-selftest run/tmp/khnmc-route-* && (KH_EXE=\$PWD/pc/kh2fm.exe KH_DOCS=\$PWD/run/docs-selftest KH_TMPDIR=\$PWD/run/tmp TMPDIR=\$PWD/run/tmp$XENV nice -n $NICE ./khnmc --selftest > run/selftest-$TAG.out 2>&1; echo \"selftest exit=\$?\" | tee -a run/selftest-$TAG.out; echo \"darwin_route: left in run/tmp: \$(ls -A run/tmp | tr '\\n' ' ')\")" || exit 1
+  "${SSH[@]}" "$MAC" "cd ~/$RDIR && mkdir -p run/tmp && $GATE && rm -rf run/docs-selftest && find run/tmp -maxdepth 1 -name 'khnmc-route-*' -exec rm -rf {} + && (KH_EXE=\$PWD/pc/kh2fm.exe KH_DOCS=\$PWD/run/docs-selftest KH_TMPDIR=\$PWD/run/tmp TMPDIR=\$PWD/run/tmp$XENV nice -n $NICE ./khnmc --selftest > run/selftest-$TAG.out 2>&1; echo \"selftest exit=\$?\" | tee -a run/selftest-$TAG.out; echo \"darwin_route: left in run/tmp: \$(ls -A run/tmp | tr '\\n' ' ')\")" || exit 1
   scp -q -o BatchMode=yes "$MAC:$RDIR/run/selftest-$TAG.out" "$RUN/mac-selftest-$TAG.out" || exit 1
   grep -a "SKIPPED\|FAIL\|transcript\|guest space\|selftest exit" "$RUN/mac-selftest-$TAG.out" | cut -c1-220
   grep -aq "^selftest exit=0" "$RUN/mac-selftest-$TAG.out"
