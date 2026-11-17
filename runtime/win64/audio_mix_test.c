@@ -9,6 +9,9 @@
 #include <math.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <time.h>
+#include <stdatomic.h>
 /* runtime/host_env.c: the scratch directory the host gives (this file is independent of khnmc_rt.h, like the mixer itself) */
 #define KH_TMP_MAX 1024
 char *kh_tmp_path(char *out, size_t cap, const char *leaf);
@@ -486,6 +489,149 @@ static uint64_t scenario(void){
     kmx_engine_destroy(e); return h;
 }
 
+/* ---- TASK28: hidden voices, deferred calls ------------------------------------------------------------------------------------- */
+static __thread uint64_t tl_stamp;                                    /* the clock of host->now: each test thread stamps its own calls */
+static uint64_t t_now(void *eu){ (void)eu; return tl_stamp; }
+static const KmxHost dhost = { NULL, NULL, t_engine_event, t_voice_event, t_fx, t_voice_free, t_now, NULL };
+static uint64_t hash_out(uint64_t h, const float *o, size_t n){ const uint8_t *q = (const uint8_t *)o; for(size_t i = 0; i < n * sizeof(float); i++){ h ^= q[i]; h *= 1099511628211ull; } return h; }
+static int pass_at(KmxEngine *e, uint64_t instant, float *dst){
+    const float *o = NULL; uint32_t oc = 0; kmx_engine_pass_at(e, NULL, instant, &o, &oc);
+    if(o) memcpy(dst, o, 960 * sizeof(float)); else memset(dst, 0, 960 * sizeof(float));
+    return (int)oc;
+}
+static int16_t dconst[2 * 48000];
+static void test_hidden(void){
+    KmxEngine *e = kmx_engine_create(&thost, NULL, 48000); kmx_engine_start(e); float o[960];
+    KmxVoice *m, *s; CHECK(kmx_voice_create_master(e, 2, 48000, KMX_VOICE_HIDDEN, NULL, &m) == KMX_OK && kmx_voice_hidden(m) == 1);
+    KmxFormat f = pcm_fmt(2, 48000, 16); for(int i = 0; i < 2 * 48000; i++) dconst[i] = 8192;
+    nev = 0; CHECK(kmx_voice_create_source(e, &f, KMX_VOICE_HIDDEN, 2.0f, (void *)0x51, 1, &s) == KMX_OK); kmx_voice_set_outputs(s, NULL, NULL, 0, 1);
+    KmxBuffer b = mkbuf(dconst, sizeof dconst, 0, 0); kmx_source_submit(s, &b); kmx_source_start(s);
+    KmxStats st0, st1; kmx_engine_stats(e, &st0);
+    CHECK(pass_at(e, UINT64_MAX, o) == 0 && nev == 0);                 /* nothing published: no output, no callback */
+    kmx_engine_stats(e, &st1); CHECK(st1.hidden_skips == st0.hidden_skips + 2);
+    CHECK(kmx_voice_publish(m) == KMX_OK && kmx_voice_hidden(m) == 0);
+    CHECK(pass_at(e, UINT64_MAX, o) == 2 && o[0] == 0.0f && nev == 0);  /* the master is out, its source is not */
+    CHECK(kmx_voice_publish(s) == KMX_OK); pass_at(e, UINT64_MAX, o); CHECK(o[0] == 0.25f && o[959] == 0.25f && count_ev(KMX_EV_PASS_START, (void *)0x51) == 1);
+    kmx_engine_destroy(e);
+}
+static int16_t dramp[2 * 4800];
+static KmxVoice *jit_v;                                                /* just-in-time submit from OnVoiceProcessingPassStart (clang has no nested functions) */
+static void jit(void *ctx, void *user, int ev, uint64_t arg){ (void)ctx; if(user == (void *)0x77 && ev == KMX_EV_PASS_START && arg){ KmxBuffer bb = mkbuf(dramp, sizeof dramp, 0, 9); kmx_source_submit(jit_v, &bb); } }
+/* the deferred rule: a call stamped T applies right before the first pass whose instant is later than T, in call order */
+static void test_deferred(void){
+    for(int i = 0; i < 4800; i++){ dramp[2 * i] = (int16_t)(i * 6); dramp[2 * i + 1] = (int16_t)(-i * 6); }
+    KmxFormat f = pcm_fmt(2, 48000, 16); float o[960];
+    uint64_t hs[3][8];
+    for(int variant = 0; variant < 3; variant++){                      /* the same calls stamped 1001, 1009 (same pass interval) and 1010 (the next instant) */
+        KmxEngine *e = kmx_engine_create(&dhost, NULL, 48000); kmx_engine_start(e);
+        KmxVoice *m, *s; kmx_voice_create_master(e, 2, 48000, 0, NULL, &m); kmx_voice_create_source(e, &f, 0, 2.0f, NULL, 0, &s); kmx_voice_set_outputs(s, NULL, NULL, 0, 1);
+        kmx_engine_set_deferred(e, 1); CHECK(kmx_engine_deferred(e) == 1);
+        tl_stamp = variant == 0 ? 1001 : variant == 1 ? 1009 : 1010;
+        KmxBuffer b = mkbuf(dramp, sizeof dramp, 0, 7); CHECK(kmx_source_submit(s, &b) == KMX_OK); CHECK(kmx_source_start(s) == KMX_OK);
+        uint64_t ctx = 0; uint32_t q = 0; kmx_source_state(s, &ctx, &q, NULL); CHECK(q == 1 && ctx == 7);   /* the caller's view: queued, not applied yet */
+        CHECK(kmx_engine_pending(e) == 2);
+        CHECK(kmx_voice_set_volume(s, 0.5f) == KMX_OK && kmx_voice_volume(s) == 0.5f);                    /* getters: the latest value set */
+        CHECK(kmx_source_set_ratio(s, 1.0f) == KMX_OK && kmx_source_ratio(s) == 1.0f);
+        for(int k = 0; k < 8; k++){ pass_at(e, 1000 + 10 * (uint64_t)k, o); hs[variant][k] = hash_out(1469598103934665603ull, o, 960); }
+        if(variant < 2) CHECK(kmx_engine_pending(e) == 0);
+        kmx_engine_destroy(e);
+    }
+    float silent[960]; memset(silent, 0, sizeof silent); uint64_t hz = hash_out(1469598103934665603ull, silent, 960);
+    CHECK(hs[0][0] == hz && hs[0][1] != hz);                           /* stamped 1001: not in the pass at 1000, playing from the pass at 1010 */
+    int same = 1; for(int k = 0; k < 8; k++) if(hs[0][k] != hs[1][k]) same = 0; CHECK(same);            /* 1001 or 1009: the same bits */
+    CHECK(hs[2][1] == hz);                                             /* stamped exactly 1010: the pass AT 1010 does not see it ... */
+    same = 1; for(int k = 1; k < 7; k++) if(hs[2][k + 1] != hs[0][k]) same = 0; CHECK(same);           /* ... the next one does: one whole pass later, bit-identical */
+    /* a buffer submitted from inside a pass (OnVoiceProcessingPassStart, the pass thread) plays in that very pass, as in XAudio2 */
+    KmxEngine *e = kmx_engine_create(&dhost, NULL, 48000); kmx_engine_start(e);
+    KmxVoice *m, *s; kmx_voice_create_master(e, 2, 48000, 0, NULL, &m); kmx_voice_create_source(e, &f, 0, 2.0f, (void *)0x77, 1, &s); kmx_voice_set_outputs(s, NULL, NULL, 0, 1);
+    kmx_engine_set_deferred(e, 1); tl_stamp = 1; kmx_source_start(s);
+    jit_v = s;
+    hook = NULL; pass_at(e, 10, o); CHECK(o[2] == 0.0f);
+    hook = jit; pass_at(e, 20, o); hook = NULL; CHECK(o[2] == 6.0f / 32768.0f);                       /* same pass: no starvation */
+    /* destroy drops the voice's queued calls, without callbacks */
+    KmxStats a0, a1; kmx_engine_stats(e, &a0); tl_stamp = 25; nev = 0;
+    kmx_voice_set_volume(s, 0.1f); kmx_source_stop(s, 0); kmx_source_flush(s); kmx_voice_destroy(s);
+    kmx_engine_stats(e, &a1); CHECK(a1.deferred_dropped == a0.deferred_dropped + 3); pass_at(e, 30, o); CHECK(nev == 0);
+    /* publish through the queue: a voice published at 40 takes part from the pass after 40 */
+    KmxVoice *s2; kmx_voice_create_source(e, &f, KMX_VOICE_HIDDEN, 2.0f, NULL, 0, &s2); kmx_voice_set_outputs(s2, NULL, NULL, 0, 1);
+    KmxBuffer b2 = mkbuf(dconst, sizeof dconst, 0, 0); tl_stamp = 40; kmx_source_submit(s2, &b2); kmx_source_start(s2); kmx_voice_publish(s2);
+    pass_at(e, 40, o); CHECK(o[0] == 0.0f && kmx_voice_hidden(s2) == 1); pass_at(e, 50, o); CHECK(o[0] == 0.25f && kmx_voice_hidden(s2) == 0);
+    kmx_engine_destroy(e);
+}
+/* review of task 28: SetEffectChain applies at once; EnableEffect / SetEffectParameters queued before it address the OLD chain by index
+ * and must not reach the new chain's effect at that index (another XAPO, a blob of another layout); channel volumes queued before a
+ * chain that changes the output width must not end as a refused call (the named fatal audio-deferred-call-refused).  Both are dropped
+ * and counted (deferred_superseded), as XAudio2's call order would have applied them to the old chain / reset them with it. */
+static void *fxp_who[8]; static int fxp_n;
+static void t_fxp(void *ctx, void *fu, const void *blob, uint32_t size){ (void)ctx; (void)blob; (void)size; if(fxp_n < 8) fxp_who[fxp_n] = fu; fxp_n++; }
+static const KmxHost dhost_fx = { NULL, NULL, t_engine_event, t_voice_event, t_fx, t_voice_free, t_now, t_fxp };
+static void test_deferred_chain(void){
+    KmxEngine *e = kmx_engine_create(&dhost_fx, NULL, 48000); kmx_engine_start(e); float o[960];
+    KmxVoice *m, *s; kmx_voice_create_master(e, 2, 48000, 0, NULL, &m);
+    KmxFormat f = pcm_fmt(2, 48000, 16); kmx_voice_create_source(e, &f, 0, 2.0f, NULL, 0, &s); kmx_voice_set_outputs(s, NULL, NULL, 0, 1);
+    static TFx fa, fb, fc; memset(&fa, 0, sizeof fa); memset(&fb, 0, sizeof fb); memset(&fc, 0, sizeof fc); fa.gain = fb.gain = fc.gain = 1.0f;
+    KmxFxDesc da[1] = {{KMX_FX_HOST, &fa, 2, 1, 0}}; CHECK(kmx_voice_set_chain(m, da, 1) == KMX_OK);
+    kmx_engine_set_deferred(e, 1); tl_stamp = 5; uint8_t blob[4] = {1, 2, 3, 4};
+    CHECK(kmx_voice_fx_enable(m, 0, 0) == KMX_OK && kmx_voice_fx_params(m, NULL, 0, blob, 4) == KMX_OK);   /* for effect A, queued */
+    float cv[2] = {0.5f, 0.25f}; CHECK(kmx_voice_set_channel_volumes(s, 2, cv) == KMX_OK);               /* for the source's 2 outputs, queued */
+    int on = -1; CHECK(kmx_voice_fx_enabled(m, 0, &on) == KMX_OK && on == 0);
+    KmxStats s0, s1; kmx_engine_stats(e, &s0);
+    KmxFxDesc db[1] = {{KMX_FX_HOST, &fb, 2, 1, 0}}; CHECK(kmx_voice_set_chain(m, db, 1) == KMX_OK);       /* A replaced by B (enabled) */
+    KmxFxDesc dc[1] = {{KMX_FX_HOST, &fc, 1, 1, 0}}; CHECK(kmx_voice_set_chain(s, dc, 1) == KMX_OK && kmx_voice_out_channels(s) == 1);   /* 2 -> 1 */
+    on = -1; CHECK(kmx_voice_fx_enabled(m, 0, &on) == KMX_OK && on == 1);                                   /* the getter: B as created */
+    fxp_n = 0; pass_at(e, 10, o); kmx_engine_stats(e, &s1);
+    CHECK(fxp_n == 0);                                                                                      /* B never got A's parameter blob */
+    CHECK(fb.calls >= 1 && fb.last_enabled == 1);                                                           /* nor A's EnableEffect(0, off) */
+    CHECK(s1.deferred_superseded == s0.deferred_superseded + 3 && s1.deferred_failed == s0.deferred_failed && kmx_engine_pending(e) == 0);
+    tl_stamp = 15; CHECK(kmx_voice_fx_enable(m, 0, 0) == KMX_OK); pass_at(e, 20, o); CHECK(fb.last_enabled == 0);   /* calls after the chain reach B */
+    kmx_engine_destroy(e);
+}
+/* the same stamped calls give the same bits whatever the host interleaving: a second thread makes 300 calls stamped on and between the
+ * pass instants while this thread runs the passes; it may only call once the clock could have reached the stamp (every pass before
+ * it is done), and a pass waits for every call stamped before its instant (as the virtual clock does) -- calls stamped exactly on an
+ * instant race with that pass in host time, and must still land in the next one */
+#define RACE_OPS 300
+#define RACE_PASSES 120
+typedef struct { uint64_t stamp; int kind; float x; } ROp;
+static ROp rops[RACE_OPS]; static KmxVoice *race_v[2]; static _Atomic int race_issued, race_done; static int race_jitter;
+static void race_issue(int k){ ROp *r = &rops[k]; tl_stamp = r->stamp; KmxVoice *v = race_v[r->kind & 1];
+    switch(r->kind >> 1){ case 0: kmx_voice_set_volume(v, r->x); break; case 1: kmx_source_set_ratio(v, r->x); break; case 2: kmx_source_stop(v, 0); break; case 3: kmx_source_start(v); break; } }
+static void *race_thread(void *arg){ (void)arg; uint32_t x = 99;
+    for(int k = 0; k < RACE_OPS; k++){
+        int need = (int)((rops[k].stamp + 9) / 10);                    /* passes whose instant is earlier than the stamp */
+        while(atomic_load(&race_done) < need){}
+        if(race_jitter){ x = x * 1664525u + 1013904223u; if(x >> 30){ struct timespec ts = {0, (long)((x >> 8) % 150000u)}; nanosleep(&ts, NULL); } }
+        race_issue(k); atomic_store(&race_issued, k + 1);
+    }
+    return NULL;
+}
+static uint64_t race_run(int threaded, int deferred){
+    KmxEngine *e = kmx_engine_create(&dhost, NULL, 48000); kmx_engine_start(e); KmxFormat f = pcm_fmt(2, 48000, 16);
+    KmxVoice *m; kmx_voice_create_master(e, 2, 48000, 0, NULL, &m);
+    for(int i = 0; i < 2; i++){ kmx_voice_create_source(e, &f, 0, 2.0f, NULL, 0, &race_v[i]); kmx_voice_set_outputs(race_v[i], NULL, NULL, 0, 1);
+        KmxBuffer b = mkbuf(dramp, sizeof dramp, 0, 0); b.loop_count = KMX_LOOP_INFINITE; kmx_source_submit(race_v[i], &b); kmx_source_start(race_v[i]); }
+    kmx_engine_set_deferred(e, deferred); atomic_store(&race_issued, 0); atomic_store(&race_done, 0);
+    pthread_t th; if(threaded) pthread_create(&th, NULL, race_thread, NULL);
+    uint64_t h = 1469598103934665603ull; float o[960]; int k = 0;
+    for(int n = 0; n < RACE_PASSES; n++){
+        uint64_t inst = 10 * (uint64_t)n; int need = 0; while(need < RACE_OPS && rops[need].stamp < inst) need++;
+        if(threaded) while(atomic_load(&race_issued) < need){}
+        else while(k < need) race_issue(k++);
+        pass_at(e, inst, o); h = hash_out(h, o, 960); atomic_store(&race_done, n + 1);
+    }
+    if(threaded) pthread_join(th, NULL);
+    kmx_engine_destroy(e); return h;
+}
+static void test_deferred_race(void){
+    uint32_t x = 4242;
+    for(int k = 0; k < RACE_OPS; k++){ x = x * 1664525u + 1013904223u; uint64_t base = 10 * (uint64_t)(1 + k * (RACE_PASSES - 10) / RACE_OPS);
+        rops[k].stamp = base + ((x >> 20) % 3 == 0 ? 0 : (x >> 20) % 3 == 1 ? 3 : 7); rops[k].kind = (int)((x >> 8) % 8); rops[k].x = 0.25f + (float)((x >> 12) % 100) / 64.0f; }
+    for(int k = 1; k < RACE_OPS; k++) if(rops[k].stamp < rops[k - 1].stamp) rops[k].stamp = rops[k - 1].stamp;   /* one thread: its stamps never go back */
+    uint64_t ref = race_run(0, 1); int same = 1;
+    for(int r = 0; r < 4; r++){ race_jitter = r & 1; if(race_run(1, 1) != ref) same = 0; }
+    CHECK(same);                                                       /* 4 threaded runs, with and without random delays: the reference bits */
+}
+
 /* ---- WAV writer ---- */
 static void test_wav(void){
     char path[KH_TMP_MAX]; kh_tmp_path(path, sizeof path, "khnmc-wav-XXXXXX"); int fd = mkstemp(path); CHECK(fd >= 0); if(fd < 0) return; close(fd);
@@ -509,6 +655,7 @@ int kh_audio_mix_selftest(void){
     test_adpcm(); test_formats(); test_playback_order(); test_queue_loops(); test_reentrancy(); test_routing(); test_ramp(); test_resample(); test_effects();
     uint64_t h1 = scenario(), h2 = scenario(); CHECK(h1 == h2);
     test_wav();
+    test_hidden(); test_deferred(); test_deferred_chain(); test_deferred_race();
     fprintf(stderr, "kh: audio mix selftest: %d checks, %d failures (determinism hash %016llx)\n", checks, fails, (unsigned long long)h1);
     return fails;
 }

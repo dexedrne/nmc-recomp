@@ -97,7 +97,7 @@ void kh_run_tls_callbacks(KCtx *g,u32 reason){
 }
 static KThread *thread_new(void){
     KThread *t=calloc(1,sizeof *t); t->g=kh_new_ctx(); t->tid=atomic_fetch_add(&next_tid,4); t->prio=0;
-    pthread_mutex_init(&t->m,0); kh_cond_init(&t->cv);
+    pthread_mutex_init(&t->m,0); kh_cond_init(&t->cv); pthread_mutex_init(&t->vc_m,0);
     pthread_mutex_lock(&tlist_m); if(ntlist<4096) tlist[ntlist++]=t; pthread_mutex_unlock(&tlist_m); return t;
 }
 static void thread_bind(KThread *t){ tl_thread=t; t->g->rt=t; kh_install_sigaltstack(); kh_set_cur_g(t->g); }
@@ -133,10 +133,22 @@ static int wobj_try(KWaitObj *w,int k,KThread *me,u64 gen0,int blocked){
     if(k==HK_MUTEX){ if(w->recurse==0||w->owner==me->tid){ w->owner=me->tid; w->recurse++; return 1; } return 0; }
     return 0;
 }
+/* TASK28, KHNMC_CLOCK_SYNC=all: a time-out is on the virtual clock (a clock client at the deadline: the clock stops there until this
+ * thread has woken and is running again), and while the thread blocks it is idle for the quiescence test unless its object is ready */
+static int wobj_ready(KWaitObj *w,int k,KThread *t,u64 gen0,int blocked){
+    if(k==HK_THREAD) return w->thread&&w->thread->done;
+    if(k==HK_EVENT){ if(w->signaled) return 1; if(w->manual) return w->gen!=gen0; return blocked&&w->pulse_tokens>0; }
+    if(k==HK_SEM) return w->count>0;
+    if(k==HK_MUTEX) return w->recurse==0||w->owner==t->tid;
+    return 1;
+}
+static _Atomic u64 vc_vwaits;
 u32 kh_wait(KCtx *g,u64 h,u32 ms){
     KThread *me=cur_thread(); SYNC_CHAOS();
     if(h==PSEUDO_THREAD||h==PSEUDO_PROCESS) return 0x102;
     int k=0; KWaitObj *w=h_get_ref(h,&k); if(!w){ kh_set_last_error(6); return 0xFFFFFFFFu; }
+    int vsync=kh_vclock_sync&&me, vcl=-1; u64 vdl=0;                                  /* the idle mark from the start; virtual time-outs once the clock steps */
+    if(vsync&&kh_vclock_stepped()&&ms!=0xFFFFFFFFu&&ms){ vdl=kh_vclock_now_ns()+(u64)ms*1000000ull; vcl=kh_vclock_deadline_add(vdl); vc_vwaits++; }
     struct timespec dl; if(ms!=0xFFFFFFFFu) abs_deadline(&dl,ms);
     pthread_mutex_t *m=&w->m; pthread_cond_t *cv=&w->cv; KThread *th=NULL;
     if(k==HK_THREAD){ th=w->thread; m=&th->m; cv=&th->cv; }                 /* signalled by the thread's own exit notification */
@@ -145,32 +157,103 @@ u32 kh_wait(KCtx *g,u64 h,u32 ms){
     for(;;){
         if(th?th->done:wobj_try(w,k,me,gen0,blocked)) break;
         if(ms==0){ res=0x102; break; }
-        if(!blocked){ blocked=1; if(!th) w->waiters++; }
+        if(!blocked){ blocked=1; if(!th){ w->waiters++; if(kh_vclock_on) pthread_cond_broadcast(cv); }     /* frames clock: a timer client may wait for a consumer to be back (kh_wobj_settle) */
+            if(vsync){ atomic_store(&me->vc_k,k); atomic_store(&me->vc_gen0,gen0); atomic_store(&me->vc_blocked,1); atomic_store(&me->vc_w,(void*)w); atomic_store(&me->vc_state,1); kh_vclock_idle(2); } }
         int rc;
+        if(vcl>=0){                                                                      /* virtual time-out: poll the clock, the object wakes us as usual */
+            /* the due test runs the quiescence test, which takes tlist_m, other threads' vc_m and THEIR objects' locks: never with m held
+             * (review of task 28: a second thread blocked on this object made the test lock m again, and two timed waiters testing at
+             * once took each other's object locks in opposite orders).  m is retaken and the object tested again before a time-out. */
+            if(kh_vclock_now_ns()>=vdl){ pthread_mutex_unlock(m); int due=kh_vclock_deadline_due(vcl,vdl); pthread_mutex_lock(m);
+                if(due){ if(!(th?th->done:wobj_try(w,k,me,gen0,blocked))) res=0x102; break; } }
+            struct timespec d2; abs_deadline(&d2,1); kh_cond_wait_until(cv,m,&d2); continue; }
         if(ms==0xFFFFFFFFu){ struct timespec d2; abs_deadline(&d2,10000); rc=kh_cond_wait_until(cv,m,&d2);
             if(rc==ETIMEDOUT){ waited+=10; if(kh_verbose||(waited%60==0)) fprintf(stderr,"kh: thread %u ('%s') waiting %llus on handle %llx kind %d (site rva %llx)\n",me->tid,me->name,(unsigned long long)waited,(unsigned long long)h,k,(unsigned long long)(rd64(g,KH_RSP(g))-GS_BASE)); } }
         else { rc=kh_cond_wait_until(cv,m,&dl); if(rc==ETIMEDOUT){ if(!(th?th->done:wobj_try(w,k,me,gen0,blocked))) res=0x102; break; } }
     }
     if(blocked&&!th){ w->waiters--; if(w->pulse_tokens>w->waiters) w->pulse_tokens=w->waiters; }
-    pthread_mutex_unlock(m); kh_wobj_unref(w); return res;
+    if(!th&&res==0){ w->satisfied++; w->last_taker=me; if(kh_vclock_on) pthread_cond_broadcast(cv); }
+    if(vsync&&blocked) atomic_store(&me->vc_state,0);                                    /* running again: set while the object's lock is held (the quiescence test takes it) */
+    pthread_mutex_unlock(m);
+    if(vsync&&blocked){ pthread_mutex_lock(&me->vc_m); atomic_store(&me->vc_w,NULL); pthread_mutex_unlock(&me->vc_m); }
+    if(vcl>=0) kh_vclock_deadline_drop(vcl);                                             /* after "running": the clock held at the deadline may go on */
+    kh_wobj_unref(w); return res;
 }
+int kh_wobj_waitstate(u64 h,int *waiters,u64 *satisfied){
+    int k; KWaitObj *w=h_get_ref(h,&k); if(!w) return -1; if(k==HK_THREAD){ kh_wobj_unref(w); return -1; }
+    pthread_mutex_lock(&w->m); *waiters=w->waiters; *satisfied=w->satisfied; pthread_mutex_unlock(&w->m); kh_wobj_unref(w); return 0;
+}
+int kh_wobj_settle(u64 h,u64 sat0,int waiters0,u32 timeout_ms,volatile int *stop){
+    int k; KWaitObj *w=h_get_ref(h,&k); if(!w) return 0; if(k==HK_THREAD){ kh_wobj_unref(w); return 0; }
+    struct timespec dl; abs_deadline(&dl,timeout_ms); int rc=0;
+    pthread_mutex_lock(&w->m);
+    while(!(w->satisfied>sat0&&w->waiters>=waiters0)){
+        if(stop&&*stop){ rc=2; break; }
+        struct timespec d2; abs_deadline(&d2,20); if(kh_cond_wait_until(&w->cv,&w->m,&d2)==ETIMEDOUT){ struct timespec now; clock_gettime(CLOCK_MONOTONIC,&now); if(now.tv_sec>dl.tv_sec||(now.tv_sec==dl.tv_sec&&now.tv_nsec>=dl.tv_nsec)){ rc=1; break; } }
+    }
+    pthread_mutex_unlock(&w->m); kh_wobj_unref(w); return rc;
+}
+static __thread void (*tl_set_hook)(void*,u64); static __thread void *tl_set_ctx;
+/* the quiescence test of KHNMC_CLOCK_SYNC=all: every live guest thread idle (a clock wait, parked) or blocked on an object that would not
+ * satisfy it now.  Lock order: tlist_m -> the thread's vc_m -> the object's m.  So no caller may hold any object's m (a waiter never takes
+ * vc_m or calls this while it holds m: kh_wait releases m around its due test). */
+static KThread *const *quiet_only; static u32 quiet_nonly;            /* selftest only: the test looks at these threads (other suites' threads live on) */
+static void (*quiet_hook)(KThread *t);                                 /* selftest only: called after a thread was judged idle, inside the test's pass */
+/* not running for the quiescence test and the wake hand-off: idle (2), or waiting for a critical section that is owned by ANOTHER thread
+ * (3; review of task 28, second fixer: owned by itself = its compare-exchange just took it and it runs, before it marks itself running);
+ * a thread blocked on an object (1) is judged by its object */
+static int vc_idle_now(KThread *t,int st){ if(st==2) return 1;
+    if(st==3){ unsigned long long *o=atomic_load(&t->vc_csown); unsigned long long ow=o?__atomic_load_n(o,__ATOMIC_ACQUIRE):0; return ow!=0&&ow!=(unsigned long long)t->tid; }
+    return 0; }
+/* review of task 28, second fixer: the test is one pass over the threads, not an atomic snapshot.  A release that makes an idle thread
+ * runnable WITHOUT a wake hand-off (LeaveCriticalSection, ResumeThread, ReleaseMutex, a thread's end) between the pass's look at the
+ * released thread (still idle then) and its look at the releasing thread (idle again by then, or ended and skipped) made the pass
+ * report "quiet" while a thread was runnable.  Every such release bumps vc_rel_seq; a pass during which it moved is not quiet (the
+ * caller tests again, as for any running thread).  SetEvent / ReleaseSemaphore do not need it: their waker hands off (vc_after_wake). */
+static _Atomic u64 vc_rel_seq, vc_rel_retests;
+static inline void vc_released(void){ if(kh_vclock_sync) atomic_fetch_add(&vc_rel_seq,1); }
+int kh_threads_quiet(char *who,size_t cap){
+    int quiet=1; KThread *self=cur_thread(); u64 seq0=atomic_load(&vc_rel_seq); pthread_mutex_lock(&tlist_m);
+    for(u32 i=0;i<ntlist&&quiet;i++){ KThread *t=tlist[i]; if(t->done||t==self) continue;
+        if(quiet_only){ int in=0; for(u32 j=0;j<quiet_nonly;j++) in|=quiet_only[j]==t; if(!in) continue; }
+        int st=atomic_load(&t->vc_state);
+        if(vc_idle_now(t,st)){ if(quiet_hook) quiet_hook(t); continue; }
+        if(st==1){ pthread_mutex_lock(&t->vc_m); KWaitObj *w=(KWaitObj*)atomic_load(&t->vc_w);
+            if(w){ pthread_mutex_t *wm=(atomic_load(&t->vc_k)==HK_THREAD&&w->thread)?&w->thread->m:&w->m; pthread_mutex_lock(wm);
+                int idle=atomic_load(&t->vc_state)==1&&!wobj_ready(w,atomic_load(&t->vc_k),t,atomic_load(&t->vc_gen0),atomic_load(&t->vc_blocked));
+                pthread_mutex_unlock(wm); pthread_mutex_unlock(&t->vc_m); if(idle){ if(quiet_hook) quiet_hook(t); continue; } }
+            else pthread_mutex_unlock(&t->vc_m); }
+        quiet=0; if(who) snprintf(who,cap,"%u '%s'%s",t->tid,t->name,st==1?" (woken)":st==3?" (critical section free or just taken)":"");
+    }
+    pthread_mutex_unlock(&tlist_m);
+    if(quiet&&atomic_load(&vc_rel_seq)!=seq0){ quiet=0; vc_rel_retests++; if(who) snprintf(who,cap,"(a thread was released during the test)"); }
+    return quiet;
+}
+u64 kh_threads_vwaits(void){ return vc_vwaits; }
+u64 kh_threads_rel_retests(void){ return vc_rel_retests; }
+void kh_set_event_hook(void (*fn)(void*,u64),void *ctx){ tl_set_hook=fn; tl_set_ctx=ctx; }
 
 /* ---- critical sections (state lives in the guest CRITICAL_SECTION: +0xC recursion, +0x10 owner) ---------------------------- */
 static inline u64 cs_owner(KCtx *g,u64 cs){ return __atomic_load_n((u64*)XL(g,cs+0x10),__ATOMIC_ACQUIRE); }
+/* KHNMC_CLOCK_SYNC=all: a waiter past 2,000 spins sleeps 50 us at a time; it used to be marked idle (2) for the quiescence test, which
+ * stayed true after the owner LEFT the section: the clock could step before the waiter took it, at a host-chosen instant.  On ONE CPU
+ * that decided which 16 ms handler tick created the title music's voice (review of task 28: pinned title starts gave 5 hashes in 20).
+ * Now it is state 3: idle only while the section's owner field is non-zero (kh_threads_quiet reads it). */
 static void cs_enter(KCtx *g,u64 cs){
     SYNC_CHAOS();
-    u64 me=cur_thread()->tid; u64 *own=(u64*)XL(g,cs+0x10);
+    KThread *ct=cur_thread(); u64 me=ct->tid; u64 *own=(u64*)XL(g,cs+0x10);
     if(__atomic_load_n(own,__ATOMIC_RELAXED)==me){ wr32(g,cs+0xC,rd32(g,cs+0xC)+1); return; }
     int spins=0;
     for(;;){ u64 z=0; if(__atomic_compare_exchange_n(own,&z,me,0,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)) break;
-        if(++spins<200) KH_CPU_RELAX(); else if(spins<2000) sched_yield(); else { struct timespec ts={0,50000}; nanosleep(&ts,0); } }
+        if(++spins<200) KH_CPU_RELAX(); else if(spins<2000) sched_yield(); else { if(spins==2000&&kh_vclock_sync){ atomic_store(&ct->vc_csown,(unsigned long long*)own); atomic_store(&ct->vc_state,3); kh_vclock_idle(2); } struct timespec ts={0,50000}; nanosleep(&ts,0); } }
+    if(spins>=2000&&kh_vclock_sync) kh_vclock_idle(0);
     wr32(g,cs+0xC,1);
 }
 static void cs_leave(KCtx *g,u64 cs){
     u64 *own=(u64*)XL(g,cs+0x10); u32 r=rd32(g,cs+0xC);
     if(__atomic_load_n(own,__ATOMIC_RELAXED)!=cur_thread()->tid){ kh_fatal(g,"LeaveCriticalSection(%llx) by non-owner (owner=%llx me=%u)",(unsigned long long)cs,(unsigned long long)*own,cur_thread()->tid); }
     if(r>1){ wr32(g,cs+0xC,r-1); return; }
-    wr32(g,cs+0xC,0); __atomic_store_n(own,0,__ATOMIC_RELEASE);
+    wr32(g,cs+0xC,0); __atomic_store_n(own,0,__ATOMIC_RELEASE); vc_released();
     SYNC_CHAOS();
 }
 IMP(K32,InitializeCriticalSection){ u64 cs=A0(g); memset(hp(g,cs),0,0x28); SET_RAX(g,0); }
@@ -202,13 +285,35 @@ static int event_signal(u64 h,int pulse){
     else w->signaled=1;                                                                   /* one waiter takes it, or it stays set */
     pthread_cond_broadcast(&w->cv); pthread_mutex_unlock(&w->m); kh_wobj_unref(w); return 1;
 }
+/* TASK28, KHNMC_CLOCK_SYNC=all: a guest thread that wakes another one with SetEvent or ReleaseSemaphore (not ReleaseMutex) waits
+ * until the thread it released (one that was blocked on the object) has taken it and is idle again, i.e. the woken thread ran to
+ * its next wait before the waker goes on, so what the waker reads of the woken thread's work afterwards does not depend on the host.
+ * Also on the mixer thread (a voice callback that wakes the stream handler) and the timer threads; never on host threads. */
+static _Atomic u64 vc_wake_waits, vc_wake_guard;
+/* the hand-off: only when the signal released a thread that was blocked on the object, and only until THAT thread is idle again */
+static void vc_after_wake(u64 h,int had_waiters,u64 sat0){
+    KThread *me=cur_thread(); if(!kh_vclock_sync||!me||!had_waiters||!kh_vclock_stepped()) return;
+    int k; KWaitObj *w=h_get_ref(h,&k); if(!w) return;
+    u64 t0=0; struct timespec ts={0,20000}; KThread *tk=NULL;
+    for(;;){
+        pthread_mutex_lock(&w->m); u64 sat=w->satisfied; tk=w->last_taker; int left=w->waiters; pthread_mutex_unlock(&w->m);
+        if(sat>sat0&&tk&&tk!=me&&(tk->done||atomic_load(&tk->vc_state)==1||vc_idle_now(tk,atomic_load(&tk->vc_state)))) break;     /* taken, and the taker waits again (or ended) */
+        if(sat==sat0&&left==0) break;                                                  /* nobody blocked any more and nobody took it */
+        struct timespec now; clock_gettime(CLOCK_MONOTONIC,&now); u64 hn=(u64)now.tv_sec*1000000000ull+(u64)now.tv_nsec;
+        if(!t0){ t0=hn; vc_wake_waits++; } if(hn-t0>2000000000ull){ vc_wake_guard++; break; }
+        nanosleep(&ts,0);
+    }
+    kh_wobj_unref(w);
+}
+static int vc_wake_state(u64 h,u64 *sat){ int wt=0; if(!kh_vclock_sync) return 0; if(kh_wobj_waitstate(h,&wt,sat)) return 0; return wt; }
+u64 kh_threads_wake_waits(u64 *guard){ if(guard) *guard=vc_wake_guard; return vc_wake_waits; }
 int kh_event_set(u64 h){ return event_signal(h,0); }
 int kh_event_pulse(u64 h){ return event_signal(h,1); }
 static int event_reset(u64 h){ int k; KWaitObj *w=h_get_ref(h,&k); if(!w) return 0; if(k!=HK_EVENT){ kh_wobj_unref(w); return 0; } pthread_mutex_lock(&w->m); w->signaled=0; pthread_mutex_unlock(&w->m); kh_wobj_unref(w); return 1; }
 IMP(K32,CreateEventA){ SET_RAX(g,mk_event((int)(A1(g)&0xff),(int)(A2(g)&0xff))); }
 IMP(K32,CreateEventW){ SET_RAX(g,mk_event((int)(A1(g)&0xff),(int)(A2(g)&0xff))); }
 IMP(K32,CreateEventExA){ u32 fl=(u32)A2(g); SET_RAX(g,mk_event((fl&1)?1:0,(fl&2)?1:0)); }   /* CREATE_EVENT_MANUAL_RESET=1 INITIAL_SET=2 */
-IMP(K32,SetEvent){ int ok=kh_event_set(A0(g)); if(!ok) kh_set_last_error(6); SET_RAX(g,ok); }
+IMP(K32,SetEvent){ if(tl_set_hook) tl_set_hook(tl_set_ctx,A0(g)); u64 s0=0; int wt=vc_wake_state(A0(g),&s0); int ok=kh_event_set(A0(g)); if(!ok) kh_set_last_error(6); SET_RAX(g,ok); if(ok) vc_after_wake(A0(g),wt,s0); }
 IMP(K32,ResetEvent){ int ok=event_reset(A0(g)); if(!ok) kh_set_last_error(6); SET_RAX(g,ok); }
 /* CreateSemaphore rejects initial<0, maximum<=0, initial>maximum (ERROR_INVALID_PARAMETER).  ReleaseSemaphore fails without changing
  * the count when the release count is <=0 (87) or would exceed the maximum (ERROR_TOO_MANY_POSTS 298); the previous count is
@@ -223,21 +328,22 @@ static int sem_release(u64 h,long n,u32 *prev,u32 *err){
 }
 IMP(K32,CreateSemaphoreA){ SET_RAX(g,mk_sem((s32)A1(g),(s32)A2(g))); }
 IMP(K32,CreateSemaphoreW){ SET_RAX(g,mk_sem((s32)A1(g),(s32)A2(g))); }
-IMP(K32,ReleaseSemaphore){ u32 prev=0,err=0; int ok=sem_release(A0(g),(long)(s32)A1(g),&prev,&err); if(ok&&kh_vclock_on) kh_vclock_note_release(A0(g)); if(ok){ if(A2(g)) wr32(g,A2(g),prev); } else kh_set_last_error(err); SET_RAX(g,ok); }
+IMP(K32,ReleaseSemaphore){ if(tl_set_hook) tl_set_hook(tl_set_ctx,A0(g)); u64 s0=0; int wt=vc_wake_state(A0(g),&s0); u32 prev=0,err=0; int ok=sem_release(A0(g),(long)(s32)A1(g),&prev,&err); if(ok&&kh_vclock_on) kh_vclock_note_release(A0(g)); if(ok){ if(A2(g)) wr32(g,A2(g),prev); } else kh_set_last_error(err); SET_RAX(g,ok); if(ok) vc_after_wake(A0(g),wt,s0); }
 IMP(K32,CreateMutexA){ KWaitObj *w=wobj_new(HK_MUTEX); u64 h=h_new(HK_MUTEX,w); if(A1(g)&0xff){ w->owner=cur_thread()->tid; w->recurse=1; } SET_RAX(g,h); }
 IMP(K32,ReleaseMutex){ int k; KWaitObj *w=h_get_ref(A0(g),&k); if(!w||k!=HK_MUTEX){ if(w) kh_wobj_unref(w); kh_set_last_error(6); SET_RAX(g,0); return; } pthread_mutex_lock(&w->m);
     if(w->recurse==0||w->owner!=cur_thread()->tid){ pthread_mutex_unlock(&w->m); kh_wobj_unref(w); kh_set_last_error(288); SET_RAX(g,0); return; }
-    if(--w->recurse==0){ w->owner=0; pthread_cond_broadcast(&w->cv); } pthread_mutex_unlock(&w->m); kh_wobj_unref(w); SET_RAX(g,1); }
+    if(--w->recurse==0){ w->owner=0; pthread_cond_broadcast(&w->cv); vc_released(); } pthread_mutex_unlock(&w->m); kh_wobj_unref(w); SET_RAX(g,1); }
 /* KHNMC_CLOCK=frames: the virtual display must know when the game thread is parked in its frame wait and when it has taken a release */
 IMP(K32,WaitForSingleObject){ u64 h=A0(g); int fw=kh_vclock_on&&kh_vclock_frame_wait_enter(h); u32 r=kh_wait(g,h,(u32)A1(g)); if(fw) kh_vclock_frame_wait_leave(r==0); SET_RAX(g,r); }
 IMP(K32,WaitForSingleObjectEx){ SET_RAX(g,kh_wait(g,A0(g),(u32)A1(g))); }
 IMP(K32,CloseHandle){ u64 h=A0(g); if(h==PSEUDO_THREAD||h==PSEUDO_PROCESS){ SET_RAX(g,1); return; } int ok=h_close(h); if(!ok) kh_set_last_error(6); SET_RAX(g,ok); }
-IMP(K32,Sleep){ u32 ms=(u32)A0(g); if(ms==0) sched_yield(); else { struct timespec ts={ms/1000,(long)(ms%1000)*1000000L}; nanosleep(&ts,0); } }
-IMP(K32,SleepEx){ u32 ms=(u32)A0(g); if(ms==0) sched_yield(); else { struct timespec ts={ms/1000,(long)(ms%1000)*1000000L}; nanosleep(&ts,0); } SET_RAX(g,0); }
+static void host_sleep_ms(u32 ms){ struct timespec ts={ms/1000,(long)(ms%1000)*1000000L}; if(kh_vclock_sync) kh_vclock_idle(1); nanosleep(&ts,0); if(kh_vclock_sync) kh_vclock_idle(0); }
+IMP(K32,Sleep){ u32 ms=(u32)A0(g); if(ms==0) sched_yield(); else if(!kh_vclock_vsleep(ms)) host_sleep_ms(ms); }
+IMP(K32,SleepEx){ u32 ms=(u32)A0(g); if(ms==0) sched_yield(); else if(!kh_vclock_vsleep(ms)) host_sleep_ms(ms); SET_RAX(g,0); }
 IMP(K32,SwitchToThread){ sched_yield(); SET_RAX(g,1); }
 
 /* ---- threads --------------------------------------------------------------------------------------------------------- */
-static void thread_exit_notify(KThread *t){ pthread_mutex_lock(&t->m); t->done=1; pthread_cond_broadcast(&t->cv); pthread_mutex_unlock(&t->m); }
+static void thread_exit_notify(KThread *t){ pthread_mutex_lock(&t->m); t->done=1; pthread_cond_broadcast(&t->cv); pthread_mutex_unlock(&t->m); vc_released(); }
 /* Windows releases a thread's stack and TEB when the thread ends.  So must we: the engine starts a short-lived worker (0xfddd0)
  * every few seconds of play, and a 2 MiB stack kept for each would fill the id zone (core.c) within the hour.  After this the
  * thread's KThread stays in the list (handles, exit code), with no stack. */
@@ -254,7 +360,7 @@ static void *thread_main(void *arg){
     jmp_buf jb; tl_exit_jb=&jb;
     if(setjmp(jb)==0){
         kh_run_tls_callbacks(g,2);
-        pthread_mutex_lock(&t->m); while(t->suspended) pthread_cond_wait(&t->cv,&t->m); pthread_mutex_unlock(&t->m);
+        pthread_mutex_lock(&t->m); if(t->suspended) atomic_store(&t->vc_state,2); while(t->suspended) pthread_cond_wait(&t->cv,&t->m); atomic_store(&t->vc_state,0); pthread_mutex_unlock(&t->m);
         t->exit_code=(u32)kh_call(g,t->start,t->param,0,0,0);
     }
     kh_run_tls_callbacks(g,3);
@@ -285,13 +391,15 @@ IMP(CRTR,_beginthread){ u64 h=thread_create(g,A1(g),A0(g),A2(g),0,NULL); SET_RAX
  * and is resumed at 0xfef04 / 0xfec40) blocks here until it is resumed.  Suspending another running thread cannot be done with
  * pthreads; that call fails loudly (-1, ERROR_ACCESS_DENIED) instead of pretending. */
 static u32 thread_resume(u64 h){ int k; KWaitObj *w=h_get_ref(h,&k); if(!w||k!=HK_THREAD){ if(w) kh_wobj_unref(w); kh_set_last_error(6); return (u32)-1; }
-    KThread *t=w->thread; pthread_mutex_lock(&t->m); int was=t->suspended; if(was>0) t->suspended=was-1; pthread_cond_broadcast(&t->cv); pthread_mutex_unlock(&t->m); kh_wobj_unref(w); return (u32)was; }
+    KThread *t=w->thread; pthread_mutex_lock(&t->m); int was=t->suspended; if(was>0) t->suspended=was-1;
+    if(was==1){ atomic_store(&t->vc_state,0); vc_released(); }   /* runnable from here on: running for the quiescence test until it blocks, not idle until it has run (review of task 28) */
+    pthread_cond_broadcast(&t->cv); pthread_mutex_unlock(&t->m); kh_wobj_unref(w); return (u32)was; }
 static u32 thread_suspend(KCtx *g,u64 h){
     KThread *me=cur_thread(), *t=me; KWaitObj *w=NULL; (void)g;
     if(h!=PSEUDO_THREAD){ int k; w=h_get_ref(h,&k); if(!w||k!=HK_THREAD){ if(w) kh_wobj_unref(w); kh_set_last_error(6); return (u32)-1; } t=w->thread; kh_wobj_unref(w); }
     if(t!=me){ atomic_fetch_add(&cnt_foreign_suspend,1); kh_warn("SuspendThread of ANOTHER thread (target %u, caller %u, handle %llx) is not implemented: the target keeps running, the call returns failure",t->tid,me->tid,(unsigned long long)h); kh_set_last_error(5); return (u32)-1; }
     atomic_fetch_add(&cnt_self_suspend,1);
-    pthread_mutex_lock(&t->m); int was=t->suspended; t->suspended=was+1; while(t->suspended>0) pthread_cond_wait(&t->cv,&t->m); pthread_mutex_unlock(&t->m);
+    pthread_mutex_lock(&t->m); int was=t->suspended; t->suspended=was+1; atomic_store(&t->vc_state,2); kh_vclock_idle(2); while(t->suspended>0) pthread_cond_wait(&t->cv,&t->m); atomic_store(&t->vc_state,0); pthread_mutex_unlock(&t->m);
     return (u32)was;
 }
 IMP(K32,ResumeThread){ SET_RAX(g,thread_resume(A0(g))); }
@@ -300,6 +408,14 @@ IMP(K32,GetCurrentThreadId){ SET_RAX(g,cur_thread()->tid); }
 IMP(K32,GetCurrentThread){ SET_RAX(g,PSEUDO_THREAD); }
 IMP(K32,GetCurrentProcess){ SET_RAX(g,PSEUDO_PROCESS); }
 IMP(K32,GetCurrentProcessId){ SET_RAX(g,ga_deterministic?4242u:(u32)getpid()); }
+/* the MSVC SetThreadName convention (RaiseException 0x406D1388, k32.c): the guest's own thread names ("CDevSd MSECHandler", "Stream
+ * Thread", ...) replace "thrN" in reports and logs (TASK28: the audio log names the thread of every call).  tid -1 = the caller. */
+void kh_thread_set_name(u32 tid,const char *name){
+    KThread *f=NULL;
+    if(tid==0xffffffffu) f=cur_thread();
+    else { pthread_mutex_lock(&tlist_m); for(u32 i=0;i<ntlist;i++) if(tlist[i]->tid==tid) f=tlist[i]; pthread_mutex_unlock(&tlist_m); }
+    if(f&&name) snprintf(f->name,sizeof f->name,"%s",name);
+}
 IMP(K32,OpenThread){ u32 tid=(u32)A2(g); pthread_mutex_lock(&tlist_m); KThread *f=NULL; for(u32 i=0;i<ntlist;i++) if(tlist[i]->tid==tid) f=tlist[i]; pthread_mutex_unlock(&tlist_m);
     if(!f){ kh_set_last_error(87); SET_RAX(g,0); return; } KWaitObj *w=wobj_new(HK_THREAD); w->thread=f; SET_RAX(g,h_new(HK_THREAD,w)); }
 IMP(K32,GetExitCodeThread){ u64 h=A0(g); KThread *t; if(h==PSEUDO_THREAD) t=cur_thread(); else { KWaitObj *w=h_get(h,HK_THREAD); if(!w){ SET_RAX(g,0); return; } t=w->thread; }
@@ -411,7 +527,7 @@ void rt_hook_fiber_yield_150080(KCtx *g){
 }
 
 /* a detached guest thread whose body is a host function (used for winmm timers and the like) */
-u64 kh_spawn_hostfn_thread(KCtx *g,const char *name,KhFn fn,u64 param){ u64 a=kh_host_fn(name,fn); u64 h=thread_create(g,0,a,param,0,NULL); if(h) h_close(h); return h; }
+u64 kh_spawn_hostfn_thread(KCtx *g,const char *name,KhFn fn,u64 param){ u64 a=kh_host_fn(name,fn); u32 tid=0; u64 h=thread_create(g,0,a,param,1,&tid); if(h){ kh_thread_set_name(tid,name); thread_resume(h); h_close(h); } return h; }
 
 u64 kh_mk_event_h(int manual,int initial){ return mk_event(manual,initial); }
 
@@ -551,5 +667,119 @@ int kh_sync_selftest(KCtx *g){
       ga_pages_free(st_fb.canary,st_fb.canary_sz); for(int i=0;i<nd;i++) if(drained[i]) ga_pages_free(drained[i],1ull<<20); }
     h_close(ev); h_close(ae);
     fprintf(stderr,"kh: sync selftest: %d checks, %d failures\n",checks,fails);
+    return fails;
+}
+
+/* ==============================================================================================================================
+ * review of task 28: the virtual time-outs of KHNMC_CLOCK_SYNC=all (kh_wait -> kh_vclock_deadline_due -> kh_threads_quiet).  The due
+ * test used to run with the waited object's lock held, while the quiescence test takes the object lock of every other blocked thread:
+ *   A. two threads blocked on ONE event, one with a 5 ms time-out: the timed waiter locked the event's (non-recursive) mutex a second
+ *      time and hung with tlist_m held; the clock then died after 30 s with "vclock-client-stuck: clock client 'timed-wait'";
+ *   B. the same on one THREAD handle (the lock is the thread's own m);
+ *   C. two timed waiters with equal keys (same name, same start) on two events, due at the same instant: both run the quiescence test,
+ *      each holding its own event's lock and taking the other's (opposite orders).  A race: repeated, not forced.
+ * Run on a stepped test clock with sync=all; the quiescence test is limited to this test's threads (threads of earlier suites live on).
+ * A watchdog turns a hang into the named fatal sync-vclock-selftest-deadlock after 5 s of host time.  Without the fix A hangs at once. */
+typedef struct { u64 h; u32 ms; KThread *_Atomic t; _Atomic u32 res; _Atomic int done; _Atomic u64 at; } StVW;
+static void st_vwaiter(KCtx *g){ StVW *a=(StVW*)(uintptr_t)A0(g); atomic_store(&a->t,cur_thread()); u32 r=kh_wait(g,a->h,a->ms); atomic_store(&a->at,kh_vclock_now_ns()); atomic_store(&a->res,r); atomic_store(&a->done,1); KH_RET(g); }
+static void vst_start(StVW *a,u64 h,u32 ms){ a->h=h; a->ms=ms; atomic_store(&a->t,NULL); atomic_store(&a->res,0xdeadu); atomic_store(&a->done,0); atomic_store(&a->at,0); }
+static int vst_blocked(StVW *a,int ms){ for(int i=0;i<ms*5;i++){ KThread *t=atomic_load(&a->t); if(t&&atomic_load(&t->vc_state)==1&&atomic_load(&t->vc_w)) return 1; struct timespec ts={0,200000}; nanosleep(&ts,0); } return 0; }
+static int vst_done(StVW *a,int ms){ for(int i=0;i<ms*5&&!atomic_load(&a->done);i++){ struct timespec ts={0,200000}; nanosleep(&ts,0); } return atomic_load(&a->done); }
+static KThread *vst_set[8];
+static void vst_filter(int n){ pthread_mutex_lock(&tlist_m); quiet_nonly=(u32)n; quiet_only=n?vst_set:NULL; pthread_mutex_unlock(&tlist_m); }
+static const char *_Atomic vst_what; static _Atomic int vst_stop;
+static void *vst_watchdog(void *arg){
+    (void)arg; const char *last=NULL; u64 t0=kh_host_ns();
+    while(!atomic_load(&vst_stop)){
+        const char *w=atomic_load(&vst_what); if(w!=last){ last=w; t0=kh_host_ns(); }
+        if(w&&kh_host_ns()-t0>5000000000ull){ fprintf(stderr,"sync vclock selftest FAIL: %s did not finish within 5 s of host time\n",w);
+            kh_fatal(NULL,"sync-vclock-selftest-deadlock: %s: a thread in the virtual time-out path of kh_wait never returned (lock-order deadlock between the object lock and the quiescence test)",w); }
+        struct timespec ts={0,10000000}; nanosleep(&ts,0);
+    }
+    return NULL;
+}
+typedef struct { u64 cs; KThread *_Atomic t; _Atomic int got, go; } StCs;
+static void st_cswaiter(KCtx *g){ StCs *c=(StCs*)(uintptr_t)A0(g); atomic_store(&c->t,cur_thread()); cs_enter(g,c->cs); atomic_store(&c->got,1);
+    while(!atomic_load(&c->go)) sched_yield();                                                       /* holds the section, running */
+    cs_leave(g,c->cs); atomic_store(&c->got,2); KH_RET(g); }
+static void vst_vblank(KCtx *g){ kh_vclock_idle(1); kh_vclock_test_vblank(g); kh_vclock_idle(0); }    /* as kh_vclock_vblank: the stepping thread is idle */
+static KThread *vst_hook_t, *vst_hook_caller; static KCtx *vst_hook_g; static u64 vst_hook_cs; static _Atomic int vst_hook_fired;
+static void vst_release_hook(KThread *t){                                                           /* E: inside the pass, after the waiter was judged idle */
+    if(t!=vst_hook_t||cur_thread()!=vst_hook_caller||atomic_load(&vst_hook_fired)) return;
+    atomic_store(&vst_hook_fired,1); cs_leave(vst_hook_g,vst_hook_cs); }
+int kh_sync_vclock_selftest(KCtx *g){
+    int checks=0,fails=0;
+    if(kh_vclock_stepped()){ fprintf(stderr,"sync vclock selftest FAIL: the clock is already stepped (KHNMC_CLOCK=frames run?): not run\n"); return 1; }
+    int sync0=kh_vclock_sync; const u64 T0=6000000000000ull;
+    kh_vclock_test_begin(T0); kh_vclock_sync=1;
+    atomic_store(&vst_stop,0); atomic_store(&vst_what,NULL); pthread_t wd; SCHECK(pthread_create(&wd,NULL,vst_watchdog,NULL)==0);
+    static StVW va[2], vb[3], vc[2];
+    /* A. one event, an infinite waiter and a 5 ms waiter */
+    atomic_store(&vst_what,"A (one event: an infinite and a 5 ms waiter)");
+    u64 ev=mk_event(0,0); vst_start(&va[0],ev,0xFFFFFFFFu); vst_start(&va[1],ev,5);
+    kh_spawn_hostfn_thread(g,"sync_vclock_selftest_a",st_vwaiter,(u64)(uintptr_t)&va[0]); SCHECK(vst_blocked(&va[0],3000));
+    kh_spawn_hostfn_thread(g,"sync_vclock_selftest_a",st_vwaiter,(u64)(uintptr_t)&va[1]); SCHECK(vst_blocked(&va[1],3000));
+    { KWaitObj *w=h_get(ev,HK_EVENT); pthread_mutex_lock(&w->m); SCHECK(w->waiters==2); pthread_mutex_unlock(&w->m); }
+    vst_set[0]=cur_thread(); vst_set[1]=atomic_load(&va[0].t); vst_set[2]=atomic_load(&va[1].t); vst_filter(3);
+    u64 a0=kh_vclock_now_ns(); vst_vblank(g);
+    SCHECK(atomic_load(&va[1].done)&&atomic_load(&va[1].res)==0x102); SCHECK(atomic_load(&va[1].at)==a0+5000000ull);   /* timed out at its virtual deadline */
+    SCHECK(!atomic_load(&va[0].done)); SCHECK(kh_vclock_now_ns()==a0+16666666ull);
+    kh_event_set(ev); SCHECK(vst_done(&va[0],3000)&&atomic_load(&va[0].res)==0);                                  /* the other waiter still takes the event */
+    /* B. one thread handle (the lock is that thread's m): an infinite and a 5 ms waiter; the thread itself waits for an event */
+    atomic_store(&vst_what,"B (one thread handle: an infinite and a 5 ms waiter)");
+    u64 evx=mk_event(1,0); vst_start(&vb[0],evx,0xFFFFFFFFu);
+    u64 hx=thread_create(g,0,kh_host_fn("sync_vclock_selftest_target",st_vwaiter),(u64)(uintptr_t)&vb[0],0,NULL); SCHECK(hx!=0); SCHECK(vst_blocked(&vb[0],3000));
+    vst_start(&vb[1],hx,0xFFFFFFFFu); vst_start(&vb[2],hx,5);
+    kh_spawn_hostfn_thread(g,"sync_vclock_selftest_b",st_vwaiter,(u64)(uintptr_t)&vb[1]); SCHECK(vst_blocked(&vb[1],3000));
+    kh_spawn_hostfn_thread(g,"sync_vclock_selftest_b",st_vwaiter,(u64)(uintptr_t)&vb[2]); SCHECK(vst_blocked(&vb[2],3000));
+    vst_set[1]=atomic_load(&vb[0].t); vst_set[2]=atomic_load(&vb[1].t); vst_set[3]=atomic_load(&vb[2].t); vst_filter(4);
+    a0=kh_vclock_now_ns(); vst_vblank(g);
+    SCHECK(atomic_load(&vb[2].done)&&atomic_load(&vb[2].res)==0x102); SCHECK(atomic_load(&vb[2].at)==a0+5000000ull); SCHECK(!atomic_load(&vb[1].done));
+    kh_event_set(evx); SCHECK(vst_done(&vb[0],3000)&&atomic_load(&vb[0].res)==0); SCHECK(vst_done(&vb[1],3000)&&atomic_load(&vb[1].res)==0);   /* the thread ended: its handle is signalled */
+    h_close(hx); h_close(evx);
+    /* C. equal keys, two events, one instant; 20 rounds (a race, not forced) */
+    atomic_store(&vst_what,"C (two timed waiters with equal keys due at one instant)");
+    u64 e1=mk_event(0,0), e2=mk_event(0,0); int okc=0, keys=1;
+    for(int r=0;r<20;r++){
+        vst_start(&vc[0],e1,5); vst_start(&vc[1],e2,5);
+        kh_spawn_hostfn_thread(g,"sync_vclock_selftest_c",st_vwaiter,(u64)(uintptr_t)&vc[0]); kh_spawn_hostfn_thread(g,"sync_vclock_selftest_c",st_vwaiter,(u64)(uintptr_t)&vc[1]);
+        if(!vst_blocked(&vc[0],3000)||!vst_blocked(&vc[1],3000)) break;
+        vst_set[1]=atomic_load(&vc[0].t); vst_set[2]=atomic_load(&vc[1].t); vst_filter(3);
+        keys&=kh_vclock_thread_key(vst_set[1])==kh_vclock_thread_key(vst_set[2]);
+        a0=kh_vclock_now_ns(); vst_vblank(g);
+        okc+=atomic_load(&vc[0].res)==0x102&&atomic_load(&vc[1].res)==0x102&&atomic_load(&vc[0].at)==a0+5000000ull&&atomic_load(&vc[1].at)==a0+5000000ull;
+        vst_done(&vc[0],3000); vst_done(&vc[1],3000);
+    }
+    SCHECK(keys); SCHECK(okc==20); h_close(e1); h_close(e2); h_close(ev);
+    /* D. a critical-section waiter past 2,000 spins: idle while the section is owned by ANOTHER thread, NOT idle once it is free (it used
+     *    to stay idle until it next polled, so the clock could step in between: the one-CPU divergence of the title music), and NOT idle
+     *    while the owner field holds its own id (second fixer: its compare-exchange has taken the section and it runs, before it marks
+     *    itself running; the old test called that idle).
+     * E. (second fixer) a release in the MIDDLE of the test's pass: the pass looks at the waiter (the section owned by this thread: idle),
+     *    then this thread leaves the section before the pass ends (as an owner that leaves and blocks between the pass's look at the
+     *    waiter and its look at the owner).  The pass must not say quiet: the waiter is runnable.  Forced with a hook inside the pass. */
+    atomic_store(&vst_what,"D (critical-section waiter)");
+    { u64 cs=ga_calloc(1,0x28); u64 *own=(u64*)XL(g,cs+0x10); wr64(g,cs+0x10,0x7777777ull); static StCs sc; sc.cs=cs; atomic_store(&sc.t,NULL); atomic_store(&sc.got,0); atomic_store(&sc.go,0);
+      kh_spawn_hostfn_thread(g,"sync_vclock_selftest_cs",st_cswaiter,(u64)(uintptr_t)&sc);
+      int st3=0; for(int i=0;i<15000&&!st3;i++){ KThread *t=atomic_load(&sc.t); st3=t&&atomic_load(&t->vc_state)==3; if(!st3){ struct timespec ts={0,200000}; nanosleep(&ts,0); } }
+      SCHECK(st3); KThread *wt=atomic_load(&sc.t), *me=cur_thread(); vst_set[0]=wt; vst_filter(1);
+      SCHECK(kh_threads_quiet(NULL,0)==1);                                                          /* owned by someone else: idle */
+      __atomic_store_n(own,(u64)wt->tid,__ATOMIC_RELEASE); SCHECK(kh_threads_quiet(NULL,0)==0);    /* its own id (it cannot take it: the field is not 0): running */
+      atomic_store(&vst_what,"E (a critical section left during the test's pass)");
+      wr32(g,cs+0xC,1); __atomic_store_n(own,(u64)me->tid,__ATOMIC_RELEASE);                         /* this thread owns it now */
+      SCHECK(kh_threads_quiet(NULL,0)==1);                                                          /* owned by another thread: idle */
+      u64 r0=vc_rel_retests; vst_hook_t=wt; vst_hook_caller=me; vst_hook_g=g; vst_hook_cs=cs; atomic_store(&vst_hook_fired,0);
+      pthread_mutex_lock(&tlist_m); quiet_hook=vst_release_hook; pthread_mutex_unlock(&tlist_m);
+      int q=kh_threads_quiet(NULL,0);
+      pthread_mutex_lock(&tlist_m); quiet_hook=NULL; pthread_mutex_unlock(&tlist_m);
+      SCHECK(atomic_load(&vst_hook_fired)==1&&rd64(g,cs+0x10)!=(u64)me->tid);                       /* left inside the pass */
+      SCHECK(q==0&&vc_rel_retests==r0+1);                                                           /* not quiet: the waiter is runnable */
+      SCHECK(kh_threads_quiet(NULL,0)==0);                                                          /* free, or just taken by the waiter: running */
+      for(int i=0;i<15000&&!atomic_load(&sc.got);i++){ struct timespec ts={0,200000}; nanosleep(&ts,0); } SCHECK(atomic_load(&sc.got)==1);
+      atomic_store(&sc.go,1); for(int i=0;i<15000&&atomic_load(&sc.got)!=2;i++){ struct timespec ts={0,200000}; nanosleep(&ts,0); }
+      SCHECK(rd64(g,cs+0x10)==0); vst_filter(0); ga_free(cs); }
+    vst_filter(0); atomic_store(&vst_what,NULL); atomic_store(&vst_stop,1); pthread_join(wd,NULL);
+    kh_vclock_sync=sync0; kh_vclock_test_end();
+    fprintf(stderr,"kh: sync vclock selftest: %d checks, %d failures\n",checks,fails);
     return fails;
 }

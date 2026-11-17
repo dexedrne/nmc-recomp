@@ -172,6 +172,12 @@ typedef struct KThread {
     KFiber *cur_fiber;        /* running fiber on this thread; NULL = the thread itself */
     u32   handle;             /* handle-table id of the thread object (0 if none) */
     char  name[24];
+    /* TASK28, KHNMC_CLOCK_SYNC=all (vclock.c): what the thread does, for the virtual clock's quiescence test (threads.c kh_threads_quiet):
+     * 0 running, 1 blocked in a wait on vc_w (idle unless that object would satisfy it now), 2 idle (a clock wait, parked, suspended),
+     * 3 waiting for a critical section after 2,000 spins (idle only while *vc_csown, its owner field, holds ANOTHER thread's id; review of
+     *   task 28: 0 = free, its own id = its compare-exchange just took it) */
+    _Atomic int vc_state, vc_k, vc_blocked; void *_Atomic vc_w; _Atomic unsigned long long vc_gen0; pthread_mutex_t vc_m; int vc_ntimers;
+    unsigned long long *_Atomic vc_csown;
     int   prio;
     u64   last_error;
     int   lasterr;
@@ -210,8 +216,18 @@ typedef struct KWaitObj {
     _Atomic int refs;                                 /* the handle + every thread currently inside a wait/signal on the object */
     u64 gen;                                          /* manual-reset event: bumped by SetEvent / pulse, releases every thread waiting at that moment */
     int waiters, pulse_tokens;                        /* threads blocked on the object; auto-reset pulses granted to them */
+    u64 satisfied;                                    /* TASK28: waits on the object that returned WAIT_OBJECT_0 (k32.c timer clients) */
+    struct KThread *last_taker;                       /* TASK28: the thread whose wait it satisfied last (KHNMC_CLOCK_SYNC=all wake hand-off) */
 } KWaitObj;
 u32 kh_wait(KCtx *g, u64 handle, u32 ms);
+/* TASK28, frames clock (k32.c timer clients): who consumes an event the timer sets.  waitstate: threads blocked on h now and the waits
+ * it satisfied so far (-1: not a wait object).  settle: wait (host time) until a wait on h returned after `satisfied0` and `waiters0`
+ * threads are blocked on it again, i.e. the consumer did its work and is back; 0 = so, 1 = timeout_ms passed, 2 = *stop became set. */
+int kh_wobj_waitstate(u64 h, int *waiters, u64 *satisfied);
+int kh_wobj_settle(u64 h, u64 satisfied0, int waiters0, u32 timeout_ms, volatile int *stop);
+/* a thread-local hook SetEvent and ReleaseSemaphore call before they signal (k32.c: what a timer callback signals; the sound driver's
+ * timer callback 0xfb020 releases a semaphore of maximum count 1 that its handler thread waits for) */
+void kh_set_event_hook(void (*fn)(void *ctx, u64 h), void *ctx);
 void *h_get_ref(u64 h, int *kind_out);               /* wait objects only (event, semaphore, mutex, thread): +1 reference, NULL otherwise */
 void kh_wobj_unref(KWaitObj *w);                     /* frees the object with its last reference */
 int  kh_event_set(u64 h);                            /* SetEvent / PulseEvent semantics for runtime-side signallers (timers, fences); 0 = bad handle */
@@ -233,10 +249,26 @@ extern int kh_vclock_on;
 void kh_vclock_init(void);
 u64  kh_vclock_now_ns(void);
 u64  kh_vclock_vblanks(void);                        /* virtual vblanks since the clock left the host clock */
+extern int kh_vclock_sync;                           /* TASK28: KHNMC_CLOCK_SYNC=all: the clock moves only while every guest thread waits */
+void kh_vclock_idle(int on);                         /* the calling thread is idle (on=1) / running again (on=0) for the quiescence test */
+int  kh_vclock_vsleep(u32 ms);                       /* sync=all, stepped: Sleep on the virtual clock (1), else 0 = the caller sleeps on the host */
+int  kh_vclock_deadline_add(u64 deadline_ns); void kh_vclock_deadline_drop(int id); int kh_vclock_deadline_due(int id,u64 deadline_ns);   /* a timed wait's virtual deadline (a clock client) */
+int  kh_threads_quiet(char *who,size_t cap);         /* threads.c: 1 = every live guest thread is idle (sync=all) */
+int  kh_vclock_pace_by_device(void);                 /* TASK28: KHNMC_AUDIO=pull: the device paces the clock (pace free unless KHNMC_CLOCK_PACE is set) */
+u64  kh_vclock_origin(void);                         /* virtual time of the first virtual vblank; 0 before it */
 int  kh_vclock_stepped(void);
+int  kh_vclock_wait_stepped(u64 max_host_ns);        /* review of task 28: wait (not idle) for the first virtual vblank; 1 = stepping has begun */
+#define KH_VCLOCK_ANCHOR_GUARD_NS 10000000000ull      /* a clock client created before the first vblank waits this long for it, then runs unanchored (named, counted) */
 void kh_vclock_wait_until(u64 t_ns);
+void kh_vclock_wait_until_raw(u64 t_ns);             /* without the idle mark of KHNMC_CLOCK_SYNC=all */
+void kh_vclock_vblank_raw(KCtx *g,u64 gx_device);
 int  kh_vclock_client_add(const char *name,u64 first_due_ns);
 void kh_vclock_client_due(int id,u64 due_ns);
+int  kh_vclock_client_add_prio(const char *name,u64 first_due_ns,int prio);   /* TASK28: same-instant order (0 = the mixer, first) */
+void kh_vclock_client_wait(int id,u64 t_ns);
+void kh_vclock_client_set_prio(int id,int prio);
+void kh_vclock_client_set_key(int id,int base,KThread *t,int seq);   /* prio = base + kh_vclock_thread_key(t) * 8 + seq, evaluated when compared */
+int  kh_vclock_thread_key(KThread *t);                /* TASK28: a run-independent order of guest threads (name + start routine) */         /* wait for t AND for the clients of a smaller prio due at <= t */
 void kh_vclock_client_drop(int id);
 void kh_vclock_on_vblank(void (*fn)(KCtx *g,u64 vblank,u64 vnow_ns));
 void kh_vclock_vblank(KCtx *g,u64 gx_device);

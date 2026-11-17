@@ -141,6 +141,24 @@ static void *poll_thread(void *arg){
     }
     return NULL;
 }
+/* review of task 28: with KHNMC_CLOCK=frames the host thread above stepped on HOST time while the virtual clock stood still during loads,
+ * and it is no guest thread, so the quiescence test of KHNMC_CLOCK_SYNC=all could not order it: the virtual frame at which the guest first
+ * saw a new byte depended on the host.  In that mode the step is driven by the virtual display instead: a vblank listener (vclock.c; it
+ * runs on the timing thread inside WaitForVBlank, before the frame that vblank releases) steps at every KH_MOD_NF_VBLANKS-th virtual
+ * vblank = every KH_MOD_NF_PERIOD_MS of virtual time, and once at init as the thread's first iteration did.  No host thread then. */
+#define KH_MOD_NF_VBLANKS ((u64)KH_MOD_NF_PERIOD_MS*60u/1000u)
+_Static_assert((KH_MOD_NF_PERIOD_MS*60u)%1000u==0,"the DLL's period is a whole number of 60 Hz vblanks");
+static int by_vblank; static _Atomic u64 first_change_vblank, last_change_vblank;
+/* the step rule of the listener; the caller holds step_m */
+u8 kh_mod_neverland_vblank_step(u64 vblank,u64 vnow){
+    if(vblank%KH_MOD_NF_VBLANKS) return 0;
+    u64 prev=atomic_exchange(&last_ns,vnow); if(prev&&vnow-prev<atomic_load(&min_gap_ns)) atomic_store(&min_gap_ns,vnow-prev);
+    u64 c0=atomic_load(&changes); u8 v=kh_mod_neverland_step();
+    if(atomic_load(&changes)!=c0){ if(!atomic_load(&first_change_vblank)) atomic_store(&first_change_vblank,vblank); atomic_store(&last_change_vblank,vblank); }
+    return v;
+}
+static void nf_vblank(KCtx *g,u64 vblank,u64 vnow){ (void)g; pthread_mutex_lock(&step_m); kh_mod_neverland_vblank_step(vblank,vnow); pthread_mutex_unlock(&step_m); }
+int kh_mod_neverland_by_vblank(void){ return by_vblank; }
 void kh_mod_neverland_thread_stats(u64 *npolls,u64 *min_gap){ *npolls=atomic_load(&polls); *min_gap=atomic_load(&min_gap_ns); }
 int kh_mod_neverland_counts(int hook,u64 *calls){ if(hook<0||hook>=H_N) return 0; *calls=atomic_load(&hits[hook]); return 1; }
 
@@ -179,13 +197,18 @@ void kh_mod_neverland_init(KCtx *g){
                      KH_MOD_NF_S1_RVA,a,v,d,!bit);
     }
     applied=1;
-    pthread_t th; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at,PTHREAD_CREATE_DETACHED);
-    int rc=pthread_create(&th,&at,poll_thread,NULL); pthread_attr_destroy(&at);
-    if(rc) kh_fatal(g,"mod-neverland-thread: pthread_create failed (%d)",rc);
+    if(kh_vclock_on){                                                                  /* KHNMC_CLOCK=frames: the virtual display steps it (above) */
+        by_vblank=1; pthread_mutex_lock(&step_m); atomic_store(&last_ns,kh_now_ns()); kh_mod_neverland_step(); pthread_mutex_unlock(&step_m);
+        kh_vclock_on_vblank(nf_vblank);
+    } else {
+        pthread_t th; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at,PTHREAD_CREATE_DETACHED);
+        int rc=pthread_create(&th,&at,poll_thread,NULL); pthread_attr_destroy(&at);
+        if(rc) kh_fatal(g,"mod-neverland-thread: pthread_create failed (%d)",rc);
+    }
     atomic_store(&started,1);
-    fprintf(stderr,"kh: mod neverland: 5 signatures verified (S1 0x%x S2 0x%x S3 0x%x S4 0x%x S5 0x%x, first of %u), %d edits / %d bytes applied in %d re-lifted functions, row-step byte 0x%x polled every %d ms (0x%02x / 0x%02x)\n",
+    fprintf(stderr,"kh: mod neverland: 5 signatures verified (S1 0x%x S2 0x%x S3 0x%x S4 0x%x S5 0x%x, first of %u), %d edits / %d bytes applied in %d re-lifted functions, row-step byte 0x%x %s (0x%02x / 0x%02x)\n",
             kh_mod_nf_sigs[0].first,kh_mod_nf_sigs[1].first,kh_mod_nf_sigs[2].first,kh_mod_nf_sigs[3].first,kh_mod_nf_sigs[4].first,kh_mod_nf_sigs[4].nhits,
-            KH_MOD_NF_NEDITS,KH_MOD_NF_BYTES,KH_MOD_NF_NFUNCS,KH_MOD_NF_IMM_RVA,KH_MOD_NF_PERIOD_MS,KH_MOD_NF_IMM_EQ,KH_MOD_NF_IMM_NE);
+            KH_MOD_NF_NEDITS,KH_MOD_NF_BYTES,KH_MOD_NF_NFUNCS,KH_MOD_NF_IMM_RVA,by_vblank?"stepped at init and every 15 virtual vblanks (KHNMC_CLOCK=frames: 250 ms of virtual time, no host thread)":"polled every 250 ms by a host thread",KH_MOD_NF_IMM_EQ,KH_MOD_NF_IMM_NE);
 }
 
 /* exit report (kh_mod_hooks_dump) */
@@ -193,8 +216,9 @@ void kh_mod_neverland_dump(void){
     if(!applied){ fprintf(stderr,"kh: mod neverland: NOT applied\n"); return; }
     int kept=0; for(int i=0;i<KH_MOD_NF_NEDITS;i++){ const struct kh_mod_nf_edit *e=&kh_mod_nf_edits[i]; kept+=!memcmp((const void*)(gs_host_base+e->rva),e->new_,e->len); }
     for(int i=0;i<H_N;i++) fprintf(stderr,"kh: mod neverland %s calls=%llu\n",hook_names[i],(unsigned long long)atomic_load(&hits[i]));
-    fprintf(stderr,"kh: mod neverland: 15b6d0 entered with row step 0x%02x: %llu, 0x%02x: %llu, other: %llu; thread: %llu polls, stored 0x%02x %llu times and 0x%02x %llu times, %llu changes of the byte, now 0x%02x; %d of %d edits still in the image\n",
-            KH_MOD_NF_IMM_EQ,(unsigned long long)atomic_load(&draw_imm[0]),KH_MOD_NF_IMM_NE,(unsigned long long)atomic_load(&draw_imm[1]),(unsigned long long)atomic_load(&draw_imm[2]),
+    fprintf(stderr,"kh: mod neverland: 15b6d0 entered with row step 0x%02x: %llu, 0x%02x: %llu, other: %llu; %s: %llu polls, stored 0x%02x %llu times and 0x%02x %llu times, %llu changes of the byte, now 0x%02x; %d of %d edits still in the image\n",
+            KH_MOD_NF_IMM_EQ,(unsigned long long)atomic_load(&draw_imm[0]),KH_MOD_NF_IMM_NE,(unsigned long long)atomic_load(&draw_imm[1]),(unsigned long long)atomic_load(&draw_imm[2]),by_vblank?"stepped by the virtual display":"thread",
             (unsigned long long)atomic_load(&polls),KH_MOD_NF_IMM_EQ,(unsigned long long)atomic_load(&stores[0]),KH_MOD_NF_IMM_NE,(unsigned long long)atomic_load(&stores[1]),
             (unsigned long long)atomic_load(&changes),*imm_ptr(),kept,KH_MOD_NF_NEDITS);
+    if(by_vblank) fprintf(stderr,"kh: mod neverland: by the virtual display: the byte changed first at virtual vblank %llu, last at %llu (0 = only at init or never)\n",(unsigned long long)atomic_load(&first_change_vblank),(unsigned long long)atomic_load(&last_change_vblank));
 }

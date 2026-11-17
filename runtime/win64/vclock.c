@@ -47,6 +47,15 @@
 #include <sys/wait.h>
 
 int kh_vclock_on;                                   /* 1 = KHNMC_CLOCK=frames (set once at start-up, or by a selftest) */
+/* TASK28, KHNMC_CLOCK_SYNC=all: the clock moves past an instant only when every guest thread is idle (blocked on an object that would not
+ * satisfy it, in a clock wait, parked); Sleep and wait time-outs are on the virtual clock (a clock client at the deadline); the gate's
+ * host-time exits (game-busy, stall-guard) become "the guest is quiet": time passes when nothing can happen without it.  Work of the
+ * guest's own threads (the sound driver's stream handler decoding, the background loader reading) therefore takes no virtual time
+ * and is finished before the next instant, whatever the host's speed.  A guest that never goes quiet for VC_QUIET_GUARD_NS of host
+ * time is let go (counted, the thread named): that step is not deterministic. */
+int kh_vclock_sync;
+#define VC_QUIET_GUARD_NS 60000000000ull               /* a field load takes 5..10 s of host time on one core: that is work, not a hang */
+static u64 n_quiet_waits, n_quiet_guard, n_vsleeps, quiet_host_ns; static int n_quiet_guard_logged;
 #define VC_HZ 60ull
 #define VC_BUSY_BOOT_NS 100000000ull
 #define VC_BUSY_RUN_NS 1000000000ull
@@ -55,7 +64,7 @@ int kh_vclock_on;                                   /* 1 = KHNMC_CLOCK=frames (s
 #define VC_CLIENT_WAIT_S 30
 #define FRAME_SEM_VA (GS_BASE+0xabc610ull)          /* main loop: pointer to the frame semaphore object {u32 waiters; u32 pad; HANDLE} */
 #define DEV_SEM_OFF 0x300ull                        /* GXDevice: pointer to its frame semaphore object (same layout) */
-#define MAXCLIENTS 8
+#define MAXCLIENTS 16
 #define MAXLISTEN 4
 
 u64 kh_host_ns(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (u64)ts.tv_sec*1000000000ull+(u64)ts.tv_nsec; }
@@ -66,7 +75,8 @@ static _Atomic u64 v_now;                           /* ns, valid when stepped */
 static u64 v_t0, host_t0;                           /* virtual / host time when stepping began */
 static _Atomic u64 n_vblank;                        /* virtual vblanks since stepping began */
 static u64 n_normal, n_multi, n_norel, n_busy, n_stall, gate_host_ns, max_gate_ns, presents_seen, ticks_seen, frames_seen; static int last_how=-1;
-typedef struct { int used; const char *name; u64 due; } VClient;
+typedef struct { int used; const char *name; u64 due; int prio; KThread *keyth; int keybase, keyseq; } VClient;   /* keyth: prio = keybase + key(keyth) * 8 + keyseq, read when compared */
+static int cprio(int i);
 static VClient clients[MAXCLIENTS];
 static void (*listeners[MAXLISTEN])(KCtx *g,u64 vblank,u64 vnow_ns); static int nlisten;
 extern _Atomic u64 gfx_presents;
@@ -125,19 +135,61 @@ void kh_vclock_init(void){
     if(strcmp(e,"frames")) kh_fatal(NULL,"clock-mode-unknown: KHNMC_CLOCK=%s (known: host = the host's clock, the default; frames = a virtual 60 Hz display drives every guest clock)",e);
     kh_vclock_on=1;
     { const char *lg=getenv("KHNMC_CLOCK_LOG"); gate_log=lg&&*lg=='1'; }
+    { const char *sy=getenv("KHNMC_CLOCK_SYNC"); kh_vclock_sync=1;                     /* TASK28: deterministic by default */
+      if(sy&&*sy){ if(!strcmp(sy,"all")) kh_vclock_sync=1; else if(!strcmp(sy,"timers")) kh_vclock_sync=0; else kh_fatal(NULL,"clock-sync-unknown: KHNMC_CLOCK_SYNC=%s (known: all = the clock moves only while every guest thread waits, the default; timers = only the winmm timers and the mixer are ordered clock clients)",sy); }
+      if(kh_vclock_sync) fprintf(stderr,"kh: vclock: KHNMC_CLOCK_SYNC=all: the virtual clock moves only while every guest thread waits; Sleep and wait time-outs are on the virtual clock\n"); }
     const char *pc=getenv("KHNMC_CLOCK_PACE");
     if(pc&&!strcmp(pc,"free")) pace_ns=0; else if(pc&&*pc&&strcmp(pc,"realtime")) kh_fatal(NULL,"clock-pace-unknown: KHNMC_CLOCK_PACE=%s (known: realtime = never faster than a real %llu Hz display, the default; free = as fast as the host allows)",pc,VC_HZ);
     fprintf(stderr,"kh: vclock: KHNMC_CLOCK=frames: QueryPerformanceCounter / timeGetTime / winmm timers / the audio device clock follow a virtual %llu Hz display from the first WaitForVBlank on (1/%llu s per call; host time before that); pace=%s\n",VC_HZ,VC_HZ,pace_ns?"realtime (never faster than the host clock)":"free");
+}
+void kh_vclock_idle(int on){
+    KThread *t=cur_thread();
+    if(on==1&&t) atomic_store(&t->vc_state,2); else if(on==0&&t) atomic_store(&t->vc_state,0);
+    if(on&&kh_vclock_sync&&!pthread_mutex_trylock(&vm)){ pthread_cond_broadcast(&vcv); pthread_mutex_unlock(&vm); }   /* a waiting step re-tests */
+}
+int kh_vclock_deadline_add(u64 dl){ int id=kh_vclock_client_add_prio("timed-wait",dl,1<<28); kh_vclock_client_set_key(id,1<<28,cur_thread(),1); return id; }
+void kh_vclock_deadline_drop(int id){ kh_vclock_client_drop(id); }
+int kh_vclock_vsleep(u32 ms){
+    if(!kh_vclock_sync||!atomic_load(&stepped)||!cur_thread()) return 0;
+    u64 dl=kh_vclock_now_ns()+(u64)ms*1000000ull; int id=kh_vclock_client_add_prio("sleep",dl,1<<28); kh_vclock_client_set_key(id,1<<28,cur_thread(),0); n_vsleeps++;
+    kh_vclock_client_wait(id,dl);                                                        /* ordered after the mixer and the timers of that instant, the guest quiet */
+    kh_vclock_client_drop(id);                                                           /* running (client_wait marked it), then the clock may leave the deadline */
+    return 1;
+}
+/* a timed wait's deadline (threads.c kh_wait): reached, the clock's ordering for that instant respected and the guest quiet */
+int kh_vclock_deadline_due(int id,u64 dl){
+    if(atomic_load(&v_now)<dl) return 0;
+    pthread_mutex_lock(&vm); int ahead=0, my=cprio(id); for(int i=0;i<MAXCLIENTS;i++) if(i!=id&&clients[i].used&&clients[i].due<=dl&&cprio(i)<my){ ahead=1; break; } pthread_mutex_unlock(&vm);
+    return !ahead&&kh_threads_quiet(NULL,0);
 }
 u64 kh_vclock_now_ns(void){
     if(atomic_load(&stepped)) return atomic_load(&v_now);
     u64 h=kh_host_ns(); return atomic_load(&stepped)?atomic_load(&v_now):h;
 }
 u64 kh_vclock_vblanks(void){ return atomic_load(&n_vblank); }
+/* TASK28, KHNMC_AUDIO=pull with the frames clock: the audio device paces the clock (the mixer waits for room before a pass while it holds
+ * the clock), so the host-time floor is not wanted on top of it: with it the clock could fall behind the device (loads) and never catch
+ * up.  Unless KHNMC_CLOCK_PACE was given explicitly, the pace becomes free.  Returns 1 when it changed the pace. */
+int kh_vclock_pace_by_device(void){ const char *pc=getenv("KHNMC_CLOCK_PACE"); if(!kh_vclock_on||(pc&&*pc)) return 0; pace_ns=0; return 1; }
+u64 kh_vclock_origin(void){ return atomic_load(&stepped)?v_t0:0; }   /* virtual time of the first virtual vblank (0 = not stepped yet) */
 int kh_vclock_stepped(void){ return atomic_load(&stepped); }
+/* review of task 28: a clock client created before the first WaitForVBlank (the audio mixer, a winmm timer) waits here before it fixes its
+ * grid, so that the grid's phase against the vblanks does not depend on the host (8 of 100 one-CPU starts created the mixer before the
+ * first vblank and got a host-phased grid).  The caller is NOT marked idle: with sync=all the clock cannot leave its origin before the
+ * caller has registered there.  Waits at most max_ns of host time; 1 = stepping has begun. */
+int kh_vclock_wait_stepped(u64 max_ns){
+    pthread_once(&vonce,vc_once); struct timespec d; abs_in(&d,max_ns);
+    pthread_mutex_lock(&vm);
+    while(!atomic_load(&stepped)) if(kh_cond_wait_until(&vcv,&vm,&d)==ETIMEDOUT) break;
+    int st=atomic_load(&stepped); pthread_mutex_unlock(&vm); return st;
+}
 /* block until the virtual clock reaches t (a host sleep while the virtual clock still is the host clock) */
 void kh_vclock_wait_until(u64 t){
     pthread_once(&vonce,vc_once);
+    if(kh_vclock_sync){ kh_vclock_idle(1); kh_vclock_wait_until_raw(t); kh_vclock_idle(0); return; }
+    kh_vclock_wait_until_raw(t);
+}
+void kh_vclock_wait_until_raw(u64 t){
     for(;;){
         if(!atomic_load(&stepped)){ u64 h=kh_host_ns(); if(h>=t) return; host_sleep_until(t-h>50000000ull?h+50000000ull:t); continue; }   /* re-check every 50 ms: stepping may begin */
         pthread_mutex_lock(&vm);
@@ -148,13 +200,53 @@ void kh_vclock_wait_until(u64 t){
 }
 /* a client is a thread with work at known virtual instants (the mixer's passes): the clock stops at every `due` and goes on only when
  * the client has announced a later one.  first_due = the instant of its first piece of work. */
-int kh_vclock_client_add(const char *name,u64 first_due){
+int kh_vclock_client_add_prio(const char *name,u64 first_due,int prio){
     pthread_once(&vonce,vc_once); pthread_mutex_lock(&vm); int id=-1;
-    for(int i=0;i<MAXCLIENTS;i++) if(!clients[i].used){ clients[i].used=1; clients[i].name=name; clients[i].due=first_due; id=i; break; }
+    for(int i=0;i<MAXCLIENTS;i++) if(!clients[i].used){ clients[i].used=1; clients[i].name=name; clients[i].due=first_due; clients[i].prio=prio; clients[i].keyth=NULL; id=i; break; }
     pthread_mutex_unlock(&vm);
     if(id<0) kh_fatal(NULL,"vclock-clients: more than %d clock clients",MAXCLIENTS);
     return id;
 }
+int kh_vclock_client_add(const char *name,u64 first_due){ return kh_vclock_client_add_prio(name,first_due,0); }
+/* TASK28: clients with work at the SAME instant run one after the other, in the order of their prio (smaller first): the mixer's pass
+ * (prio 0) before the winmm timers (k32.c, keyed by the creating thread), then sleepers and time-outs (keyed by their thread), so a
+ * timer's handler always sees the pass of its instant done, and the
+ * calls it makes (stamped with that instant) go to the next pass.  A client of prio p waits here for its instant t: the clock at t
+ * or later, and every used client of a smaller prio due later than t (done with t).  Before the clock steps, it is a host sleep. */
+static void client_wait_raw(int id,u64 t);
+void kh_vclock_client_wait(int id,u64 t){
+    pthread_once(&vonce,vc_once);
+    if(kh_vclock_sync) kh_vclock_idle(1);
+    client_wait_raw(id,t);
+    if(kh_vclock_sync) kh_vclock_idle(0);
+}
+static void client_wait_raw(int id,u64 t){
+    for(;;){
+        if(!atomic_load(&stepped)){ u64 h=kh_host_ns(); if(h>=t) return; host_sleep_until(t-h>50000000ull?h+50000000ull:t); continue; }
+        pthread_mutex_lock(&vm);
+        for(;;){
+            if(!atomic_load(&stepped)) break;
+            int ahead=0; if(atomic_load(&v_now)>=t){ int my=cprio(id); for(int i=0;i<MAXCLIENTS;i++) if(i!=id&&clients[i].used&&clients[i].due<=t&&cprio(i)<my){ ahead=1; break; } }
+            if(atomic_load(&v_now)>=t&&!ahead){ if(!kh_vclock_sync) break;                     /* sync=all: and nothing else of the guest is still running at t */
+                pthread_mutex_unlock(&vm); int q=kh_threads_quiet(NULL,0); pthread_mutex_lock(&vm); if(q) break;
+                struct timespec d2; abs_in(&d2,200000ull); kh_cond_wait_until(&vcv,&vm,&d2); continue; }
+            pthread_cond_wait(&vcv,&vm);
+        }
+        int done=atomic_load(&stepped); pthread_mutex_unlock(&vm);
+        if(done) return;
+    }
+}
+void kh_vclock_client_set_prio(int id,int prio){ pthread_mutex_lock(&vm); clients[id].prio=prio; pthread_cond_broadcast(&vcv); pthread_mutex_unlock(&vm); }
+/* TASK28: same-instant order must not depend on which thread happened to create its timer or start its sleep first (a run with the
+ * MSEC and VSYNC handlers' timers created in the other order swapped their ticks at a common instant: 1 title start in 100 differed).
+ * The key is the guest's own thread name (SetThreadName, set long before the first tick) and start routine, never an id that thread
+ * creation order assigns.  20 bits; equal keys (unnamed threads with the same start routine) fall back to the order of their ids. */
+int kh_vclock_thread_key(KThread *t){
+    if(!t) return 0; u32 h=2166136261u; for(const char *p=t->name;*p;p++){ if(!strncmp(t->name,"thr",3)) break; h^=(u8)*p; h*=16777619u; }
+    u64 st=t->start; h^=(u32)st^(u32)(st>>32); h*=16777619u; return (int)(h&0xFFFFFu);
+}
+static int cprio(int i){ return clients[i].keyth?clients[i].keybase+kh_vclock_thread_key(clients[i].keyth)*8+clients[i].keyseq:clients[i].prio; }
+void kh_vclock_client_set_key(int id,int base,KThread *t,int seq){ pthread_mutex_lock(&vm); clients[id].keyth=t; clients[id].keybase=base; clients[id].keyseq=seq&7; pthread_cond_broadcast(&vcv); pthread_mutex_unlock(&vm); }
 void kh_vclock_client_due(int id,u64 due){ pthread_mutex_lock(&vm); clients[id].due=due; pthread_cond_broadcast(&vcv); pthread_mutex_unlock(&vm); }
 void kh_vclock_client_drop(int id){ pthread_mutex_lock(&vm); clients[id].used=0; pthread_cond_broadcast(&vcv); pthread_mutex_unlock(&vm); }
 void kh_vclock_on_vblank(void (*fn)(KCtx *g,u64 vblank,u64 vnow_ns)){ for(int i=0;i<nlisten;i++) if(listeners[i]==fn) return; if(nlisten>=MAXLISTEN) kh_fatal(NULL,"vclock-listeners: more than %d vblank listeners",MAXLISTEN); listeners[nlisten++]=fn; }
@@ -170,6 +262,17 @@ static void advance_locked(KCtx *g,u64 target){
             if(kh_cond_wait_until(&vcv,&vm,&dl)==ETIMEDOUT){ const char *nm=clients[behind].name; u64 due=clients[behind].due; pthread_mutex_unlock(&vm);
                 kh_fatal(g,"vclock-client-stuck: clock client '%s' did not finish its work due at virtual time %llu ns within %d s of host time (the clock is at %llu ns)",nm,(unsigned long long)due,VC_CLIENT_WAIT_S,(unsigned long long)now); } }
         if(now>=target) return;
+        if(kh_vclock_sync){                                                             /* nothing may still be running at `now` */
+            u64 q0=0; char who[64]="";
+            while(!kh_threads_quiet(who,sizeof who)){
+                u64 h=kh_host_ns(); if(!q0){ q0=h; n_quiet_waits++; }
+                if(h-q0>=VC_QUIET_GUARD_NS){ n_quiet_guard++; if(n_quiet_guard_logged++<8) fprintf(stderr,"kh: vclock: quiescence guard: thread %s still running %.1f s of host time after virtual %llu ns; the clock goes on\n",who,(h-q0)/1e9,(unsigned long long)now); break; }
+                struct timespec d2; abs_in(&d2,200000ull); kh_cond_wait_until(&vcv,&vm,&d2);
+            }
+            if(q0) quiet_host_ns+=kh_host_ns()-q0;
+            int moved=0; for(int i=0;i<MAXCLIENTS;i++) if(clients[i].used&&clients[i].due<=atomic_load(&v_now)){ moved=1; break; }   /* a deadline was added meanwhile */
+            if(moved) continue;
+        }
         u64 stop=target; for(int i=0;i<MAXCLIENTS;i++) if(clients[i].used&&clients[i].due<stop) stop=clients[i].due;
         atomic_store(&v_now,stop); pthread_cond_broadcast(&vcv);
     }
@@ -181,6 +284,12 @@ static void one_period_locked(KCtx *g,u64 *k_out,u64 *vnow_out){
  * timing thread (0 when the call does not come from one of its two known call sites). */
 void kh_vclock_vblank(KCtx *g,u64 dev){
     pthread_once(&vonce,vc_once);
+    if(kh_vclock_sync) kh_vclock_idle(1);                                              /* the timing thread moves the clock: it is not "running" */
+    kh_vclock_vblank_raw(g,dev);
+    if(kh_vclock_sync) kh_vclock_idle(0);
+}
+static u64 n_quiet_rel;
+void kh_vclock_vblank_raw(KCtx *g,u64 dev){
     u64 t_enter=kh_host_ns();
     pthread_mutex_lock(&vm);
     if(!atomic_load(&stepped)){ v_t0=host_t0=t_enter; atomic_store(&v_now,v_t0); atomic_store(&stepped,1); presents_seen=gate_presents(); ticks_seen=gate_releases(); frames_seen=gate_frames(); pthread_cond_broadcast(&vcv);
@@ -191,11 +300,15 @@ void kh_vclock_vblank(KCtx *g,u64 dev){
     int how, w=0, released=0; u64 p=0, gf=0, q_since=0; long q_diff=0;
     for(;;){
         u64 now=kh_host_ns(); frame_calibrate(now,&q_since,&q_diff); released=gate_releases()!=ticks_seen; w=gate_waiting(g,dev); p=gate_presents(); gf=gate_frames();
-        if(released){ if(w&&gf==frames_seen){ how=4; break; } if(w&&p>presents_seen){ how=0; break; } if(now-t_enter>=gate_stall_ns){ how=3; break; } }
-        else { if(w&&(prev!=1||now-t_enter>=gate_period_ns)){ how=1; break; } if(!w&&now-t_enter>=(n_normal?gate_busy_run_ns:gate_busy_ns)){ how=2; break; } }
+        if(released){ if(w&&gf==frames_seen){ how=4; break; } if(w&&p>presents_seen){ how=0; break; }
+            if(kh_vclock_sync){ if(kh_threads_quiet(NULL,0)){ how=5; break; } if(now-t_enter>=VC_QUIET_GUARD_NS){ how=3; break; } }
+            else if(now-t_enter>=gate_stall_ns){ how=3; break; } }
+        else { if(w&&(prev!=1||now-t_enter>=gate_period_ns)){ how=1; break; }
+            if(!w&&kh_vclock_sync){ if(kh_threads_quiet(NULL,0)){ how=5; break; } if(now-t_enter>=VC_QUIET_GUARD_NS){ how=2; break; } }
+            else if(!w&&now-t_enter>=(n_normal?gate_busy_run_ns:gate_busy_ns)){ how=2; break; } }
         struct timespec ts={0,(long)VC_POLL_NS}; nanosleep(&ts,0);
     }
-    if(gate_log&&how){ static const char *const hn[5]={"frame-presented","no-release","game-busy","stall-guard","multi-vblank"};
+    if(gate_log&&how){ static const char *const hn[6]={"frame-presented","no-release","game-busy","stall-guard","multi-vblank","quiet"};
         fprintf(stderr,"kh: vclock: vblank %llu released by %s after %.1f ms: game-parked=%d (guest waiter counts: main=%d device=%d) release-seen=%d presents=%llu (+%llu since the last vblank) game-frames=%llu (+%llu) [in-wait=%ld taken=%llu releases=%llu seen=%llu rest=%ld%s]\n",(unsigned long long)atomic_load(&n_vblank)+1,hn[how],(kh_host_ns()-t_enter)/1e6,
                 w,sem_waiters(g,FRAME_SEM_VA),dev?sem_waiters(g,dev+DEV_SEM_OFF):-1,released,(unsigned long long)p,(unsigned long long)(p-presents_seen),(unsigned long long)gf,(unsigned long long)(gf-frames_seen),atomic_load(&frame_in_wait),(unsigned long long)atomic_load(&frame_taken),(unsigned long long)atomic_load(&frame_releases),(unsigned long long)ticks_seen,atomic_load(&frame_rest),atomic_load(&frame_rest_ok)?"":" (not calibrated)"); }
     if(pace_ns&&last_release_host){ u64 now=kh_host_ns(), floor_t=last_release_host+pace_ns; if(now<floor_t){ host_sleep_until(floor_t); paced_ns+=floor_t-now; } }
@@ -203,7 +316,7 @@ void kh_vclock_vblank(KCtx *g,u64 dev){
     u64 waited=last_release_host-t_enter, k, vnow;
     pthread_mutex_lock(&vm);
     presents_seen=gate_presents(); ticks_seen=gate_releases(); frames_seen=gate_frames(); gate_host_ns+=waited; if(waited>max_gate_ns) max_gate_ns=waited; last_how=how;
-    if(how==0) n_normal++; else if(how==1) n_norel++; else if(how==2) n_busy++; else if(how==4) n_multi++; else n_stall++;
+    if(how==0) n_normal++; else if(how==1) n_norel++; else if(how==2) n_busy++; else if(how==4) n_multi++; else if(how==5) n_quiet_rel++; else n_stall++;
     one_period_locked(g,&k,&vnow);
     pthread_mutex_unlock(&vm);
     for(int i=0;i<nlisten;i++) listeners[i](g,k,vnow);
@@ -215,6 +328,10 @@ void kh_vclock_report(FILE *f){
             VC_HZ,st?"yes":"NEVER BEGAN (no WaitForVBlank call)",(unsigned long long)k,(unsigned long long)n_normal,(unsigned long long)n_multi,(unsigned long long)n_norel,(unsigned long long)n_busy,(unsigned long long)n_stall,
             (unsigned long long)atomic_load(&frame_releases),(unsigned long long)atomic_load(&frame_taken),(unsigned long long)n_calib,virt/1e9,host/1e9,host?(double)virt/(double)host:0.0,gate_host_ns/1e9,max_gate_ns/1e6,paced_ns/1e9,pace_ns?"realtime":"free");
     pthread_mutex_unlock(&vm);
+    extern void kh_timer_frames_report(FILE*); kh_timer_frames_report(f);
+    if(kh_vclock_sync){ extern u64 kh_threads_vwaits(void); extern u64 kh_threads_wake_waits(u64*); extern u64 kh_threads_rel_retests(void); u64 wg=0, ww=kh_threads_wake_waits(&wg);
+        fprintf(f,"kh: vclock: KHNMC_CLOCK_SYNC=all: vblanks released because the guest was quiet=%llu; clock steps that waited for running threads=%llu (%.1f s of host time), let go by the %.0f s guard=%llu; Sleep calls on the virtual clock=%llu, waits with a virtual time-out=%llu; wake-ups after which the waker waited for the woken thread=%llu, let go by the 2 s guard=%llu; quiescence tests not quiet because a thread was released during their pass=%llu\n",
+        (unsigned long long)n_quiet_rel,(unsigned long long)n_quiet_waits,quiet_host_ns/1e9,VC_QUIET_GUARD_NS/1e9,(unsigned long long)n_quiet_guard,(unsigned long long)n_vsleeps,(unsigned long long)kh_threads_vwaits(),(unsigned long long)ww,(unsigned long long)wg,(unsigned long long)kh_threads_rel_retests()); }
 }
 
 /* ---- test hooks for the selftests of this and other modules (audio clock, timers, video): a stepped clock that only the test moves */
@@ -249,6 +366,8 @@ static void st_client_thread(KCtx *g){ StClient *c=(StClient*)(uintptr_t)A0(g);
 typedef struct { u64 until; _Atomic int done; _Atomic u64 woke_at; } StSleeper;
 static void st_sleeper_thread(KCtx *g){ StSleeper *s=(StSleeper*)(uintptr_t)A0(g); kh_vclock_wait_until(s->until); atomic_store(&s->woke_at,kh_vclock_now_ns()); atomic_store(&s->done,1); KH_RET(g); }
 static void st_settle(_Atomic int *flag,int want){ for(int i=0;i<3000&&atomic_load(flag)!=want;i++){ struct timespec ts={0,1000000}; nanosleep(&ts,0); } }
+static _Atomic int st_tn; static u64 st_tat[8];
+static void st_anchor_cb(KCtx *g){ int n=atomic_fetch_add(&st_tn,1); if(n<8) st_tat[n]=kh_vclock_now_ns(); KH_RET(g); }   /* section 9: the virtual instant of each tick */
 static u64 st_imp(KCtx *g,void (*f)(KCtx*),u64 a0){ u64 sp=KH_RSP(g),rc=KH_RCX(g); KH_RSP(g)=((sp-0x100)&~15ull)-8; wr64(g,KH_RSP(g),0x7ff7ffff0000ull); KH_RCX(g)=a0; f(g); u64 r=KH_RAX(g); KH_RSP(g)=sp; KH_RCX(g)=rc; return r; }
 int kh_vclock_selftest(KCtx *g){
     int checks=0,fails=0;
@@ -381,6 +500,23 @@ int kh_vclock_selftest(KCtx *g){
       atomic_store(&frame_sem_h[0],sh[0]); atomic_store(&frame_sem_h[1],sh[1]); atomic_store(&frame_releases,sh[2]);
       wr64(g,FRAME_SEM_VA,saved); ga_free(o); ga_free(o2); ga_free(dev); }
     kh_vclock_test_end(); ga_free(m);
+    /* 9. review of task 28: a winmm timer created BEFORE the first vblank (the clock still the host's) does not tick on the host, and once
+     *    the clock steps its grid starts at the origin (ticks at origin + 5, 10, 15 ms), not at the host instant of its creation */
+    if(atomic_load(&stepped)) VCHECK(!"9: the clock is already stepped (KHNMC_CLOCK=frames selftest?)");
+    else { extern u64 kh_timer_anchor_counts(u64*); int on0=kh_vclock_on; kh_vclock_on=1; atomic_store(&st_tn,0); u64 an0=kh_timer_anchor_counts(NULL);
+      u64 sp=KH_RSP(g), sv[4]={KH_RCX(g),KH_RDX(g),KH_R8(g),KH_R9(g)};
+      KH_RSP(g)=((sp-0x100)&~15ull); wr64(g,KH_RSP(g)+0x20,0x01); KH_RSP(g)-=8; wr64(g,KH_RSP(g),0x7ff7ffff0000ull);                 /* fuEvent = TIME_PERIODIC | TIME_CALLBACK_FUNCTION */
+      KH_RCX(g)=5; KH_RDX(g)=1; KH_R8(g)=kh_host_fn("vclock_selftest_anchor_cb",st_anchor_cb); KH_R9(g)=0; rt_imp_winmm__timeSetEvent(g); u32 id=(u32)KH_RAX(g);
+      KH_RSP(g)=sp; KH_RCX(g)=sv[0]; KH_RDX(g)=sv[1]; KH_R8(g)=sv[2]; KH_R9(g)=sv[3]; VCHECK(id!=0);
+      { struct timespec ts={0,40000000}; nanosleep(&ts,0); } VCHECK(atomic_load(&st_tn)==0);                  /* 40 ms of host time before the first vblank: no tick */
+      const u64 T1=7000000000000ull; kh_vclock_test_begin(T1);
+      for(int i=0;i<3000&&kh_timer_anchor_counts(NULL)==an0;i++){ struct timespec ts={0,1000000}; nanosleep(&ts,0); }
+      VCHECK(kh_timer_anchor_counts(NULL)==an0+1);                                                          /* registered at the origin */
+      kh_vclock_test_vblank(g);
+      VCHECK(atomic_load(&st_tn)==3&&st_tat[0]==T1+5000000ull&&st_tat[1]==T1+10000000ull&&st_tat[2]==T1+15000000ull);
+      if(atomic_load(&st_tn)!=3||st_tat[0]!=T1+5000000ull) fprintf(stderr,"vclock selftest: anchored timer: %d ticks, first at origin %+lld ns\n",atomic_load(&st_tn),(long long)(st_tat[0]-T1));
+      VCHECK((u32)st_imp(g,rt_imp_winmm__timeKillEvent,id)==0); kh_vclock_test_vblank(g); { struct timespec ts={0,20000000}; nanosleep(&ts,0); }
+      kh_vclock_test_end(); kh_vclock_on=on0; }
     /* 8. KHNMC_CLOCK values */
     if(!kh_fork_ok()) kh_selftest_not_run("vclock","KHNMC_CLOCK=bogus and frames with KHNMC_CLOCK_PACE=warp (named fatals at start-up)",2);   /* iOS: no fork (host_env.c) */
     else { pid_t pid=kh_fork(); if(pid==0){ setenv("KHNMC_CLOCK","bogus",1); if(!freopen("/dev/null","w",stderr)){} kh_vclock_init(); _exit(0); }

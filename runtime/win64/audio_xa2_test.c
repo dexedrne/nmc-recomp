@@ -2,6 +2,7 @@
  * stack arguments), with test callback objects and a test XAPO built from host-function COM classes.  The passes are driven by the
  * test (kh_audio_test_pass), no clock thread and no WAV.  Part of `khnmc --selftest` (kh_audio_soft_selftest). */
 #include "khnmc_rt.h"
+#include "khnmc_audio_out.h"
 #include "khnmc_mix.h"
 #include <math.h>
 #include <time.h>
@@ -306,6 +307,33 @@ int kh_audio_vclock_selftest(KCtx *g){
     return fails-f0;
 }
 
+/* ---- review of task 28: an engine created BEFORE the first vblank (the clock still the host's) ---------------------------------------
+ * 8 of 100 one-CPU starts created the XAudio2 engine before the first WaitForVBlank; its mixer then took t0 = the host instant of
+ * creation and ran passes on the host clock until stepping began: a pass grid whose phase against the vblanks depended on the host.
+ * Now: no pass before the first vblank, pass 0 at its origin, then one pass per 10 ms of virtual time. */
+int kh_audio_vclock_anchor_selftest(KCtx *g){
+    int c0=checks, f0=fails;
+    if(kh_vclock_stepped()){ CHECK(!"the clock is already stepped (KHNMC_CLOCK=frames selftest?)"); return fails-f0; }
+    char path[KH_TMP_MAX]; kh_tmp_path(path,sizeof path,"khnmc-anchor-wav-XXXXXX"); int fd=mkstemp(path); CHECK(fd>=0); if(fd<0) return 1; close(fd);
+    int on0=kh_vclock_on; kh_vclock_on=1;                                                       /* KHNMC_CLOCK=frames before the first WaitForVBlank */
+    int prev=kh_audio_test_mode(2); kh_audio_test_wav(path);
+    u64 out=ga_calloc(1,128), q0=kh_audio_test_quanta();
+    imp(g,rt_imp_xaudio2_9__ord1,out); u64 engine=rd64(g,out); CHECK(KH_RAX(g)==0&&engine!=0);
+    { struct timespec ts={0,50000000}; nanosleep(&ts,0); }
+    CHECK(kh_audio_test_quanta()==q0); CHECK(kh_audio_vclock_t0()==0);                          /* 50 ms of host time before the first vblank: no pass, no grid yet */
+    const u64 T0=11000000000000ull; kh_vclock_test_begin(T0);                                    /* the first vblank: the clock leaves the host clock at T0 */
+    for(int i=0;i<3000&&(!kh_audio_vclock_t0()||kh_audio_test_quanta()==q0);i++){ struct timespec ts={0,1000000}; nanosleep(&ts,0); }
+    CHECK(kh_audio_vclock_t0()==T0); CHECK(kh_audio_test_quanta()==q0+1);                       /* pass 0 at the origin */
+    for(int i=0;i<3;i++) kh_vclock_test_vblank(g);
+    CHECK(kh_audio_test_quanta()==q0+6);                                                         /* 50 ms: passes at 0, 10, .., 50 ms */
+    CHECK(kh_audio_test_stop_clock(g)==1);
+    kh_audio_test_wav(NULL); vc(g,engine,2,0,0,0);
+    kh_audio_test_mode(prev); kh_vclock_test_end(); kh_vclock_on=on0;
+    unlink(path); ga_free(out);
+    fprintf(stderr,"kh: audio vclock anchor selftest: %d checks, %d failures\n",checks-c0,fails-f0);
+    return fails-f0;
+}
+
 /* ---- SetParameters never runs inside Process (the XAPO rule the engine's effects rely on) ------------------------------------------
  * The test XAPO's Process takes 60 ms; a second guest thread calls IXAudio2Voice::SetEffectParameters 15 ms into it.  The call must
  * wait for Process to return (so it takes about 45 ms), and the XAPO must never see SetParameters while its Process is running. */
@@ -336,5 +364,94 @@ int kh_audio_fx_serial_selftest(KCtx *g){
     CHECK(vc(g,master,18,0,0,0)==0); vc(g,engine,2,0,0,0);
     kh_audio_test_mode(prev); ga_free(out); ga_free(fs.blob);
     fprintf(stderr,"kh: audio fx serialisation selftest: %d checks, %d failures\n",checks-c0,fails-f0);
+    return fails-f0;
+}
+
+/* ---- TASK28: a voice takes part in the processing passes only once its creation is complete ------------------------------------------
+ * The boot failure "the mastering voice produces 8 channels; only a stereo device is implemented" (1 of 5 software-mixer starts in task
+ * 27, 1 of 100 / 3 of 60 on one CPU in task 28): the engine creates its mastering voice with 8 input channels and an effect chain that
+ * folds 8 -> 6 -> 2.  The runtime created the mixer voice first and then hosted the chain's XAPOs (QueryInterface, registration
+ * properties, format checks, LockForProcess: guest calls); a pass of the mixer thread that came in between read the voice without its
+ * chain and produced 8 channels.  The same window let a pass call the voice callbacks of a source voice whose CreateSourceVoice had not
+ * returned yet.  These tests FORCE that interleaving: a pass is run inside the window, (A) by the test itself, (B) by the real mixer
+ * thread (two passes of its own clock), and must see neither the half-built mastering voice nor the half-built source voice.
+ * With the fix compiled out (-DKH_M28_VISIBLE_AT_ONCE_MUTANT) A fails 2 checks and B ends the process with the boot failure's FATAL
+ * (m28/selftest-mutant.out). */
+void kh_audio_test_mid_create(void (*fn)(KCtx*,int)); int kh_audio_test_stop_mixer(void);
+static void sleep_ms_test(int ms){ struct timespec ts={0,(long)ms*1000000L}; nanosleep(&ts,0); }
+static u64 mc_engine, mc_q0; static int mc_calls, mc_oc[8], mc_cb[8], mc_waited[8]; static float mc_mix[480*8];
+static void mid_create_manual(KCtx *g,int slot){ (void)slot; if(mc_calls<8){ u32 oc=99; int n0=ncb; kh_audio_test_pass(g,mc_engine,mc_mix,&oc); mc_oc[mc_calls]=(int)oc; mc_cb[mc_calls]=ncb-n0; } mc_calls++; }
+static void mid_create_thread(KCtx *g,int slot){ (void)g; (void)slot;                  /* hold the creating thread until the mixer thread has made two passes */
+    u64 q=kh_audio_test_quanta(); int ok=0; for(int i=0;i<2000&&!ok;i++){ if(kh_audio_test_quanta()>=q+2) ok=1; else { struct timespec ts={0,1000000}; nanosleep(&ts,0); } }
+    if(mc_calls<8) mc_waited[mc_calls]=ok; mc_calls++; }
+int kh_audio_creation_selftest(KCtx *g){
+    int c0=checks, f0=fails; memset(&tx,0,sizeof tx);
+    if(!C_tx){ C_tx=kh_com_class("xa2:test-IXAPO",13,COM_STRICT,h_tx); C_txp=kh_com_class("xa2:test-IXAPOParameters",5,COM_STRICT,h_txp); }
+    if(!C_vcb) C_vcb=kh_com_class("xa2:test-IXAudio2VoiceCallback",7,COM_STRICT|COM_NOUNK,h_vcb);
+    u64 out=ga_calloc(1,128); u32 oc=0;
+    /* A: passes driven by the test (manual mode) */
+    int prev=kh_audio_test_mode(1);
+    imp(g,rt_imp_xaudio2_9__ord1,out); mc_engine=rd64(g,out); CHECK(mc_engine!=0);
+    u64 xapo=kh_com_obj(C_tx,16); tx.gain=1.0f; tx.flags=0;                                          /* 8 -> 2: sums its inputs (like the engine's 8 -> 6 -> 2) */
+    u64 objs[1]={xapo}; u32 ini[1]={1},och[1]={2}; u64 chain=mk_chain(g,1,objs,ini,och);
+    mc_calls=0; memset(mc_oc,0,sizeof mc_oc); kh_audio_test_mid_create(mid_create_manual);
+    CHECK((u32)call8(g,mc_engine,7,out,8,48000,0,0,chain,0)==0); u64 master=rd64(g,out); CHECK(master!=0);
+    CHECK(mc_calls==1); CHECK(mc_oc[0]==0);                                                         /* the pass inside CreateMasteringVoice: no device output yet */
+    CHECK(tx.lock_in_ch==8&&tx.lock_out_ch==2);
+    kh_audio_test_mid_create(NULL); CHECK(kh_audio_test_pass(g,mc_engine,mc_mix,&oc)==1&&oc==2);  /* complete: stereo from the next pass on */
+    u64 vcb=kh_com_obj(C_vcb,0), fmt=mk_pcm_format(g,2,48000,16);
+    kh_audio_test_mid_create(mid_create_manual); ncb=0;
+    CHECK(create_source(g,mc_engine,out,fmt,vcb,0,0)==0); u64 src=rd64(g,out); CHECK(src!=0);
+    CHECK(mc_calls==2); CHECK(mc_cb[1]==0);                                                         /* no callback for a voice whose CreateSourceVoice has not returned */
+    kh_audio_test_mid_create(NULL); ncb=0; kh_audio_test_pass(g,mc_engine,mc_mix,&oc); CHECK(!strcmp(cbseq(vcb),"01"));
+    CHECK(vc(g,src,18,0,0,0)==0); CHECK(vc(g,master,18,0,0,0)==0); vc(g,mc_engine,2,0,0,0);
+    fprintf(stderr,"kh: audio creation selftest, passes driven by the test: %d checks, %d failures\n",checks-c0,fails-f0);
+    /* B: the real mixer thread (host clock) makes two passes while CreateMasteringVoice is between its voice and its chain */
+    kh_audio_test_mode(2); u64 q0=kh_audio_test_quanta(); (void)mc_q0;
+    imp(g,rt_imp_xaudio2_9__ord1,out); u64 engine=rd64(g,out); CHECK(engine!=0);
+    for(int i=0;i<2000&&kh_audio_test_quanta()==q0;i++){ struct timespec ts={0,1000000}; nanosleep(&ts,0); }
+    mc_calls=0; memset(mc_waited,0,sizeof mc_waited); kh_audio_test_mid_create(mid_create_thread);
+    CHECK((u32)call8(g,engine,7,out,8,48000,0,0,chain,0)==0); master=rd64(g,out); CHECK(master!=0);
+    kh_audio_test_mid_create(NULL);
+    CHECK(mc_calls==1&&mc_waited[0]==1);                                                            /* two passes of the mixer thread ran inside the window ... */
+    u64 q1=kh_audio_test_quanta(); for(int i=0;i<2000&&kh_audio_test_quanta()<q1+3;i++){ struct timespec ts={0,1000000}; nanosleep(&ts,0); }
+    CHECK(kh_audio_test_quanta()>=q1+3);                                                            /* ... and the thread goes on (no FATAL) with the stereo master */
+    CHECK(kh_audio_test_stop_mixer()==1);
+    CHECK(vc(g,master,18,0,0,0)==0); vc(g,engine,2,0,0,0);
+    kh_audio_test_mode(prev); free_chain(g,chain); ga_free(fmt); ga_free(out);
+    fprintf(stderr,"kh: audio creation selftest: %d checks, %d failures\n",checks-c0,fails-f0);
+    return fails-f0;
+}
+
+/* ---- TASK28: KHNMC_AUDIO=pull, the mixer thread follows the device (khnmc_audio_out.h) ------------------------------------------------
+ * With the host clock: no device = passes on the host clock, discarded and counted; a device that pulls as fast as the ring allows gets
+ * 2 s of audio in far less than 2 s of host time (the passes follow its consumption, not CLOCK_MONOTONIC), no frame is lost or
+ * repeated (produced = delivered + what is still in the ring), the ring never holds more than the target fill; a device at real time
+ * keeps the fill at the target; after kh_audio_out_stop the mixer is back on the host clock. */
+void kh_audio_test_pull(int on);
+int kh_audio_pull_selftest(KCtx *g){
+    int c0=checks, f0=fails; u64 out=ga_calloc(1,128);
+    int prev=kh_audio_test_mode(2); kh_audio_test_pull(1);
+    imp(g,rt_imp_xaudio2_9__ord1,out); u64 engine=rd64(g,out); CHECK(engine!=0);
+    CHECK((u32)call8(g,engine,7,out,2,48000,0,0,0,0)==0); u64 master=rd64(g,out); CHECK(master!=0);
+    KhAudioOutStats a,b; KhAudioOutFormat f; kh_audio_out_format(&f); CHECK(f.target_frames==KH_AUDIO_OUT_TARGET_FRAMES&&f.ring_frames==KH_AUDIO_OUT_RING_FRAMES);   /* 2048 / 16384 (review of task 28: was 8192) */
+    { struct timespec ts={0,150000000}; nanosleep(&ts,0); }
+    kh_audio_out_stats(&a); CHECK(a.stopped_passes>=8&&a.stopped_passes<=40&&a.produced_frames==0);      /* no device: ~15 host-clock passes in 150 ms, discarded */
+    CHECK(kh_audio_out_start()==0);
+    static float buf[1024*2]; u64 t0=kh_host_ns(), got=0;
+    while(got<96000&&kh_host_ns()-t0<3000000000ull){ got+=kh_audio_out_pull(buf,1024); struct timespec ts={0,100000}; nanosleep(&ts,0); }
+    u64 dt=kh_host_ns()-t0; kh_audio_out_stats(&b);
+    CHECK(got>=96000); CHECK(dt<1500000000ull);                                                     /* 2 s of audio, paced by the device, not by the host clock */
+    CHECK(b.overruns==0); CHECK(b.produced_frames==b.delivered_frames+kh_audio_ring_fill());        /* nothing lost, nothing repeated */
+    CHECK(b.max_fill<=f.target_frames);
+    u64 t1=kh_host_ns(); for(int i=0;i<30;i++){ kh_audio_out_pull(buf,480); sleep_ms_test(10); }      /* a device at real time */
+    u32 fill=kh_audio_ring_fill(); CHECK(fill+480>=f.target_frames-480&&fill<=f.target_frames); (void)t1;
+    kh_audio_out_stats(&a); kh_audio_out_stop();
+    { struct timespec ts={0,100000000}; nanosleep(&ts,0); }
+    kh_audio_out_stats(&b); CHECK(b.stopped_passes>=a.stopped_passes+5);                            /* stopped: back on the host clock, discarded */
+    CHECK(kh_audio_test_stop_mixer()==1);
+    CHECK(vc(g,master,18,0,0,0)==0); vc(g,engine,2,0,0,0);
+    kh_audio_test_pull(0); kh_audio_test_mode(prev); ga_free(out);
+    fprintf(stderr,"kh: audio pull selftest: %d checks, %d failures (2 s of audio pulled in %.0f ms of host time; %llu underruns while the device ran ahead)\n",checks-c0,fails-f0,(double)dt/1e6,(unsigned long long)b.underruns);
     return fails-f0;
 }

@@ -16,9 +16,13 @@ typedef struct { uint32_t flags, bytes; const uint8_t *data; uint64_t ctx; uint3
 typedef struct { KmxVoice *dest; uint32_t flags; float *matrix; uint32_t msrc, mdst; float *prev; uint32_t nprev; } Send;
 typedef struct { int kind; void *user; uint32_t in_ch, out_ch; int enabled, inplace; float peak[KMX_MAXCH], rms[KMX_MAXCH]; } Fx;
 
+/* a deferred call (deferred mode): applied by the pass thread before the first pass whose instant is later than `stamp` */
+enum { OP_START = 1, OP_STOP, OP_SUBMIT, OP_FLUSH, OP_DISC, OP_EXITLOOP, OP_VOLUME, OP_CHANVOL, OP_MATRIX, OP_RATIO, OP_RATE, OP_FXEN, OP_FXPARAMS, OP_PUBLISH };
+typedef struct { int kind; KmxVoice *v, *dest; uint64_t stamp; uint32_t a, b; float f; float *vals; void *blob; QBuf q; } Op;
+
 struct KmxVoice {
     KmxEngine *e; int kind; uint32_t id; void *user; int has_cb;
-    int dead, busy, closing;
+    int dead, busy, closing, hidden;
     uint32_t flags, stage;
     uint32_t in_ch, in_rate, in_frames;          /* source: channels / rate of the queued data; submix, master: the input mix */
     uint32_t out_rate, out_frames;               /* processing rate = input rate of the destinations */
@@ -34,6 +38,7 @@ struct KmxVoice {
     uint64_t starve_count, starve_first, starve_last;      /* episodes; engine pass numbers of the first and last */
     uint64_t *pend; uint32_t npend, cpend;
     int16_t *ad_cache; const uint8_t *ad_data; int64_t ad_block; uint32_t ad_frames;
+    float peak_stage[10]; uint32_t nstage;         /* TASK28 level analysis (kmx_engine_set_peaks): |x| peak at the chain input and after each effect, last pass */
 };
 struct KmxEngine {
     KmxHost host; void *user; uint32_t rate, quantum;
@@ -44,6 +49,8 @@ struct KmxEngine {
     KmxVoice **snap; uint32_t csnap;
     KmxVoice **grave; uint32_t ngrave, cgrave;
     float *out; size_t cout;                     /* copy of the last master output (the voice may be destroyed by another thread) */
+    int deferred; Op *ops; uint32_t ophead, nops, cops;   /* deferred calls: ops[ophead .. nops) in call (= stamp) order */
+    int peaks;                                   /* level analysis on (kmx_engine_set_peaks) */
     KmxStats st;
 };
 
@@ -61,6 +68,13 @@ static void *xcalloc(size_t n, size_t s){ void *p = calloc(n ? n : 1, s); if(!p)
 #define LOCK(e) pthread_mutex_lock(&(e)->m)
 #define UNLOCK(e) pthread_mutex_unlock(&(e)->m)
 static int on_pass_thread(KmxEngine *e){ return e->in_pass && pthread_equal(e->pass_thread, pthread_self()); }
+/* deferred mode queues a call, except one made by the pass thread itself from inside a pass (a callback): that one applies at once, as in
+ * XAudio2 (a buffer submitted from OnVoiceProcessingPassStart is played in that very pass), and its moment in the pass is deterministic */
+#ifdef KH_M28_IMMEDIATE_MUTANT                     /* mutation check of the selftest only: deferred mode applies every call at once */
+static int defer(KmxEngine *e){ (void)e; return 0; }
+#else
+static int defer(KmxEngine *e){ return e->deferred && !on_pass_thread(e); }
+#endif
 
 /* ---- MS-ADPCM ------------------------------------------------------------------------------------------------------------------- */
 static inline int clamp16(int v){ return v < -32768 ? -32768 : v > 32767 ? 32767 : v; }
@@ -147,7 +161,7 @@ static void realloc_proc(KmxVoice *v){            /* (re)allocate the processing
 }
 static KmxVoice *new_voice(KmxEngine *e, int kind, uint32_t ch, uint32_t rate, uint32_t flags, void *user){
     KmxVoice *v = xcalloc(1, sizeof *v);
-    v->e = e; v->kind = kind; v->id = e->next_id++; v->user = user; v->flags = flags;
+    v->e = e; v->kind = kind; v->id = e->next_id++; v->user = user; v->flags = flags & ~KMX_VOICE_HIDDEN; v->hidden = (flags & KMX_VOICE_HIDDEN) != 0;
     v->in_ch = v->out_ch = v->max_ch = ch; v->in_rate = rate; v->in_frames = rate / 100;
     v->out_rate = kind == KMX_MASTER ? rate : e->rate; v->out_frames = v->out_rate / 100;
     v->volume = v->prev_volume = 1.0f; for(uint32_t i = 0; i < KMX_MAXCH; i++) v->chan_vol[i] = v->prev_chan_vol[i] = 1.0f;
@@ -173,6 +187,7 @@ static int wait_idle(KmxVoice *v){
     while(v->busy) if(pthread_cond_timedwait(&e->cv, &e->m, &dl) == ETIMEDOUT) return KMX_E_TIMEOUT;
     return KMX_OK;
 }
+static void op_drop_voice(KmxEngine *e, KmxVoice *v);
 static int has_host_fx(KmxVoice *v){ for(uint32_t i = 0; i < v->nfx; i++) if(v->fx[i].kind == KMX_FX_HOST) return 1; return 0; }
 
 int kmx_voice_set_outputs(KmxVoice *v, KmxVoice *const *dests, const uint32_t *sflags, uint32_t n, int use_default){
@@ -250,6 +265,7 @@ void kmx_voice_destroy(KmxVoice *v){
     v->closing = 1;
     if(v->busy && !on_pass_thread(e)) wait_idle(v);                 /* XAudio2's DestroyVoice also waits for the audio thread */
     v->dead = 1;
+    op_drop_voice(e, v);
     for(uint32_t i = 0; i < e->nvoices; i++){
         KmxVoice *o = e->voices[i];
         for(uint32_t k = 0; k < o->nsends;) if(o->sends[k].dest == v){ free_send(&o->sends[k]); memmove(&o->sends[k], &o->sends[k + 1], (o->nsends - k - 1) * sizeof(Send)); o->nsends--; } else k++;
@@ -269,7 +285,78 @@ void kmx_engine_destroy(KmxEngine *e){
     while(e->nvoices){ KmxVoice *v = e->voices[e->nvoices - 1]; kmx_voice_destroy(v); }
     for(uint32_t i = 0; i < e->ngrave; i++) free_voice(e->grave[i]);
     UNLOCK(e);
-    free(e->voices); free(e->snap); free(e->grave); free(e->out); pthread_mutex_destroy(&e->m); pthread_cond_destroy(&e->cv); free(e);
+    free(e->voices); free(e->snap); free(e->grave); free(e->out); free(e->ops); pthread_mutex_destroy(&e->m); pthread_cond_destroy(&e->cv); free(e);
+}
+
+/* ---- deferred calls ------------------------------------------------------------------------------------------------------------- */
+static float default_level(uint32_t S, uint32_t D, uint32_t d, uint32_t s, int *ok);
+void kmx_engine_set_peaks(KmxEngine *e, int on){ LOCK(e); e->peaks = !!on; UNLOCK(e); }
+/* the last pass, for the level analysis: every published voice that carried signal, with what scales it on its way to the master */
+void kmx_engine_peak_dump(KmxEngine *e, FILE *f, const char *(*name)(void *voice_user)){
+    LOCK(e);
+    for(uint32_t i = 0; i < e->nvoices; i++){ KmxVoice *v = e->voices[i]; if(v->hidden || v->dead || !v->nstage || v->peak_stage[0] == 0.0f) continue;
+        if(v->kind == KMX_SOURCE && !v->started) continue;
+        fprintf(f, "  %s %u%s%s in %uch@%u: peak in=%.3f", v->kind == KMX_SOURCE ? "source" : v->kind == KMX_SUBMIX ? "submix" : "MASTER", v->id, name ? " " : "", name ? name(v->user) : "", v->in_ch, v->in_rate, (double)v->peak_stage[0]);
+        for(uint32_t k = 1; k < v->nstage; k++) fprintf(f, " fx%u=%.3f", k - 1, (double)v->peak_stage[k]);
+        fprintf(f, " vol=%.3f", (double)v->volume);
+        if(v->kind == KMX_SOURCE) fprintf(f, " ratio=%.3f", (double)v->ratio);
+        for(uint32_t si = 0; si < v->nsends; si++){ Send *sd = &v->sends[si]; uint32_t S = v->out_ch, D = sd->dest->in_ch; float mx = 0.0f;
+            for(uint32_t d = 0; d < D; d++){ float row = 0.0f; for(uint32_t c = 0; c < S; c++){ int ok; float m = (sd->matrix && sd->msrc == S && sd->mdst == D) ? sd->matrix[d * S + c] : default_level(S, D, d, c, &ok); row += fabsf(v->chan_vol[c] * m); } if(row > mx) mx = row; }
+            fprintf(f, " -> %s %u (largest row sum of |chanvol*matrix| %.3f)", sd->dest->kind == KMX_MASTER ? "master" : "submix", sd->dest->id, (double)mx); }
+        if(v->kind == KMX_MASTER){ float cm = 0.0f; for(uint32_t c = 0; c < v->out_ch; c++) if(v->chan_vol[c] > cm) cm = v->chan_vol[c]; fprintf(f, " largest channel volume %.3f", (double)cm); }
+        fputc('\n', f);
+    }
+    UNLOCK(e);
+}
+void kmx_engine_set_deferred(KmxEngine *e, int on){ LOCK(e); e->deferred = !!on; UNLOCK(e); }   /* off: new calls apply at once; queued ones still apply at their pass */
+int kmx_engine_deferred(KmxEngine *e){ LOCK(e); int r = e->deferred; UNLOCK(e); return r; }
+uint32_t kmx_engine_pending(KmxEngine *e){ LOCK(e); uint32_t r = e->nops - e->ophead; UNLOCK(e); return r; }
+static void op_free(Op *o){ free(o->vals); free(o->blob); o->vals = NULL; o->blob = NULL; }
+/* caller holds the lock; the stamp is read under it, so the queue is in stamp order */
+static Op *op_push(KmxEngine *e, int kind, KmxVoice *v){
+    if(e->ophead && e->ophead * 2 >= e->nops){ memmove(e->ops, e->ops + e->ophead, (e->nops - e->ophead) * sizeof *e->ops); e->nops -= e->ophead; e->ophead = 0; }
+    if(e->nops == e->cops){ e->cops = e->cops ? e->cops * 2 : 64; e->ops = realloc(e->ops, e->cops * sizeof *e->ops); if(!e->ops) abort(); }
+    Op *o = &e->ops[e->nops++]; memset(o, 0, sizeof *o);
+    o->kind = kind; o->v = v; o->stamp = e->host.now ? e->host.now(e->user) : 0;
+    e->st.deferred_ops++; return o;
+}
+/* the latest queued call of `kind` on v (dest / index a must match where they matter), or NULL: what a getter returns in deferred mode */
+static const Op *op_latest(KmxEngine *e, KmxVoice *v, int kind, KmxVoice *dest, int match_a, uint32_t a){
+    for(uint32_t i = e->nops; i-- > e->ophead;){ const Op *o = &e->ops[i];
+        if(o->v == v && o->kind == kind && (kind != OP_MATRIX || o->dest == dest) && (!match_a || o->a == a)) return o; }
+    return NULL;
+}
+/* destroy: the voice's queued calls (and matrices that name it as the destination) go with it, without callbacks */
+static void op_drop_voice(KmxEngine *e, KmxVoice *v){
+    uint32_t w = e->ophead;
+    for(uint32_t i = e->ophead; i < e->nops; i++){
+        if(e->ops[i].v == v || e->ops[i].dest == v){ op_free(&e->ops[i]); e->st.deferred_dropped++; continue; }
+        if(w != i) e->ops[w] = e->ops[i];
+        w++;
+    }
+    e->nops = w;
+}
+/* review of task 28: SetEffectChain applies at once (not deferred).  Calls of this voice still queued were made BEFORE it: EnableEffect /
+ * SetEffectParameters address an effect of the OLD chain by index, and (when the output width changed) SetChannelVolumes /
+ * SetOutputMatrix the old width, which the new chain resets.  In XAudio2's call order they went to the old chain or were reset with it;
+ * applied later they would reach whatever the new chain holds at that index (another XAPO, a parameter blob of another layout).  They
+ * are dropped here and counted (deferred_superseded).  Caller holds the lock. */
+static void op_drop_superseded(KmxEngine *e, KmxVoice *v, int levels){
+    uint32_t w = e->ophead;
+    for(uint32_t i = e->ophead; i < e->nops; i++){ int k = e->ops[i].kind;
+        if(e->ops[i].v == v && (k == OP_FXEN || k == OP_FXPARAMS || (levels && (k == OP_CHANVOL || k == OP_MATRIX)))){ op_free(&e->ops[i]); e->st.deferred_superseded++; continue; }
+        if(w != i) e->ops[w] = e->ops[i];
+        w++;
+    }
+    e->nops = w;
+}
+/* buffers queued on a source voice as its caller sees them: the applied queue changed by the queued submits and flushes */
+static uint32_t front_queued(KmxEngine *e, KmxVoice *v, uint64_t *ctx){
+    uint32_t n = v->qn; uint64_t c = v->qn ? v->q[0].ctx : 0;
+    for(uint32_t i = e->ophead; i < e->nops; i++){ const Op *o = &e->ops[i]; if(o->v != v) continue;
+        if(o->kind == OP_SUBMIT){ if(!n) c = o->q.ctx; n++; }
+        else if(o->kind == OP_FLUSH){ uint32_t keep = (v->started && v->qn && v->q[0].begun) ? 1 : 0; if(n > keep) n = keep; if(!n) c = 0; } }
+    if(ctx) *ctx = c; return n;
 }
 
 int kmx_voice_set_chain(KmxVoice *v, const KmxFxDesc *d, uint32_t n){
@@ -287,6 +374,7 @@ int kmx_voice_set_chain(KmxVoice *v, const KmxFxDesc *d, uint32_t n){
     if((rc = wait_idle(v)) != KMX_OK) goto out;
     uint32_t old_out = v->out_ch;
     free(v->fx); v->fx = nf; v->nfx = n; nf = NULL; realloc_proc(v);
+    op_drop_superseded(e, v, v->out_ch != old_out);
     if(v->out_ch != old_out){                                        /* output width changed: levels and matrices return to their defaults */
         for(uint32_t i = 0; i < KMX_MAXCH; i++) v->chan_vol[i] = v->prev_chan_vol[i] = 1.0f;
         for(uint32_t k = 0; k < v->nsends; k++){ free(v->sends[k].matrix); free(v->sends[k].prev); v->sends[k].matrix = v->sends[k].prev = NULL; v->sends[k].nprev = 0; }
@@ -295,25 +383,57 @@ out:
     free(nf); UNLOCK(e); return rc;
 }
 void *kmx_voice_fx_user(KmxVoice *v, uint32_t i){ KmxEngine *e = v->e; LOCK(e); void *u = i < v->nfx ? v->fx[i].user : NULL; UNLOCK(e); return u; }
-int kmx_voice_fx_enable(KmxVoice *v, uint32_t i, int on){ KmxEngine *e = v->e; LOCK(e); int rc = i < v->nfx ? KMX_OK : KMX_E_INVALID; if(rc == KMX_OK) v->fx[i].enabled = !!on; UNLOCK(e); return rc; }
-int kmx_voice_fx_enabled(KmxVoice *v, uint32_t i, int *on){ KmxEngine *e = v->e; LOCK(e); int rc = i < v->nfx ? KMX_OK : KMX_E_INVALID; if(rc == KMX_OK) *on = v->fx[i].enabled; UNLOCK(e); return rc; }
+int kmx_voice_fx_enable(KmxVoice *v, uint32_t i, int on){
+    KmxEngine *e = v->e; LOCK(e); int rc = i < v->nfx ? KMX_OK : KMX_E_INVALID;
+    if(rc == KMX_OK){ if(defer(e)){ Op *o = op_push(e, OP_FXEN, v); o->a = i; o->b = !!on; } else v->fx[i].enabled = !!on; }
+    UNLOCK(e); return rc;
+}
+int kmx_voice_fx_enabled(KmxVoice *v, uint32_t i, int *on){
+    KmxEngine *e = v->e; LOCK(e); int rc = i < v->nfx ? KMX_OK : KMX_E_INVALID;
+    if(rc == KMX_OK){ const Op *o = op_latest(e, v, OP_FXEN, NULL, 1, i); *on = o ? (int)o->b : v->fx[i].enabled; }
+    UNLOCK(e); return rc;
+}
+/* effect parameters (host fx only): deferred mode queues them for host->fx_params on the pass thread; from the pass thread itself (a callback)
+ * they are delivered at once on it.  Without deferred mode the caller delivers them itself: KMX_E_UNSUPPORTED. */
+int kmx_voice_fx_params(KmxVoice *v, void *ctx, uint32_t i, const void *blob, uint32_t size){
+    KmxEngine *e = v->e; LOCK(e); int rc = (i < v->nfx && v->fx[i].kind == KMX_FX_HOST && e->host.fx_params && blob && size) ? KMX_OK : KMX_E_INVALID;
+    if(rc == KMX_OK && !e->deferred) rc = KMX_E_UNSUPPORTED;
+    if(rc == KMX_OK){
+        if(defer(e)){ Op *o = op_push(e, OP_FXPARAMS, v); o->a = i; o->b = size; o->blob = xcalloc(size, 1); memcpy(o->blob, blob, size); }
+        else { void *fu = v->fx[i].user; UNLOCK(e); e->host.fx_params(ctx, fu, blob, size); LOCK(e); }
+    }
+    UNLOCK(e); return rc;
+}
+int kmx_voice_publish(KmxVoice *v){
+    KmxEngine *e = v->e; LOCK(e); int rc = v->dead ? KMX_E_INVALID : KMX_OK;
+    if(rc == KMX_OK && v->hidden){ if(defer(e)) op_push(e, OP_PUBLISH, v); else v->hidden = 0; }
+    UNLOCK(e); return rc;
+}
+int kmx_voice_hidden(KmxVoice *v){ KmxEngine *e = v->e; LOCK(e); int r = v->hidden; UNLOCK(e); return r; }
 int kmx_voice_meter(KmxVoice *v, uint32_t i, float *peak, float *rms, uint32_t ch){
     KmxEngine *e = v->e; LOCK(e); int rc = KMX_E_INVALID;
     if(i < v->nfx && v->fx[i].kind == KMX_FX_METER && ch == v->fx[i].out_ch){ memcpy(peak, v->fx[i].peak, ch * sizeof(float)); memcpy(rms, v->fx[i].rms, ch * sizeof(float)); rc = KMX_OK; }
     UNLOCK(e); return rc;
 }
 static int vol_ok(float x){ return x >= -16777216.0f && x <= 16777216.0f; }      /* XAUDIO2_MAX_VOLUME_LEVEL = 2^24 */
-int kmx_voice_set_volume(KmxVoice *v, float vol){ if(!vol_ok(vol)) return KMX_E_INVALID; KmxEngine *e = v->e; LOCK(e); v->volume = vol; UNLOCK(e); return KMX_OK; }
-float kmx_voice_volume(KmxVoice *v){ KmxEngine *e = v->e; LOCK(e); float r = v->volume; UNLOCK(e); return r; }
+int kmx_voice_set_volume(KmxVoice *v, float vol){
+    if(!vol_ok(vol)) return KMX_E_INVALID; KmxEngine *e = v->e; LOCK(e);
+    if(defer(e)) op_push(e, OP_VOLUME, v)->f = vol; else v->volume = vol;
+    UNLOCK(e); return KMX_OK;
+}
+float kmx_voice_volume(KmxVoice *v){ KmxEngine *e = v->e; LOCK(e); const Op *o = op_latest(e, v, OP_VOLUME, NULL, 0, 0); float r = o ? o->f : v->volume; UNLOCK(e); return r; }
 int kmx_voice_set_channel_volumes(KmxVoice *v, uint32_t n, const float *vols){
     KmxEngine *e = v->e; LOCK(e); int rc = (vols && n == v->out_ch) ? KMX_OK : KMX_E_INVALID;
     for(uint32_t i = 0; rc == KMX_OK && i < n; i++) if(!vol_ok(vols[i])) rc = KMX_E_INVALID;
-    if(rc == KMX_OK) memcpy(v->chan_vol, vols, n * sizeof(float));
+    if(rc == KMX_OK){
+        if(defer(e)){ Op *o = op_push(e, OP_CHANVOL, v); o->a = n; o->vals = xcalloc(n, sizeof(float)); memcpy(o->vals, vols, n * sizeof(float)); }
+        else memcpy(v->chan_vol, vols, n * sizeof(float));
+    }
     UNLOCK(e); return rc;
 }
 int kmx_voice_channel_volumes(KmxVoice *v, uint32_t n, float *vols){
     KmxEngine *e = v->e; LOCK(e); int rc = (vols && n == v->out_ch) ? KMX_OK : KMX_E_INVALID;
-    if(rc == KMX_OK) memcpy(vols, v->chan_vol, n * sizeof(float));
+    if(rc == KMX_OK){ const Op *o = op_latest(e, v, OP_CHANVOL, NULL, 1, n); memcpy(vols, o ? o->vals : v->chan_vol, n * sizeof(float)); }
     UNLOCK(e); return rc;
 }
 /* XAudio2 default levels, only the shapes that need no down-mix table: identity, and "first channels" for an up-mix (mono feeds
@@ -326,19 +446,24 @@ static float default_level(uint32_t S, uint32_t D, uint32_t d, uint32_t s, int *
     if(S < D) return s == d ? 1.0f : 0.0f;
     *ok = 0; return 0.0f;
 }
+static void matrix_store(Send *s, uint32_t S, uint32_t D, const float *m){ free(s->matrix); s->matrix = xcalloc((size_t)S * D, sizeof(float)); memcpy(s->matrix, m, (size_t)S * D * sizeof(float)); s->msrc = S; s->mdst = D; }
 int kmx_voice_set_matrix(KmxVoice *v, KmxVoice *dest, uint32_t S, uint32_t D, const float *m){
     KmxEngine *e = v->e; LOCK(e); int rc = KMX_E_INVALID; Send *s = find_send(v, dest);
     if(s && m && S == v->out_ch && D == s->dest->in_ch){
         rc = KMX_OK; for(uint32_t i = 0; i < S * D; i++) if(!vol_ok(m[i])) rc = KMX_E_INVALID;
-        if(rc == KMX_OK){ free(s->matrix); s->matrix = xcalloc((size_t)S * D, sizeof(float)); memcpy(s->matrix, m, (size_t)S * D * sizeof(float)); s->msrc = S; s->mdst = D; }
+        if(rc == KMX_OK){
+            if(defer(e)){ Op *o = op_push(e, OP_MATRIX, v); o->dest = s->dest; o->a = S; o->b = D; o->vals = xcalloc((size_t)S * D, sizeof(float)); memcpy(o->vals, m, (size_t)S * D * sizeof(float)); }
+            else matrix_store(s, S, D, m);
+        }
     }
     UNLOCK(e); return rc;
 }
 int kmx_voice_matrix(KmxVoice *v, KmxVoice *dest, uint32_t S, uint32_t D, float *m){
     KmxEngine *e = v->e; LOCK(e); int rc = KMX_E_INVALID; Send *s = find_send(v, dest);
     if(s && m && S == v->out_ch && D == s->dest->in_ch){
-        rc = KMX_OK;
-        if(s->matrix && s->msrc == S && s->mdst == D) memcpy(m, s->matrix, (size_t)S * D * sizeof(float));
+        rc = KMX_OK; const Op *o = op_latest(e, v, OP_MATRIX, s->dest, 0, 0);
+        if(o && o->a == S && o->b == D) memcpy(m, o->vals, (size_t)S * D * sizeof(float));
+        else if(s->matrix && s->msrc == S && s->mdst == D) memcpy(m, s->matrix, (size_t)S * D * sizeof(float));
         else for(uint32_t d = 0; d < D && rc == KMX_OK; d++) for(uint32_t c = 0; c < S; c++){ int ok; m[d * S + c] = default_level(S, D, d, c, &ok); if(!ok){ rc = KMX_E_UNSUPPORTED; break; } }
     }
     UNLOCK(e); return rc;
@@ -352,17 +477,26 @@ int kmx_voice_kind(KmxVoice *v){ return v->kind; }
 void *kmx_voice_user(KmxVoice *v){ return v->user; }
 
 /* ---- source voice API ------------------------------------------------------------------------------------------------------------- */
-int kmx_source_start(KmxVoice *v){ if(v->kind != KMX_SOURCE) return KMX_E_INVALID; KmxEngine *e = v->e; LOCK(e); v->started = 1; v->tails = 0; UNLOCK(e); return KMX_OK; }
+static void start_locked(KmxVoice *v){ v->started = 1; v->tails = 0; }
+static void stop_locked(KmxVoice *v, uint32_t flags){
+    v->started = 0;
+    v->tails = (flags & KMX_PLAY_TAILS) && v->nfx; v->tail_quiet = 0; v->tail_left = 1000;      /* effect tails: until 8 silent passes, 10 s at most */
+}
+int kmx_source_start(KmxVoice *v){
+    if(v->kind != KMX_SOURCE) return KMX_E_INVALID; KmxEngine *e = v->e; LOCK(e);
+    if(defer(e)) op_push(e, OP_START, v); else start_locked(v);
+    UNLOCK(e); return KMX_OK;
+}
 int kmx_source_stop(KmxVoice *v, uint32_t flags){
     if(v->kind != KMX_SOURCE || (flags & ~KMX_PLAY_TAILS)) return KMX_E_INVALID;
-    KmxEngine *e = v->e; LOCK(e); v->started = 0;
-    v->tails = (flags & KMX_PLAY_TAILS) && v->nfx; v->tail_quiet = 0; v->tail_left = 1000;      /* effect tails: until 8 silent passes, 10 s at most */
+    KmxEngine *e = v->e; LOCK(e);
+    if(defer(e)) op_push(e, OP_STOP, v)->a = flags; else stop_locked(v, flags);
     UNLOCK(e); return KMX_OK;
 }
 int kmx_source_submit(KmxVoice *v, const KmxBuffer *b){
     if(v->kind != KMX_SOURCE || !b) return KMX_E_INVALID;
     KmxEngine *e = v->e; LOCK(e); int rc = KMX_E_INVALID; QBuf q; memset(&q, 0, sizeof q);
-    if(v->dead || (b->flags & ~KMX_END_OF_STREAM) || v->qn >= KMX_MAX_QUEUED || !b->data || !b->bytes) goto out;
+    if(v->dead || (b->flags & ~KMX_END_OF_STREAM) || front_queued(e, v, NULL) >= KMX_MAX_QUEUED || !b->data || !b->bytes) goto out;
     if(v->fmt.tag == KMX_TAG_ADPCM ? b->bytes < 7 * v->fmt.channels : (b->bytes % v->fmt.block_align) != 0) goto out;
     q.flags = b->flags; q.bytes = b->bytes; q.data = b->data; q.ctx = b->context; q.frames = kmx_buffer_frames(&v->fmt, b->bytes);
     if(!q.frames || b->play_begin >= q.frames || (uint64_t)b->play_begin + b->play_length > q.frames) goto out;
@@ -374,9 +508,10 @@ int kmx_source_submit(KmxVoice *v, const KmxBuffer *b){
         if(q.loop_end <= q.play_begin || q.loop_end > q.play_end || q.loop_end <= q.loop_begin) goto out;
         q.loop_count = b->loop_count;
     } else if(b->loop_begin || b->loop_length) goto out;
-    q.cursor = q.play_begin;
-    v->q[v->qn++] = q; rc = KMX_OK;
-    e->st.buffers_submitted++; e->st.bytes_submitted += b->bytes; if(v->qn > e->st.peak_queued) e->st.peak_queued = v->qn;
+    q.cursor = q.play_begin; rc = KMX_OK;
+    e->st.buffers_submitted++; e->st.bytes_submitted += b->bytes;
+    if(defer(e)) op_push(e, OP_SUBMIT, v)->q = q;
+    else { v->q[v->qn++] = q; if(v->qn > e->st.peak_queued) e->st.peak_queued = v->qn; }
 out:
     UNLOCK(e); return rc;
 }
@@ -386,26 +521,34 @@ static void pend_push(KmxVoice *v, uint64_t ctx){
 }
 /* XAudio2: every removed buffer reports OnBufferEnd (and nothing else) from the next processing pass; a started voice keeps the
  * buffer it is playing; a stopped voice loses that one too and its position is reset. */
-int kmx_source_flush(KmxVoice *v){
-    if(v->kind != KMX_SOURCE) return KMX_E_INVALID;
-    KmxEngine *e = v->e; LOCK(e);
+static void flush_locked(KmxEngine *e, KmxVoice *v){
     uint32_t keep = (v->started && v->qn && v->q[0].begun) ? 1 : 0;
     for(uint32_t i = keep; i < v->qn; i++){ pend_push(v, v->q[i].ctx); e->st.buffers_flushed++; }
     v->qn = keep; if(!keep) reset_src(v);
+}
+int kmx_source_flush(KmxVoice *v){
+    if(v->kind != KMX_SOURCE) return KMX_E_INVALID;
+    KmxEngine *e = v->e; LOCK(e);
+    if(defer(e)) op_push(e, OP_FLUSH, v); else flush_locked(e, v);
     UNLOCK(e); return KMX_OK;
 }
 int kmx_source_discontinuity(KmxVoice *v){
     if(v->kind != KMX_SOURCE) return KMX_E_INVALID;
-    KmxEngine *e = v->e; LOCK(e); if(v->qn) v->q[v->qn - 1].flags |= KMX_END_OF_STREAM; UNLOCK(e); return KMX_OK;
+    KmxEngine *e = v->e; LOCK(e);
+    if(defer(e)) op_push(e, OP_DISC, v); else if(v->qn) v->q[v->qn - 1].flags |= KMX_END_OF_STREAM;
+    UNLOCK(e); return KMX_OK;
 }
 int kmx_source_exit_loop(KmxVoice *v){
     if(v->kind != KMX_SOURCE) return KMX_E_INVALID;
-    KmxEngine *e = v->e; LOCK(e); if(v->qn) v->q[0].loop_count = 0; UNLOCK(e); return KMX_OK;
+    KmxEngine *e = v->e; LOCK(e);
+    if(defer(e)) op_push(e, OP_EXITLOOP, v); else if(v->qn) v->q[0].loop_count = 0;
+    UNLOCK(e); return KMX_OK;
 }
 int kmx_source_state(KmxVoice *v, uint64_t *ctx, uint32_t *queued, uint64_t *played){
     if(v->kind != KMX_SOURCE) return KMX_E_INVALID;
     KmxEngine *e = v->e; LOCK(e);
-    if(ctx) *ctx = v->qn ? v->q[0].ctx : 0; if(queued) *queued = v->qn; if(played) *played = v->samples_played;
+    uint64_t c; uint32_t n = front_queued(e, v, &c);
+    if(ctx) *ctx = c; if(queued) *queued = n; if(played) *played = v->samples_played;
     UNLOCK(e); return KMX_OK;
 }
 int kmx_source_starvations(KmxVoice *v, uint64_t *count, uint64_t *first_pass, uint64_t *last_pass){
@@ -414,13 +557,15 @@ int kmx_source_starvations(KmxVoice *v, uint64_t *count, uint64_t *first_pass, u
 }
 int kmx_source_set_ratio(KmxVoice *v, float r){
     if(v->kind != KMX_SOURCE || !(r >= 1.0f / 1024.0f && r <= 1024.0f)) return KMX_E_INVALID;
-    KmxEngine *e = v->e; LOCK(e); v->ratio = r > v->max_ratio ? v->max_ratio : r; UNLOCK(e); return KMX_OK;   /* XAudio2 clamps to MaxFrequencyRatio */
+    KmxEngine *e = v->e; LOCK(e); float x = r > v->max_ratio ? v->max_ratio : r;                                  /* XAudio2 clamps to MaxFrequencyRatio */
+    if(defer(e)) op_push(e, OP_RATIO, v)->f = x; else v->ratio = x;
+    UNLOCK(e); return KMX_OK;
 }
-float kmx_source_ratio(KmxVoice *v){ KmxEngine *e = v->e; LOCK(e); float r = v->ratio; UNLOCK(e); return r; }
+float kmx_source_ratio(KmxVoice *v){ KmxEngine *e = v->e; LOCK(e); const Op *o = op_latest(e, v, OP_RATIO, NULL, 0, 0); float r = o ? o->f : v->ratio; UNLOCK(e); return r; }
 int kmx_source_set_rate(KmxVoice *v, uint32_t rate){
     if(v->kind != KMX_SOURCE || !check_rate(rate)) return KMX_E_INVALID;
-    KmxEngine *e = v->e; LOCK(e); int rc = v->qn ? KMX_E_INVALID : KMX_OK;                                     /* XAudio2: only with an empty queue */
-    if(rc == KMX_OK){ v->in_rate = v->fmt.rate = rate; reset_src(v); }
+    KmxEngine *e = v->e; LOCK(e); int rc = front_queued(e, v, NULL) ? KMX_E_INVALID : KMX_OK;   /* XAudio2: only with an empty queue */
+    if(rc == KMX_OK){ if(defer(e)) op_push(e, OP_RATE, v)->a = rate; else { v->in_rate = v->fmt.rate = rate; reset_src(v); } }
     UNLOCK(e); return rc;
 }
 
@@ -547,9 +692,11 @@ static void render_source(KmxEngine *e, KmxVoice *v, void *ctx){
     }
 }
 static int all_zero(const float *p, size_t n){ for(size_t i = 0; i < n; i++) if(p[i] != 0.0f) return 0; return 1; }
+static float peak_of(const float *p, size_t n){ float m = 0.0f; for(size_t i = 0; i < n; i++){ float a = fabsf(p[i]); if(a > m) m = a; } return m; }
 /* run the effect chain over cur (ch channels, n frames); returns the buffer holding the result and updates *pch */
 static float *run_chain(KmxEngine *e, KmxVoice *v, void *ctx, float *cur, uint32_t *pch, uint32_t n){
     uint32_t ch = *pch;
+    if(e->peaks){ v->peak_stage[0] = peak_of(cur, (size_t)n * ch); v->nstage = 1; }
     for(uint32_t i = 0; i < v->nfx && !gone(v); i++){
         Fx *f = &v->fx[i];
         if(f->kind == KMX_FX_METER){
@@ -569,6 +716,7 @@ static float *run_chain(KmxEngine *e, KmxVoice *v, void *ctx, float *cur, uint32
             if(gone(v)) break;
             if(silent_out) memset(dst, 0, (size_t)n * oc * sizeof(float));
             cur = dst; ch = oc;
+            if(e->peaks && v->nstage < 10) v->peak_stage[v->nstage++] = peak_of(cur, (size_t)n * ch);
         }
     }
     *pch = ch; return cur;
@@ -578,7 +726,7 @@ static int mix_to_sends(KmxVoice *v, const float *buf, uint32_t S, uint32_t n, f
     int rc = KMX_OK;
     for(uint32_t si = 0; si < v->nsends; si++){
         Send *s = &v->sends[si]; KmxVoice *d = s->dest; uint32_t D = d->in_ch;
-        if(d->dead || d->in_frames != n) continue;
+        if(d->dead || d->hidden || d->in_frames != n) continue;
         size_t nc = (size_t)S * D; float coef[nc];
         int nz = 0;
         for(uint32_t dd = 0; dd < D; dd++) for(uint32_t ss = 0; ss < S; ss++){
@@ -668,24 +816,59 @@ static int snap_order(const void *pa, const void *pb){
     if(a->kind == KMX_SUBMIX && a->stage != b->stage) return a->stage < b->stage ? -1 : 1;
     return a->id < b->id ? -1 : a->id > b->id;
 }
-int kmx_engine_pass(KmxEngine *e, void *ctx, const float **out, uint32_t *out_ch){
+/* deferred mode: the queued calls stamped before `instant`, in call order, on the pass thread (lock held; released only around the
+ * delivery of effect parameters, with the voice marked busy so that it cannot be destroyed meanwhile) */
+static void apply_ops(KmxEngine *e, void *ctx, uint64_t instant){
+    while(e->ophead < e->nops && e->ops[e->ophead].stamp < instant){
+        Op o = e->ops[e->ophead++]; KmxVoice *v = o.v;
+        if(gone(v)){ e->st.deferred_dropped++; op_free(&o); continue; }
+        int ok = 1;
+        switch(o.kind){
+        case OP_START: start_locked(v); break;
+        case OP_STOP: stop_locked(v, o.a); break;
+        case OP_SUBMIT: if(v->qn >= KMX_MAX_QUEUED) ok = 0; else { v->q[v->qn++] = o.q; if(v->qn > e->st.peak_queued) e->st.peak_queued = v->qn; } break;
+        case OP_FLUSH: flush_locked(e, v); break;
+        case OP_DISC: if(v->qn) v->q[v->qn - 1].flags |= KMX_END_OF_STREAM; break;
+        case OP_EXITLOOP: if(v->qn) v->q[0].loop_count = 0; break;
+        case OP_VOLUME: v->volume = o.f; break;
+        case OP_CHANVOL: if(o.a == v->out_ch) memcpy(v->chan_vol, o.vals, o.a * sizeof(float)); else ok = 0; break;
+        case OP_MATRIX: { Send *s = find_send(v, o.dest); if(s && o.a == v->out_ch && o.b == o.dest->in_ch) matrix_store(s, o.a, o.b, o.vals); else ok = 0; break; }
+        case OP_RATIO: v->ratio = o.f; break;
+        case OP_RATE: if(v->qn) ok = 0; else { v->in_rate = v->fmt.rate = o.a; reset_src(v); } break;
+        case OP_FXEN: if(o.a < v->nfx) v->fx[o.a].enabled = (int)o.b; else ok = 0; break;
+        case OP_FXPARAMS:
+            if(o.a < v->nfx && v->fx[o.a].kind == KMX_FX_HOST && e->host.fx_params){ void *fu = v->fx[o.a].user; v->busy = 1;
+                UNLOCK(e); e->host.fx_params(ctx, fu, o.blob, o.b); LOCK(e); v->busy = 0; pthread_cond_broadcast(&e->cv); }
+            else ok = 0;
+            break;
+        case OP_PUBLISH: v->hidden = 0; break;
+        default: ok = 0;
+        }
+        if(ok) e->st.deferred_applied++; else e->st.deferred_failed++;
+        op_free(&o);
+    }
+}
+int kmx_engine_pass(KmxEngine *e, void *ctx, const float **out, uint32_t *out_ch){ return kmx_engine_pass_at(e, ctx, UINT64_MAX, out, out_ch); }
+int kmx_engine_pass_at(KmxEngine *e, void *ctx, uint64_t instant, const float **out, uint32_t *out_ch){
     if(out) *out = NULL; if(out_ch) *out_ch = 0;
     LOCK(e);
     if(e->in_pass){ UNLOCK(e); return KMX_E_INVALID; }
     if(!e->running){ UNLOCK(e); return KMX_OK; }
     e->in_pass = 1; e->pass_thread = pthread_self();
+    apply_ops(e, ctx, instant);
     uint32_t n = e->nvoices;
     if(n > e->csnap){ e->csnap = n + 32; e->snap = realloc(e->snap, e->csnap * sizeof *e->snap); if(!e->snap) abort(); }
     memcpy(e->snap, e->voices, n * sizeof *e->snap);
     qsort(e->snap, n, sizeof *e->snap, snap_order);
     uint32_t act = 0;
-    for(uint32_t i = 0; i < n; i++){ KmxVoice *v = e->snap[i]; if(v->kind != KMX_SOURCE) memset(v->mix, 0, (size_t)v->in_frames * v->in_ch * sizeof(float)); else if(v->started) act++; }
+    for(uint32_t i = 0; i < n; i++){ KmxVoice *v = e->snap[i]; if(v->kind != KMX_SOURCE) memset(v->mix, 0, (size_t)v->in_frames * v->in_ch * sizeof(float)); else if(v->started && !v->hidden) act++; }
     if(act > e->st.peak_active_source) e->st.peak_active_source = act;
     if(e->callbacks && e->host.engine_event){ e->ecb_busy = 1; e->st.engine_pass_callbacks++; UNLOCK(e); e->host.engine_event(ctx, e->user, KMX_EV_PASS_START); LOCK(e); e->ecb_busy = 0; pthread_cond_broadcast(&e->cv); }
     const float *res = NULL; uint32_t res_ch = 0;
     for(uint32_t i = 0; i < n; i++){
         KmxVoice *v = e->snap[i];
         if(gone(v)) continue;
+        if(v->hidden){ e->st.hidden_skips++; continue; }                                   /* not published yet: its creation is not finished */
         v->busy = 1;
         if(v->kind == KMX_SOURCE) process_source(e, v, ctx);
         else { uint32_t oc = 0; const float *r = process_mix_voice(e, v, ctx, &oc); if(v->kind == KMX_MASTER && r && !gone(v)){ res = r; res_ch = oc; } }

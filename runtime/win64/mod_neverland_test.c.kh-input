@@ -20,6 +20,7 @@ void f_424570(KCtx *); void f_306400(KCtx *); void f_15b6d0(KCtx *);
 enum { S1=0x2e5380, S2=0x424570, S3=0x30660a, S4=0x2ffa30, S5=0x15b6d0, S5_SECOND=0x1a05a0 };
 #define SAVE_FLAGS (GS_BASE+0x9a98b0+0x41a4)    /* GAME_SAVE (exe 0x152380 returns 0x9a98b0) + 0x41a4: the dword f_2e5380 tests */
 #define ROW_IMM    (GS_BASE+0x15b962)           /* S5+0x292: imm8 of `add ebp,imm8` at 0x15b960 */
+u8 kh_mod_neverland_vblank_step(u64 vblank,u64 vnow); int kh_mod_neverland_by_vblank(void);   /* review of task 28: KHNMC_CLOCK=frames */
 
 static int run_child(KCtx *g,void (*body)(KCtx *),int fd,char *out,size_t cap){
     FILE *log=kh_tmpfile(); if(!log) kh_fatal(g,"mod neverland selftest: tmpfile failed");
@@ -301,11 +302,31 @@ static void test_thread(KCtx *g){
 static void test_thread_live(KCtx *g){
     u64 p0,p1,gap; kh_mod_neverland_thread_stats(&p0,&gap); p1=p0;
     u32 flags=rd32(g,SAVE_FLAGS);
+    if(kh_mod_neverland_by_vblank()){                                             /* KHNMC_CLOCK=frames at init: no host thread, nothing steps on host time */
+        kh_mod_neverland_hold(0); { struct timespec ts={0,600000000}; nanosleep(&ts,0); } kh_mod_neverland_hold(1);
+        kh_mod_neverland_thread_stats(&p1,&gap); T(p1==p0); T(rd32(g,SAVE_FLAGS)==flags); return; }
     kh_mod_neverland_hold(0);
     for(int i=0;i<4000&&p1<p0+2;i++){ struct timespec ts={0,5000000}; nanosleep(&ts,0); kh_mod_neverland_thread_stats(&p1,&gap); }
     kh_mod_neverland_hold(1);
     kh_mod_neverland_thread_stats(&p1,&gap);
     T(p1>=p0+2); T(gap>=250000000ull); T(rd8(g,ROW_IMM)==((flags&0x40)?0x1c:0x16)); T(rd32(g,SAVE_FLAGS)==flags);
+}
+
+/* review of task 28: KHNMC_CLOCK=frames steps the byte from a vblank listener (no host thread): exactly at every 15th virtual vblank
+ * (250 ms of virtual time), never in between, with the same rule as the thread.  The caller holds the thread (step_m). */
+static void test_vblank_step(KCtx *g){
+    u32 keep=rd32(g,SAVE_FLAGS); u8 keep_imm=rd8(g,ROW_IMM); u64 p0,p1,gap; int wrong=0, steps=0;
+    kh_mod_neverland_thread_stats(&p0,&gap);
+    for(u64 v=1;v<=60;v++){
+        u32 fl=(v<20)?0u:(v<40)?0x40u:0u; wr32(g,SAVE_FLAGS,fl);                  /* the flag flips between vblanks 15..30 and 30..45 */
+        u8 want=(fl&0x40)?0x1c:0x16, before=rd8(g,ROW_IMM), r=kh_mod_neverland_vblank_step(v,1000000000ull+v*16666667ull);
+        if(v%15){ if(r!=0||rd8(g,ROW_IMM)!=before) wrong++; }                     /* between: nothing stored */
+        else { steps++; if(r!=want||rd8(g,ROW_IMM)!=want) wrong++; }
+    }
+    kh_mod_neverland_thread_stats(&p1,&gap);
+    T(wrong==0); T(steps==4); T(p1==p0+4);                                        /* vblanks 15, 30, 45, 60 */
+    T(rd8(g,ROW_IMM)==0x16);                                                       /* flags 0 again at 45 and 60 */
+    wr32(g,SAVE_FLAGS,keep); wr8(g,ROW_IMM,keep_imm);
 }
 
 /* ---- link ------------------------------------------------------------------------------------------------------------------------ */
@@ -332,6 +353,7 @@ int kh_mod_neverland_selftest(KCtx *g){
     test_menu_slot(g);
     test_site(g);
     test_thread(g);
+    test_vblank_step(g);
     test_thread_live(g);
     test_image(g);                                                        /* everything is as init left it */
     kh_mod_neverland_hold(0);

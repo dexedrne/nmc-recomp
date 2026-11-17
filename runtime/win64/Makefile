@@ -100,6 +100,16 @@ endif
 CFLAGS = -std=gnu11 $(OPT) -w -fno-strict-aliasing -fwrapv -fno-delete-null-pointer-checks -fno-math-errno -ffp-contract=off -pthread \
          -I$(ROOT)/lifter-rt -I$(ROOT)/runtime -I$(LIFTED)/gen $(XFLAGS) $(IOSFLAGS) $(EXTRA)
 RTSRC = $(wildcard $(ROOT)/runtime/*.c)
+# TASK28, PREPARED, NOT RUN: COREAUDIO=1 adds the Apple output-unit glue (runtime/ios/audio_coreaudio.c, an audio unit whose render
+# callback calls kh_audio_out_pull) and AudioToolbox.  Darwin / iOS SDK builds only; never built on the machines this was written on.
+ifeq ($(COREAUDIO),1)
+ifneq ($(UNAME_S),Darwin)
+$(error COREAUDIO=1 needs a Mac (AudioToolbox))
+endif
+RTSRC += $(ROOT)/runtime/ios/audio_coreaudio.c
+CFLAGS += -DKH_AUDIO_COREAUDIO=1
+COREAUDIO_LDFLAGS = -framework AudioToolbox -framework CoreFoundation
+endif
 RTOBJ = $(patsubst $(ROOT)/runtime/%.c,$(O)/%.o,$(RTSRC))
 LIFTOBJ = $(O)/khrt_cpu.o $(O)/khrt_rcp_tab.o $(O)/rt_libm.o $(O)/kh_table.o $(O)/rt_imports_default.o $(O)/nep_stubs.o
 # link-time entry probes (runtime/gxwrap.c): ld --wrap on Linux, renamed definitions + generated forwarders with HOOKMODE=rename
@@ -291,7 +301,7 @@ all: $(O)/hook_link.ok
 $(O)/hook_link.ok: $(BIN) tools/check_hook_link.py
 	python3 tools/check_hook_link.py --bin $(BIN) --objs $(RTOBJ) $(LIFTOBJ) $(HOOK_OBJ) --hooks $(HOOKS_UNIQ) --wrap $(WRAP_FNS) $(if $(HOOK_OBJ),--forwarders $(HOOK_OBJ)) $(if $(filter 1,$(HOOK_STRICT)),--strict) && touch $@
 $(O)/%.o: $(ROOT)/runtime/%.c $(wildcard $(ROOT)/runtime/*.h)
-	@mkdir -p $(O) && $(CC) $(CFLAGS) -c $< -o $@
+	@mkdir -p $(@D) && $(CC) $(CFLAGS) -c $< -o $@
 $(O)/khrt_cpu.o: $(ROOT)/lifter-rt/khrt_cpu.c
 	@mkdir -p $(O) && $(CC) $(CFLAGS) -c $< -o $@
 $(O)/khrt_rcp_tab.o: $(ROOT)/lifter-rt/khrt_rcp_tab.c
@@ -307,7 +317,7 @@ $(O)/nep_stubs.c: $(LIFTED)/gen/nep_stubs.c $(ROOT)/tools/gen_nep.sh
 $(O)/nep_stubs.o: $(O)/nep_stubs.c
 	$(CC) $(CFLAGS) -c $< -o $@
 $(BIN): $(RTOBJ) $(LIFTOBJ) $(HOOK_OBJ) $(OL)/libkh2loose.a
-	$(CC) -o $@ $(RTOBJ) $(LIFTOBJ) $(HOOK_OBJ) $(OL)/libkh2loose.a -lm -lpthread $(LDEXPORT) $(HOOK_LINK) $(GFX_LDFLAGS)
+	$(CC) -o $@ $(RTOBJ) $(LIFTOBJ) $(HOOK_OBJ) $(OL)/libkh2loose.a -lm -lpthread $(LDEXPORT) $(HOOK_LINK) $(GFX_LDFLAGS) $(COREAUDIO_LDFLAGS)
 # ---- Task 26: the game as two static libraries and a shell that owns main() (what an iOS app links) ----
 APP_RTOBJ = $(filter-out $(O)/loader.o,$(RTOBJ)) $(O)/loader_app.o
 $(O)/loader_app.o: $(ROOT)/runtime/loader.c $(wildcard $(ROOT)/runtime/*.h)

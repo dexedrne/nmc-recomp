@@ -36,7 +36,10 @@ IMP(K32,IsDebuggerPresent){ SET_RAX(g,0); }
 IMP(K32,IsProcessorFeaturePresent){ u32 f=(u32)A0(g); static const int on[]={3,6,10,13,14,17,23,36,37,38,39,40}; int r=0; for(unsigned i=0;i<sizeof on/sizeof*on;i++) if(on[i]==(int)f) r=1; SET_RAX(g,r); }
 IMP(K32,SetUnhandledExceptionFilter){ SET_RAX(g,0); }
 IMP(K32,UnhandledExceptionFilter){ kh_fatal(g,"UnhandledExceptionFilter reached (guest crash filter): exception pointers %llx",(unsigned long long)A0(g)); }
-IMP(K32,RaiseException){ u32 code=(u32)A0(g); if(code==0x406D1388u) return;   /* SetThreadName convention: no-op */
+IMP(K32,RaiseException){ u32 code=(u32)A0(g);
+    if(code==0x406D1388u){                                                           /* SetThreadName convention: THREADNAME_INFO {0x1000, szName, dwThreadID, dwFlags} as ULONG_PTRs */
+        u64 args=A3(g); if((u32)A2(g)>=3&&args&&GA_OK(args)&&GA_OK(args+23)&&rd32(g,args)==0x1000u){ u64 nm=rd64(g,args+8); if(nm&&GA_OK(nm)){ extern void kh_thread_set_name(u32,const char*); kh_thread_set_name((u32)rd64(g,args+16),gstr(g,nm)); } }
+        return; }
     kh_fatal(g,"RaiseException(0x%x) reached (terminate-on-throw policy)",code); }
 IMP(K32,RtlCaptureContext){ memset(hp(g,A0(g)),0,0x4d0); }
 IMP(K32,RtlLookupFunctionEntry){ SET_RAX(g,0); }
@@ -130,7 +133,8 @@ IMP(winmm,timeBeginPeriod){ SET_RAX(g,0); }
 IMP(winmm,timeEndPeriod){ SET_RAX(g,0); }
 IMP(winmm,timeGetDevCaps){ if(A0(g)){ wr32(g,A0(g),1); wr32(g,A0(g)+4,1000000); } SET_RAX(g,0); }
 static u64 t0ms; IMP(winmm,timeGetTime){ u64 n=kh_now_ns()/1000000; if(!t0ms) t0ms=n; SET_RAX(g,(u32)(n-t0ms+1000)); }
-typedef struct Timer { u32 id; u32 delay; u64 cb, user; u32 flags; volatile int killed; struct Timer *next; } Timer;
+typedef struct Timer { u32 id; u32 delay; u64 cb, user; u32 flags; volatile int killed; struct Timer *next;
+    u64 fires, settled, no_consumer, guard_hits; u64 seth[4]; u64 setsat[4]; int setwait[4]; int nset; KThread *owner; int owner_seq; int anchor; } Timer;   /* anchor: review of task 28, 1 = created before the first vblank and anchored there, -1 = not anchored (guard) */   /* frames clock: consumer tracking, same-instant order (TASK28) */
 static Timer *timers; static u32 next_timer=1; static pthread_mutex_t tmm=PTHREAD_MUTEX_INITIALIZER;
 /* A multimedia timer fires on a fixed grid (start + n*period), it does not drift by the time its handler takes: absolute deadlines.
  * A timer that fell behind by more than a period drops the missed periods, as Windows does.  TIME_CALLBACK_EVENT_SET (0x10) is
@@ -140,18 +144,68 @@ static void timer_fire(KCtx *g,Timer *t){
     else if(t->flags&0x10){ if(!kh_event_set(t->cb)) kh_warn("winmm timer %u: set of a closed or invalid event handle %llx",t->id,(unsigned long long)t->cb); }
     else kh_call5(g,t->cb,t->id,0,t->user,0,0);
 }
-/* KHNMC_CLOCK=frames: the timer's grid is on the virtual clock.  The clock moves in steps (to the mixer's next pass, to the vblank), so
- * several instants can pass at once: the timer fires ONCE per wake-up and continues with the first grid instant after "now" (missed
- * periods are dropped, as Windows drops them; the sound driver's handlers measure the elapsed time themselves). */
+/* KHNMC_CLOCK=frames: the timer's grid is on the virtual clock.
+ * Before TASK28 the timer thread woke whenever the clock passed its next grid instant and fired ONCE (missed periods dropped), while the
+ * clock moved on: the sound driver's handlers ("CDevSd MSECHandler" and "CDevSd VSYNCHandler", two 16 ms timers; the loop 0xfb040:
+ * wait for the semaphore, run the tick, wait again; the timer callback 0xfb020 releases that semaphore of maximum count 1) then ran at
+ * whatever virtual time the clock had reached, concurrently with the mixer's passes.  Nearly every XAudio2 call of the game comes from
+ * those handlers (TASK28 audio logs), so their timing in host terms decided which pass a call reached.
+ * Now each timer is a CLOCK CLIENT (after the mixer's pass of the same instant; timers of one instant in the order of their creating
+ * threads' names, kh_vclock_thread_key, not of their ids, which thread start-up order assigns): the clock stops at every grid
+ * instant (no period is dropped: a 1 ms timer fires 1000 times per virtual second), the timer fires, and it announces its next instant
+ * only when the consumer of what it signalled is back in its wait (kh_wobj_settle: the wait was satisfied after the fire and the
+ * consumer blocks on the event again).  So a handler's tick runs entirely at its own instant: its QueryPerformanceCounter reads that
+ * instant and every call it makes is stamped with it.  A consumer that is not waiting when the timer fires (none yet, or busy with
+ * something else) is not waited for (counted: no-consumer); one that is not back within VC_TIMER_GUARD_MS of host time is let go
+ * (counted: guard) so that a handler that waits for virtual time to pass cannot stop the clock.  Both counts are in the report. */
+#define VC_TIMER_GUARD_MS 5000u
+static _Atomic u64 tm_fires, tm_settled, tm_noconsumer, tm_guard; static Timer *tm_list_frames[16]; static int tm_nframes;
+static void timer_set_hook(void *ctx,u64 h){ Timer *t=ctx; if(t->nset>=4) return;
+    int w=0; u64 sat=0; if(kh_wobj_waitstate(h,&w,&sat)) return;
+    t->seth[t->nset]=h; t->setwait[t->nset]=w; t->setsat[t->nset]=sat; t->nset++; }
+static _Atomic u64 tm_anchored, tm_unanchored;
 static void timer_proc_virtual(KCtx *g,Timer *t){
-    u64 per=(u64)t->delay*1000000ull, start=kh_vclock_now_ns(), next=start+per;
+    /* review of task 28: a timer created before the first WaitForVBlank used to start its grid at the host instant of creation, a phase
+     * against the vblanks that depends on the host.  It now waits for the first vblank (not idle: under sync=all the clock cannot leave
+     * its origin before this thread has registered there) and its grid starts at the origin, as if created there.  A timer that sees no
+     * vblank within the guard keeps the host grid: named here and in the report. */
+    if(!kh_vclock_stepped()){ u64 h0=kh_host_ns();
+        while(!kh_vclock_stepped()&&!t->killed&&kh_host_ns()-h0<KH_VCLOCK_ANCHOR_GUARD_NS) kh_vclock_wait_stepped(10000000ull);
+        if(kh_vclock_stepped()) t->anchor=1;
+        else if(!t->killed){ t->anchor=-1; tm_unanchored++; kh_warn("vclock: winmm timer %u (%u ms) was created before the first WaitForVBlank and none came within %.0f s of host time: its grid follows the host (not anchored, a determinism break)",t->id,t->delay,KH_VCLOCK_ANCHOR_GUARD_NS/1e9); } }
+    u64 per=(u64)t->delay*1000000ull, now0=kh_vclock_now_ns(), start=t->anchor==1?kh_vclock_origin():now0, next=start+per;
+    if(t->anchor==1&&next<=now0) next=start+((now0-start)/per+1)*per;                 /* sync=timers: the clock may have moved on meanwhile */
+    char nm[32]; snprintf(nm,sizeof nm,"winmm-timer-%u",t->id);
+    int cid=kh_vclock_client_add_prio(strdup(nm),next,16);
+    kh_vclock_client_set_key(cid,16,t->owner,t->owner_seq);                            /* the creating thread's name / start routine (read at each comparison), then its own creation order */
+    if(t->anchor==1) tm_anchored++;                                                    /* counted once registered at the origin (the selftest waits for it) */
+    if(tm_nframes<16) tm_list_frames[tm_nframes++]=t;
     for(;;){
-        kh_vclock_wait_until(next);
+        kh_vclock_client_wait(cid,next);                                                /* the clock is held at `next` until this client announces a later instant */
         if(t->killed) break;
-        timer_fire(g,t);
+        t->nset=0;
+        if(t->flags&0x30) timer_set_hook(t,t->cb);                                      /* SetEvent / PulseEvent by the timer itself */
+        else kh_set_event_hook(timer_set_hook,t);                                       /* a callback: what it signals (0xfb020: ReleaseSemaphore) */
+        timer_fire(g,t); kh_set_event_hook(NULL,NULL); t->fires++; tm_fires++;
+        for(int i=0;i<t->nset;i++){
+            if(t->setwait[i]<=0){ t->no_consumer++; tm_noconsumer++; continue; }
+            int rc=kh_wobj_settle(t->seth[i],t->setsat[i],t->setwait[i],VC_TIMER_GUARD_MS,&t->killed);
+            if(rc==1){ t->guard_hits++; tm_guard++; kh_warn("vclock: winmm timer %u: the consumer of event %llx was not back in its wait %u ms of host time after the tick at virtual %llu ns: the clock goes on without it",t->id,(unsigned long long)t->seth[i],VC_TIMER_GUARD_MS,(unsigned long long)next); }
+            else { t->settled++; tm_settled++; }
+        }
         if(!(t->flags&1)) break;
         u64 now=kh_vclock_now_ns(); next=start+((now-start)/per+1)*per;
+        kh_vclock_client_due(cid,next);
     }
+    kh_vclock_client_drop(cid);
+}
+u64 kh_timer_anchor_counts(u64 *unanchored){ if(unanchored) *unanchored=tm_unanchored; return tm_anchored; }
+void kh_timer_frames_report(FILE *f){
+    if(!kh_vclock_on||!tm_nframes) return;
+    fprintf(f,"kh: vclock: winmm timers as clock clients: %llu ticks, %llu waited until their consumer was back in its wait, %llu without a waiting consumer, %llu let go by the %u ms guard; created before the first vblank: %llu anchored at it, %llu NOT anchored;",
+            (unsigned long long)tm_fires,(unsigned long long)tm_settled,(unsigned long long)tm_noconsumer,(unsigned long long)tm_guard,VC_TIMER_GUARD_MS,(unsigned long long)tm_anchored,(unsigned long long)tm_unanchored);
+    for(int i=0;i<tm_nframes;i++){ Timer *t=tm_list_frames[i]; fprintf(f," timer %u (%u ms, flags %x): %llu ticks / %llu settled / %llu no consumer / %llu guard%s%s",t->id,t->delay,t->flags,(unsigned long long)t->fires,(unsigned long long)t->settled,(unsigned long long)t->no_consumer,(unsigned long long)t->guard_hits,t->anchor==1?" (created before the first vblank, anchored at it)":t->anchor<0?" (NOT anchored)":"",i+1<tm_nframes?";":""); }
+    fputc('\n',f);
 }
 static void timer_proc(KCtx *g){ Timer *t=(Timer*)(uintptr_t)A0(g);
     if(kh_vclock_on&&!ga_deterministic){ timer_proc_virtual(g,t); KH_RET(g); return; }
@@ -167,7 +221,7 @@ static void timer_proc(KCtx *g){ Timer *t=(Timer*)(uintptr_t)A0(g);
         timer_fire(g,t);
         if(!(t->flags&1)) break; }
     KH_RET(g); }
-IMP(winmm,timeSetEvent){ Timer *t=calloc(1,sizeof *t); t->delay=(u32)A0(g)?(u32)A0(g):1; t->cb=A2(g); t->user=A3(g); t->flags=(u32)ARG(g,4); pthread_mutex_lock(&tmm); t->id=next_timer++; t->next=timers; timers=t; pthread_mutex_unlock(&tmm);
+IMP(winmm,timeSetEvent){ Timer *t=calloc(1,sizeof *t); t->owner=cur_thread(); t->owner_seq=t->owner?t->owner->vc_ntimers++:0; t->delay=(u32)A0(g)?(u32)A0(g):1; t->cb=A2(g); t->user=A3(g); t->flags=(u32)ARG(g,4); pthread_mutex_lock(&tmm); t->id=next_timer++; t->next=timers; timers=t; pthread_mutex_unlock(&tmm);
     kh_spawn_hostfn_thread(g,"winmm_timer",timer_proc,(u64)(uintptr_t)t); SET_RAX(g,t->id); }
 IMP(winmm,timeKillEvent){ u32 id=(u32)A0(g); int ok=1; pthread_mutex_lock(&tmm); for(Timer *t=timers;t;t=t->next) if(t->id==id){ t->killed=1; ok=0; } pthread_mutex_unlock(&tmm); SET_RAX(g,ok?0xffffffffu:0); }
 

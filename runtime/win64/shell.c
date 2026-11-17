@@ -42,9 +42,10 @@ void f_579bf0(KCtx *g){                                  /* ManageRun(app) */
     kh_call(g,GS_BASE+0x11d070,HWND_MAIN,app,0,0);        /* BaseSimpleForm.OnShown */
     kh_warn("shell: GXDevice.init returned; parking until ExitApplication");
     const char *lim=getenv("KH_RUN_SECONDS"); long secs=lim?atol(lim):0; struct timespec dl; clock_gettime(CLOCK_REALTIME,&dl); dl.tv_sec+=secs;
+    kh_vclock_idle(1);                                     /* TASK28: parked, idle for the frames clock's quiescence test */
     pthread_mutex_lock(&sm);
     while(!exit_requested){ if(secs){ if(pthread_cond_timedwait(&scv,&sm,&dl)!=0){ pthread_mutex_unlock(&sm); kh_warn("shell: KH_RUN_SECONDS=%ld elapsed, ending the run",secs); kh_exit_process(0); } } else pthread_cond_wait(&scv,&sm); }
-    pthread_mutex_unlock(&sm);
+    pthread_mutex_unlock(&sm); kh_vclock_idle(0);
     kh_warn("shell: ExitApplication requested; ManageRun returns");
     KH_RET(g);
 }
