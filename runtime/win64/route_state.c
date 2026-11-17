@@ -497,6 +497,7 @@ static void trace_menu(KCtx *g,u64 n){
     }
 }
 void kh_route_state_tick(KCtx *g,u64 n){
+    { extern void kh_music_tick(KCtx *,u64); kh_music_tick(g,n); }      /* task 32: KHNMC_MUSICLOG, a line when the music manager's state changes (readers only) */
     trace_menu(g,n);
     u64 fc=kh_phase_field_cmds(); fc_frame=fc-fc_prev; fc_prev=fc;
     { int w=kh_route_world(g), a=kh_route_area(g), m=w>=0&&a>=0?(w<<8|a):-1;

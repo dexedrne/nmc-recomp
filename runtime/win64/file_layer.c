@@ -14,6 +14,9 @@ void orig_f_1063d0(KCtx *g);
 void orig_f_106700(KCtx *g);
 void orig_f_106790(KCtx *g);
 void orig_f_106870(KCtx *g);
+int kh_data_denied(KCtx *g,const char *rel,const char *what);        /* data_deny.c (task 32): KHNMC_DATA_DENY */
+void kh_data_deny_remastered(KCtx *g,const char *rel);
+void kh_music_note_file(KCtx *g,const char *path,int hit,long long size);   /* music_log.c (task 32): bgm/ and vagstream/ requests */
 
 static int real_package(const char *name){
     if(!getenv("KHNMC_PKGDIR")) return 0;
@@ -34,7 +37,7 @@ static int package_fallback(const char *path){
     return 1;
 }
 static void file_log(KCtx *g,const char *path,const char *source,int size){
-    kh_phase_file(g,path);
+    kh_phase_file(g,path); kh_music_note_file(g,path,source!=NULL,size);
     const char *log=getenv("KHNMC_FILELOG"); FILE *lf=fopen(log?log:"filelog.txt","a");
     if(!lf) kh_fatal(g,"cannot append file log %s",log?log:"filelog.txt");
     int failed=fprintf(lf,"%s %s %d %s\n",source?"HIT":"MISS",source?source:"NONE",size,path)<0;
@@ -76,10 +79,11 @@ static int relative(KCtx *g,const char *path,char *rel,size_t cap){
     for(char *p=rel;*p;){ size_t n=strcspn(p,"/"); if(n>=512||(n==2&&!strncmp(p,"..",2))) return 0; p+=n; if(*p) p++; }
     return 1;
 }
-static FILE *open_loose(KCtx *g,const char *path,int *size){
+/* `what` names the kind of request for the deny list: a listed file is answered exactly as an absent one (data_deny.c) */
+static FILE *open_loose(KCtx *g,const char *path,int *size,const char *what){
     char rel[2048],host[4096]; FILE *f=NULL; struct stat st;
     const char *root=getenv("KHNMC_DATA"); if(!root) root="data";
-    if(relative(g,path,rel,sizeof rel)&&strlen(root)+strlen(rel)+2<sizeof host &&
+    if(relative(g,path,rel,sizeof rel)&&!kh_data_denied(g,rel,what)&&strlen(root)+strlen(rel)+2<sizeof host &&
        kh_resolve_ci(root,rel,host,sizeof host)){
         f=fopen(host,"rb");
         if(f&&(fstat(fileno(f),&st)||!S_ISREG(st.st_mode)||st.st_size>INT_MAX)){ fclose(f); f=NULL; }
@@ -90,7 +94,7 @@ static FILE *open_loose(KCtx *g,const char *path,int *size){
 /* For the stream-fd layer (stream_layer.c): the same tree-relative mapping and the same file log as the loaders. */
 int kh_file_loose_path(KCtx *g,const char *path,char *host,size_t cap){
     char rel[2048]; const char *root=getenv("KHNMC_DATA"); if(!root) root="data";
-    return relative(g,path,rel,sizeof rel)&&strlen(root)+strlen(rel)+2<cap&&kh_resolve_ci(root,rel,host,cap);
+    return relative(g,path,rel,sizeof rel)&&!kh_data_denied(g,rel,"stream")&&strlen(root)+strlen(rel)+2<cap&&kh_resolve_ci(root,rel,host,cap);
 }
 void kh_file_log_entry(KCtx *g,const char *path,const char *source,long long size){ file_log(g,path,source,size>INT_MAX?INT_MAX:(int)size); }
 int kh_file_package_fallback(const char *path){ return package_fallback(path); }
@@ -98,6 +102,7 @@ static int register_resource(KCtx *g,u64 path,int n,u64 dst){
     /* HD sidecars: the lifted ResourceEntry constructor runs inside SetResourceItem on this thread and pulls GetRemasteredCount/Entry/Asset (hd_assets.c). */
     char rel[2048]; const char *root=getenv("KHNMC_DATA"); if(!root) root="data";
     if(!relative(g,gstr(g,path),rel,sizeof rel)) kh_fatal(g,"hd assets: cannot derive a tree-relative path from %s",gstr(g,path));
+    kh_data_deny_remastered(g,rel);                    /* a deny list that names textures of this file but not the file: named fatal */
     wr32(g,GS_BASE+0x79cfd4,0);
     HdTable *prev=kh_hd_begin(g,root,rel,(const unsigned char*)hp(g,dst),n);
     int ok=(s32)kh_call(g,GS_BASE+0x12f070,path,n,dst,0)!=-1;
@@ -106,7 +111,7 @@ static int register_resource(KCtx *g,u64 path,int n,u64 dst){
 }
 void f_1063d0(KCtx *g){
     pthread_mutex_lock(&files_lock);
-    int n=0; FILE *f=open_loose(g,gstr(g,A1(g)),&n);
+    int n=0; FILE *f=open_loose(g,gstr(g,A1(g)),&n,"size");
     if(f){ fclose(f); file_log(g,gstr(g,A1(g)),"LOOSE",n); }
     else if(package_fallback(gstr(g,A1(g)))){
         const char *path=gstr(g,A1(g)); orig_f_1063d0(g);
@@ -121,7 +126,7 @@ static void load(KCtx *g,int bounded,int allocate){
     u64 path=A1(g),dst=A2(g),sizeptr=A2(g); int hd=bounded?A4(g):A3(g);
     s32 oldsize=allocate?(s32)rd32(g,sizeptr):0;
     pthread_mutex_lock(&files_lock);
-    int n=0; FILE *f=open_loose(g,gstr(g,path),&n); s64 result=allocate||bounded?0:-1;
+    int n=0; FILE *f=open_loose(g,gstr(g,path),&n,"load"); s64 result=allocate||bounded?0:-1;
     if(!f){
         if(package_fallback(gstr(g,path))){
             if(allocate) orig_f_106870(g); else if(bounded) orig_f_106790(g); else orig_f_106700(g);

@@ -139,6 +139,9 @@ FILE_HOOKS += $(IDTABLE_HOOKS)
 # KH2Moose pool sizes (runtime/moose.c): cache layout, cache free bytes, data heap release / reset (the four functions whose pool-start instruction the DLL re-encodes), reserved block sizes
 MOOSE_HOOKS = 39d590 39dab0 3e5f30 3e5f90 39e260 39e270
 FILE_HOOKS += $(MOOSE_HOOKS)
+# Task 32 (runtime/events_stub.c, KHNMC_EVENTS=stub): 3a1f70 = find an event entry (BAR type 22) of the loaded area file by name; its only caller is the event starter 3ac350
+EVENT_HOOKS = 3a1f70
+FILE_HOOKS += $(EVENT_HOOKS)
 # ---- Task 12: mod static edits ---------------------------------------------------------------------------------------------------
 # The mod DLL patches code bytes in 28 exe functions and attaches two INLINE detours (inside 3c3fe0 and 360920).  Those 30 functions
 # are re-lifted from the patched image into $(GEN)/mod_static_lifted.c and replace the vanilla lifted bodies through the alias list
