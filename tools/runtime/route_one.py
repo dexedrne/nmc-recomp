@@ -175,6 +175,21 @@ def main():
          'wall_s': int(wall), 'cpu_s': int(ru.ru_utime + ru.ru_stime), 'rss_mb': rss_mb, 'route': route,
          'states': (lambda m: m.group(1).strip().replace(' ', ',') if m else None)(re.search(r'kh: route report:.*met at game frame:([^;\n]*)', txt)),
          'binary_sha256': subprocess.check_output(['shasum', '-a', '256', binc] if darwin else ['sha256sum', binc], universal_newlines=True)[:16]}
+    # A route that reads a file the data SUBSET does not hold (but the full tree does) is not a fault of the build: say so first.
+    left = []
+    try:
+        full = set(open(os.path.join(os.path.dirname(os.path.abspath(a.data).rstrip('/')), 'FULLTREE.txt')).read().split('\n'))
+        seen = set()
+        for m in re.finditer(r'^MISS \S+ \d+ .*?/KH2ReSource/(.+)$', files, re.M):
+            n = m.group(1).strip().lower()
+            if n in full and n not in seen and not os.path.exists(os.path.join(a.data, m.group(1).strip())):
+                seen.add(n); left.append(m.group(1).strip())
+    except OSError:
+        pass
+    c['subset_missing'] = len(left)
+    if left:
+        print('route_one: SUBSET TOO SMALL: the run asked for %d file(s) that the full data tree has and this subset does not (first: %s). '
+              'Rebuild the subset from open logs of THIS route (tools/route_subset.py) and sync it before reading any fault below.' % (len(left), ', '.join(left[:5])))
     result, sig = 'ok', ''
     if ios_note:
         result, sig = 'FAIL', 'ios-paths: ' + ios_note
@@ -196,6 +211,7 @@ def main():
         frames = re.findall(r'\b(?:orig_|__real_)?f_[0-9a-f]+\b(?:\s*\+\s*(?:0x)?[0-9a-f]+)?', bt)[:4]      # glibc "(f_x+0x12)" and macOS "f_x + 18"
         g = re.search(r'rip\(state\)=[0-9a-f]+', txt)
         sig = '%s | %s | %s' % (line, g.group(0) if g else '', '<'.join(re.sub(r'\s+', '', f) for f in frames) or 'no lifted frame')
+    if left: result = 'SUBSET'; sig = 'SUBSET TOO SMALL (%d files, first %s) | %s' % (len(left), left[0], sig)
     c['result'] = result; c['signature'] = sig
     cols = ['label', 'exit', 'result', 'presents', 'gframes', 'draws', 'psos', 'resources', 'file_hits', 'file_miss', 'field_cmds', 'late',
             'damage_calls', 'hd_assets', 'source_voices', 'id_slots', 'wall_s', 'cpu_s', 'rss_mb', 'states', 'signature']

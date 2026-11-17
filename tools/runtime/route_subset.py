@@ -167,7 +167,14 @@ def main():
         if row[1] == 'ranges': print('route_subset:   ranges of %s (%d bytes): %s' % (row[0], row[2], row[4]))
     print('route_subset: paths outside both roots (not copied): %d distinct; the most frequent:' % len(outside))
     for p, n in outside.most_common(6): print('route_subset:   %6d  %s' % (n, p))
-    print('route_subset: wrote %s (data/, pkgdir/, MANIFEST.tsv)' % out)
+    # FULLTREE.txt: the relative name of every file of the FULL data tree (names only).  tools/route_one.py uses it to tell a route
+    # that left the subset (a MISS of a file the full tree has: the game then walks garbage and faults far away) from a real fault.
+    names = []
+    for root, dirs, fs in os.walk(a.data, followlinks=True):
+        rel = os.path.relpath(root, a.data)
+        for fn in fs: names.append((fn if rel == '.' else rel + '/' + fn).replace(os.sep, '/').lower())
+    with open(os.path.join(out, 'FULLTREE.txt'), 'w') as f: f.write('\n'.join(sorted(names)) + '\n')
+    print('route_subset: wrote %s (data/, pkgdir/, MANIFEST.tsv, FULLTREE.txt: %d names of the full tree)' % (out, len(names)))
 
 
 if __name__ == '__main__':
