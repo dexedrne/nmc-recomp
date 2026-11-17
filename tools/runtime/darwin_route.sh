@@ -9,7 +9,8 @@
 #   tools/darwin_route.sh run TAG [route_one.py options, e.g. --difficulty 2 --env KH_IMPORT_COUNTS=1]
 #                                               ONE route (tools/route_one.py: the environment of route_batch.sh, niced, watchdog,
 #                                               refused below the memory threshold); run.out / phase.log / files.log / summary.*
-#                                               fetched to $RUN/mac-<TAG>/
+#                                               fetched to $RUN/mac-<TAG>/.  Default script: input/route-field-battle.txt (task 27,
+#                                               state-driven; --difficulty is then chosen in the game's New Game dialog)
 #   tools/darwin_route.sh ios-selftest [TAG]    the KH_IOS_PATHS build (tools/darwin_build.sh with MAKE_ARGS=IOS_PATHS=1) started
 #                                               the way an app is (tools/ios_paths_selftest.sh); $RUN/mac-iospaths-selftest-<TAG>.out
 #   tools/darwin_route.sh ios-run TAG [...]     ONE route of that build with route_one.py --ios-paths; $RUN/mac-<TAG>/
@@ -24,7 +25,8 @@
 #        here (default run-J26); KHNMC_MAC_NICE (default 10) and KHNMC_MAC_MIN_FREE (default 30: `memory_pressure` free
 #        percentage below which nothing is started; the reading is printed before every run)
 # Everything on the Mac stays inside ~/$KHNMC_MAC_DIR (build, runs, the data subset in route-data/, the exe in pc/; the
-# selftests' scratch files in run/tmp through KH_TMPDIR, not in /tmp).  One run at a time:
+# selftests' scratch files in run/tmp through KH_TMPDIR, not in /tmp; `selftest` first removes run/tmp/khnmc-route-*, the files
+# the task-27 route suite of an early build left there).  One run at a time:
 # the script refuses to start while another khnmc of this user is running there.  After a route its own state directories
 # (run/<TAG>/root, docs, home) are removed there; nothing else is deleted.
 set -u
@@ -40,7 +42,9 @@ SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 -o Serv
 cmd=${1:-}; [ $# -gt 0 ] && shift
 busy(){ "${SSH[@]}" "$MAC" 'pgrep -u "$(id -u)" -x khnmc.bin >/dev/null || pgrep -u "$(id -u)" -x khnmc >/dev/null || pgrep -u "$(id -u)" -x khnmc-iospaths >/dev/null' && { echo "darwin_route: a khnmc process is already running on the Mac mini: one run at a time" >&2; return 0; }; return 1; }
 # the scripts that run there (route_one.py, ios_paths_selftest.sh, wav_compare.py) are this worktree's: same rsync as darwin_build.sh
-push_tools(){ rsync -a --delete --exclude '__pycache__' -e "ssh -o BatchMode=yes -o ConnectTimeout=20" "$HERE/tools/" "$MAC:$RDIR/tools/" || { echo "darwin_route: cannot copy tools/ to the Mac mini" >&2; exit 1; }; }
+# task 27: and input/ (route_one.py's default route, input/route-field-battle.txt, is read there)
+push_tools(){ rsync -a --delete --exclude '__pycache__' -e "ssh -o BatchMode=yes -o ConnectTimeout=20" "$HERE/tools/" "$MAC:$RDIR/tools/" || { echo "darwin_route: cannot copy tools/ to the Mac mini" >&2; exit 1; }
+              rsync -a --delete -e "ssh -o BatchMode=yes -o ConnectTimeout=20" "$HERE/input/" "$MAC:$RDIR/input/" || { echo "darwin_route: cannot copy input/ to the Mac mini" >&2; exit 1; }; }
 tagok(){ case "$1" in ''|*[!A-Za-z0-9._-]*) echo "darwin_route: TAG may hold letters, digits, . _ - only" >&2; exit 2;; esac; }
 # remote shell text: read memory_pressure, print it, refuse below the threshold (exit 3)
 GATE="free=\$(memory_pressure | tail -1 | sed -n 's/.*percentage: \\([0-9]*\\)%.*/\\1/p'); echo \"darwin_route: memory free \${free:-?}% (start at >= $MINFREE%), load \$(sysctl -n vm.loadavg)\"; { [ -n \"\$free\" ] && [ \"\$free\" -ge $MINFREE ]; } || { echo \"darwin_route: memory free \${free:-?}% is below $MINFREE%: not starting\" >&2; exit 3; }"
@@ -75,7 +79,7 @@ sync)
 selftest)
   TAG=${1:-run}; tagok "$TAG"; busy && exit 3
   mkdir -p "$RUN"; push_tools
-  "${SSH[@]}" "$MAC" "cd ~/$RDIR && mkdir -p run/tmp && $GATE && rm -rf run/docs-selftest && (KH_EXE=\$PWD/pc/kh2fm.exe KH_DOCS=\$PWD/run/docs-selftest KH_TMPDIR=\$PWD/run/tmp nice -n $NICE ./khnmc --selftest > run/selftest-$TAG.out 2>&1; echo \"selftest exit=\$?\" | tee -a run/selftest-$TAG.out; echo \"darwin_route: left in run/tmp: \$(ls -A run/tmp | tr '\\n' ' ')\")" || exit 1
+  "${SSH[@]}" "$MAC" "cd ~/$RDIR && mkdir -p run/tmp && $GATE && rm -rf run/docs-selftest run/tmp/khnmc-route-* && (KH_EXE=\$PWD/pc/kh2fm.exe KH_DOCS=\$PWD/run/docs-selftest KH_TMPDIR=\$PWD/run/tmp nice -n $NICE ./khnmc --selftest > run/selftest-$TAG.out 2>&1; echo \"selftest exit=\$?\" | tee -a run/selftest-$TAG.out; echo \"darwin_route: left in run/tmp: \$(ls -A run/tmp | tr '\\n' ' ')\")" || exit 1
   scp -q -o BatchMode=yes "$MAC:$RDIR/run/selftest-$TAG.out" "$RUN/mac-selftest-$TAG.out" || exit 1
   grep -a "SKIPPED\|FAIL\|transcript\|guest space\|selftest exit" "$RUN/mac-selftest-$TAG.out" | cut -c1-220
   grep -aq "^selftest exit=0" "$RUN/mac-selftest-$TAG.out"

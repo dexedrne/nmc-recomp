@@ -114,7 +114,8 @@ STREAM_HOOKS = 106da0 106fa0 106b40      # OpenStream / ReadStream / CloseStream
 # background-load list serialisation (runtime/bgload.c): loader loop + its blocking calls, the three enqueue entries, kn::MemoryAllocator::free, id->pointer (stress/selftest step)
 BGLOAD_HOOKS = 3a0c60 15edd0 3f99e0 3f9850 3a64f0 3a0aa0 3a0b30 3a0bd0 19c470 4ad270
 # scripted input clock (runtime/null_input.c): 0x105e10 is called once per game frame (end-of-frame task and the settings menu loop)
-INPUT_HOOKS = 105e10
+# Task 27: 0x2b7420 = the New Game menu task (runtime/phase_log.c: alive between entry and return; the route's newgame-* conditions)
+INPUT_HOOKS = 105e10 2b7420
 FILE_HOOKS = 1f9a80 3a9cf0 131ef0 106000 1063d0 106700 106790 106870 $(HD_HOOKS) $(PHASE_HOOKS) $(DIFFICULTY_HOOKS) $(MOD_A_HOOKS) $(MOD_B_HOOKS) $(MOD_PARAMS_HOOKS) $(STREAM_HOOKS) $(BGLOAD_HOOKS) $(INPUT_HOOKS)
 # object-id table guard (runtime/idtable.c): 0x4ad390 registers a 32 MiB window in the game's 64-slot id table and encodes the pointer
 IDTABLE_HOOKS = 4ad390

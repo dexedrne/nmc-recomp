@@ -208,7 +208,8 @@ void orig_f_92680(KCtx *g); void mod_f_92680(KCtx *g); void orig_f_2b4590(KCtx *
 static KhFn patch_body[KH_MOOSE_NPATCH][2]={{orig_f_92680,mod_f_92680},{orig_f_2b4590,mod_f_2b4590}};   /* [patch][off / on]; replaced by recorders in the selftest */
 void kh_phase_title_entry(void);                         /* phase_log.c: the title.Layout.task counter stays in front */
 void f_92680(KCtx *g){ int on=patch_on[0]; atomic_fetch_add(&c_patch[0][on],1); patch_body[0][on](g); }
-void f_2b4590(KCtx *g){ kh_phase_title_entry(); int on=patch_on[1]; atomic_fetch_add(&c_patch[1][on],1); patch_body[1][on](g); }
+void kh_phase_title_exit(void);                          /* ... and learns that the title task returned (Task 27: the route's title conditions) */
+void f_2b4590(KCtx *g){ kh_phase_title_entry(); int on=patch_on[1]; atomic_fetch_add(&c_patch[1][on],1); patch_body[1][on](g); kh_phase_title_exit(); }
 struct kh_mod_static_fn { u32 rva; KhFn mod, orig; int chained; };
 extern const struct kh_mod_static_fn kh_mod_moose_fn_table[]; extern const u32 kh_mod_moose_fn_count;
 extern KhFn kh_lookup(u64 target);

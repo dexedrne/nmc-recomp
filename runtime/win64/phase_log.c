@@ -8,9 +8,21 @@ static _Atomic u64 entries[11];
 static const char *names[]={"1505a0:GAME_MODE.start","5111d0:InitialSetting.ctor","5122e0:InitialSetting.vfn1","511300:InitialSetting.dtor","13da10:movie.open","13d260:movie.prepare","405440:EVENT.MapEvent","3f29e0:FIELD_COMMAND.execute","3c12f0:BATTLE.calc_damage","2b4590:title.Layout.task","4f94b0:SettingMenu.vfn1"};
 #define PHASE(RVA,I) void orig_f_##RVA(KCtx *); void f_##RVA(KCtx *g){ entries[I]++; orig_f_##RVA(g); }
 void kh_phase_mode_entry(void){ entries[0]++; }
-PHASE(5111d0,1)
+/* Task 27: liveness of the screens the scripted route waits for (runtime/route_state.c).  A screen's own globals outlive it (the
+ * title's layout pointers, the New Game dialog's context: freed but never cleared), so a state read from them is only believed while
+ * the object or task that owns them is alive: InitialSetting between its ctor 0x5111d0 and dtor 0x511300, the title task 0x2b4590
+ * and the New Game menu task 0x2b7420 between their entry and their return (both are task bodies that yield frame by frame on their
+ * own fiber and return when the screen is done). */
+static _Atomic int initial_alive, title_depth, newgame_depth;
+int kh_phase_initial_alive(void){ return atomic_load(&initial_alive)>0; }
+int kh_phase_title_alive(void){ return atomic_load(&title_depth)>0; }
+int kh_phase_newgame_alive(void){ return atomic_load(&newgame_depth)>0; }
+void kh_phase_test_set_alive(int initial,int title,int newgame){ atomic_store(&initial_alive,initial); atomic_store(&title_depth,title); atomic_store(&newgame_depth,newgame); }   /* selftest only */
+void orig_f_5111d0(KCtx *); void f_5111d0(KCtx *g){ entries[1]++; atomic_store(&initial_alive,1); orig_f_5111d0(g); }
 void orig_f_5122e0(KCtx *);
 static _Atomic int initial_state=-1,initial_choice=-1;
+int kh_phase_initial_state(void){ return atomic_load(&initial_state); }
+void kh_phase_test_set_initial_state(int st){ atomic_store(&initial_state,st); }   /* selftest only */
 /* present number at which each Initial Settings state was first observed (-1 = not yet): the scripted input's `@hold` uses it */
 static _Atomic long long initial_first[64];
 long long kh_phase_initial_first(int state){ if(state<0||state>=64) return -1; return atomic_load(&initial_first[state])-1; }
@@ -25,7 +37,7 @@ void f_5122e0(KCtx *g){
     }
     orig_f_5122e0(g);
 }
-PHASE(511300,3)
+void orig_f_511300(KCtx *); void f_511300(KCtx *g){ entries[3]++; atomic_store(&initial_alive,0); orig_f_511300(g); }
 PHASE(13da10,4)
 PHASE(13d260,5)
 void kh_phase_mapevent_entry(void){ entries[6]++; } /* f_405440 itself lives in mod_hooks_a.c (Task 9) */
@@ -40,12 +52,22 @@ void kh_phase_field_cmd_entry(void){ entries[7]++;
     if(atomic_fetch_add(&field_cmds_total,1)==0){ extern _Atomic u64 gfx_presents;
         fprintf(stderr,"kh: phase: first FIELD_COMMAND.execute at present %llu, game frame %llu, virtual vblank %llu\n",(unsigned long long)gfx_presents,(unsigned long long)kh_input_game_frames(),(unsigned long long)(kh_vclock_on?kh_vclock_vblanks():0)); } }
 /* BATTLE.calc_damage: one line per call with every clock, so that a hit can be found in the picture stream and in the sound */
-void kh_phase_damage_entry(void){ entries[8]++; extern _Atomic u64 gfx_presents; static _Atomic u64 n;
+/* Task 27: the hits counted here (only while something is on screen) and the game frame of the last one feed the route conditions
+ * `battle` and `hits N` (runtime/route_state.c). */
+static _Atomic u64 damage_hits, damage_last_frame;
+u64 kh_phase_damage_hits(void){ return atomic_load(&damage_hits); }
+u64 kh_phase_damage_last_frame(void){ return atomic_load(&damage_last_frame); }
+void kh_phase_test_set_damage(u64 hits,u64 last_frame){ atomic_store(&damage_hits,hits); atomic_store(&damage_last_frame,last_frame); }   /* selftest only */
+void kh_phase_damage_entry(void){ entries[8]++; extern _Atomic u64 gfx_presents;
     if(!gfx_presents) return;                                       /* not while nothing is on screen (selftests) */
-    u64 k=atomic_fetch_add(&n,1)+1;
+    u64 k=atomic_fetch_add(&damage_hits,1)+1; atomic_store(&damage_last_frame,kh_input_game_frames());
     fprintf(stderr,"kh: event damage #%llu present=%llu game-frame=%llu vblank=%llu virtual-ns=%llu\n",(unsigned long long)k,(unsigned long long)gfx_presents,(unsigned long long)kh_input_game_frames(),
             (unsigned long long)(kh_vclock_on?kh_vclock_vblanks():0),(unsigned long long)(kh_vclock_on?kh_vclock_now_ns():0)); }
-void kh_phase_title_entry(void){ entries[9]++; } /* f_2b4590 itself lives in moose.c (Task 23: KH2Moose fast_title picks the patched or the vanilla body) */
+void kh_phase_title_entry(void){ entries[9]++; atomic_fetch_add(&title_depth,1); } /* f_2b4590 itself lives in moose.c (Task 23: KH2Moose fast_title picks the patched or the vanilla body) */
+void kh_phase_title_exit(void){ atomic_fetch_sub(&title_depth,1); }                  /* ... and calls this when the title task returns */
+/* Task 27: the New Game menu task (title mode 1; the exe calls it once, from the title task at 0x2b493f): difficulty, the second
+ * question and the final confirmation are pages of [0x140b1d800] inside it (runtime/route_state.c) */
+void orig_f_2b7420(KCtx *); void f_2b7420(KCtx *g){ atomic_fetch_add(&newgame_depth,1); orig_f_2b7420(g); atomic_fetch_sub(&newgame_depth,1); }
 void orig_f_4f94b0(KCtx *);
 void f_4f94b0(KCtx *g){
     entries[10]++;

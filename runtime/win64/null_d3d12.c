@@ -13,7 +13,7 @@ static int C_factory,C_adapter,C_output,C_swap,C_dev,C_queue,C_alloc,C_list,C_re
 static u64 o_adapter,o_output;
 static _Atomic u64 res_ids=1, heap_ids=1;
 _Atomic u64 gfx_draws, gfx_clears, gfx_barriers, gfx_execs, gfx_presents, gfx_copies, gfx_psos, gfx_resources, gfx_buffers_bytes;
-static long vblank_ns=16666667;            /* the null backend's frame sleep; KHNMC_NULL_VBLANK_NS=n (1,000,000..100,000,000) overrides it */
+static long vblank_ns=16666667;            /* the null backend's frame sleep; KHNMC_NULL_VBLANK_NS=n (1,000,000..500,000,000) overrides it (task 27: 120 ms frames) */
 void kh_gfx_report(FILE *f);
 void kh_gfx_tex_report(FILE *f);
 static int log_gfx;
@@ -243,7 +243,7 @@ static u64 mk_blob(KCtx *g,u64 src,u64 size){ u64 b=new_obj(C_blob,16); u64 d=ga
 void kh_seam_gfx_init(void){
     const char *e=getenv("KH_LOG_GFX"); log_gfx=e&&*e=='1'; (void)log_gfx;
     e=getenv("KHNMC_GFX_PSOLOG"); log_pso=e&&*e=='1';
-    e=getenv("KHNMC_NULL_VBLANK_NS"); if(e&&*e){ long v=strtol(e,0,10); if(v<1000000||v>100000000) kh_fatal(NULL,"KHNMC_NULL_VBLANK_NS=%s: expected 1000000..100000000 nanoseconds",e);
+    e=getenv("KHNMC_NULL_VBLANK_NS"); if(e&&*e){ long v=strtol(e,0,10); if(v<1000000||v>500000000) kh_fatal(NULL,"KHNMC_NULL_VBLANK_NS=%s: expected 1000000..500000000 nanoseconds",e);
         vblank_ns=v; fprintf(stderr,"kh: gfx: null backend frame sleep %ld ns instead of 16666667 (KHNMC_NULL_VBLANK_NS)\n",v); }
     e=getenv("KHNMC_GFX");                                                    /* graphics backend: unset / "null" = this recorder, "vkd3d" = gfx_vkd3d.c, "vkd3dw" = gfx_wrap.c */
     if(e&&!strcmp(e,"vkd3d")) kh_gfx_vkd3d_init();

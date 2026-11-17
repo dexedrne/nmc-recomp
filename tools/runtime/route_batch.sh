@@ -9,8 +9,10 @@
 #   -s  KH_RUN_SECONDS per run (default 120)       -o  output directory (default run-batch/<date>-<pid>)
 #   -g  end every run after GAME_FRAMES frames of the game thread (KH_RUN_GAME_FRAMES): the same route length on a loaded and on
 #       an idle machine; -s is then only the time limit (give it room: a loaded machine makes 20 game frames per second, not 60)
-#   -d  KHNMC_DIFFICULTY: none = not set (default), cycle = run index mod 4, or a fixed 0..3
-#   -i  KHNMC_INPUT_SCRIPT (default runtime/task20-field-input.txt)
+#   -d  the difficulty: none = not set (default), cycle = run index mod 4, or a fixed 0..3.  For a ROUTE script (task 27: it has
+#       @wait / @press / @select / @expect steps) this sets KHNMC_ROUTE_DIFFICULTY: the route chooses it in the game's own New Game
+#       dialog.  For a frame-numbered script it sets KHNMC_DIFFICULTY as before (forced into the save after InitSave)
+#   -i  KHNMC_INPUT_SCRIPT (default input/route-field-battle.txt, the state-driven route; relative paths are made absolute)
 #   -c  pin every run to its own block of CPUS_PER_RUN cpus (taskset; parallel slot k gets cpus k*C .. k*C+C-1): a stress
 #       variant that forces the guest threads of one run to share few cpus (0 = no pinning, default)
 #   -w  command prefix for every run, e.g. -w "nice -n 10"
@@ -19,19 +21,23 @@
 #       room for one, then stops loudly; it never skips silently
 #   -b  binary to test (default ./khnmc); it is copied into OUTDIR first, so rebuilding during a batch cannot mix binaries
 #   -r  what a run must have reached to count as ok: field (default; the phase log shows FIELD_COMMAND.execute calls) or none
-#       (for runs shorter than the route).  A run that exits 0 without reaching it is DIVERGED and counts as a failure: the
-#       scripted input is clocked by presents, and a route that never leaves the settings menu tests nothing
+#       (for runs shorter than the route).  A run that exits 0 without reaching it is DIVERGED and counts as a failure: a route
+#       that never leaves the settings menu tests nothing.  With a route script, -r field also requires every step of the route
+#       to be done (`kh: route report: ... ROUTE INCOMPLETE` = DIVERGED, with the step it was waiting at); a state that never came
+#       within its time-out is a named fatal (`route-wait-timeout`), i.e. a FAIL
 #   -t  also write an import trace (KH_TRACE, first 50,000 calls)            -k  keep the binary copy even when all runs pass
 #
 # Per run R (r01, r02, ...): OUTDIR/R/{root,docs}/ (fresh KH_ROOT and KH_DOCS), phase.log, files.log, run.out, exit, time.
 # Result: OUTDIR/summary.tsv + a printed table.  Exit status 0 only when every run exited 0 and reached the required point; 1 when
 # any run failed (non-zero exit, signal, watchdog timeout, diverged route) or the batch was cut short; 2 for usage/setup errors.
 # Nothing is retried.  Columns: gframes = frames the game thread made, late = presents by which the script's @hold delayed the
-# input (- = no hold line or not released), wall_s / cpu_s / rss_mb = wall time, cpu time and peak RSS of the run.
+# input (- = no hold line or not released), wall_s / cpu_s / rss_mb = wall time, cpu time and peak RSS of the run, states = for a
+# route script the game frame at which each step's state was met (`L<line>:<condition>=<game frame>`, from `kh: route report`).
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
-N=8; J=4; SECS=120; GFR=0; OUT=""; DIFF=none; INPUT="$HERE/runtime/task20-field-input.txt"; WRAP=""; MINMB=1500; TRACE=0; PIN=0; KEEP=0; REQ=field
+N=8; J=4; SECS=120; GFR=0; OUT=""; DIFF=none; WRAP=""; MINMB=1500; TRACE=0; PIN=0; KEEP=0; REQ=field
 BIN="$HERE/khnmc"; EXTRA=()
+INPUT="$HERE/input/route-field-battle.txt"
 while getopts "n:j:s:g:o:d:i:c:w:e:m:b:r:tk" o; do case "$o" in
   n) N=$OPTARG;; j) J=$OPTARG;; s) SECS=$OPTARG;; g) GFR=$OPTARG;; o) OUT=$OPTARG;; d) DIFF=$OPTARG;; i) INPUT=$OPTARG;; c) PIN=$OPTARG;;
   w) WRAP=$OPTARG;; e) EXTRA+=("$OPTARG");; m) MINMB=$OPTARG;; b) BIN=$OPTARG;; r) REQ=$OPTARG;; t) TRACE=1;; k) KEEP=1;;
@@ -44,12 +50,16 @@ case "$DIFF" in none|cycle|0|1|2|3) ;; *) echo "route_batch: -d takes none, cycl
 case "$REQ" in field|none) ;; *) echo "route_batch: -r takes field or none" >&2; exit 2;; esac
 EXE="$HERE/pc/kh2fm.exe"
 for f in "$BIN" "$EXE" "$INPUT" "$HERE/data-full" "$HERE/pkgdir"; do [ -e "$f" ] || { echo "route_batch: missing $f" >&2; exit 2; }; done
+INPUT=$(cd "$(dirname "$INPUT")" && pwd)/$(basename "$INPUT")      # every run starts in its own root directory
+ROUTE=0; grep -qE '^[[:space:]]*@(wait|press|select|expect)([[:space:]]|$)' "$INPUT" && ROUTE=1
+DIFFVAR=KHNMC_DIFFICULTY; [ "$ROUTE" = 1 ] && DIFFVAR=KHNMC_ROUTE_DIFFICULTY
 [ -n "$OUT" ] || OUT="$HERE/run-batch/$(date +%Y%m%d-%H%M%S)-$$"
 mkdir -p "$OUT" || exit 2; OUT=$(cd "$OUT" && pwd)
 cp -f "$BIN" "$OUT/khnmc.bin" || { echo "route_batch: cannot copy $BIN" >&2; exit 2; }
 BINSUM=$(sha256sum "$OUT/khnmc.bin" | cut -c1-16)
 avail_mb(){ awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo; }
-echo "route_batch: $N runs, $J parallel, ${SECS}s each, game frames=$GFR, difficulty=$DIFF, cpus/run=$PIN, must reach=$REQ, wrapper='${WRAP}', extra env='${EXTRA[*]:-}'"
+echo "route_batch: $N runs, $J parallel, ${SECS}s each, game frames=$GFR, difficulty=$DIFF ($DIFFVAR), cpus/run=$PIN, must reach=$REQ, wrapper='${WRAP}', extra env='${EXTRA[*]:-}'"
+echo "route_batch: input $INPUT ($([ "$ROUTE" = 1 ] && echo "route: state-driven steps" || echo "frame-numbered script"))"
 echo "route_batch: binary $BIN sha256 $BINSUM..., out=$OUT, MemAvailable $(avail_mb) MB (need $MINMB MB per started run)"
 
 # child cpu seconds (user, system) and peak RSS in MB into the file named by argv[1]; exit status = the command's (128+n for signal n)
@@ -62,7 +72,7 @@ one_run(){   # $1 = run index (1-based), $2 = parallel slot (0-based)
   local envv=( "KH_EXE=$EXE" "KH_ROOT=$d/root" "KH_DOCS=$d/docs" "KHNMC_DATA=$HERE/data-full" "KHNMC_PKGDIR=$HERE/pkgdir"
                "KHNMC_INPUT_SCRIPT=$INPUT" "KH_RUN_SECONDS=$SECS" "KH_DUMP_THREADS=1"
                "KHNMC_PHASELOG=$d/phase.log" "KHNMC_FILELOG=$d/files.log" )
-  case "$DIFF" in none) ;; cycle) envv+=("KHNMC_DIFFICULTY=$(( (i-1) % 4 ))");; *) envv+=("KHNMC_DIFFICULTY=$DIFF");; esac
+  case "$DIFF" in none) ;; cycle) envv+=("$DIFFVAR=$(( (i-1) % 4 ))");; *) envv+=("$DIFFVAR=$DIFF");; esac
   [ "$TRACE" = 1 ] && envv+=("KH_TRACE=$d/trace.txt" "KH_TRACE_MAX=50000")
   [ "$GFR" -gt 0 ] && envv+=("KH_RUN_GAME_FRAMES=$GFR")
   [ "${#EXTRA[@]}" -gt 0 ] && envv+=("${EXTRA[@]}")
@@ -90,7 +100,7 @@ done
 # ---- summary ---------------------------------------------------------------------------------------------------------------
 num(){ sed -n "s/.*[ =:]$2=\([0-9][0-9]*\).*/\1/p" <<<"$1" | tail -1; }
 S="$OUT/summary.tsv"; fails=0; diverged=0
-printf 'run\texit\tresult\tpresents\tgframes\tdraws\tpsos\tresources\tfile_hits\tfile_miss\tfield_cmds\tlate\twall_s\tcpu_s\trss_mb\tsignature\n' > "$S"
+printf 'run\texit\tresult\tpresents\tgframes\tdraws\tpsos\tresources\tfile_hits\tfile_miss\tfield_cmds\tlate\twall_s\tcpu_s\trss_mb\tstates\tsignature\n' > "$S"
 for i in $(seq 1 "$started"); do
   tag=$(printf 'r%02d' "$i"); d="$OUT/$tag"; ex=$(cat "$d/exit" 2>/dev/null || echo missing); o="$d/run.out"
   gl=$(grep -a 'kh: gfx: draws=' "$o" 2>/dev/null | grep -av 'gfx frame' | tail -1)
@@ -101,8 +111,14 @@ for i in $(seq 1 "$started"); do
   fld=$(grep -ao 'FIELD_COMMAND.execute=[0-9]*' "$d/phase.log" 2>/dev/null | awk -F= '{s+=$2} END{print s+0}')
   late=$(grep -a -m1 'scripted XInput: hold at script frame' "$o" 2>/dev/null | sed -n 's/.*script delayed by \([0-9]*\) presents.*/\1/p')
   gfr=$(grep -a 'kh: input report:' "$o" 2>/dev/null | tail -1 | sed -n 's/.* game-frames=\([0-9]*\).*/\1/p'); wall=$(awk 'END{if(NF>=4) printf "%d", $4}' "$d/time" 2>/dev/null)
+  rrep=$(grep -a 'kh: route report:' "$o" 2>/dev/null | tail -1)
+  states=$(sed -n 's/.*met at game frame: *\([^;]*\).*/\1/p' <<<"$rrep" | tr ' ' ',')
   sig=""; result=ok
-  if [ "$ex" = 0 ] && [ "$REQ" = field ] && [ "${fld:-0}" -eq 0 ]; then
+  if [ "$ex" = 0 ] && [ "$REQ" = field ] && [ "$ROUTE" = 1 ] && { [ -z "$rrep" ] || grep -q 'ROUTE INCOMPLETE' <<<"$rrep"; }; then
+    fails=$((fails+1)); diverged=$((diverged+1)); result=DIVERGED
+    if [ -n "$rrep" ]; then sig="exit 0 but the route did not finish | $(sed -n 's/.*; \(waiting at line .*\)/\1/p' <<<"$rrep")"
+    else sig="exit 0 but no route report line in run.out"; fi
+  elif [ "$ex" = 0 ] && [ "$REQ" = field ] && [ "${fld:-0}" -eq 0 ]; then
     fails=$((fails+1)); diverged=$((diverged+1)); result=DIVERGED
     sig="exit 0 but the route never reached the field | last $(grep -a 'InitialSetting frame=' "$o" 2>/dev/null | tail -1 | sed 's/^kh: //')"
   elif [ "$ex" != 0 ]; then
@@ -114,7 +130,7 @@ for i in $(seq 1 "$started"); do
     [ "$ex" = 137 ] && line="KILLED (SIGKILL: watchdog or out of memory)"
     sig="${line:-no report line in run.out} | ${grip:-} | ${frames:-no lifted frame}"
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$tag" "$ex" "$result" "${pres:--}" "${gfr:--}" "${draws:--}" "${psos:--}" "${res:--}" "${hits:--}" "${miss:--}" "${fld:--}" "${late:--}" "${wall:--}" "${cpu:--}" "${rss:--}" "$sig" >> "$S"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$tag" "$ex" "$result" "${pres:--}" "${gfr:--}" "${draws:--}" "${psos:--}" "${res:--}" "${hits:--}" "${miss:--}" "${fld:--}" "${late:--}" "${wall:--}" "${cpu:--}" "${rss:--}" "${states:--}" "$sig" >> "$S"
 done
 column -t -s "$(printf '\t')" "$S" 2>/dev/null || cat "$S"
 grep -ah '^kh: bgload' "$OUT"/r*/run.out 2>/dev/null | grep -a 'report' | sort | uniq -c | sort -rn | head -3

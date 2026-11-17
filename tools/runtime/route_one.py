@@ -2,7 +2,7 @@
 """route_one.py : ONE headless field route with the environment tools/route_batch.sh gives a run, on Linux or macOS.
 
   tools/route_one.py --bin ./khnmc --exe PATH/kh2fm.exe --data DATA_TREE --pkgdir PKGDIR --out OUTDIR
-                     [--game-frames 7000] [--seconds 600] [--difficulty none|0..3] [--input runtime/task6-field-input.txt]
+                     [--game-frames 7000] [--seconds 600] [--difficulty none|0..3] [--input input/route-field-battle.txt]
                      [--env VAR=VALUE]... [--require field|none] [--label TEXT] [--no-nice] [--nice 10] [--min-free-pct 30]
                      [--ios-paths]
 
@@ -11,6 +11,10 @@ mini runs one route at a time.  This script makes the same run: fresh OUTDIR/{ro
 KHNMC_DATA KHNMC_PKGDIR KHNMC_INPUT_SCRIPT KH_RUN_SECONDS KH_DUMP_THREADS KHNMC_PHASELOG KHNMC_FILELOG KH_RUN_GAME_FRAMES
 KHNMC_DIFFICULTY), `nice -n 10`, a watchdog that kills a run still alive 90 s after its own time limit (exit 124), and the same
 verdict: ok only for exit 0 AND the phase log showing FIELD_COMMAND.execute calls (else DIVERGED / FAIL).  Nothing is retried.
+Task 27: the default input is the state-driven route input/route-field-battle.txt.  For a ROUTE script (@wait / @press / @select /
+@expect steps) --difficulty sets KHNMC_ROUTE_DIFFICULTY (the route chooses it in the game's New Game dialog) instead of
+KHNMC_DIFFICULTY, a run whose route did not finish is DIVERGED (signature: the step it waited at), and the summary has `states`:
+the game frame at which each step's state was met (from `kh: route report`).  A frame-numbered script behaves as before.
 Outputs: OUTDIR/run.out, phase.log, files.log, exit, env, summary.tsv (one header line + one row; the columns of route_batch.sh
 plus damage calls, HD assets served, source voices and the peak RSS) and summary.json with every counter that was parsed.
 macOS: before starting, `memory_pressure` must report at least --min-free-pct free (default 30), else the run is refused (exit 3).
@@ -55,7 +59,7 @@ def main():
     if not 0 <= a.nice <= 20:
         sys.stderr.write('route_one: --nice takes 0..20\n'); return 2
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    inp = a.input or os.path.join(here, 'runtime', 'task6-field-input.txt')
+    inp = a.input or os.path.join(here, 'input', 'route-field-battle.txt')
     for f in (a.bin, a.exe, a.data, a.pkgdir, inp):
         if not os.path.exists(f):
             sys.stderr.write('route_one: missing %s\n' % f); return 2
@@ -90,7 +94,8 @@ def main():
                'KHNMC_DATA': os.path.abspath(a.data), 'KHNMC_PKGDIR': os.path.abspath(a.pkgdir), 'KHNMC_INPUT_SCRIPT': os.path.abspath(inp),
                'KH_RUN_SECONDS': str(a.seconds), 'KH_DUMP_THREADS': '1', 'KHNMC_PHASELOG': os.path.join(out, 'phase.log'),
                'KHNMC_FILELOG': os.path.join(out, 'files.log')}
-    if a.difficulty != 'none': run_env['KHNMC_DIFFICULTY'] = a.difficulty
+    route = bool(re.search(r'^[ \t]*@(wait|press|select|expect)(\s|$)', open(inp, errors='replace').read(), re.M))
+    if a.difficulty != 'none': run_env['KHNMC_ROUTE_DIFFICULTY' if route else 'KHNMC_DIFFICULTY'] = a.difficulty
     if a.game_frames > 0: run_env['KH_RUN_GAME_FRAMES'] = str(a.game_frames)
     for kv in a.env:
         if '=' not in kv:
@@ -167,11 +172,16 @@ def main():
          'id_slots': last(r'kh: object-id table: (\d+) of 64', txt),
          'id_zone_mib': last(r'guest arena: id zone .*high-water 0x[0-9a-f]+ = (\d+) MiB', txt),
          'far_zone_mib': last(r'guest arena: far zone .*high-water 0x[0-9a-f]+ = (\d+) MiB', txt),
-         'wall_s': int(wall), 'cpu_s': int(ru.ru_utime + ru.ru_stime), 'rss_mb': rss_mb,
+         'wall_s': int(wall), 'cpu_s': int(ru.ru_utime + ru.ru_stime), 'rss_mb': rss_mb, 'route': route,
+         'states': (lambda m: m.group(1).strip().replace(' ', ',') if m else None)(re.search(r'kh: route report:.*met at game frame:([^;\n]*)', txt)),
          'binary_sha256': subprocess.check_output(['shasum', '-a', '256', binc] if darwin else ['sha256sum', binc], universal_newlines=True)[:16]}
     result, sig = 'ok', ''
     if ios_note:
         result, sig = 'FAIL', 'ios-paths: ' + ios_note
+    elif ex == 0 and a.require == 'field' and route and (not re.search(r'kh: route report:', txt) or re.search(r'kh: route report:.*ROUTE INCOMPLETE', txt)):
+        result = 'DIVERGED'
+        m = re.search(r'kh: route report:.*; (waiting at line .*)', txt)
+        sig = 'exit 0 but the route did not finish | %s' % (m.group(1) if m else 'no route report line in run.out')
     elif ex == 0 and a.require == 'field' and c['field_cmds'] == 0:
         result = 'DIVERGED'
         ls = re.findall(r'kh: (InitialSetting frame=.*)', txt)
@@ -188,7 +198,7 @@ def main():
         sig = '%s | %s | %s' % (line, g.group(0) if g else '', '<'.join(re.sub(r'\s+', '', f) for f in frames) or 'no lifted frame')
     c['result'] = result; c['signature'] = sig
     cols = ['label', 'exit', 'result', 'presents', 'gframes', 'draws', 'psos', 'resources', 'file_hits', 'file_miss', 'field_cmds', 'late',
-            'damage_calls', 'hd_assets', 'source_voices', 'id_slots', 'wall_s', 'cpu_s', 'rss_mb', 'signature']
+            'damage_calls', 'hd_assets', 'source_voices', 'id_slots', 'wall_s', 'cpu_s', 'rss_mb', 'states', 'signature']
     row = ['-' if c.get(k) is None else str(c.get(k)) for k in cols]
     with open(os.path.join(out, 'summary.tsv'), 'w') as f: f.write('\t'.join(cols) + '\n' + '\t'.join(row) + '\n')
     with open(os.path.join(out, 'summary.json'), 'w') as f: json.dump(c, f, indent=1, sort_keys=True)
