@@ -794,8 +794,15 @@ int kh_hd_selftest(KCtx *g){
     /* the same without a package table: the mod's files are never used */
     TEST(put_file(dir,"remastered/msg/us/C2.bar/-0.png","MODX",4)&&prov_add("remastered/msg/us/C2.bar/-0.png")); TEST(BUILD("msg/us/C2.bar",bar)); if(t) TEST(t->rule==R_NONE&&t->n==0&&t->unserved==1&&t->mod_files==1); table_free(t);
     /* a tree that kept the vanilla file next to a mod file of the same name in another case: named error (NTFS has one name for both) */
+    { /* ... which can only exist where the file system keeps both spellings.  Probe the scratch tree itself (macOS APFS folds case by
+       * default; a case-sensitive volume there, or a folding one on Linux, is decided by the probe, not by the platform). */
+        char pa[1200],pb[1200]; struct stat sb; snprintf(pa,sizeof pa,"%s/CaseProbe.tmp",dir); snprintf(pb,sizeof pb,"%s/caseprobe.tmp",dir);
+        FILE *pf=fopen(pa,"w"); int folds=0; if(pf){ fclose(pf); folds=(stat(pb,&sb)==0); remove(pa); }
+        if(folds) fprintf(stderr,"kh: hd selftest: NOT RUN on this file system: 4 checks (two names that differ only in case cannot both exist in %s)\n",dir);
+        else {
     TEST(put_file(dir,"remastered/msg/us/C1.bar/-2.dds","VAN2",4)); TEST(FAILS("msg/us/C1.bar",bar,"differ only in case"));
     TEST(!remove((snprintf(err,sizeof err,"%s/remastered/msg/us/C1.bar/-2.dds",dir),err))); TEST(BUILD("msg/us/C1.bar",bar)); table_free(t);
+        } }
     /* list and tree disagree: named error */
     TEST(prov_add("remastered/msg/us/C1.bar/gone.png")); TEST(FAILS("msg/us/C1.bar",bar,"list and tree do not belong together"));
 

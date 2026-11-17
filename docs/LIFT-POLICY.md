@@ -92,3 +92,13 @@ UCRT bit for bit; if a differential against the original shows a difference, swa
 ## 8. Build flags
 
 `-O1 -fno-strict-aliasing -fwrapv -fno-delete-null-pointer-checks -fno-math-errno -ffp-contract=off` (see `buildgen.py`).
+
+## Integer division: a host difference (found 2026-11-17 on the Mac mini)
+The lifter emits `DivMod` as plain C `/` and `%` (tools/khlift/khlift/ops.py). On an x86-64 host a zero divisor therefore raises
+SIGFPE exactly where the original would raise #DE, and the runtime stops with a fault report. On arm64 the divide instruction does not
+fault: the quotient is 0 and the C remainder is the dividend, and the program continues (formally undefined behaviour in C). The
+original game with the mod's KH2Moose handler also continues past a divide error, with both result registers zeroed, so neither host
+matches the modded PC exactly, and the two hosts differ from each other. A quotient that does not fit (x86 #DE) is truncated silently
+on both hosts. Open decision: (a) make arm64 stop as x86 does (`-fsanitize=integer-divide-by-zero -fsanitize-trap=...` on the lifted
+shards: a defined trap, no re-lift), or (b) re-lift with a zero-divisor select that yields quotient 0 and remainder 0, which is what the
+modded PC game does. No divide error has occurred on any test route so far.
