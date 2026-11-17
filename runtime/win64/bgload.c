@@ -67,11 +67,11 @@ static void bg_lock(KCtx *g){
     BgTls *t=bg_tls();
     if(t->depth++) return;
     if(pthread_mutex_trylock(&bg_m)!=0){
-        atomic_fetch_add(&c_contended,1); u64 t0=kh_now_ns();
+        atomic_fetch_add(&c_contended,1); u64 t0=kh_host_ns();
         struct timespec dl; clock_gettime(CLOCK_REALTIME,&dl); dl.tv_sec+=BG_LOCK_WAIT_MAX_S;
         int rc=pthread_mutex_timedlock(&bg_m,&dl);
         if(rc) kh_fatal(g,"bgload: waited %d s for the load-list lock (held by thread %u, pthread rc %d): a holder is blocked, which the design excludes",BG_LOCK_WAIT_MAX_S,atomic_load(&bg_owner_tid),rc);
-        u64 w=kh_now_ns()-t0, m=atomic_load(&c_wait_ns_max); while(w>m && !atomic_compare_exchange_weak(&c_wait_ns_max,&m,w)){}
+        u64 w=kh_host_ns()-t0, m=atomic_load(&c_wait_ns_max); while(w>m && !atomic_compare_exchange_weak(&c_wait_ns_max,&m,w)){}
     }
     KThread *th=cur_thread(); atomic_store(&bg_owner_tid,th?th->tid:1);
 }
@@ -301,7 +301,7 @@ static int bg_scenario(KCtx *g,int lock,int *trips_out){
         /* 5. while the loader is inside a read (lock released) the main thread enqueues and completes (frees "e") without waiting for it */
         CHECK(wait_for(&T.in_read,1,10000));
         CHECK(rd32(g,E+4)==2 && rd32(g,F+4)==1 && rd32(g,G+4)==0);
-        u64 t0=kh_now_ns(); u64 H=st_enqueue(g,strs,"h",bufs+0x140,cb,0x888); kh_call(g,GS_BASE+0x3a0790,0,0,0,0); u64 dt=kh_now_ns()-t0;
+        u64 t0=kh_host_ns(); u64 H=st_enqueue(g,strs,"h",bufs+0x140,cb,0x888); kh_call(g,GS_BASE+0x3a0790,0,0,0,0); u64 dt=kh_host_ns()-t0;
         CHECK(H && atomic_load(&T.in_read)==1 && dt<2000000000ull);           /* did not block behind the reading loader */
         CHECK(atomic_load(&T.ncb)==3 && T.cb_arg[2]==0xE55 && rd32(g,E)==FREE_FILL && list_len(g)==3);
         atomic_store(&T.read_gate,0);

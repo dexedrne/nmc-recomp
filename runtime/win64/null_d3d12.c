@@ -87,7 +87,10 @@ static int h_adapter(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) retur
     case 14: { u64 info=ARG(g,3); wr64(g,info,6ull<<30); wr64(g,info+8,64ull<<20); wr64(g,info+16,3ull<<30); wr64(g,info+24,0); SET_RAX(g,0); return 1; }   /* QueryVideoMemoryInfo(node, group, info) */
     default: return 0; } }
 static int h_output(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)o;(void)c;
-    if(s==10){ struct timespec ts={0,16666667}; nanosleep(&ts,0); SET_RAX(g,0); return 1; }                          /* WaitForVBlank: pace at 60 Hz */
+    if(s==10){                                                                                                        /* WaitForVBlank */
+        if(kh_vclock_on){ u64 ra=guest_return_addr(g)-GS_BASE;                 /* KHNMC_CLOCK=frames: one virtual display period; rbx = GXDevice at the timing thread's two call sites (0x1288cc, 0x128f3b) */
+            kh_vclock_vblank(g,(ra==0x1288cf||ra==0x128f3e)&&GA_OK(KH_RBX(g))?KH_RBX(g):0); SET_RAX(g,0); return 1; }
+        struct timespec ts={0,16666667}; nanosleep(&ts,0); SET_RAX(g,0); return 1; }                                 /* host clock: pace at 60 Hz */
     if(s==7){ u64 d=A1(g); memset(hp(g,d),0,0x60); utf8_to_gw(g,d,32,"\\\\.\\DISPLAY1");
         /* DesktopCoordinates RECT at +0x40, AttachedToDesktop +0x50 */ wr32(g,d+0x48,1920); wr32(g,d+0x4c,1080); wr32(g,d+0x50,1); wr64(g,d+0x58,0xAB0100); SET_RAX(g,0); return 1; }
     return 0; }

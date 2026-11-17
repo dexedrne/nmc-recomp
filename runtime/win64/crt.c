@@ -132,7 +132,7 @@ IMP(CRTI,_localtime64){ time_t t=(time_t)rd64(g,A0(g)); struct tm r; localtime_r
 IMP(CRTI,_gmtime64){ time_t t=(time_t)rd64(g,A0(g)); struct tm r; gmtime_r(&t,&r); u64 b=tm_block(g); put_tm(g,b,&r); SET_RAX(g,b); }
 IMP(CRTI,_mktime64){ u64 b=A0(g); struct tm r; memset(&r,0,sizeof r); r.tm_sec=(int)rd32(g,b); r.tm_min=(int)rd32(g,b+4); r.tm_hour=(int)rd32(g,b+8); r.tm_mday=(int)rd32(g,b+12); r.tm_mon=(int)rd32(g,b+16); r.tm_year=(int)rd32(g,b+20); r.tm_isdst=(int)rd32(g,b+32); SET_RAX(g,(u64)mktime(&r)); }
 IMP(CRTI,_difftime64){ ret_d(g,(double)((s64)A0(g)-(s64)A1(g))); }
-IMP(CRTI,clock){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); static u64 t0; u64 n=(u64)ts.tv_sec*1000+(u64)ts.tv_nsec/1000000; if(!t0) t0=n; SET_RAX(g,n-t0); }
+IMP(CRTI,clock){ static u64 t0; u64 n=kh_now_ns()/1000000ull; if(!t0) t0=n; SET_RAX(g,n-t0); }
 IMP(CRTM,__setusermatherr){ }
 IMP(CRTL,_configthreadlocale){ SET_RAX(g,0); }
 IMP(CRTF,_mkdir){ char p[2048]; kh_winpath(gstr(g,A0(g)),p,sizeof p); if(ga_deterministic){ SET_RAX(g,0); return; } int r=mkdir(p,0755); if(r){ kh_set_errno(g,errno); kh_set_last_error(errno==EEXIST?183:3); } SET_RAX(g,(u32)r); }

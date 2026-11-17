@@ -63,6 +63,7 @@ void kh_vkd3d_swap_getbuffer(KCtx *g,u64 o){ (void)o; NOT_BUILT("IDXGISwapChain:
 void kh_vkd3d_swap_resize(KCtx *g,u64 o,u32 w,u32 h){ (void)o;(void)w;(void)h; NOT_BUILT("IDXGISwapChain::ResizeBuffers"); }
 void kh_vkd3d_present(KCtx *g,u64 o,u64 n){ (void)o;(void)n; NOT_BUILT("IDXGISwapChain::Present"); }
 void kh_gfx_vkd3d_report(FILE *f){ (void)f; }
+void kh_gfx_vkd3d_finish(void){}
 int kh_gfx_vkd3d_selftest(KCtx *g){ NOT_BUILT("the vkd3d selftest"); }
 #else
 /* ---- backend ------------------------------------------------------------------------------------------------------------- */
@@ -85,7 +86,7 @@ extern KhFn kh_lookup(u64 target);
 #define LVP_ICD "/usr/share/vulkan/icd.d/lvp_icd.json"
 #define DXGI_INVALID_CALL 0x887A0001u
 static int drv_system;
-static char dump_dir[1024]; static u64 dump_every=300; static _Atomic u64 dumps_written;
+static char dump_dir[1024]; static u64 dump_every=300; static _Atomic u64 dumps_written; static u64 dump_from, dump_to=~0ull;
 static char vk_dev_name[300]="(no Vulkan device created yet)";
 static struct vkd3d_instance *vk_inst; static pthread_mutex_t vm=PTHREAD_MUTEX_INITIALIZER;
 static _Atomic u64 n_devices, n_probe_devices, n_events_signalled, n_bundles_made, n_bundles_run, n_bundle_cmds, n_bundles_live, n_default_tables;
@@ -120,6 +121,20 @@ static int phdr_cb(struct dl_phdr_info *info,size_t size,void *data){
             fprintf(stderr,"kh: gfx vkd3d: native Windows-ABI range %s [0x%llx,0x%llx) from %s\n",base,P(lo),P(lo+ph->p_memsz),nm); } }
     return 0;
 }
+static void video_vblank(KCtx *g,u64 k,u64 vnow);
+static char video_path[1024]; static int video_scale, video_from_field, video_exit; static u64 video_from, video_lead, video_max;
+static void video_setup(void){
+    const char *e=getenv("KHNMC_GFX_VIDEO"); if(!e||!*e) return;
+    if(!kh_vclock_on) kh_fatal(NULL,"gfx-video-needs-frames-clock: KHNMC_GFX_VIDEO writes one picture per virtual vblank and needs KHNMC_CLOCK=frames; on the host clock the pictures would have no fixed cadence");
+    if(snprintf(video_path,sizeof video_path,"%s",e)>=(int)sizeof video_path-8) kh_fatal(NULL,"gfx-video: KHNMC_GFX_VIDEO is too long");
+    e=getenv("KHNMC_GFX_VIDEO_FRAMES"); char *end=NULL; if(!e||!*e||(video_max=strtoull(e,&end,10),*end)||!video_max) kh_fatal(NULL,"gfx-video-frames: KHNMC_GFX_VIDEO_FRAMES=%s must be the number of pictures to write (a positive integer)",e?e:"(unset)");
+    e=getenv("KHNMC_GFX_VIDEO_SCALE"); video_scale=1; if(e&&*e){ if(!strcmp(e,"2")) video_scale=2; else if(strcmp(e,"1")) kh_fatal(NULL,"gfx-video-scale: KHNMC_GFX_VIDEO_SCALE=%s (1 = full size, 2 = mean of 2x2 blocks)",e); }
+    e=getenv("KHNMC_GFX_VIDEO_FROM");
+    if(e&&!strncmp(e,"field",5)){ video_from_field=1; if(e[5]=='+'&&e[6]){ video_lead=strtoull(e+6,&end,10); if(*end) kh_fatal(NULL,"gfx-video-from: KHNMC_GFX_VIDEO_FROM=%s (field or field+<vblanks>)",e); } else if(e[5]) kh_fatal(NULL,"gfx-video-from: KHNMC_GFX_VIDEO_FROM=%s (field or field+<vblanks>)",e); }
+    else if(e&&*e){ video_from=strtoull(e,&end,10); if(*end) kh_fatal(NULL,"gfx-video-from: KHNMC_GFX_VIDEO_FROM=%s (a virtual vblank number, field, or field+<vblanks>)",e); }
+    e=getenv("KHNMC_GFX_VIDEO_EXIT"); video_exit=e&&*e=='1';
+    kh_vclock_on_vblank(video_vblank);
+}
 void kh_gfx_vkd3d_init(void){
     driver_setup();
     int n=0; dl_iterate_phdr(phdr_cb,&n);
@@ -129,11 +144,17 @@ void kh_gfx_vkd3d_init(void){
         if(mkdir(dump_dir,0755)&&errno!=EEXIST) kh_fatal(NULL,"gfx-dump-dir: cannot create %s (%s)",dump_dir,strerror(errno)); }
     e=getenv("KHNMC_GFX_DUMP_EVERY");
     if(e&&*e){ char *end; unsigned long long v=strtoull(e,&end,10); if(*end||!v) kh_fatal(NULL,"gfx-dump-every: KHNMC_GFX_DUMP_EVERY=%s is not a positive integer",e); dump_every=v; }
+    e=getenv("KHNMC_GFX_DUMP_FROM"); if(e&&*e){ char *end; dump_from=strtoull(e,&end,10); if(*end) kh_fatal(NULL,"gfx-dump-window: KHNMC_GFX_DUMP_FROM=%s is not a present number",e); }
+    e=getenv("KHNMC_GFX_DUMP_TO"); if(e&&*e){ char *end; dump_to=strtoull(e,&end,10); if(*end||dump_to<dump_from) kh_fatal(NULL,"gfx-dump-window: KHNMC_GFX_DUMP_TO=%s is not a present number at or after KHNMC_GFX_DUMP_FROM=%llu",e,P(dump_from)); }
+    video_setup();
     e=getenv("KHNMC_GFX_TRACE"); kh_native_trace=e&&*e=='1';
     kh_fiber_host_stack=16ull<<20;          /* vkd3d and the Vulkan driver run on the calling fiber's host stack */
     C_balloc=kh_com_class("vkd3d:BundleAllocator",9,COM_STRICT,h_balloc); C_bundle=kh_com_class("vkd3d:BundleCommandList",60,COM_STRICT,h_bundle);
     kh_gfx_vkd3d_on=1;
-    fprintf(stderr,"kh: gfx backend: vkd3d (D3D12 on Vulkan); frame dump: %s%s every %llu presents\n",dump_dir[0]?"to ":"off",dump_dir,P(dump_every));
+    fprintf(stderr,"kh: gfx backend: vkd3d (D3D12 on Vulkan); frame dump: %s%s every %llu presents",dump_dir[0]?"to ":"off",dump_dir,P(dump_every));
+    if(dump_from||dump_to!=~0ull) fprintf(stderr,", presents %llu..%llu only",P(dump_from),P(dump_to));
+    if(video_path[0]) fprintf(stderr,"; video stream: %s, %llu pictures from %s%s%llu, scale 1/%d%s",video_path,P(video_max),video_from_field?"the field":"virtual vblank ",video_from_field?" + ":"",P(video_from_field?video_lead:video_from),video_scale,video_exit?", then exit":"");
+    fputc('\n',stderr);
 }
 
 /* ---- vkd3d instance --------------------------------------------------------------------------------------------------------- */
@@ -328,6 +349,50 @@ static int ov_execute_bundle(KCtx *g){
     KH_RET(g); return 1;
 }
 
+/* ---- census (TASK18): what the game asks for, for the report -------------------------------------------------------------------
+ * Render-target / depth-stencil textures and every multisampled texture by (format, size, samples, flags); barriers by type; the
+ * distinct pairs of ALIASING barriers (vkd3d 2.1 answers those with "Aliasing barriers not implemented yet": it does nothing, which
+ * is correct as long as the game initialises the resource it switches to before reading it); ResolveSubresource calls. */
+typedef struct { u32 dim, fmt, samples, flags, w, h, mips; u64 n; } ResKind;
+typedef struct { u64 before, after, n; u32 bf, af, bw, bh, aw, ah, bfl, afl; } AliasPair;
+static ResKind res_kinds[48]; static int n_res_kinds; static AliasPair alias_pairs[16]; static int n_alias_pairs; static pthread_mutex_t cm=PTHREAD_MUTEX_INITIALIZER;
+static _Atomic u64 c_res_total, c_res_buffers, c_res_sampled, c_bar_transition, c_bar_aliasing, c_bar_uav, c_resolves, c_msaa_resources;
+static void census_resource(KCtx *g,u64 desc){
+    if(!desc) return; u32 dim=rd32(g,desc), fmt=rd32(g,desc+32), samples=rd32(g,desc+36), flags=rd32(g,desc+48), w=(u32)rd64(g,desc+16), h=rd32(g,desc+24), mips=rd16(g,desc+30);
+    atomic_fetch_add(&c_res_total,1);
+    if(dim==1){ atomic_fetch_add(&c_res_buffers,1); return; }
+    if(samples>1) atomic_fetch_add(&c_msaa_resources,1);
+    if(!(flags&3)&&samples<=1){ atomic_fetch_add(&c_res_sampled,1); return; }
+    pthread_mutex_lock(&cm); int i; for(i=0;i<n_res_kinds;i++){ ResKind *k=&res_kinds[i]; if(k->dim==dim&&k->fmt==fmt&&k->samples==samples&&k->flags==flags&&k->w==w&&k->h==h&&k->mips==mips) break; }
+    if(i==n_res_kinds&&n_res_kinds<48){ res_kinds[i]=(ResKind){dim,fmt,samples,flags,w,h,mips,0}; n_res_kinds++; }
+    if(i<48) res_kinds[i].n++; pthread_mutex_unlock(&cm);
+}
+/* CreateCommittedResource(this, heap props, heap flags, desc, ...) / CreatePlacedResource(this, heap, offset, desc, ...): desc is the 4th argument of both */
+static void post_create_resource(KCtx *g,const u64 *a,const u64 *stk,u64 rax){ (void)stk; if(!(u32)rax) census_resource(g,a[3]); }
+static void post_resolve(KCtx *g,const u64 *a,const u64 *stk,u64 rax){ (void)g;(void)a;(void)stk;(void)rax; atomic_fetch_add(&c_resolves,1); }
+/* ResourceBarrier(this, count, barriers) */
+static void post_barrier(KCtx *g,const u64 *a,const u64 *stk,u64 rax){ (void)stk;(void)rax; u32 n=(u32)a[1]; if(!a[2]||n>64) return; const D3D12_RESOURCE_BARRIER *b=(const D3D12_RESOURCE_BARRIER*)hp(g,a[2]);
+    for(u32 i=0;i<n;i++){
+        if(b[i].Type==D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) atomic_fetch_add(&c_bar_transition,1);
+        else if(b[i].Type==D3D12_RESOURCE_BARRIER_TYPE_UAV) atomic_fetch_add(&c_bar_uav,1);
+        else if(b[i].Type==D3D12_RESOURCE_BARRIER_TYPE_ALIASING){ atomic_fetch_add(&c_bar_aliasing,1);
+            u64 rb=U(b[i].Aliasing.pResourceBefore), ra=U(b[i].Aliasing.pResourceAfter);
+            pthread_mutex_lock(&cm); int k; for(k=0;k<n_alias_pairs;k++) if(alias_pairs[k].before==rb&&alias_pairs[k].after==ra) break;
+            if(k==n_alias_pairs&&n_alias_pairs<16){ AliasPair *p=&alias_pairs[k]; memset(p,0,sizeof *p); p->before=rb; p->after=ra; n_alias_pairs++;
+                if(rb){ D3D12_RESOURCE_DESC d=ID3D12Resource_GetDesc((ID3D12Resource*)(uintptr_t)rb); p->bf=d.Format; p->bw=(u32)d.Width; p->bh=d.Height; p->bfl=d.Flags; }
+                if(ra){ D3D12_RESOURCE_DESC d=ID3D12Resource_GetDesc((ID3D12Resource*)(uintptr_t)ra); p->af=d.Format; p->aw=(u32)d.Width; p->ah=d.Height; p->afl=d.Flags; } }
+            if(k<16) alias_pairs[k].n++; pthread_mutex_unlock(&cm); } }
+}
+static void census_report(FILE *f){
+    fprintf(f,"kh: gfx vkd3d census: resources created=%llu (buffers=%llu, sampled single-sample textures=%llu, multisampled=%llu); barriers: transition=%llu aliasing=%llu uav=%llu; ResolveSubresource calls=%llu\n",
+            P(c_res_total),P(c_res_buffers),P(c_res_sampled),P(c_msaa_resources),P(c_bar_transition),P(c_bar_aliasing),P(c_bar_uav),P(c_resolves));
+    pthread_mutex_lock(&cm);
+    if(n_res_kinds){ fprintf(f,"kh: gfx vkd3d census: render-target / depth-stencil / multisampled textures (dimension format WxH mips samples flags = count):");
+        for(int i=0;i<n_res_kinds;i++){ ResKind *k=&res_kinds[i]; fprintf(f," [%uD fmt%u %ux%u m%u s%u fl0x%x = %llu]",k->dim-1,k->fmt,k->w,k->h,k->mips,k->samples,k->flags,P(k->n)); } fputc('\n',f); }
+    for(int i=0;i<n_alias_pairs;i++){ AliasPair *p=&alias_pairs[i]; fprintf(f,"kh: gfx vkd3d census: aliasing barrier pair %d: before=%llx (fmt%u %ux%u fl0x%x) after=%llx (fmt%u %ux%u fl0x%x) x%llu\n",i,P(p->before),p->bf,p->bw,p->bh,p->bfl,P(p->after),p->af,p->aw,p->ah,p->afl,P(p->n)); }
+    pthread_mutex_unlock(&cm);
+}
+
 /* ---- d3d12.dll imports ------------------------------------------------------------------------------------------------------ */
 static void need_native(KCtx *g,const void *obj,const char *what){
     u64 fn=U(*(void**)*(void***)obj);
@@ -355,6 +420,8 @@ static void learn_entry_points(KCtx *g,ID3D12Device *dev){
     kh_native_post(U(v->Reset),post_list_reset); kh_native_post(U(v->Release),post_list_release); kh_native_post(U(v->SetGraphicsRootSignature),post_list_rootsig);
     kh_native_post(U(v->SetDescriptorHeaps),post_list_heaps); kh_native_post(U(v->SetGraphicsRootDescriptorTable),post_list_table);
     kh_native_post(U(dev->lpVtbl->CreateRootSignature),post_create_rootsig);
+    kh_native_post(U(dev->lpVtbl->CreateCommittedResource),post_create_resource); kh_native_post(U(dev->lpVtbl->CreatePlacedResource),post_create_resource);
+    kh_native_post(U(v->ResourceBarrier),post_barrier); kh_native_post(U(v->ResolveSubresource),post_resolve);
     if(kh_native_trace){                                                        /* labels for the trace: one object of each common interface */
         ID3D12DescriptorHeap *dh=NULL; ID3D12Fence *fe=NULL; ID3D12Resource *rb=NULL; D3D12_DESCRIPTOR_HEAP_DESC hd; memset(&hd,0,sizeof hd); hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors=1;
         D3D12_HEAP_PROPERTIES up; memset(&up,0,sizeof up); up.Type=D3D12_HEAP_TYPE_UPLOAD;
@@ -455,26 +522,48 @@ void kh_vkd3d_swap_resize(KCtx *g,u64 o,u32 w,u32 h){
     SET_RAX(g,0);
 }
 
-/* ---- frame dump ------------------------------------------------------------------------------------------------------------- */
+/* ---- frame output --------------------------------------------------------------------------------------------------------------
+ * Two consumers of the picture that was just presented, one readback for both:
+ *   image dumps   KHNMC_GFX_DUMP=<dir>: frame-NNNNNN.ppm for every KHNMC_GFX_DUMP_EVERY-th present inside the present window
+ *                 KHNMC_GFX_DUMP_FROM .. KHNMC_GFX_DUMP_TO (inclusive, default: all), full size, with a line in index.tsv;
+ *   video stream  KHNMC_GFX_VIDEO=<file or FIFO>: raw RGB24 pictures, ONE PER VIRTUAL VBLANK (needs KHNMC_CLOCK=frames, vclock.c), so
+ *                 the stream has a fixed cadence of 60 pictures per second of GAME time however slowly the host renders, and picture
+ *                 k is the same instant as sample 800*k of the audio device clock.  A vblank without a new Present repeats the
+ *                 previous picture (what a display shows); two Presents inside one vblank keep the later one.
+ *                 KHNMC_GFX_VIDEO_FROM=<virtual vblank> | field[+<n>]  first picture: that vblank, or n vblanks after the first
+ *                                                       FIELD_COMMAND.execute (the field is up); default: the first vblank
+ *                 KHNMC_GFX_VIDEO_FRAMES=<n>            pictures to write (required)
+ *                 KHNMC_GFX_VIDEO_SCALE=1|2             2 = each output pixel is the mean of a 2x2 block (1920x1080 -> 960x540)
+ *                 KHNMC_GFX_VIDEO_EXIT=1                end the run (exit 0, with all reports) one vblank after the last picture
+ *                                                       (the last picture is on screen for 1/60 s: its sound has to exist too)
+ *                 <file>.tsv gets one line per picture: vblank, virtual time, present, game frame, new/repeat, audio sample.
+ *                 A FIFO is opened when the first picture is due, so a reader (ffmpeg -f rawvideo) may start any time before. */
+static FILE *video_f, *video_ix;
+static u64 video_first;                                              /* vblank of picture 0 once known (0 = not yet) */
+static pthread_mutex_t vid_m=PTHREAD_MUTEX_INITIALIZER;
+static u8 *vid_buf; static u32 vid_w, vid_h; static int vid_have, vid_fresh, vid_armed, vid_done, vid_cut; static u64 vid_present, vid_gframe;
+static _Atomic u64 vid_written, vid_repeats, vid_replaced, vid_captures, vid_before_first; static u64 vid_exit_at;
+u64 kh_phase_field_cmds(void); u64 kh_input_game_frames(void); u64 kh_audio_vclock_t0(void); void kh_exit_process(int);
+
 static void barrier(ID3D12GraphicsCommandList *l,ID3D12Resource *r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b){
     D3D12_RESOURCE_BARRIER x; memset(&x,0,sizeof x); x.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; x.Transition.pResource=r; x.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     x.Transition.StateBefore=a; x.Transition.StateAfter=b; ID3D12GraphicsCommandList_ResourceBarrier(l,1,&x);
 }
-static void dump_frame(KCtx *g,Swap *s,u32 idx,u64 n){
-    u64 t0=kh_now_ns();
-    HRCHK(ID3D12CommandAllocator_Reset(s->alloc),"ID3D12CommandAllocator::Reset(frame dump)");
-    HRCHK(ID3D12GraphicsCommandList_Reset(s->list,s->alloc,NULL),"ID3D12GraphicsCommandList::Reset(frame dump)");
+/* copy back buffer idx to the readback buffer and map it; the caller unmaps with readback_done */
+static const u8 *readback(KCtx *g,Swap *s,u32 idx,u64 n){
+    HRCHK(ID3D12CommandAllocator_Reset(s->alloc),"ID3D12CommandAllocator::Reset(frame readback)");
+    HRCHK(ID3D12GraphicsCommandList_Reset(s->list,s->alloc,NULL),"ID3D12GraphicsCommandList::Reset(frame readback)");
     barrier(s->list,s->buf[idx],D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_COPY_SOURCE);
     D3D12_TEXTURE_COPY_LOCATION src,dst; memset(&src,0,sizeof src); memset(&dst,0,sizeof dst);
     src.pResource=s->buf[idx]; src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex=0;
     dst.pResource=s->rb; dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint=s->fp;
     ID3D12GraphicsCommandList_CopyTextureRegion(s->list,&dst,0,0,0,&src,NULL);
     barrier(s->list,s->buf[idx],D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_PRESENT);
-    HRCHK(ID3D12GraphicsCommandList_Close(s->list),"ID3D12GraphicsCommandList::Close(frame dump)");
+    HRCHK(ID3D12GraphicsCommandList_Close(s->list),"ID3D12GraphicsCommandList::Close(frame readback)");
     ID3D12CommandList *lists[1]={(ID3D12CommandList*)s->list};
     ID3D12CommandQueue_ExecuteCommandLists(s->queue,1,lists);
     u64 want=++s->fence_val;
-    HRCHK(ID3D12CommandQueue_Signal(s->queue,s->fence,want),"ID3D12CommandQueue::Signal(frame dump)");
+    HRCHK(ID3D12CommandQueue_Signal(s->queue,s->fence,want),"ID3D12CommandQueue::Signal(frame readback)");
     for(u64 waited=0;;waited++){                                               /* the copy runs after everything the game queued for this frame */
         UINT64 done=ID3D12Fence_GetCompletedValue(s->fence);
         if(done==~0ull) kh_fatal(g,"gfx-device-removed: the fence reports a removed device while reading back present %llu (GetDeviceRemovedReason hr=0x%08x)",P(n),(unsigned)ID3D12Device_GetDeviceRemovedReason(s->dev));
@@ -485,7 +574,11 @@ static void dump_frame(KCtx *g,Swap *s,u32 idx,u64 n){
     u8 *p=NULL; D3D12_RANGE rg={0,(SIZE_T)s->rb_size};
     HRCHK(ID3D12Resource_Map(s->rb,0,&rg,(void**)&p),"ID3D12Resource::Map(readback buffer)");
     if(!p) kh_fatal(g,"gfx-vkd3d-call: Map(readback buffer) returned a null pointer");
-    u32 w=s->w,h=s->h,pitch=s->fp.Footprint.RowPitch; const u8 *base=p+s->fp.Offset;
+    return p+s->fp.Offset;
+}
+static void readback_done(Swap *s){ D3D12_RANGE none={0,0}; ID3D12Resource_Unmap(s->rb,0,&none); }
+static void dump_frame(KCtx *g,Swap *s,const u8 *base,u32 idx,u64 n,u64 t0){
+    u32 w=s->w,h=s->h,pitch=s->fp.Footprint.RowPitch;
     char path[1200]; snprintf(path,sizeof path,"%s/frame-%06llu.ppm",dump_dir,P(n));
     FILE *f=fopen(path,"wb"); if(!f) kh_fatal(g,"gfx-dump-write: cannot create %s (%s)",path,strerror(errno));
     u8 *row=malloc(3ull*w); if(!s->seen) s->seen=malloc(1u<<21); if(!row||!s->seen) kh_fatal(g,"gfx-dump-write: out of memory");
@@ -498,24 +591,93 @@ static void dump_frame(KCtx *g,Swap *s,u32 idx,u64 n){
         if(fwrite(row,3,w,f)!=w) kh_fatal(g,"gfx-dump-write: short write to %s (%s)",path,strerror(errno)); }
     free(row);
     if(fclose(f)) kh_fatal(g,"gfx-dump-write: closing %s failed (%s)",path,strerror(errno));
-    D3D12_RANGE none={0,0}; ID3D12Resource_Unmap(s->rb,0,&none);
     double px=(double)w*h;
     char idx_path[1200]; snprintf(idx_path,sizeof idx_path,"%s/index.tsv",dump_dir);
     FILE *ix=fopen(idx_path,"a"); if(!ix) kh_fatal(g,"gfx-dump-write: cannot append %s (%s)",idx_path,strerror(errno));
-    if(ftell(ix)==0) fprintf(ix,"present\tfile\twidth\theight\tnonblack_pct\tmean_r\tmean_g\tmean_b\tmean_a\tdistinct_rgb\tdraws_total\n");
-    fprintf(ix,"%llu\tframe-%06llu.ppm\t%u\t%u\t%.3f\t%.2f\t%.2f\t%.2f\t%.2f\t%llu\t%llu\n",P(n),P(n),w,h,100.0*nonblack/px,sr/px,sg/px,sb/px,sa/px,P(distinct),P(gfx_draws));
+    if(ftell(ix)==0) fprintf(ix,"present\tfile\twidth\theight\tnonblack_pct\tmean_r\tmean_g\tmean_b\tmean_a\tdistinct_rgb\tdraws_total\tgame_frame\tvblank\n");
+    fprintf(ix,"%llu\tframe-%06llu.ppm\t%u\t%u\t%.3f\t%.2f\t%.2f\t%.2f\t%.2f\t%llu\t%llu\t%llu\t%llu\n",P(n),P(n),w,h,100.0*nonblack/px,sr/px,sg/px,sb/px,sa/px,P(distinct),P(gfx_draws),P(kh_input_game_frames()),P(kh_vclock_on?kh_vclock_vblanks():0));
     if(fclose(ix)) kh_fatal(g,"gfx-dump-write: closing %s failed (%s)",idx_path,strerror(errno));
     atomic_fetch_add(&dumps_written,1);
-    fprintf(stderr,"kh: gfx dump present=%llu back-buffer=%u file=%s %ux%u non-black=%.2f%% mean-rgb=(%.1f,%.1f,%.1f) mean-a=%.1f distinct-rgb=%llu readback-ms=%.1f\n",P(n),idx,path,w,h,100.0*nonblack/px,sr/px,sg/px,sb/px,sa/px,P(distinct),(kh_now_ns()-t0)/1e6);
+    fprintf(stderr,"kh: gfx dump present=%llu back-buffer=%u file=%s %ux%u non-black=%.2f%% mean-rgb=(%.1f,%.1f,%.1f) mean-a=%.1f distinct-rgb=%llu readback-ms=%.1f\n",P(n),idx,path,w,h,100.0*nonblack/px,sr/px,sg/px,sb/px,sa/px,P(distinct),(kh_host_ns()-t0)/1e6);
+}
+/* BGRA rows -> RGB24, optionally the mean of each 2x2 block (rounded to nearest) */
+static void video_convert(u8 *out,const u8 *base,u32 pitch,u32 w,u32 h,int scale){
+    if(scale==1){ for(u32 y=0;y<h;y++){ const u8 *q=base+(u64)y*pitch; u8 *o=out+3ull*w*y; for(u32 x=0;x<w;x++){ o[3*x]=q[4*x+2]; o[3*x+1]=q[4*x+1]; o[3*x+2]=q[4*x]; } } return; }
+    u32 ow=w/2,oh=h/2;
+    for(u32 y=0;y<oh;y++){ const u8 *q0=base+(u64)(2*y)*pitch,*q1=q0+pitch; u8 *o=out+3ull*ow*y;
+        for(u32 x=0;x<ow;x++){ const u8 *a=q0+8*x,*b=q1+8*x;
+            o[3*x]=(u8)((a[2]+a[6]+b[2]+b[6]+2)>>2); o[3*x+1]=(u8)((a[1]+a[5]+b[1]+b[5]+2)>>2); o[3*x+2]=(u8)((a[0]+a[4]+b[0]+b[4]+2)>>2); } }
+}
+static int video_wanted(void){                       /* at a Present: is this picture needed for the stream? arms the stream when its start is known */
+    if(!video_path[0]||vid_done) return 0;
+    if(!vid_armed){
+        u64 vb=kh_vclock_vblanks();
+        if(video_from_field){ if(!kh_phase_field_cmds()) return 0; video_first=vb+1+video_lead; }
+        else { if(vb+2<video_from) return 0; video_first=video_from>vb+1?video_from:vb+1; }
+        vid_armed=1;
+        fprintf(stderr,"kh: gfx video: armed at present %llu, virtual vblank %llu: picture 0 is virtual vblank %llu%s\n",P(gfx_presents),P(vb),P(video_first),video_from_field?" (the field is up)":"");
+    }
+    return 1;
+}
+static void video_capture(KCtx *g,Swap *s,const u8 *base,u64 n){
+    u32 ow=s->w/(u32)video_scale, oh=s->h/(u32)video_scale;
+    if(video_scale==2&&((s->w|s->h)&1)) kh_fatal(g,"gfx-video-scale: KHNMC_GFX_VIDEO_SCALE=2 needs even back-buffer dimensions, got %ux%u",s->w,s->h);
+    pthread_mutex_lock(&vid_m);
+    if(vid_buf&&(vid_w!=ow||vid_h!=oh)){ pthread_mutex_unlock(&vid_m); kh_fatal(g,"gfx-video-size: the back buffer changed from a %ux%u picture to %ux%u while the video stream is open",vid_w,vid_h,ow,oh); }
+    if(!vid_buf){ vid_buf=malloc(3ull*ow*oh); vid_w=ow; vid_h=oh; if(!vid_buf){ pthread_mutex_unlock(&vid_m); kh_fatal(g,"gfx-video: out of memory"); } }
+    video_convert(vid_buf,base,s->fp.Footprint.RowPitch,s->w,s->h,video_scale);
+    if(vid_fresh) atomic_fetch_add(&vid_replaced,1);
+    vid_have=1; vid_fresh=1; vid_present=n; vid_gframe=kh_input_game_frames(); atomic_fetch_add(&vid_captures,1);
+    pthread_mutex_unlock(&vid_m);
+}
+static void video_close(void){
+    if(video_f){ if(fclose(video_f)) fprintf(stderr,"kh: gfx video: ERROR: closing %s failed (%s)\n",video_path,strerror(errno)); video_f=NULL; }
+    if(video_ix){ if(fclose(video_ix)) fprintf(stderr,"kh: gfx video: ERROR: closing the index of %s failed (%s)\n",video_path,strerror(errno)); video_ix=NULL; }
+}
+/* vclock.c calls this after every virtual vblank, on the timing thread */
+static void video_vblank(KCtx *g,u64 k,u64 vnow){
+    if(!video_path[0]) return;
+    if(vid_exit_at&&k>=vid_exit_at){ fprintf(stderr,"kh: gfx video: KHNMC_GFX_VIDEO_EXIT=1: virtual vblank %llu, one after the last picture: ending the run\n",P(k)); kh_exit_process(0); }
+    pthread_mutex_lock(&vid_m);
+    if(vid_done||!vid_armed||k<video_first){ pthread_mutex_unlock(&vid_m); return; }
+    if(!vid_have){ atomic_fetch_add(&vid_before_first,1); video_first=k+1; pthread_mutex_unlock(&vid_m); return; }   /* nothing presented since arming: picture 0 moves on */
+    if(!video_f){
+        video_f=fopen(video_path,"wb"); if(!video_f){ pthread_mutex_unlock(&vid_m); kh_fatal(g,"gfx-video-write: cannot open %s for writing (%s)",video_path,strerror(errno)); }
+        char ip[1100]; snprintf(ip,sizeof ip,"%s.tsv",video_path); video_ix=fopen(ip,"w"); if(!video_ix){ pthread_mutex_unlock(&vid_m); kh_fatal(g,"gfx-video-write: cannot create %s (%s)",ip,strerror(errno)); }
+        fprintf(video_ix,"picture\tvblank\tvirtual_ns\tpresent\tgame_frame\tnew\taudio_sample\n");
+        fprintf(stderr,"kh: gfx video: stream %s opened: rawvideo rgb24 %ux%u, 60 pictures per second of game time, picture 0 = virtual vblank %llu (virtual time %llu ns), %llu pictures to come\n",video_path,vid_w,vid_h,P(k),P(vnow),P(video_max));
+    }
+    if(fwrite(vid_buf,3ull*vid_w,vid_h,video_f)!=vid_h){ int e=errno; pthread_mutex_unlock(&vid_m); kh_fatal(g,"gfx-video-write: short write to %s at picture %llu (%s); a FIFO reader that went away ends the stream",video_path,P(vid_written),strerror(e)); }
+    u64 t0=kh_audio_vclock_t0(); long long as=t0&&vnow>=t0?(long long)(((unsigned __int128)(vnow-t0)*48000u)/1000000000u):-1;
+    fprintf(video_ix,"%llu\t%llu\t%llu\t%llu\t%llu\t%d\t%lld\n",P(vid_written),P(k),P(vnow),P(vid_present),P(vid_gframe),vid_fresh,as);
+    if(!vid_fresh) atomic_fetch_add(&vid_repeats,1);
+    vid_fresh=0; u64 wn=atomic_fetch_add(&vid_written,1)+1; int end=wn>=video_max;
+    if(end){ vid_done=1; video_close(); fprintf(stderr,"kh: gfx video: complete: %llu pictures (%llu repeats of the previous picture, %llu presents replaced by a later one before their vblank), last = virtual vblank %llu\n",P(wn),P(vid_repeats),P(vid_replaced),P(k)); }
+    pthread_mutex_unlock(&vid_m);
+    if(end&&video_exit) vid_exit_at=k+1;
 }
 /* Present / Present1: called by null_d3d12.c (which keeps the present counter, the phase log and the frame line) BEFORE the index advances */
 void kh_vkd3d_present(KCtx *g,u64 o,u64 n){
     Swap *s=swap_of(g,o,"Present");
-    if(dump_dir[0]&&n%dump_every==0) dump_frame(g,s,rd32(g,o+40)%NBUF,n);
+    int want_dump=dump_dir[0]&&n>=dump_from&&n<=dump_to&&n%dump_every==0, want_video=video_wanted();
+    if(!want_dump&&!want_video) return;
+    u64 t0=kh_host_ns(); u32 idx=rd32(g,o+40)%NBUF; const u8 *base=readback(g,s,idx,n);
+    if(want_video) video_capture(g,s,base,n);
+    if(want_dump) dump_frame(g,s,base,idx,n,t0);
+    readback_done(s);
 }
+/* process exit (loader.c, before the reports): an open video stream is closed here and nowhere else; the report says if it was cut short */
+void kh_gfx_vkd3d_finish(void){ if(!video_path[0]) return; pthread_mutex_lock(&vid_m); if(video_f){ vid_cut=!vid_done; video_close(); } else if(!vid_done) vid_cut=vid_armed; vid_done=1; pthread_mutex_unlock(&vid_m); }
 void kh_gfx_vkd3d_report(FILE *f){
     fprintf(f,"kh: gfx vkd3d: device=%s driver-mode=%s devices-created=%llu (+%llu probes) native-calls=%llu fence-events-signalled=%llu bundles: recorded=%llu executed=%llu (%llu replayed calls) live=%llu; default-descriptor-tables=%llu on %d tracked command lists; frame-dumps=%llu%s%s\n",vk_dev_name,drv_system?"system":"lavapipe",
             P(n_devices),P(n_probe_devices),P(kh_native_calls),P(n_events_signalled),P(n_bundles_made),P(n_bundles_run),P(n_bundle_cmds),P(n_bundles_live),P(n_default_tables),nlst,P(dumps_written),dump_dir[0]?" in ":"",dump_dir);
+    census_report(f);
+    if(video_path[0]){
+        pthread_mutex_lock(&vid_m); int open=video_f!=NULL||vid_cut; pthread_mutex_unlock(&vid_m);
+        fprintf(f,"kh: gfx video: %s: %llu of %llu pictures written%s (rgb24 %ux%u, scale 1/%d, 60 per second of game time; picture 0 = virtual vblank %llu); repeats=%llu replaced-presents=%llu captures=%llu vblanks-before-the-first-picture=%llu%s\n",video_path,P(vid_written),P(video_max),
+                vid_done?" (complete)":vid_cut?" (INCOMPLETE: the run ended first)":open?" (open)":vid_armed?" (armed, no picture written yet)":" (not started: its first vblank has not been reached)",vid_w,vid_h,video_scale,P(video_first),P(vid_repeats),P(vid_replaced),P(vid_captures),P(vid_before_first),
+                kh_vclock_on?"":" [KHNMC_CLOCK is not frames]");
+    }
 }
 
 /* ---- selftest (only with KHNMC_GFX=vkd3d): the game's call pattern through the guest ABI, then the picture is checked ------------ */
@@ -542,6 +704,18 @@ static int ppm_is(const char *path,u32 w,u32 h,u8 r,u8 gg,u8 b){
     u64 bad=0,cnt=0; int c0,c1,c2; while(ok&&(c0=fgetc(f))!=EOF){ c1=fgetc(f); c2=fgetc(f); cnt++; if(c0!=r||c1!=gg||c2!=b){ if(!bad) fprintf(stderr,"vkd3d selftest: pixel %llu is (%d,%d,%d), expected (%u,%u,%u)\n",P(cnt-1),c0,c1,c2,r,gg,b); bad++; } }
     fclose(f); return ok&&!bad&&cnt==(u64)w*h;
 }
+/* clear the current back buffer to a colour through the guest ABI and present it (the swap chain's buffers rest in state PRESENT) */
+static int st_clear_present(KCtx *g,u64 m,u64 dev,u64 q,u64 sc,u64 al,u64 cl,u64 handle,float r,float gg,float b){
+    u32 i=(u32)GC(VT(sc,36),sc); if((u32)GC(VT(sc,9),sc,i,U(&IID_ID3D12Resource),m+1024)) return 0; u64 rt=rd64(g,m+1024); if(!rt) return 0;
+    GC(VT(dev,20),dev,rt,0,handle);
+    if((u32)GC(VT(al,8),al)||(u32)GC(VT(cl,10),cl,al,0)){ GC(VT(rt,2),rt); return 0; }
+    D3D12_RESOURCE_BARRIER x; memset(&x,0,sizeof x); x.Transition.pResource=(ID3D12Resource*)(uintptr_t)rt; x.Transition.Subresource=0xffffffffu; x.Transition.StateAfter=D3D12_RESOURCE_STATE_RENDER_TARGET; memcpy(hp(g,m+1040),&x,sizeof x); GC(VT(cl,26),cl,1,m+1040);
+    float col[4]={r,gg,b,1.0f}; memcpy(hp(g,m+1104),col,16); GC(VT(cl,48),cl,handle,m+1104,0,0);
+    x.Transition.StateBefore=D3D12_RESOURCE_STATE_RENDER_TARGET; x.Transition.StateAfter=0; memcpy(hp(g,m+1040),&x,sizeof x); GC(VT(cl,26),cl,1,m+1040);
+    int ok=(u32)GC(VT(cl,9),cl)==0; wr64(g,m+1120,cl); GC(VT(q,10),q,1,m+1120); GC(VT(rt,2),rt);
+    return ok&&(u32)GC(VT(sc,8),sc,1,0)==0;
+}
+static int raw_is(const u8 *p,size_t n,u8 r,u8 gg,u8 b){ for(size_t i=0;i<n;i+=3) if(p[i]!=r||p[i+1]!=gg||p[i+2]!=b) return 0; return 1; }
 int kh_gfx_vkd3d_selftest(KCtx *g){
     extern void rt_imp_d3d12__ord101(KCtx*), rt_imp_d3d12__D3D12SerializeRootSignature(KCtx*), rt_imp_dxgi__CreateDXGIFactory1(KCtx*);
     st_checks=st_fails=0;
@@ -696,6 +870,49 @@ int kh_gfx_vkd3d_selftest(KCtx *g){
       T((u32)GI(rt_imp_d3d12__D3D12SerializeRootSignature,m+448,1,m+136,0)==0); blob=rd64(g,m+136); T(blob!=0);
       if(blob){ u64 ptr=GC(VT(blob,3),blob), size=GC(VT(blob,4),blob); T(ptr!=0&&size>=24&&rd32(g,ptr)==0x43425844u /* "DXBC" */);
           T((u32)GC(VT(dev,16),dev,0,ptr,size,U(&IID_ID3D12RootSignature),m+144)==0); rs=rd64(g,m+144); T(rs!=0); } }
+    /* ---- TASK18: picture conversion, dump window, video stream ------------------------------------------------------------------ */
+    { /* BGRA rows with a row pitch above 4*width -> RGB24; scale 2 = mean of each 2x2 block, rounded to nearest */
+      u8 src[2*20]; memset(src,0xEE,sizeof src); static const u8 px[2][4][4]={{{10,20,30,255},{12,22,32,0},{100,110,120,9},{101,111,121,9}},{{14,24,34,7},{16,26,36,7},{103,113,123,9},{102,112,122,9}}};
+      for(int y=0;y<2;y++) memcpy(src+20*y,px[y],16);
+      u8 o1[24], o2[6]; video_convert(o1,src,20,4,2,1); video_convert(o2,src,20,4,2,2);
+      T(o1[0]==30&&o1[1]==20&&o1[2]==10&&o1[3]==32&&o1[9]==121&&o1[10]==111&&o1[11]==101&&o1[12]==34&&o1[21]==122&&o1[23]==102);
+      T(o2[0]==33&&o2[1]==23&&o2[2]==13&&o2[3]==122&&o2[4]==112&&o2[5]==102); }                      /* (30+32+34+36+2)/4 = 33 ; (120+121+123+122+2)/4 = 122 (121.5 rounds up) */
+    if(heap&&al&&cl){ u64 handle2; GC(VT(heap,9),heap,m+336); handle2=rd64(g,m+336);
+      /* dump window: with KHNMC_GFX_DUMP_FROM..TO only the presents inside are written */
+      snprintf(dump_dir,sizeof dump_dir,"%s",tmp); dump_every=1; gfx_presents=2000000; u64 sf=dump_from, stt=dump_to, d0=dumps_written; dump_from=2000002; dump_to=2000002;
+      T(st_clear_present(g,m,dev,q,sc,al,cl,handle2,0.25f,0.5f,0.75f)); T(dumps_written==d0);       /* present 2000001: before the window */
+      T(st_clear_present(g,m,dev,q,sc,al,cl,handle2,0.25f,0.5f,0.75f)); T(dumps_written==d0+1);     /* 2000002: inside */
+      T(st_clear_present(g,m,dev,q,sc,al,cl,handle2,0.25f,0.5f,0.75f)); T(dumps_written==d0+1);     /* 2000003: after */
+      { char path[1200]; snprintf(path,sizeof path,"%s/frame-2000002.ppm",tmp); T(ppm_is(path,128,72,64,128,191)); unlink(path); snprintf(path,sizeof path,"%s/frame-2000001.ppm",tmp); T(access(path,F_OK)!=0);
+        snprintf(path,sizeof path,"%s/frame-2000003.ppm",tmp); T(access(path,F_OK)!=0); snprintf(path,sizeof path,"%s/index.tsv",tmp); unlink(path); }
+      dump_from=sf; dump_to=stt; dump_dir[0]=0;
+      /* video stream: one picture per VIRTUAL VBLANK from the stream's first vblank on; a vblank without a new Present repeats the
+       * previous picture, two Presents inside one vblank keep the later; the stream ends after KHNMC_GFX_VIDEO_FRAMES pictures.
+       * 128x72 back buffer, scale 2 -> 64x36 pictures. */
+      char sv_path[sizeof video_path]; memcpy(sv_path,video_path,sizeof video_path); int sv_scale=video_scale, sv_ff=video_from_field, sv_exit=video_exit; u64 sv_from=video_from, sv_max=video_max;
+      kh_vclock_test_begin(7000000000000ull); kh_vclock_on_vblank(video_vblank);
+      snprintf(video_path,sizeof video_path,"%s/video.raw",tmp); video_scale=2; video_from_field=0; video_exit=0; video_from=2; video_max=3; video_first=0;
+      vid_have=vid_fresh=vid_armed=vid_done=vid_cut=0; atomic_store(&vid_written,0); atomic_store(&vid_repeats,0); atomic_store(&vid_replaced,0); atomic_store(&vid_captures,0); atomic_store(&vid_before_first,0);
+      T(st_clear_present(g,m,dev,q,sc,al,cl,handle2,1.0f,0.0f,0.5f)); T(vid_armed==1&&video_first==2&&vid_captures==1);   /* picture A = (255,0,128) */
+      kh_vclock_test_vblank(g); T(vid_written==0&&video_f==NULL);                                   /* vblank 1: before the stream's first vblank */
+      kh_vclock_test_vblank(g); T(vid_written==1&&video_f!=NULL);                                   /* vblank 2: picture 0 = A */
+      kh_vclock_test_vblank(g); T(vid_written==2&&vid_repeats==1);                                  /* vblank 3: nothing new presented: A again */
+      T(st_clear_present(g,m,dev,q,sc,al,cl,handle2,0.5f,0.5f,0.5f)); T(st_clear_present(g,m,dev,q,sc,al,cl,handle2,0.0f,1.0f,0.25f)); T(vid_replaced==1&&vid_captures==3);   /* B, then C = (0,255,64) inside the same vblank */
+      kh_vclock_test_vblank(g); T(vid_written==3&&vid_done==1&&video_f==NULL&&vid_repeats==1);      /* vblank 4: picture 2 = C, the stream is complete and closed */
+      T(st_clear_present(g,m,dev,q,sc,al,cl,handle2,1.0f,1.0f,1.0f)); T(vid_captures==3); kh_vclock_test_vblank(g); T(vid_written==3);   /* after the end: no capture, nothing written */
+      { FILE *vf=fopen(video_path,"rb"); T(vf!=NULL); size_t one=64u*36u*3u; u8 *b=malloc(3*one+16); size_t got=vf&&b?fread(b,1,3*one+16,vf):0; if(vf) fclose(vf);
+        T(got==3*one); if(got==3*one){ T(raw_is(b,one,255,0,128)); T(raw_is(b+one,one,255,0,128)); T(raw_is(b+2*one,one,0,255,64)); } free(b);
+        char ip[1200]; snprintf(ip,sizeof ip,"%s.tsv",video_path); FILE *ix=fopen(ip,"r"); T(ix!=NULL);
+        if(ix){ char ln[256]; unsigned long long pic,vb,vns,pr,gf; int nw; long long as; int rows=0, ok=1;
+            if(!fgets(ln,sizeof ln,ix)||strncmp(ln,"picture\tvblank\t",15)) ok=0;
+            while(fgets(ln,sizeof ln,ix)){ if(sscanf(ln,"%llu %llu %llu %llu %llu %d %lld",&pic,&vb,&vns,&pr,&gf,&nw,&as)!=7){ ok=0; break; }
+                if(pic!=(unsigned)rows||vb!=(unsigned)rows+2||vns!=7000000000000ull+vb*1000000000ull/60ull||nw!=(rows==1?0:1)) ok=0; rows++; }
+            fclose(ix); T(ok&&rows==3); unlink(ip); }
+        unlink(video_path); }
+      kh_vclock_test_end();
+      memcpy(video_path,sv_path,sizeof video_path); video_scale=sv_scale; video_from_field=sv_ff; video_exit=sv_exit; video_from=sv_from; video_max=sv_max; video_first=0;
+      vid_have=vid_fresh=vid_armed=vid_done=vid_cut=0; atomic_store(&vid_written,0); atomic_store(&vid_repeats,0); atomic_store(&vid_replaced,0); atomic_store(&vid_captures,0);
+      pthread_mutex_lock(&vid_m); free(vid_buf); vid_buf=NULL; vid_w=vid_h=0; pthread_mutex_unlock(&vid_m); }
 done:
     if(rt2) GC(VT(rt2,2),rt2); if(psoT) GC(VT(psoT,2),psoT); if(rsT) GC(VT(rsT,2),rsT); if(blobT) GC(VT(blobT,2),blobT); if(srvh) GC(VT(srvh,2),srvh); if(samph) GC(VT(samph,2),samph); if(ptb) ID3D10Blob_Release(ptb);
     if(bl) GC(VT(bl,2),bl); if(ba) GC(VT(ba,2),ba); if(rt1) GC(VT(rt1,2),rt1); if(vb) GC(VT(vb,2),vb); if(pso) GC(VT(pso,2),pso); if(rs0) GC(VT(rs0,2),rs0); if(blob0) GC(VT(blob0,2),blob0);

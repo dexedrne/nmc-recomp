@@ -4,6 +4,8 @@
 #include "khnmc_rt.h"
 #include "khnmc_mix.h"
 #include <math.h>
+#include <time.h>
+#include <unistd.h>
 
 int kh_audio_test_mode(int mode);
 u32 kh_audio_test_pass(KCtx *g,u64 engine,float *out,u32 *channels);
@@ -51,7 +53,8 @@ static const char *cbseq(u64 obj){                       /* voice callback slots
     s[n]=0; return s;
 }
 /* ---- test XAPO: IXAPO object {+32 gain(float), +36 refs seen via AddRef/Release are the COM refcount at +16} and its IXAPOParameters twin ---- */
-static struct { int qi_xapo, qi_params, regprops, in_ok, out_ok, lock, unlock, process, last_enabled, last_in_flags; u32 lock_in_ch, lock_out_ch, lock_rate, lock_frames, last_frames, flags; u64 params_obj; float gain; int silent_out; } tx;
+static struct { int qi_xapo, qi_params, regprops, in_ok, out_ok, lock, unlock, process, last_enabled, last_in_flags; u32 lock_in_ch, lock_out_ch, lock_rate, lock_frames, last_frames, flags; u64 params_obj; float gain; int silent_out;
+                int slow_ms; _Atomic int in_process, overlap, setp; } tx;
 static const u8 IID_XAPO[16]={0x84,0xb9,0x10,0xa4,0x39,0x98,0x19,0x48,0xa0,0xbe,0x28,0x56,0xae,0x6b,0x3a,0xdb};
 static const u8 IID_PARAMS[16]={0x66,0x5c,0xd9,0x26,0xf2,0x80,0x9a,0x49,0xad,0x54,0x5a,0xe7,0xf0,0x1c,0x6d,0x98};
 static const u8 IID_UNK[16]={0,0,0,0,0,0,0,0,0xc0,0,0,0,0,0,0,0x46};
@@ -73,6 +76,7 @@ static int h_tx(KCtx *g,u64 o,int s,const char *c){
         SET_RAX(g,rd32(g,out+8)==tx.lock_frames&&rd32(g,fo+4)==tx.lock_rate?0:0x80070057u); return 1; }
     case 9: tx.unlock++; SET_RAX(g,0); return 1;
     case 10:{ u64 in=A2(g),out=ARG(g,4); u32 en=(u32)ARG(g,5),n=rd32(g,in+12); tx.process++; tx.last_enabled=(int)en; tx.last_in_flags=(int)rd32(g,in+8); tx.last_frames=n;
+        if(tx.slow_ms){ atomic_store(&tx.in_process,1); struct timespec ts={0,(long)tx.slow_ms*1000000L}; nanosleep(&ts,0); atomic_store(&tx.in_process,0); }   /* a Process that takes a while: is SetParameters kept out? */
         float *src=hp(g,rd64(g,in)),*dst=hp(g,rd64(g,out)); u32 ic=tx.lock_in_ch,oc=tx.lock_out_ch; float gn=en?tx.gain:1.0f;
         for(u32 k=0;k<n;k++){ if(ic==oc) for(u32 ch=0;ch<oc;ch++) dst[k*oc+ch]=src[k*ic+ch]*gn; else { float sum=0; for(u32 ch=0;ch<ic;ch++) sum+=src[k*ic+ch]; for(u32 ch=0;ch<oc;ch++) dst[k*oc+ch]=sum*gn; } }
         wr32(g,out+8,tx.silent_out?0:1); wr32(g,out+12,n); SET_RAX(g,0); return 1; }
@@ -82,7 +86,7 @@ static int h_tx(KCtx *g,u64 o,int s,const char *c){
 }
 static int h_txp(KCtx *g,u64 o,int s,const char *c){
     (void)c; (void)o;
-    if(s==3){ if((u32)A2(g)==4) memcpy(&tx.gain,hp(g,A1(g)),4); SET_RAX(g,0); return 1; }        /* SetParameters(const void*, UINT32) */
+    if(s==3){ atomic_fetch_add(&tx.setp,1); if(atomic_load(&tx.in_process)) atomic_fetch_add(&tx.overlap,1); if((u32)A2(g)==4) memcpy(&tx.gain,hp(g,A1(g)),4); SET_RAX(g,0); return 1; }        /* SetParameters(const void*, UINT32) */
     if(s==4){ if((u32)A2(g)==4) memcpy(hp(g,A1(g)),&tx.gain,4); SET_RAX(g,0); return 1; }        /* GetParameters */
     return 0;
 }
@@ -250,4 +254,87 @@ int kh_audio_soft_selftest(KCtx *g){
     kh_audio_test_mode(prev);
     fprintf(stderr,"kh: audio xa2 selftest: %d checks, %d failures\n",checks,fails);
     return fails;
+}
+
+/* ---- KHNMC_CLOCK=frames: the device clock is the virtual display clock (TASK18) ------------------------------------------------
+ * The real clock thread ("xa2-mix") runs on a stepped virtual clock that only this test moves, and writes a WAV:
+ *   - while the clock stands, no pass is made, however much host time goes by;
+ *   - a virtual vblank is exactly 800 sample frames: 30 vblanks = 0.5 s = the passes at 0, 10, ..., 500 ms;
+ *   - a sound submitted and started after vblank 30 begins at the first pass after that instant (sample 24,480 = 510 ms), inside the
+ *     picture interval that follows vblank 30 (samples 24,000..24,800), and plays its 4,800 frames bit-exactly (through the file gain
+ *     of KHNMC_AUDIO_WAV_GAIN_DB, here 0.5: 16384 -> 8192, -8192 -> -4096);
+ *   - the WAV length is the number of passes, nothing is skipped or inserted. */
+void kh_audio_test_wav(const char *path); u64 kh_audio_test_quanta(void); int kh_audio_test_stop_clock(KCtx *g); u64 kh_audio_vclock_t0(void);
+int kh_audio_vclock_selftest(KCtx *g){
+    int c0=checks, f0=fails;
+    char path[]="/tmp/khnmc-vclock-wav-XXXXXX"; int fd=mkstemp(path); CHECK(fd>=0); if(fd<0) return 1; close(fd);
+    const u64 T0=9000000000000ull; kh_vclock_test_begin(T0);
+    extern float kh_audio_test_wav_gain(float); float prev_gain=kh_audio_test_wav_gain(0.5f);        /* the file gain (KHNMC_AUDIO_WAV_GAIN_DB) at -6.02 dB: exact halves */
+    int prev=kh_audio_test_mode(2); kh_audio_test_wav(path);
+    u64 out=ga_calloc(1,128), q0=kh_audio_test_quanta();
+    imp(g,rt_imp_xaudio2_9__ord1,out); u64 engine=rd64(g,out); CHECK(KH_RAX(g)==0&&engine!=0);
+    for(int i=0;i<3000&&(!kh_audio_vclock_t0()||kh_audio_test_quanta()==q0);i++){ struct timespec ts={0,1000000}; nanosleep(&ts,0); }
+    CHECK(kh_audio_vclock_t0()==T0); CHECK(kh_audio_test_quanta()==q0+1);                          /* pass 0 at the instant the device starts */
+    CHECK((u32)call8(g,engine,7,out,2,48000,0,0,0,0)==0); u64 master=rd64(g,out); CHECK(master!=0);
+    u64 fmt=mk_pcm_format(g,2,48000,16); CHECK(create_source(g,engine,out,fmt,0,0,0)==0); u64 src=rd64(g,out); CHECK(src!=0);
+    { struct timespec ts={0,60000000}; nanosleep(&ts,0); } CHECK(kh_audio_test_quanta()==q0+1);     /* 60 ms of host time, 0 ms of guest time: no pass */
+    for(int i=0;i<30;i++) kh_vclock_test_vblank(g);
+    CHECK(kh_now_ns()==T0+500000000ull); CHECK(kh_audio_test_quanta()==q0+51);                     /* 0.5 s: passes at 0 .. 500 ms, all done when the vblank returns */
+    u32 frames=4800; u64 pcm=ga_alloc(frames*4,16); for(u32 i=0;i<frames;i++){ wr16(g,pcm+4*i,16384); wr16(g,pcm+4*i+2,(u16)(s16)-8192); }
+    u64 buf=mk_buffer(g,0x40,pcm,frames*4,0);
+    CHECK(vc(g,src,21,buf,0,0)==0&&vc(g,src,19,0,0,0)==0);                                         /* SubmitSourceBuffer + Start "during the frame after vblank 30" */
+    for(int i=0;i<12;i++) kh_vclock_test_vblank(g);
+    CHECK(kh_now_ns()==T0+700000000ull); CHECK(kh_audio_test_quanta()==q0+71);
+    { struct timespec ts={0,40000000}; nanosleep(&ts,0); } CHECK(kh_audio_test_quanta()==q0+71);
+    CHECK(kh_audio_test_stop_clock(g)==1); CHECK(kh_audio_test_quanta()==q0+71);                  /* the clock thread ends at its next instant without a pass */
+    kh_audio_test_wav(NULL);
+    CHECK(vc(g,src,18,0,0,0)==0); CHECK(vc(g,master,18,0,0,0)==0); vc(g,engine,2,0,0,0);
+    kh_audio_test_mode(prev); kh_vclock_test_end(); kh_audio_test_wav_gain(prev_gain);
+    FILE *f=fopen(path,"rb"); CHECK(f!=NULL);
+    if(f){ unsigned char h[44]; CHECK(fread(h,1,44,f)==44&&!memcmp(h,"RIFF",4)&&!memcmp(h+8,"WAVEfmt ",8)&&!memcmp(h+36,"data",4));
+        u32 rate,dlen; u16 ch,bits; memcpy(&ch,h+22,2); memcpy(&rate,h+24,4); memcpy(&bits,h+34,2); memcpy(&dlen,h+40,4);
+        CHECK(ch==2&&rate==48000&&bits==16); CHECK(dlen==71u*480u*4u);                              /* 71 passes, 34,080 frames: 42 vblanks * 800 + the pass due at the last instant */
+        s16 *d=malloc(dlen?dlen:4); size_t got=d?fread(d,1,dlen,f):0; CHECK(got==dlen);
+        long first=-1,last=-1,wrong=0; u32 n=dlen/4;
+        if(d&&got==dlen) for(u32 i=0;i<n;i++){ if(d[2*i]||d[2*i+1]){ if(first<0) first=(long)i; last=(long)i; if(d[2*i]!=8192||d[2*i+1]!=-4096) wrong++; } }
+        CHECK(first==51*480); CHECK(last==51*480+4800-1); CHECK(wrong==0);
+        CHECK(first>30*800&&first<=31*800);                                                         /* in the sound of the picture interval that follows vblank 30 */
+        if(first!=51*480||wrong) fprintf(stderr,"audio vclock selftest: first non-zero frame %ld, last %ld, wrong samples %ld\n",first,last,wrong);
+        free(d); fclose(f); }
+    unlink(path); ga_free(out); ga_free(fmt); ga_free(pcm); ga_free(buf);
+    fprintf(stderr,"kh: audio vclock selftest: %d checks, %d failures\n",checks-c0,fails-f0);
+    return fails-f0;
+}
+
+/* ---- SetParameters never runs inside Process (the XAPO rule the engine's effects rely on) ------------------------------------------
+ * The test XAPO's Process takes 60 ms; a second guest thread calls IXAudio2Voice::SetEffectParameters 15 ms into it.  The call must
+ * wait for Process to return (so it takes about 45 ms), and the XAPO must never see SetParameters while its Process is running. */
+typedef struct { u64 voice, blob; _Atomic int done; _Atomic u64 took_ns; u32 hr; } FxSetter;
+u64 kh_host_ns(void);
+static void fx_setter_thread(KCtx *g){ FxSetter *s=(FxSetter*)(uintptr_t)A0(g);
+    { struct timespec ts={0,15000000}; nanosleep(&ts,0); }
+    u64 t=kh_host_ns(); s->hr=(u32)call8(g,s->voice,6,0,s->blob,4,0,0,0,0); atomic_store(&s->took_ns,kh_host_ns()-t); atomic_store(&s->done,1); KH_RET(g); }
+int kh_audio_fx_serial_selftest(KCtx *g){
+    int c0=checks, f0=fails; memset(&tx,0,sizeof tx);
+    int prev=kh_audio_test_mode(1);
+    if(!C_tx){ C_tx=kh_com_class("xa2:test-IXAPO",13,COM_STRICT,h_tx); C_txp=kh_com_class("xa2:test-IXAPOParameters",5,COM_STRICT,h_txp); }
+    u64 out=ga_calloc(1,128); float mix[960]; u32 oc=0;
+    imp(g,rt_imp_xaudio2_9__ord1,out); u64 engine=rd64(g,out); CHECK(engine!=0);
+    u64 xapo=kh_com_obj(C_tx,16); tx.params_obj=kh_com_obj(C_txp,0); tx.gain=0.5f; tx.flags=0x10;
+    u64 objs[1]={xapo}; u32 ini[1]={1},och[1]={2}; u64 chain=mk_chain(g,1,objs,ini,och);
+    CHECK((u32)call8(g,engine,7,out,2,48000,0,0,chain,0)==0); u64 master=rd64(g,out); CHECK(master!=0);
+    CHECK(kh_audio_test_pass(g,engine,mix,&oc)==1); int p0=tx.process; CHECK(p0>=1);
+    static FxSetter fs; memset(&fs,0,sizeof fs); fs.voice=master; fs.blob=ga_alloc(16,16); float gnew=0.25f; memcpy(hp(g,fs.blob),&gnew,4);
+    tx.slow_ms=60; atomic_store(&tx.setp,0); atomic_store(&tx.overlap,0);
+    kh_spawn_hostfn_thread(g,"audio_fx_setter",fx_setter_thread,(u64)(uintptr_t)&fs);
+    CHECK(kh_audio_test_pass(g,engine,mix,&oc)==1); CHECK(tx.process==p0+1);                       /* 60 ms inside the XAPO's Process */
+    for(int i=0;i<3000&&!atomic_load(&fs.done);i++){ struct timespec ts={0,1000000}; nanosleep(&ts,0); }
+    CHECK(atomic_load(&fs.done)==1&&fs.hr==0); CHECK(atomic_load(&tx.setp)==1); CHECK(atomic_load(&tx.overlap)==0);
+    CHECK(atomic_load(&fs.took_ns)>=25000000ull);                                                  /* it waited for Process instead of running through it */
+    CHECK(tx.gain==0.25f);                                                                         /* and was delivered */
+    tx.slow_ms=0; u64 t=kh_host_ns(); CHECK((u32)call8(g,master,6,0,fs.blob,4,0,0,0,0)==0); CHECK(kh_host_ns()-t<20000000ull);   /* no Process running: at once */
+    CHECK(vc(g,master,18,0,0,0)==0); vc(g,engine,2,0,0,0);
+    kh_audio_test_mode(prev); ga_free(out); ga_free(fs.blob);
+    fprintf(stderr,"kh: audio fx serialisation selftest: %d checks, %d failures\n",checks-c0,fails-f0);
+    return fails-f0;
 }

@@ -55,6 +55,7 @@ static u64 script_frame(u64 present){
     if(clock_game){ long long f=atomic_load(&clock_sf0)+((long long)atomic_load(&game_frames)-atomic_load(&clock_gf0)); return f>0?(u64)f:0; }
     long long sh=atomic_load(&hold_shift); return present>(u64)sh?present-(u64)sh:0;
 }
+u64 kh_input_game_frames(void){ return atomic_load(&game_frames); }
 void kh_input_report(FILE *f){
     if(!scripted) return;
     fprintf(f,"kh: input report: presents=%llu game-frames=%llu last-script-frame=%llu clock=%s hold=%s\n",(unsigned long long)atomic_load(&gfx_presents),(unsigned long long)atomic_load(&game_frames),

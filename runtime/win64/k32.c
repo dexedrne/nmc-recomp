@@ -135,7 +135,26 @@ static Timer *timers; static u32 next_timer=1; static pthread_mutex_t tmm=PTHREA
 /* A multimedia timer fires on a fixed grid (start + n*period), it does not drift by the time its handler takes: absolute deadlines.
  * A timer that fell behind by more than a period drops the missed periods, as Windows does.  TIME_CALLBACK_EVENT_SET (0x10) is
  * SetEvent, TIME_CALLBACK_EVENT_PULSE (0x20) is PulseEvent (the GX frame timer: period timer pulsing an auto-reset event). */
+static void timer_fire(KCtx *g,Timer *t){
+    if(t->flags&0x20){ if(!kh_event_pulse(t->cb)) kh_warn("winmm timer %u: pulse of a closed or invalid event handle %llx",t->id,(unsigned long long)t->cb); }
+    else if(t->flags&0x10){ if(!kh_event_set(t->cb)) kh_warn("winmm timer %u: set of a closed or invalid event handle %llx",t->id,(unsigned long long)t->cb); }
+    else kh_call5(g,t->cb,t->id,0,t->user,0,0);
+}
+/* KHNMC_CLOCK=frames: the timer's grid is on the virtual clock.  The clock moves in steps (to the mixer's next pass, to the vblank), so
+ * several instants can pass at once: the timer fires ONCE per wake-up and continues with the first grid instant after "now" (missed
+ * periods are dropped, as Windows drops them; the sound driver's handlers measure the elapsed time themselves). */
+static void timer_proc_virtual(KCtx *g,Timer *t){
+    u64 per=(u64)t->delay*1000000ull, start=kh_vclock_now_ns(), next=start+per;
+    for(;;){
+        kh_vclock_wait_until(next);
+        if(t->killed) break;
+        timer_fire(g,t);
+        if(!(t->flags&1)) break;
+        u64 now=kh_vclock_now_ns(); next=start+((now-start)/per+1)*per;
+    }
+}
 static void timer_proc(KCtx *g){ Timer *t=(Timer*)(uintptr_t)A0(g);
+    if(kh_vclock_on&&!ga_deterministic){ timer_proc_virtual(g,t); KH_RET(g); return; }
     struct timespec next; clock_gettime(CLOCK_MONOTONIC,&next);
     for(;;){
         if(ga_deterministic){ struct timespec ts={t->delay/1000,(long)(t->delay%1000)*1000000L}; nanosleep(&ts,0); }
@@ -145,9 +164,7 @@ static void timer_proc(KCtx *g){ Timer *t=(Timer*)(uintptr_t)A0(g);
             if(late>(s64)t->delay*1000000ll) next=now;                                      /* more than one period behind: resynchronise */
             else while(clock_nanosleep(CLOCK_MONOTONIC,TIMER_ABSTIME,&next,0)==EINTR){} }
         if(t->killed) break;
-        if(t->flags&0x20){ if(!kh_event_pulse(t->cb)) kh_warn("winmm timer %u: pulse of a closed or invalid event handle %llx",t->id,(unsigned long long)t->cb); }
-        else if(t->flags&0x10){ if(!kh_event_set(t->cb)) kh_warn("winmm timer %u: set of a closed or invalid event handle %llx",t->id,(unsigned long long)t->cb); }
-        else kh_call5(g,t->cb,t->id,0,t->user,0,0);
+        timer_fire(g,t);
         if(!(t->flags&1)) break; }
     KH_RET(g); }
 IMP(winmm,timeSetEvent){ Timer *t=calloc(1,sizeof *t); t->delay=(u32)A0(g)?(u32)A0(g):1; t->cb=A2(g); t->user=A3(g); t->flags=(u32)ARG(g,4); pthread_mutex_lock(&tmm); t->id=next_timer++; t->next=timers; timers=t; pthread_mutex_unlock(&tmm);

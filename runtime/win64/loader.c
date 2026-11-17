@@ -75,6 +75,8 @@ void kh_exit_process(int code){
     { extern void kh_idtable_exit_report(FILE*); kh_idtable_exit_report(stderr); }
     { extern void kh_sync_report(FILE*); kh_sync_report(stderr); }
     { extern void kh_input_report(FILE*); kh_input_report(stderr); }
+    kh_vclock_report(stderr);
+    { extern void kh_gfx_vkd3d_finish(void); kh_gfx_vkd3d_finish(); }
     kh_report_seams(stderr); { extern void kh_dump_threads(FILE*); if(getenv("KH_DUMP_THREADS")) kh_dump_threads(stderr); } fflush(stderr); fflush(stdout); _exit(code);
 }
 
@@ -139,6 +141,7 @@ int main(int argc,char **argv){
     }
     mkdir(kh_docs,0755);
     kh_trace_init(); kh_install_signals();
+    kh_vclock_init();
     { extern void kh_bgload_init(void); kh_bgload_init(); }
     { extern int ga_no_stress; ga_no_stress=selftest; }
     if(load_image()) return 1;

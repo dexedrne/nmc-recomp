@@ -207,7 +207,26 @@ u32  kh_get_last_error(void);
 
 /* ---- time --------------------------------------------------------------------------------------------------------- */
 u64 kh_qpc(void);                                    /* 10 MHz ticks (QueryPerformanceFrequency = 10,000,000) */
-u64 kh_now_ns(void);
+u64 kh_now_ns(void);                                 /* the GUEST's monotonic clock: the host's, or the virtual display clock (vclock.c) */
+u64 kh_host_ns(void);                                /* the host's monotonic clock, always (measurements of the runtime itself) */
+/* KHNMC_CLOCK=frames (vclock.c): a virtual 60 Hz display drives every guest clock */
+extern int kh_vclock_on;
+void kh_vclock_init(void);
+u64  kh_vclock_now_ns(void);
+u64  kh_vclock_vblanks(void);                        /* virtual vblanks since the clock left the host clock */
+int  kh_vclock_stepped(void);
+void kh_vclock_wait_until(u64 t_ns);
+int  kh_vclock_client_add(const char *name,u64 first_due_ns);
+void kh_vclock_client_due(int id,u64 due_ns);
+void kh_vclock_client_drop(int id);
+void kh_vclock_on_vblank(void (*fn)(KCtx *g,u64 vblank,u64 vnow_ns));
+void kh_vclock_vblank(KCtx *g,u64 gx_device);
+void kh_vclock_note_release(u64 semaphore_handle);
+int  kh_vclock_frame_wait_enter(u64 handle);          /* 1 = a frame semaphore: call kh_vclock_frame_wait_leave when the wait returns */
+void kh_vclock_frame_wait_leave(int got_it);
+void kh_vclock_report(FILE *f);
+void kh_vclock_test_begin(u64 start_ns); void kh_vclock_test_vblank(KCtx *g); void kh_vclock_test_end(void);
+int  kh_vclock_selftest(KCtx *g);
 
 /* ---- paths -------------------------------------------------------------------------------------------------------- */
 extern char kh_root[1024];                           /* host data root: the "game directory" */

@@ -219,12 +219,13 @@ static int sem_release(u64 h,long n,u32 *prev,u32 *err){
 }
 IMP(K32,CreateSemaphoreA){ SET_RAX(g,mk_sem((s32)A1(g),(s32)A2(g))); }
 IMP(K32,CreateSemaphoreW){ SET_RAX(g,mk_sem((s32)A1(g),(s32)A2(g))); }
-IMP(K32,ReleaseSemaphore){ u32 prev=0,err=0; int ok=sem_release(A0(g),(long)(s32)A1(g),&prev,&err); if(ok){ if(A2(g)) wr32(g,A2(g),prev); } else kh_set_last_error(err); SET_RAX(g,ok); }
+IMP(K32,ReleaseSemaphore){ u32 prev=0,err=0; int ok=sem_release(A0(g),(long)(s32)A1(g),&prev,&err); if(ok&&kh_vclock_on) kh_vclock_note_release(A0(g)); if(ok){ if(A2(g)) wr32(g,A2(g),prev); } else kh_set_last_error(err); SET_RAX(g,ok); }
 IMP(K32,CreateMutexA){ KWaitObj *w=wobj_new(HK_MUTEX); u64 h=h_new(HK_MUTEX,w); if(A1(g)&0xff){ w->owner=cur_thread()->tid; w->recurse=1; } SET_RAX(g,h); }
 IMP(K32,ReleaseMutex){ int k; KWaitObj *w=h_get_ref(A0(g),&k); if(!w||k!=HK_MUTEX){ if(w) kh_wobj_unref(w); kh_set_last_error(6); SET_RAX(g,0); return; } pthread_mutex_lock(&w->m);
     if(w->recurse==0||w->owner!=cur_thread()->tid){ pthread_mutex_unlock(&w->m); kh_wobj_unref(w); kh_set_last_error(288); SET_RAX(g,0); return; }
     if(--w->recurse==0){ w->owner=0; pthread_cond_broadcast(&w->cv); } pthread_mutex_unlock(&w->m); kh_wobj_unref(w); SET_RAX(g,1); }
-IMP(K32,WaitForSingleObject){ SET_RAX(g,kh_wait(g,A0(g),(u32)A1(g))); }
+/* KHNMC_CLOCK=frames: the virtual display must know when the game thread is parked in its frame wait and when it has taken a release */
+IMP(K32,WaitForSingleObject){ u64 h=A0(g); int fw=kh_vclock_on&&kh_vclock_frame_wait_enter(h); u32 r=kh_wait(g,h,(u32)A1(g)); if(fw) kh_vclock_frame_wait_leave(r==0); SET_RAX(g,r); }
 IMP(K32,WaitForSingleObjectEx){ SET_RAX(g,kh_wait(g,A0(g),(u32)A1(g))); }
 IMP(K32,CloseHandle){ u64 h=A0(g); if(h==PSEUDO_THREAD||h==PSEUDO_PROCESS){ SET_RAX(g,1); return; } int ok=h_close(h); if(!ok) kh_set_last_error(6); SET_RAX(g,ok); }
 IMP(K32,Sleep){ u32 ms=(u32)A0(g); if(ms==0) sched_yield(); else { struct timespec ts={ms/1000,(long)(ms%1000)*1000000L}; nanosleep(&ts,0); } }

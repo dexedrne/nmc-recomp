@@ -18,12 +18,16 @@ static int C_xa2,C_src,C_sub,C_mast,C_xapo,C_enum,C_device,C_client;
 #define XA2_E_INVALID 0x88960001u
 /* ---- mode, log ---- */
 static int soft_mode, soft_manual;                 /* soft_manual: tests drive the passes, no clock thread, no WAV */
+/* KHNMC_AUDIO_WAV_GAIN_DB=<dB, 0 or negative>: gain applied to the device output on its way into the WAV (default 0 dB).  The battle
+ * mix peaks above full scale (+5 dBFS seen; Windows' shared-mode engine has a limiter, this path has none) and a 16-bit file clips. */
+static float wav_gain=1.0f; static double wav_gain_db;
 static char wav_path[1024];
 static FILE *alog_f; static int alog_init; static pthread_mutex_t alog_m=PTHREAD_MUTEX_INITIALIZER;
 static void alog(const char *fmt,...){
     pthread_mutex_lock(&alog_m);
     if(!alog_init){ alog_init=1; const char *p=getenv("KHNMC_AUDIOLOG"); if(p&&*p){ alog_f=fopen(p,"a"); if(!alog_f) kh_fatal(NULL,"audio: cannot open KHNMC_AUDIOLOG %s",p); setvbuf(alog_f,NULL,_IOLBF,0); } }
-    if(alog_f){ va_list ap; va_start(ap,fmt); vfprintf(alog_f,fmt,ap); va_end(ap); fputc('\n',alog_f); }
+    if(alog_f){ if(kh_vclock_on) fprintf(alog_f,"[v=%llu vbl=%llu] ",(unsigned long long)kh_vclock_now_ns(),(unsigned long long)kh_vclock_vblanks());   /* frames clock: every line carries the virtual time and vblank */
+        va_list ap; va_start(ap,fmt); vfprintf(alog_f,fmt,ap); va_end(ap); fputc('\n',alog_f); }
     pthread_mutex_unlock(&alog_m);
 }
 #define RVA(a) ((unsigned long long)((a)-GS_BASE))
@@ -161,12 +165,27 @@ static void soft_engine_event(void *ctx,void *eu,int ev){
     for(int i=0;i<n;i++){ st_ecb[ev]++; TIMED(st_ecb_ns[ev],st_ecb_max[ev],kh_call(g,vslot(g,cbs[i],ev),cbs[i],0,0,0)); }
 }
 /* one guest XAPO, one quantum: IXAPO::Process(1, &in, 1, &out, IsEnabled) with XAPO_PROCESS_BUFFER_PARAMETERS {pBuffer, BufferFlags, ValidFrameCount} */
+/* XAudio2 hands IXAPOParameters::SetParameters to an effect on its audio processing thread, never while IXAPO::Process runs (XAPO
+ * rule: "no synchronization between SetParameters and Process is necessary"), and the engine's own XAPOs are written for that: its
+ * IIR filter rebuilds its coefficients in SetParameters.  Here the game's threads reach SetParameters directly (IXAudio2Voice::
+ * SetEffectParameters, issued for every voice by the sound driver's periodic handlers) while the mixer thread is inside Process:
+ * one pass could run on half-written coefficients.  Seen once (TASK18, run v3: a single 480-frame burst at 16 times full scale in
+ * the pass that followed a SetEffectParameters on a just-started voice; on the frames clock the handlers wake at the very instants
+ * the passes start, which makes the overlap likely).  fx_m serialises the two guest calls; nothing else is held across them. */
+static pthread_mutex_t fx_m=PTHREAD_MUTEX_INITIALIZER; static _Atomic u64 st_fx_waits;
+#ifdef KH_FX_NOLOCK_MUTANT                           /* mutation check of the selftest only: the old, unserialised behaviour */
+static void fx_lock(void){}
+#define pthread_mutex_unlock_fx() ((void)0)
+#else
+static void fx_lock(void){ if(pthread_mutex_trylock(&fx_m)){ st_fx_waits++; pthread_mutex_lock(&fx_m); } }
+#define pthread_mutex_unlock_fx() pthread_mutex_unlock(&fx_m)
+#endif
 static void soft_fx_process(void *ctx,void *fu,float *in,u32 ic,int in_silent,float *out,u32 oc,u32 frames,int enabled,int *out_silent){
     KCtx *g=ctx; SoftFx *f=fu; u64 p=f->procp; (void)ic; (void)oc;
     wr64(g,p,GADDR(in)); wr32(g,p+8,in_silent?0:1); wr32(g,p+12,frames);
     wr64(g,p+16,GADDR(out)); wr32(g,p+24,1); wr32(g,p+28,frames);
     u64 a[6]={f->xapo,1,p,1,p+16,(u64)(enabled?1:0)};
-    TIMED(st_fx_ns,st_fx_max,gcall(g,vslot(g,f->xapo,10),6,a));
+    fx_lock(); TIMED(st_fx_ns,st_fx_max,gcall(g,vslot(g,f->xapo,10),6,a)); pthread_mutex_unlock_fx();
     *out_silent=rd32(g,p+24)==0;
     __atomic_fetch_add(&xapos[f->stat].process,1,__ATOMIC_RELAXED);
 }
@@ -318,7 +337,26 @@ static void sleep_until_ns(u64 t){
  * engine's own threads can refill the queues between passes as they would against a steady device.  More than a second behind =
  * the device played silence. */
 #define CATCHUP_SPACING_NS 5000000ull
+/* KHNMC_CLOCK=frames (vclock.c): the device clock is the virtual display clock.  Pass n is due at t0 + n * 10 ms of VIRTUAL time; the
+ * clock stops at that instant until the pass is done (this thread is a clock client), so the device is never late and never ahead:
+ * exactly 800 sample frames per virtual vblank, WAV sample s = virtual time t0 + s/48000 s, on any host load.  No catch-up, no resync. */
+static _Atomic u64 mix_v_t0; static _Atomic int mix_virtual, mix_quit; static int mix_client=-1;
+u64 kh_audio_vclock_t0(void){ return atomic_load(&mix_virtual)?atomic_load(&mix_v_t0):0; }       /* virtual time of WAV sample 0 (0 = host clock / not started) */
+static void mix_thread_virtual(KCtx *g){
+    u64 t0=kh_vclock_now_ns(); atomic_store(&mix_v_t0,t0); atomic_store(&mix_virtual,1);
+    mix_client=kh_vclock_client_add("xa2-mix",t0);
+    fprintf(stderr,"kh: audio: clock=frames: the XAudio2 device clock is the virtual display clock; pass 0 (WAV sample 0) is at virtual time %llu ns%s\n",ULL(t0),kh_vclock_stepped()?"":" (the clock still follows the host: no WaitForVBlank yet)");
+    for(u64 n=0;;n++){
+        u64 due=t0+n*10000000ull;
+        if(n) kh_vclock_client_due(mix_client,due);
+        kh_vclock_wait_until(due);
+        if(atomic_load(&mix_quit)) break;
+        u64 h=mono_ns(); soft_quantum(g); u64 dur=mono_ns()-h; st_pass_ns+=dur; if(dur>st_max_pass_ns) st_max_pass_ns=dur;
+    }
+    kh_vclock_client_drop(mix_client); mix_client=-1; atomic_store(&mix_virtual,0);
+}
 static void mix_thread(KCtx *g){
+    if(kh_vclock_on){ mix_thread_virtual(g); pthread_mutex_lock(&soft_m); clock_started=0; atomic_store(&mix_quit,0); pthread_cond_broadcast(&soft_cv); pthread_mutex_unlock(&soft_m); KH_RET(g); return; }
     u64 t0=mono_ns(),n=0,last=0;
     for(;;){
         u64 due=t0+n*10000000ull,now=mono_ns();
@@ -350,6 +388,7 @@ static void soft_quantum(KCtx *g){
     }
     pthread_mutex_lock(&soft_m); for(int i=0;i<n;i++) list[i]->inuse--; pthread_cond_broadcast(&soft_cv); pthread_mutex_unlock(&soft_m);
     pthread_mutex_lock(&wav_m);
+    if(have&&wav_gain!=1.0f) for(int k=0;k<960;k++) acc[k]*=wav_gain;            /* KHNMC_AUDIO_WAV_GAIN_DB: head-room for the file; the mix itself is untouched */
     if(wav){ if(kmx_wav_write(wav,have?acc:NULL,480)) kh_fatal(g,"audio: WAV write failed: %s",strerror(errno));
         if(++wav_since_sync>=100){ wav_since_sync=0; if(kmx_wav_sync(wav)) kh_fatal(g,"audio: WAV header update failed: %s",strerror(errno)); } }
     pthread_mutex_unlock(&wav_m);
@@ -366,7 +405,7 @@ static void soft_engine_new(KCtx *g,u64 obj){
         if(wav_path[0]&&!wav){ wav=kmx_wav_open(wav_path,48000,2); if(!wav) kh_fatal(g,"audio: cannot create the WAV file %s: %s",wav_path,strerror(errno)); }
         pthread_mutex_unlock(&wav_m);
         if(!kh_spawn_hostfn_thread(g,"xa2-mix",mix_thread,0)) kh_fatal(g,"audio: cannot start the mixer thread");
-        kh_warn("audio: software XAudio2 started: 48000 Hz stereo, 10 ms passes, WAV -> %s",wav_path);
+        kh_warn("audio: software XAudio2 started: 48000 Hz stereo, 10 ms passes, device clock = %s, WAV -> %s",kh_vclock_on?"virtual display clock (KHNMC_CLOCK=frames)":"host clock",wav_path);
     }
     alog("IXAudio2 created engine=%llx mode=%s",ULL(obj),e->manual?"soft-manual":"soft");
 }
@@ -480,9 +519,9 @@ static int h_voice_soft(KCtx *g,u64 o,int s,const char *c,Voice *v){
         u32 i=(u32)A1(g),size=(u32)A3(g); u64 p=A2(g); SoftFx *f=kmx_voice_fx_user(mv,i);
         if(!f||!p||!size) goto invalid;
         if(s==6){ NODEFER(A4(g),"SetEffectParameters");
-            if(f->kind==KMX_FX_HOST){ if(!f->params) goto invalid; st_setparams++; kh_call(g,vslot(g,f->params,3),f->params,p,size,0); }      /* IXAPOParameters::SetParameters */
+            if(f->kind==KMX_FX_HOST){ if(!f->params) goto invalid; st_setparams++; fx_lock(); kh_call(g,vslot(g,f->params,3),f->params,p,size,0); pthread_mutex_unlock_fx(); }      /* IXAPOParameters::SetParameters, never inside Process */
             else { void *data=malloc(size); if(!data) kh_fatal(g,"audio: effect parameters allocation failed"); memcpy(data,hp(g,p),size); free(f->blob); f->blob=data; f->blob_size=size; if(f->kind==KMX_FX_PASS) st_reverb_params++; }
-        } else if(f->kind==KMX_FX_HOST){ if(!f->params) goto invalid; kh_call(g,vslot(g,f->params,4),f->params,p,size,0); }                 /* IXAPOParameters::GetParameters */
+        } else if(f->kind==KMX_FX_HOST){ if(!f->params) goto invalid; fx_lock(); kh_call(g,vslot(g,f->params,4),f->params,p,size,0); pthread_mutex_unlock_fx(); }                 /* IXAPOParameters::GetParameters */
         else if(f->kind==KMX_FX_METER){                                             /* XAUDIO2FX_VOLUMEMETER_LEVELS {float *pPeakLevels, *pRMSLevels; UINT32 ChannelCount}, packed */
             float pk[KMX_MAXCH],rms[KMX_MAXCH]; u32 n=size==20?rd32(g,p+16):0;
             if(size!=20||!n||n>KMX_MAXCH||kmx_voice_meter(mv,i,pk,rms,n)!=KMX_OK) goto invalid;
@@ -641,6 +680,9 @@ void kh_seam_audio_init(void){
         if(strncmp(mode,"wav:",4)||!mode[4]||strlen(mode+4)>=sizeof wav_path){ fprintf(stderr,"kh: FATAL: KHNMC_AUDIO=%s not understood (use: null | wav:<file>)\n",mode); exit(2); }
         snprintf(wav_path,sizeof wav_path,"%s",mode+4); soft_mode=1;
     }
+    { const char *e=getenv("KHNMC_AUDIO_WAV_GAIN_DB"); if(e&&*e){ char *end; double db=strtod(e,&end);
+        if(*end||!(db<=0.0)||db<-60.0){ fprintf(stderr,"kh: FATAL: KHNMC_AUDIO_WAV_GAIN_DB=%s not understood (a gain in dB from -60 to 0)\n",e); exit(2); }
+        wav_gain_db=db; wav_gain=(float)pow(10.0,db/20.0); } }
     C_enum=kh_com_class("xa2:IMMDeviceEnumerator",8,COM_STRICT,h_device);
     C_device=kh_com_class("xa2:IMMDevice",7,COM_STRICT,h_device);
     C_client=kh_com_class("xa2:IAudioClient",15,COM_STRICT,h_device);
@@ -669,6 +711,18 @@ u32 kh_audio_test_pass(KCtx *g,u64 engine,float *out,u32 *channels){
     if(channels) *channels=oc; if(out){ if(o&&oc&&oc<=8) memcpy(out,o,sizeof(float)*480*oc); else memset(out,0,sizeof(float)*480*2); }
     KmxStats ks; kmx_engine_stats(e->mx,&ks); return ks.missing_default_matrix?0:1;
 }
+/* selftest of the frames clock: route the device output to `path` (NULL = restore), read the pass count, stop the virtual clock thread */
+static char wav_path_saved[1024];
+void kh_audio_test_wav(const char *path){ pthread_mutex_lock(&wav_m);
+    if(path){ memcpy(wav_path_saved,wav_path,sizeof wav_path); snprintf(wav_path,sizeof wav_path,"%s",path); }
+    else { if(wav){ KmxWavStats ws; kmx_wav_close(wav,&ws); wav=NULL; } memcpy(wav_path,wav_path_saved,sizeof wav_path); }
+    pthread_mutex_unlock(&wav_m); }
+u64 kh_audio_test_quanta(void){ return st_quanta; }
+float kh_audio_test_wav_gain(float gain){ float prev=wav_gain; wav_gain=gain; return prev; }
+int kh_audio_test_stop_clock(KCtx *g){             /* asks the virtual clock thread to end at its next pass instant; the caller moves the clock; 1 = it ended */
+    atomic_store(&mix_quit,1);
+    for(int i=0;i<400;i++){ pthread_mutex_lock(&soft_m); int run=clock_started; pthread_mutex_unlock(&soft_m); if(!run) return 1; kh_vclock_test_vblank(g); struct timespec ts={0,1000000}; nanosleep(&ts,0); }
+    return 0; }
 void kh_audio_test_counters(u64 *voice_cb,u64 *engine_cb){ for(int i=0;i<6;i++) voice_cb[i]=st_cb[i]; engine_cb[0]=st_ecb[0]; engine_cb[1]=st_ecb[1]; }
 
 /* ---- end-of-run report; finalises the WAV ---- */
@@ -686,13 +740,15 @@ void kh_audio_report(FILE *f){
     for(int i=0;i<nfmts;i++) fprintf(f,"kh: audio: source format %s(0x%x) %u ch %u Hz %u bit align %u: voices=%llu buffers=%llu bytes=%llu\n",fmt_tag_name(fmts[i].tag),fmts[i].tag,fmts[i].ch,fmts[i].rate,fmts[i].bits,fmts[i].align,ULL(fmts[i].voices),ULL(fmts[i].buffers),ULL(fmts[i].bytes));
     if(!soft_mode){ fprintf(f,"kh: audio: null device: %llu submitted buffers (%llu bytes) dropped, no callbacks\n",ULL(st_null_buffers),ULL(st_null_bytes)); return; }
     fprintf(f,"kh: audio: passes=%llu (%.2f s) clock: passes started >10 ms late=%llu (worst %.1f ms), catch-up passes spaced=%llu, resync-quanta=%llu; pass time mean %.3f ms worst %.1f ms\n",ULL(t.passes),(double)t.passes/100.0,ULL(st_late),(double)st_max_late_ns/1e6,ULL(st_spaced),ULL(st_resync),st_quanta?(double)st_pass_ns/(double)st_quanta/1e6:0.0,(double)st_max_pass_ns/1e6);
+    if(atomic_load(&mix_virtual)) fprintf(f,"kh: audio: clock=frames: WAV sample 0 = virtual time %llu ns; passes are tied to the virtual clock (late / catch-up / resync do not exist in this mode)\n",ULL(atomic_load(&mix_v_t0)));
     fprintf(f,"kh: audio: destroyed voices=%llu peak live sources=%u peak started sources=%u peak queue depth=%u\n",ULL(t.voices_destroyed),t.peak_live_source,t.peak_active_source,t.peak_queued);
     fprintf(f,"kh: audio: buffers submitted=%llu (%llu bytes) rejected=%llu flushed=%llu started=%llu ended=%llu loop-ends=%llu stream-ends=%llu starvations=%llu; frames decoded=%llu resampled=%llu\n",ULL(t.buffers_submitted),ULL(t.bytes_submitted),ULL(st_submit_rejected),ULL(t.buffers_flushed),ULL(t.buffers_started),ULL(t.buffers_ended),ULL(t.loops_ended),ULL(t.streams_ended),ULL(t.starvations),ULL(t.frames_decoded),ULL(t.frames_resampled));
     fprintf(f,"kh: audio: guest callbacks: OnVoiceProcessingPassStart=%llu PassEnd=%llu OnStreamEnd=%llu OnBufferStart=%llu OnBufferEnd=%llu OnLoopEnd=%llu; engine OnProcessingPassStart=%llu PassEnd=%llu\n",ULL(st_cb[0]),ULL(st_cb[1]),ULL(st_cb[2]),ULL(st_cb[3]),ULL(st_cb[4]),ULL(st_cb[5]),ULL(st_ecb[0]),ULL(st_ecb[1]));
     fprintf(f,"kh: audio: mixer-thread time inside guest code, total / worst ms: OnVoiceProcessingPassStart %.0f / %.1f, PassEnd %.0f / %.1f, OnStreamEnd %.0f / %.1f, OnBufferStart %.0f / %.1f, OnBufferEnd %.0f / %.1f, OnLoopEnd %.0f / %.1f, engine PassStart %.0f / %.1f, engine PassEnd %.0f / %.1f, XAPO Process %.0f / %.1f\n",
             st_cb_ns[0]/1e6,st_cb_max[0]/1e6,st_cb_ns[1]/1e6,st_cb_max[1]/1e6,st_cb_ns[2]/1e6,st_cb_max[2]/1e6,st_cb_ns[3]/1e6,st_cb_max[3]/1e6,st_cb_ns[4]/1e6,st_cb_max[4]/1e6,st_cb_ns[5]/1e6,st_cb_max[5]/1e6,st_ecb_ns[0]/1e6,st_ecb_max[0]/1e6,st_ecb_ns[1]/1e6,st_ecb_max[1]/1e6,st_fx_ns/1e6,st_fx_max/1e6);
-    fprintf(f,"kh: audio: effects: volume-meter passes=%llu; system reverb passed through unchanged (no DSP) on %llu voice-passes, its parameters set %llu times; guest XAPO SetParameters=%llu\n",ULL(t.fx_meter),ULL(t.fx_pass_through),ULL(st_reverb_params),ULL(st_setparams));
+    fprintf(f,"kh: audio: effects: volume-meter passes=%llu; system reverb passed through unchanged (no DSP) on %llu voice-passes, its parameters set %llu times; guest XAPO SetParameters=%llu (%llu times a Process or SetParameters call waited for the other)\n",ULL(t.fx_meter),ULL(t.fx_pass_through),ULL(st_reverb_params),ULL(st_setparams),ULL(st_fx_waits));
     for(int i=0;i<nxapos;i++) fprintf(f,"kh: audio: guest XAPO %s (vtbl rva 0x%llx): locked in %llu chains, Process calls=%llu\n",xapos[i].name,RVA(xapos[i].vtbl),ULL(xapos[i].chains),ULL(xapos[i].process));
     if(had){ double sec=(double)ws.frames/48000.0,rms=ws.frames?sqrt(ws.sum_sq/((double)ws.frames*2.0)):0.0;
+        if(wav_gain!=1.0f) fprintf(f,"kh: audio: wav gain %.2f dB (x%.4f) applied to the file (KHNMC_AUDIO_WAV_GAIN_DB); the figures below are after it\n",wav_gain_db,(double)wav_gain);
         fprintf(f,"kh: audio: wav %s: %llu frames (%.2f s) 48000 Hz 16-bit stereo, peak=%.4f (%.1f dBFS) rms=%.5f (%.1f dBFS) clipped samples=%llu non-silent=%.2f s\n",wav_path,ULL(ws.frames),sec,(double)ws.peak,ws.peak>0?20.0*log10((double)ws.peak):-999.0,rms,rms>0?20.0*log10(rms):-999.0,ULL(ws.clipped_samples),(double)ws.nonsilent_frames/48000.0); }
 }

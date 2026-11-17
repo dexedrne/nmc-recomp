@@ -29,10 +29,22 @@ PHASE(511300,3)
 PHASE(13da10,4)
 PHASE(13d260,5)
 void kh_phase_mapevent_entry(void){ entries[6]++; } /* f_405440 itself lives in mod_hooks_a.c (Task 9) */
+/* FIELD_COMMAND.execute: also a running total (the video stream starts "when the field is up") and the place of its first call */
+static _Atomic u64 field_cmds_total;
+u64 kh_phase_field_cmds(void){ return atomic_load(&field_cmds_total); }
+u64 kh_input_game_frames(void);
 /* Task 12: 3f29e0 has two static edits (0x3f2d2e, 0x3f2d4a); the probe forwards to the body re-lifted from the patched image. */
 void mod_f_3f29e0(KCtx *);
-void f_3f29e0(KCtx *g){ entries[7]++; mod_f_3f29e0(g); }
-void kh_phase_damage_entry(void){ entries[8]++; }
+void f_3f29e0(KCtx *g){ entries[7]++;
+    if(atomic_fetch_add(&field_cmds_total,1)==0){ extern _Atomic u64 gfx_presents;
+        fprintf(stderr,"kh: phase: first FIELD_COMMAND.execute at present %llu, game frame %llu, virtual vblank %llu\n",(unsigned long long)gfx_presents,(unsigned long long)kh_input_game_frames(),(unsigned long long)(kh_vclock_on?kh_vclock_vblanks():0)); }
+    mod_f_3f29e0(g); }
+/* BATTLE.calc_damage: one line per call with every clock, so that a hit can be found in the picture stream and in the sound */
+void kh_phase_damage_entry(void){ entries[8]++; extern _Atomic u64 gfx_presents; static _Atomic u64 n;
+    if(!gfx_presents) return;                                       /* not while nothing is on screen (selftests) */
+    u64 k=atomic_fetch_add(&n,1)+1;
+    fprintf(stderr,"kh: event damage #%llu present=%llu game-frame=%llu vblank=%llu virtual-ns=%llu\n",(unsigned long long)k,(unsigned long long)gfx_presents,(unsigned long long)kh_input_game_frames(),
+            (unsigned long long)(kh_vclock_on?kh_vclock_vblanks():0),(unsigned long long)(kh_vclock_on?kh_vclock_now_ns():0)); }
 PHASE(2b4590,9)
 void orig_f_4f94b0(KCtx *);
 void f_4f94b0(KCtx *g){

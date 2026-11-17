@@ -31,3 +31,10 @@ render-counter deltas, first-seen CFileMan request names and eleven entry counte
 Native archive aliases extend the existing link hooks to same-shard calls;
 `lifted/` and `lifter-rt/` are untouched. File names repeat in `KHNMC_FILELOG`
 when the engine asks again; the phase log lists each name only once per run.
+
+`field-battle-d18.txt` (task 18) is the field route of `runtime/task6-field-input.txt` plus battle input: the same presses up to
+script frame 2790 EXCEPT the one at frame 90 (it only did nothing because the Initial Settings page used to appear after present
+92; with `KHNMC_CLOCK=frames` boot presents are fewer, the press opened the confirm dialog early and the route looped in the
+settings menu), then from script frame 2800 on an attack every 20 game frames, lock-on every 300, a jump every 400 and the
+reaction command in between. It is clocked by game frames (`@clock game-frames`), so it is the same on any backend and at any
+host load; the field comes up near script frame 2600..2850.
