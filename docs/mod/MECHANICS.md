@@ -23,7 +23,7 @@ Main gaps a player would notice:
 - Levelling Bladeless and Light & Dark gives no growth rewards. Awakened gives Glide instead of the PS2 abilities.
 - Several story extras are missing: the Kingdom Key for the Bag Wonder, the level 13 Marluxia fix for level-1 runs, the contents of the eight Sandswept Ruins chests, the custom Roxas model for the first Xemnas fight, the Twilight Town world-map barrier, and many small per-fight balance tweaks.
 
-Big risk to check by running the game: the PC sends the Zexion (mu13), Marluxia (ca26) and Larxene (nm11) fights to rooms that have no map file, neither in the mod nor in the baked game tree. These files alone cannot show that those fights load.
+To check by running the game (see Open questions; probably normal): the Zexion (mu13), Marluxia (ca26) and Larxene (nm11) rooms have no map file of their own name.
 
 Counts after the judge's corrections: After my corrections: 133 features. Present on PC 75 (script 26, dll 7, data 42), absent 31, not_needed_on_pc 21, undetermined 6. Combat part (34): script 11, dll 5, data 5, not_needed_on_pc 6, absent 6, undetermined 1. Forms/spawners part (49): script 12, dll 2, data 17, not_needed_on_pc 6, absent 10, undetermined 2. Worlds/story part (50): script 3, dll 0, data 20, not_needed_on_pc 9, absent 15, undetermined 3. Of the 112 features that apply to PC: 75 present (about 12 only in part: the 5 wave rooms, actor scaling, Awakened and Light & Dark menu abilities, Limit finisher ANB, the Axel 2 model, the Oogie HP gate, the 1K Neoshadow stat override, and the Zexion/Marluxia rooms without maps), 31 absent, 6 undetermined. Of the 31 absent, 29 are player-visible and listed below in 22 entries (some entries group several features); 2 are not player-visible (the Skateboard Wind fix and the Havoc's Divide debug-lockout fix).
 
@@ -95,10 +95,12 @@ Counts after the judge's corrections: After my corrections: 133 features. Presen
 - Fog for the story Marluxia fight (pnach 6984-6991): moot until the PC has a map/ca26.map; no fog op on PC.
 - Post Final Xemnas cutscenes fix (pnach 7505-7516): unknown PS2 byte. The PC keeps the vanilla final-fight files (no B_EX170*/P_EH000* in the mod), so it is probably not needed.
 - Munny Pouch turned into Final Form at Betwixt and Between (pnach 7120-7130), moved here from absent: the PC gives no Final Form item there or anywhere (no trsr or bons row with item 29). Vanilla gives none either; the game gives Final Form through its own forced-Final drive. Whether that path still fires on PC (the PS2 needed the item, probably because its Anti-Form patch also stops forced Final; my guess) was not traced. Note: PC tt40 evt program 1 grants treasure id 601, which does not exist in the PC trsr (ids jump from 593 to 602).
-- **Three fights point at rooms without a map file.** The PC mod sends the Zexion (mu13), Marluxia (ca26) and Larxene (nm11)
-  fights to rooms for which there is no `map/` file in the mod, in the baked data tree or in the real package tables of the PC
-  game (checked 2026-11-17). What the game does there is unknown until a run reaches one, or the owner reports what his
-  installed game does.
+- **The Zexion (mu13), Marluxia (ca26) and Larxene (nm11) rooms have no map file of their own name: probably normal.** These
+  are the Absent Silhouette fights, the optional Organization XIII bosses that Final Mix added (the owner pointed this out); the
+  mod restages three of them as fights in other worlds (the area files carry the missions `MU13_FM_ZEX`, `CA26_FM_MAR` / the
+  original `HB38_FM_MAR`, and Larxene's object in nm11). The game itself has 32 area files without a map file of the same name,
+  among them its own rooms hb35, hb36, hb37, hb39..hb45 and eh30..eh40, so a room evidently can use another room's map. Which
+  map each of these rooms loads has not been read from the code yet; a sweep that enters every room (task 33) will show it.
 - **Flight in Neverland.** The PC mod's text describes a Flight Mode and `NeverlandFly.dll` is ported, but nothing in the
   public mod data puts the player into the flight action (`runtime/win64/implementation notes`).
 
