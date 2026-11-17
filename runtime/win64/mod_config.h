@@ -112,3 +112,23 @@ int  kh_mod_site_360a5a(KCtx *g);                                  /* 1 = contin
 extern u64 kh_mod_dual_slots_va;
 void kh_mod_static_dump(void);                                     /* exit report: which edits the running game rewrote, buffer use */
 int kh_mod_static_selftest(KCtx *g);
+
+/* ---- Task 19: NeverlandFly.dll (mod_neverland.c; the re-lifted bodies are in gen/mod_static_lifted.c, the site handler for the
+ * thread-rewritten immediate is kh_mod_site_15b960 in mod_static_sites.c, mod_neverland_test.c is the selftest). */
+void kh_mod_neverland_init(KCtx *g);                               /* signatures, old bytes, write, "flytest", thread; named fatals */
+u32  kh_mod_neverland_scan(KCtx *g,u64 base,u64 size,int sig,u32 *nhits);   /* the DLL's scan of signature 0..4: first match (rva) and match count */
+int  kh_mod_neverland_sig_check(KCtx *g,u64 base,u64 size,u32 *first,u32 *nhits);   /* -1, or the first signature whose first match / count differs */
+void kh_mod_neverland_sig_verify(KCtx *g,u64 base,u64 size);       /* named fatal on a difference */
+int  kh_mod_neverland_nedits(void);
+int  kh_mod_neverland_edit(int i,u32 *rva,u32 *len,int *pad,u32 *func,const u8 **oldb,const u8 **newb);
+int  kh_mod_neverland_check(KCtx *g,u64 base);                     /* first edit whose old bytes are not at base+rva, or -1 */
+void kh_mod_neverland_apply(KCtx *g,u64 base);                     /* check, then write */
+void kh_mod_neverland_banner(void);                                /* the DLL's printf("flytest\n") */
+u8   kh_mod_neverland_step(void);                                  /* one iteration of the DLL thread (without the sleep): returns the byte stored */
+void kh_mod_neverland_hold(int on);                                /* test only: 1 = park the thread between two steps, 0 = release */
+void kh_mod_neverland_thread_stats(u64 *polls,u64 *min_gap_ns);    /* steps so far; shortest time between two steps of the thread */
+int  kh_mod_neverland_counts(int hook,u64 *calls);                 /* 0 = 424570, 1 = 306400, 2 = 15b6d0 */
+int  kh_mod_neverland_s1_agrees(KCtx *g,u32 save_flags,u8 *al_guest,u8 *al_direct);   /* linked f_2e5380 against the thread's direct read */
+int  kh_mod_site_15b960(KCtx *g);                                  /* add ebp,<image byte 0x15b962>; continue at 0x15b963 */
+void kh_mod_neverland_dump(void);
+int  kh_mod_neverland_selftest(KCtx *g);

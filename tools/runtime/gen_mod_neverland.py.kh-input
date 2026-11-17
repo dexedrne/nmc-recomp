@@ -1,0 +1,307 @@
+#!/usr/bin/env python3
+"""Task 19: decode NeverlandFly.dll STATICALLY and generate what the port needs.
+
+  gen_mod_neverland.py --dll NeverlandFly.dll --exe kh2fm.exe --universe DIR --edits edit_list.json
+                       --out-json gen/mod_neverland_edits.json --out-h gen/mod_neverland_table.h
+
+Nothing of the DLL is executed (not natively, not emulated): the file is read as bytes.  Standard library only.
+
+The DLL (508,928 bytes, no exports, no ini) consists of 8 own functions (0x1000..0x17cb) and an unreferenced copy of a
+disassembler library.  Its two dynamic initialisers (table at 0x9160) and DllMain(process attach) do, in this order:
+  0x1000  base = GetModuleHandleW(NULL), end = base + SizeOfImage                      (K32GetModuleInformation)
+  0x1070  S1   = first match of signature 1 in [base, end-1)                          -> a function pointer the thread calls
+  0x15a0  S2   = first match of signature 2; 13 bytes written at S2+3.. (see below)   the page protection is NOT changed by this DLL:
+          0x12d0: S3, S4 = signatures 3, 4; 26 bytes at S3+0x11, 4 bytes at S3+0x17a  OpenKH Panacea made every exe section writable
+          printf("flytest\\n")                                                         before it loaded the mod DLLs
+          S5   = first match of signature 5 (two matches in the exe; the lower address wins)
+          CreateThread(0x1290): for(;;){ [S5+0x292] = (S1()==1) ? 0x16 : 0x1c; Sleep(250); }
+A signature that is not found yields address 0 and the first store through it faults (the DLL does not check): this tool and the
+runtime refuse instead (named error).
+
+How the payload is obtained: every store instruction of the DLL is matched against a template (fixed opcode bytes, `??` for the
+bytes that carry the payload or the target offset) at its DLL address; payload and offsets are READ FROM THE DLL, so a different
+DLL build fails here instead of producing a wrong table.  The signatures are read from the DLL's .rdata, the exe is scanned with the
+DLL's own first-match rule, vanilla AND with the main mod DLL's edits and Detours jumps applied (KH2Tweaks_Refactor.dll loads before
+NeverlandFly.dll: Panacea's FindFirstFile order), and both scans must agree.
+
+Outputs (mod-derived: gen/ only, never committed):
+  --out-json  the byte edits for tools/mod_static_lift.py / mod_static_difftest.py (`--extra-edits`), the code cave, the signatures
+  --out-h     the same for runtime/mod_neverland.c (old/new bytes, signature table, thread constants)
+"""
+import sys, os, re, json, struct, hashlib, argparse, bisect
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from gen_mod_static import PE, load_universe
+
+DLL_SHA256 = '1fca202b4c3f90dac5b593d5423a88e894c1b1cc9ff6efedb64aecc50d107dfb'
+DLL_BASE = 0x180000000
+
+def die(msg):
+    sys.stderr.write('gen_mod_neverland: ERROR: %s\n' % msg); sys.exit(1)
+
+class Img:
+    """a PE mapped the way the loader maps it (headers + sections at their RVAs)."""
+    def __init__(self, path):
+        self.pe = PE(path); raw = self.pe.raw
+        soh = struct.unpack_from('<I', raw, struct.unpack_from('<I', raw, 0x3c)[0] + 24 + 60)[0]
+        m = bytearray(self.pe.size_of_image); m[:soh] = raw[:soh]
+        for name, va, vsz, off, rsz, ch in self.pe.secs:
+            n = min(vsz, rsz); m[va:va + n] = raw[off:off + n]
+        self.mem = m
+
+class Dll:
+    def __init__(self, path):
+        self.img = Img(path); self.mem = bytes(self.img.mem)
+        self.sha = hashlib.sha256(self.img.pe.raw).hexdigest()
+    def match(self, rva, tmpl):
+        """tmpl: hex bytes, `??` = captured byte.  -> the captured bytes; dies when a fixed byte differs."""
+        toks = tmpl.split(); got = bytearray()
+        for i, t in enumerate(toks):
+            b = self.mem[rva + i]
+            if t == '??': got.append(b)
+            elif int(t, 16) != b: die('DLL 0x%x+%d: byte %02x, expected %s (template "%s"): not the analysed build' % (rva, i, b, t, tmpl))
+        return bytes(got)
+
+def u32(b): return struct.unpack('<I', b)[0]
+def s32(b): return struct.unpack('<i', b)[0]
+
+def decode_dll(D):
+    """-> dict(sigs, writes, thread).  writes: [(signature name, offset from the match, bytes or ('abs', signature name))]"""
+    m = D.match
+    # ---- dynamic initialiser table: {0, 0x1000, 0x1070, 0}
+    if [struct.unpack_from('<Q', D.mem, 0x9158 + 8 * i)[0] for i in range(4)] != [0, DLL_BASE + 0x1000, DLL_BASE + 0x1070, 0]:
+        die('initialiser table at DLL 0x9158 is not {0x1000, 0x1070}')
+    # 0x1000: module range
+    m(0x1015, '33 c9 ff 15 ?? ?? ?? ?? 48 8b d8 48 89 05 ?? ?? ?? ??')          # GetModuleHandleW(NULL) -> [base]
+    m(0x1044, '8b 44 24 28 48 03 05 ?? ?? ?? ?? 48 89 05 ?? ?? ?? ??')          # end = base + SizeOfImage
+    # ---- signatures: (name, mask rva, pattern rva, length); the lengths are the loop bounds of the four scanners
+    def lea_rva(at, tmpl):                                                        # `lea reg,[r14/r15/r12 + disp32]` with the image base in the register
+        return u32(m(at, tmpl))
+    sig = {}
+    # S1, scanner 0x1070: mask/pattern = lea r11,[r14+..] / lea rdi,[r14+..], compare unrolled by 6, 0x18 bytes
+    s1m = lea_rva(0x10b1, '4d 8d 9e ?? ?? ?? ??'); s1p = lea_rva(0x10bb, '49 8d be ?? ?? ?? ??')
+    n1 = m(0x1192, '49 83 f9 ??')[0]; m(0x11b9, '49 83 f9 18 74 31'); m(0x11f0, '4c 89 15 ?? ?? ?? ??')
+    m(0x11ce, '48 c7 05 ?? ?? ?? ?? 00 00 00 00')                                 # not found: pointer = 0
+    sig['S1'] = (s1m, s1p, n1)
+    # S2, scanner in 0x15a0: lea r9,[r15+mask] / lea r10,[r15+pattern], 0x13 bytes
+    s2m = lea_rva(0x15d1, '4d 8d 8f ?? ?? ?? ??'); s2p = lea_rva(0x15dd, '4d 8d 97 ?? ?? ?? ??')
+    n2 = m(0x1606, '48 83 fa ??')[0]; m(0x160c, '48 83 fa 13 74 0e'); m(0x161d, '45 33 c0')
+    sig['S2'] = (s2m, s2p, n2)
+    # S3 and S4, scanners in 0x12d0
+    s3m = lea_rva(0x1320, '4d 8d 9c 24 ?? ?? ?? ??'); s3p = lea_rva(0x132b, '49 8d bc 24 ?? ?? ?? ??')
+    n3 = m(0x1405, '49 83 f9 ??')[0]; m(0x142c, '49 83 f9 0c 74 11'); m(0x1441, '33 ed')
+    sig['S3'] = (s3m, s3p, n3)
+    s4m = lea_rva(0x1460, '4d 8d 8c 24 ?? ?? ?? ??'); s4p = lea_rva(0x146b, '49 8d 9c 24 ?? ?? ?? ??')
+    n4 = m(0x14fc, '49 83 f8 ??')[0]; m(0x1513, '49 83 f8 1c 74 12'); m(0x1528, '45 33 ff')
+    sig['S4'] = (s4m, s4p, n4)
+    # S5, scanner in 0x15a0 after the printf
+    s5m = lea_rva(0x16c2, '4d 8d 9f ?? ?? ?? ??'); s5p = lea_rva(0x16cc, '49 8d bf ?? ?? ?? ??')
+    n5 = m(0x1759, '49 83 f8 ??')[0]; m(0x1770, '49 83 f8 10 74 12'); m(0x1785, '45 33 d2')
+    sig['S5'] = (s5m, s5p, n5)
+    sigs = {}
+    for name, (mr, pr, n) in sig.items():
+        mask = D.mem[mr:mr + n]; pat = D.mem[pr:pr + n]
+        if any(c not in (0x78, 0x3f) for c in mask) or D.mem[mr + n] != 0: die('%s: mask at DLL 0x%x is not %d x/? characters' % (name, mr, n))
+        sigs[name] = dict(mask=mask.decode(), pattern=pat, length=n, mask_rva=mr, pattern_rva=pr)
+    # ---- stores of 0x15a0 through r8 = S2
+    W = []
+    v = m(0x1620, 'c7 45 28 ?? ?? ?? ?? 8b 45 28'); d = m(0x162a, '41 89 40 ??')[0]; W.append(('S2', d, v))
+    r = m(0x162e, '41 c6 40 ?? ??'); W.append(('S2', r[0], r[1:]))
+    r = m(0x1633, '41 c6 40 ?? ??'); W.append(('S2', r[0], r[1:]))
+    v = m(0x1638, 'c7 45 30 ?? ?? ?? ?? 8b 45 30'); d = m(0x1642, '41 89 40 ??')[0]; W.append(('S2', d, v))
+    r = m(0x1646, '41 c6 40 ?? ??'); W.append(('S2', r[0], r[1:]))
+    v = m(0x164b, 'c7 45 e8 ?? ?? ?? ?? c7 45 ec ?? ?? ?? ?? f2 0f 10 45 e8'); d = u32(m(0x165e, 'f2 41 0f 11 80 ?? ?? ?? ??')); W.append(('S2', d, v))
+    v = m(0x1667, 'c7 45 f0 ?? ?? ?? ?? 8b 45 f0'); d = u32(m(0x1671, '41 89 80 ?? ?? ?? ??')); W.append(('S2', d, v))
+    r = m(0x1680, '41 c6 80 ?? ?? ?? ?? ??'); W.append(('S2', u32(r[:4]), r[4:]))
+    m(0x168d, 'e8 3e fc ff ff')                                                   # call 0x12d0
+    # ---- stores of 0x12d0 through rbp = S3 (r15 = S4)
+    v = m(0x1530, 'c7 04 24 ?? ?? ?? ?? c7 44 24 04 ?? ?? ?? ?? f2 0f 10 04 24'); d = m(0x1544, 'f2 0f 11 45 ??')[0]; W.append(('S3', d, v))
+    v = m(0x1549, 'c7 44 24 08 ?? ?? ?? ?? 8b 44 24 08'); d = m(0x1555, '89 45 ??')[0]; W.append(('S3', d, v))
+    v = m(0x1558, '66 c7 44 24 0c ?? ?? 0f b7 44 24 0c'); d = m(0x1564, '66 89 45 ??')[0]; W.append(('S3', d, v))
+    r = m(0x1568, 'c6 45 ?? ??'); W.append(('S3', r[0], r[1:]))
+    d = m(0x156c, '4c 89 7d ??')[0]; W.append(('S3', d, ('abs', 'S4')))            # mov [rbp+d],r15: the run-time address of S4
+    v = m(0x1570, '66 c7 44 24 40 ?? ?? 0f b7 44 24 40'); d = m(0x157c, '66 89 45 ??')[0]; W.append(('S3', d, v))
+    r = m(0x1580, 'c6 45 ?? ??'); W.append(('S3', r[0], r[1:]))
+    r = m(0x1584, 'c7 85 ?? ?? ?? ?? ?? ?? ?? ??'); W.append(('S3', u32(r[:4]), r[4:]))
+    # ---- printf("flytest\n") between the stores and the last scan, then the thread
+    fmt = s32(m(0x1692, '48 8d 0d ?? ?? ?? ?? e8 92 fb ff ff')) + 0x1699
+    text = D.mem[fmt:D.mem.index(b'\0', fmt)]
+    m(0x124a, 'b9 01 00 00 00')                                                   # __acrt_iob_func(1) = stdout
+    thr = s32(m(0x1791, '4c 8d 05 ?? ?? ?? ??')) + 0x1798
+    if thr != 0x1290: die('thread routine is DLL 0x%x, expected 0x1290' % thr)
+    m(0x17a5, '4c 89 15 ?? ?? ?? ?? 33 c9 ff 15 ?? ?? ?? ??')                     # [S5 slot] = r10 ; CreateThread
+    # thread 0x1290: ebx = eq ; loop: call [S1 slot] ; cmp al,1 ; ecx = ne ; rax = [S5 slot] ; cmove ecx,ebx ; mov [rax+off],cl ; Sleep(ms)
+    eq = u32(m(0x1296, 'bb ?? ?? ?? ??')); m(0x12a0, 'ff 15 ?? ?? ?? ?? 3c 01'); ne = u32(m(0x12a8, 'b9 ?? ?? ?? ??'))
+    m(0x12ad, '48 8b 05 ?? ?? ?? ?? 0f 44 cb'); off = u32(m(0x12b7, '88 88 ?? ?? ?? ??')); ms = u32(m(0x12bd, 'b9 ?? ?? ?? ?? ff 15 ?? ?? ?? ?? eb d6')[:4])
+    if eq > 0xff or ne > 0xff: die('thread values do not fit the byte it stores')
+    return dict(sigs=sigs, writes=W, text=text, thread=dict(offset=off, eq=eq, ne=ne, period_ms=ms))
+
+def scan(mem, sig):
+    """every match of the signature in [0, len-1): the DLL takes the first one."""
+    rx = b''.join(b'.' if c == '?' else re.escape(bytes([p])) for c, p in zip(sig['mask'], sig['pattern']))
+    return [x.start() for x in re.finditer(b'(?=' + rx + b')', mem, re.S) if x.start() < len(mem) - 1]
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--dll', required=True); ap.add_argument('--exe', required=True); ap.add_argument('--universe', required=True)
+    ap.add_argument('--edits', required=True, help='edit list of the main mod DLL (its edits and Detours jumps precede this DLL on the PC)')
+    ap.add_argument('--out-json', required=True); ap.add_argument('--out-h', required=True)
+    a = ap.parse_args()
+    D = Dll(a.dll)
+    if D.sha != DLL_SHA256: die('%s: sha256 %s is not the analysed NeverlandFly.dll %s' % (a.dll, D.sha, DLL_SHA256))
+    if D.img.pe.base != DLL_BASE: die('DLL image base')
+    X = Img(a.exe); E = json.load(open(a.edits))
+    exe_sha = hashlib.sha256(X.pe.raw).hexdigest()
+    if exe_sha != E['exe_sha256']: die('exe is not the pinned build')
+    base = X.pe.base
+    R = decode_dll(D)
+    # ---- the exe as NeverlandFly.dll sees it on the PC: main mod DLL edits + Detours jumps already written
+    pc = bytearray(X.mem); nmc_rva = X.pe.size_of_image
+    for e in E['edits']:
+        rva = int(e['rva'], 16)
+        if e['cls'] == 'runtime_only_bss': continue
+        new = struct.pack('<i', nmc_rva + int(e['buffer_offset'], 16) - (rva + 4)) if e['cls'] == 'rel32_to_new_section' else bytes.fromhex(e['new'])
+        if bytes(pc[rva:rva + len(new)]) != bytes.fromhex(e['old']): die('main mod edit at 0x%x: vanilla bytes' % rva)
+        pc[rva:rva + len(new)] = new
+    for r in E['detour_hook_regions']:
+        rva = int(r['rva'], 16); old = bytes.fromhex(r['old'])
+        if bytes(pc[rva:rva + len(old)]) != old: die('main mod Detours region at 0x%x: vanilla bytes' % rva)
+        pc[rva:rva + len(old)] = bytes.fromhex(r['new'])
+    main_regions = [(int(e['rva'], 16), e['length']) for e in E['edits']] + [(int(r['rva'], 16), len(r['old']) // 2) for r in E['detour_hook_regions']]
+    S = {}; sig_rows = []
+    for name in ('S1', 'S2', 'S3', 'S4', 'S5'):
+        sg = R['sigs'][name]; hv = scan(bytes(X.mem), sg); hp = scan(bytes(pc), sg)
+        if not hv: die('%s: no match in the exe (the DLL would store through address 0)' % name)
+        if hv != hp: die('%s: matches differ once the main mod DLL has patched the exe: vanilla %s, patched %s' % (name, [hex(x) for x in hv], [hex(x) for x in hp]))
+        for h in hv:
+            if X.pe.sec(h) != '.text': die('%s: match 0x%x is not in .text' % (name, h))
+        S[name] = hv[0]
+        sig_rows.append(dict(name=name, mask=sg['mask'], pattern=sg['pattern'].hex(), length=sg['length'], dll_mask_rva='%x' % sg['mask_rva'],
+                             dll_pattern_rva='%x' % sg['pattern_rva'], hits=['%x' % h for h in hv], first='%x' % hv[0]))
+    # ---- byte writes -> contiguous edits
+    cell = {}
+    for sname, off, val in R['writes']:
+        if isinstance(val, tuple): val = struct.pack('<Q', base + S[val[1]])
+        for i, b in enumerate(val):
+            rva = S[sname] + off + i
+            if rva in cell: die('the DLL writes exe 0x%x twice' % rva)
+            cell[rva] = b
+    runs = []
+    for rva in sorted(cell):
+        if runs and runs[-1][0] + len(runs[-1][1]) == rva: runs[-1][1].append(cell[rva])
+        else: runs.append([rva, bytearray([cell[rva]])])
+    fs = load_universe(a.universe); los = [f[0] for f in fs]
+    def owner(rva):
+        i = bisect.bisect_right(los, rva) - 1
+        return fs[i] if i >= 0 and fs[i][0] <= rva < fs[i][1] else None
+    def pad_owner(rva, n):
+        """rva..rva+n lies in the alignment padding behind a function (all 0xCC, before the next function): -> that function"""
+        i = bisect.bisect_right(los, rva) - 1
+        if i < 0 or rva < fs[i][1] or (i + 1 < len(fs) and rva + n > fs[i + 1][0]): return None
+        if any(b != 0xcc for b in X.mem[fs[i][1]:rva + n]): return None
+        return fs[i]
+    edits = []
+    for rva, new in runs:
+        new = bytes(new); old = bytes(X.mem[rva:rva + len(new)])
+        if bytes(pc[rva:rva + len(new)]) != old: die('exe 0x%x: the main mod DLL changes bytes this DLL overwrites' % rva)
+        if any(rva < r + n and r < rva + len(new) for r, n in main_regions): die('exe 0x%x: overlaps a main mod DLL edit' % rva)
+        if X.pe.file_off(rva, len(new)) is None or X.pe.sec(rva) != '.text': die('exe 0x%x: not file-backed .text' % rva)
+        f = owner(rva)
+        if f:
+            if owner(rva + len(new) - 1) != f: die('exe 0x%x+%d crosses a function end' % (rva, len(new)))
+            edits.append(dict(rva=rva, old=old, new=new, func=f[2], pad=0))
+        else:
+            f = pad_owner(rva, len(new))
+            if not f: die('exe 0x%x+%d is neither inside a function nor in the 0xCC padding behind one' % (rva, len(new)))
+            edits.append(dict(rva=rva, old=old, new=new, func=f[2], pad=1))
+    # ---- shape checks: what the written bytes ARE (every claim of implementation notes about them is asserted here)
+    s2, s3, s4, s5, s1 = S['S2'], S['S3'], S['S4'], S['S5'], S['S1']
+    def new_at(rva, n):
+        for e in edits:
+            if e['rva'] <= rva and rva + n <= e['rva'] + len(e['new']): return e['new'][rva - e['rva']:rva - e['rva'] + n]
+        die('expected the DLL to write exe 0x%x+%d' % (rva, n))
+    for name, st in (('S1', s1), ('S2', s2), ('S4', s4), ('S5', s5)):
+        if owner(st) is None or owner(st)[2] != st: die('%s = 0x%x is not a function start' % (name, st))
+    f2 = owner(s2); f3 = owner(s3); f5 = owner(s5)
+    # (a) S2+3: jmp rel32 into a cave behind the function; the cave ends with jmp rel32 back to S2+8
+    j = new_at(s2 + 3, 5)
+    if j[0] != 0xe9: die('S2+3 is not a jmp rel32')
+    cave = s2 + 8 + s32(j[1:]); ce = next((e for e in edits if e['rva'] == cave and e['pad'] and e['func'] == f2[2]), None)
+    if ce is None or cave != f2[1]: die('the jmp at S2+3 does not enter a written cave directly behind the function (target 0x%x)' % cave)
+    cb = ce['new']
+    if cb[-5] != 0xe9 or cave + len(cb) + s32(cb[-4:]) != s2 + 8: die('the cave does not end with a jmp back to S2+8')
+    if bytes(X.mem[s2 + 3:s2 + 8]) != bytes.fromhex('@KHINPUT(hex,pc/kh2fm.exe,1828715,5,db755d096858c62016020099ca42ec4be6203dce2b428056c6b95f9d0e084382)@'): die('S2+3: vanilla bytes are not xorps xmm3,xmm3 ; xor edx,edx')
+    if cb[:5] != bytes.fromhex('@KHINPUT(hex,pc/kh2fm.exe,1828715,5,db755d096858c62016020099ca42ec4be6203dce2b428056c6b95f9d0e084382)@') or cb[5:7] != b'\x83\xc2': die('the cave does not start with the two moved instructions + add edx,imm8')
+    motion_idle = cb[7]
+    # (b) S2+0x37: the imm32 low byte of `add edx,imm32` (vanilla 0x9a); S2+0x5a: setbe dl ; inc edx -> xor edx,edx ; add edx,imm8
+    e37 = next(e for e in edits if e['rva'] == s2 + 0x37)
+    if bytes(X.mem[s2 + 0x35:s2 + 0x3b]) != bytes.fromhex('@KHINPUT(hex,pc/kh2fm.exe,4340133,6,193c857038dae0ea1c2d85366421d8b39ad104666f31a5b3c50c5c818d21fcb1)@') or len(e37['new']) != 1: die('S2+0x37 is not the immediate of add edx,0x9a')
+    e5a = new_at(s2 + 0x5a, 5)
+    if bytes(X.mem[s2 + 0x5a:s2 + 0x5f]) != bytes.fromhex('@KHINPUT(hex,pc/kh2fm.exe,4340170,5,200b5e19642756160ebab0f5121fdc6898e05f0fabc92c26c30a3f3cf10736e7)@') or e5a[:4] != bytes.fromhex('@KHINPUT(hex,mod/dll/NeverlandFly.dll,2619,4,6d0e8a0d6f94f3a60eda34872cb2ada49b58a0d449105b66d7a1aa7cb4284506)@'): die('S2+0x5a is not setbe dl ; inc edx -> xor edx,edx ; add edx,imm8')
+    # (c) S3+0x11: two calls with xmm2 = 0 replaced by one call of S4 with xmm2 = the float behind the function
+    blk = new_at(s3 + 0x11, 0x1a)
+    if blk[:4] != bytes.fromhex('@KHINPUT(hex,pc/kh2fm.exe,33295,4,deeba8a83b89ccac296f6f59797dc14bc921dcab2e32d20d7e73a93494ca1cf0)@'): die('S3+0x11 is not movss xmm2,[rip+disp32]')
+    fl = s3 + 0x11 + 8 + s32(blk[4:8]); fe = next((e for e in edits if e['rva'] == fl and e['pad'] and len(e['new']) == 4 and e['func'] == f3[2]), None)
+    if fe is None: die('the movss at S3+0x11 does not read the 4 bytes the DLL writes behind the function (0x%x)' % fl)
+    if blk[8:13] != bytes.fromhex('@KHINPUT(hex,pc/kh2fm.exe,221759,5,303a412e43eade90f8058de0d9207ed313ac48f4265b074c893a69e06bc3ec07)@') or blk[13:15] != b'\x48\xb8' or struct.unpack('<Q', blk[15:23])[0] != base + s4 or blk[23:] != bytes.fromhex('ffd090'):
+        die('S3+0x19 is not mov edx,edi ; mov rcx,r14 ; mov rax,S4 ; call rax ; nop')
+    van = bytes(X.mem[s3 + 0x11:s3 + 0x2b])
+    if van[:8] != bytes.fromhex('@KHINPUT(hex,pc/kh2fm.exe,3168795,8,f19828c596e0f53df99e878efcf91385d66d9b9168a782b1b458730ad6dcc391)@') or van[8] != 0xe8 or van[13:21] != bytes.fromhex('@KHINPUT(hex,pc/kh2fm.exe,3168795,8,f19828c596e0f53df99e878efcf91385d66d9b9168a782b1b458730ad6dcc391)@') or van[21] != 0xe8:
+        die('S3+0x11: vanilla bytes are not two `xorps xmm2,xmm2 ; mov edx,edi ; mov rcx,r14 ; call` sequences')
+    removed = [s3 + 0x11 + 13 + s32(van[9:13]), s3 + 0x11 + 26 + s32(van[22:26])]
+    # (d) the thread's byte: imm8 of `add ebp,imm8` (83 c5 ib) inside the S5 function, vanilla value = the thread's "equal" value
+    T = R['thread']; imm = s5 + T['offset']
+    if owner(imm) != f5 or bytes(X.mem[imm - 2:imm]) != b'\x83\xc5' or X.mem[imm] != T['eq']:
+        die('S5+0x%x is not the immediate of add ebp,0x%x in the S5 function' % (T['offset'], T['eq']))
+    if any(imm - 2 < r + n and r < imm + 1 for r, n in main_regions): die('the thread byte overlaps a main mod DLL edit')
+    if bytes(X.mem[s1:s1 + 4]) != bytes.fromhex('@KHINPUT(hex,pc/kh2fm.exe,1024,4,78fed029e2ced62cd189bfe8136387148aefd72120e35b0ff85c1d379bb362f9)@') or bytes(X.mem[s1 + 9:s1 + 0x1b]) != bytes.fromhex('@KHINPUT(hex,pc/kh2fm.exe,3032969,18,5346a1aefe007f827b804afc6b1247c8fcf2c0da588be4ac6a8561aac67727ce)@'):
+        die('S1 is not `sub rsp,28 ; call ; mov eax,[rax+0x41a4] ; shr eax,6 ; not al ; and al,1 ; add rsp,28 ; ret`')
+    getter = s1 + 9 + s32(bytes(X.mem[s1 + 5:s1 + 9]))
+    if bytes(X.mem[getter:getter + 3]) != b'\x48\x8d\x05' or X.mem[getter + 7] != 0xc3: die('the function S1 calls (0x%x) is not `lea rax,[rip+disp] ; ret`' % getter)
+    save = getter + 7 + s32(bytes(X.mem[getter + 3:getter + 7]))
+    funcs = sorted(set(e['func'] for e in edits) | {f5[2]})
+    caves = [dict(func='%x' % f2[2], lo='%x' % cave, hi='%x' % (cave + len(cb)))]
+    nxt = fs[bisect.bisect_right(los, cave)][0]
+    if cave + len(cb) > nxt: die('the cave runs into the next function')
+    summary = dict(S1='%x' % s1, S2='%x' % s2, S3='%x' % s3, S4='%x' % s4, S5='%x' % s5, cave='%x' % cave, cave_len=len(cb), float_rva='%x' % fl,
+                   float_bits='%08x' % u32(fe['new']), float=struct.unpack('<f', fe['new'])[0], motion_idle=motion_idle, motion_vertical_base=e37['new'][0],
+                   motion_horizontal=e5a[4], removed_calls=['%x' % x for x in removed], thread_imm='%x' % imm, save_block='%x' % save, save_flag_offset=0x41a4, save_flag_bit=6)
+    J = dict(dll_sha256=D.sha, exe_sha256=exe_sha, image_base='%x' % base, summary=summary, sigs=sig_rows,
+             edits=[dict(rva='%x' % e['rva'], length=len(e['new']), old=e['old'].hex(), new=e['new'].hex(), func='%x' % e['func'], pad=e['pad']) for e in edits],
+             caves=caves, functions=['%x' % f for f in funcs],
+             thread=dict(fn='%x' % s1, func='%x' % f5[2], imm_rva='%x' % imm, insn_rva='%x' % (imm - 2), eq=T['eq'], ne=T['ne'], period_ms=T['period_ms'], offset=T['offset']),
+             text=R['text'].decode('latin1'))
+    os.makedirs(os.path.dirname(os.path.abspath(a.out_json)), exist_ok=True)
+    json.dump(J, open(a.out_json, 'w'), indent=1)
+    def arr(b): return '{' + ','.join('0x%02x' % x for x in b) + '}'
+    def cstr(b): return '"' + ''.join('\\x%02x' % x for x in b) + '"'
+    o = ['/* GENERATED by tools/gen_mod_neverland.py from NeverlandFly.dll (static decode): mod-derived, local only, never commit. */', '#pragma once',
+         '#define KH_MOD_NF_DLL_SHA256 "%s"' % D.sha, '#define KH_MOD_NF_EXE_SHA256 "%s"' % exe_sha, '#define KH_MOD_NF_IMAGE_BASE 0x%xull' % base,
+         '#define KH_MOD_NF_NSIGS %d' % len(sig_rows),
+         'struct kh_mod_nf_sig { const char *name; unsigned len; const char *mask; const unsigned char *pattern; unsigned first, nhits; };',
+         'static const struct kh_mod_nf_sig kh_mod_nf_sigs[KH_MOD_NF_NSIGS] = {']
+    for r in sig_rows:
+        o.append('  {"%s",%d,"%s",(const unsigned char*)%s,0x%s,%d},' % (r['name'], r['length'], r['mask'], cstr(bytes.fromhex(r['pattern'])), r['first'], len(r['hits'])))
+    o += ['};', '#define KH_MOD_NF_NEDITS %d' % len(edits),
+          'struct kh_mod_nf_edit { unsigned rva; unsigned char len, pad; unsigned func; unsigned char old[32], new_[32]; };   /* pad: 1 = in the 0xCC padding behind func */',
+          'static const struct kh_mod_nf_edit kh_mod_nf_edits[KH_MOD_NF_NEDITS] = {']
+    for e in edits:
+        if len(e['new']) > 32: die('edit longer than the table field')
+        o.append('  {0x%x,%d,%d,0x%x,%s,%s},' % (e['rva'], len(e['new']), e['pad'], e['func'], arr(e['old']), arr(e['new'])))
+    o += ['};', '#define KH_MOD_NF_BYTES %d' % sum(len(e['new']) for e in edits),
+          '#define KH_MOD_NF_NFUNCS %d' % len(funcs), 'static const unsigned kh_mod_nf_funcs[KH_MOD_NF_NFUNCS] = {%s};' % ','.join('0x%x' % f for f in funcs),
+          '/* thread DLL 0x1290: every PERIOD ms  byte[IMM_RVA] = (S1() == 1) ? EQ : NE */',
+          '#define KH_MOD_NF_S1_RVA 0x%xu' % s1, '#define KH_MOD_NF_IMM_RVA 0x%xu' % imm, '#define KH_MOD_NF_IMM_EQ 0x%02x' % T['eq'], '#define KH_MOD_NF_IMM_NE 0x%02x' % T['ne'],
+          '#define KH_MOD_NF_PERIOD_MS %d' % T['period_ms'],
+          '/* what S1 reads (exe code, checked by the generator): bit BIT of the dword at SAVE_RVA + FLAG_OFF */',
+          '#define KH_MOD_NF_SAVE_RVA 0x%xu' % save, '#define KH_MOD_NF_FLAG_OFF 0x41a4u', '#define KH_MOD_NF_FLAG_BIT 6',
+          '#define KH_MOD_NF_ABS_RVA 0x%xu   /* the 8 bytes here are image base + S4 (0x%x): the DLL stores the run-time address */' % (s3 + 0x20, s4),
+          '#define KH_MOD_NF_S4_RVA 0x%xu' % s4, '#define KH_MOD_NF_FLOAT_RVA 0x%xu' % fl, '#define KH_MOD_NF_CAVE_RVA 0x%xu' % cave, '#define KH_MOD_NF_CAVE_LEN %d' % len(cb),
+          '#define KH_MOD_NF_TEXT %s' % json.dumps(R['text'].decode('latin1'))]
+    open(a.out_h, 'w').write('\n'.join(o) + '\n')
+    print('gen_mod_neverland: 5 signatures (%s), %d edits / %d bytes in %d functions (%s), cave 0x%x+%d, float 0x%x = %g, thread byte 0x%x %#x/%#x every %d ms'
+          % (' '.join('%s=%s%s' % (r['name'], r['first'], '' if len(r['hits']) == 1 else ' [first of %d]' % len(r['hits'])) for r in sig_rows), len(edits),
+             sum(len(e['new']) for e in edits), len(funcs), ' '.join('%x' % f for f in funcs), cave, len(cb), fl, summary['float'], imm, T['eq'], T['ne'], T['period_ms']))
+
+if __name__ == '__main__':
+    main()

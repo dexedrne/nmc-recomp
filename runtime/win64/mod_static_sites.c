@@ -67,3 +67,20 @@ int kh_mod_site_360a5a(KCtx *g){
     u16 w=LD(u16,ent); cmp_flags(g,1,(u64)w,(u64)di);
     return (s16)w<(s16)di;
 }
+
+/* ---- exe 0x15b960 (in f_15b6d0): Task 19, NeverlandFly.dll (sha256 1fca202b...7dfb) ---------------------------------------------
+ * Not a Detours site: the DLL never touches the instruction `83 c5 16  add ebp,0x16`, its THREAD (DLL 0x1290) rewrites the
+ * immediate byte at exe 0x15b962 every 250 ms:  [S5+0x292] = (S1()==1) ? 0x16 : 0x1c   (S5 = 0x15b6d0, S1 = exe 0x2e5380).
+ * A lifted function has its immediates baked in, so this one instruction is a site whose handler fetches the immediate from the
+ * image byte each time it runs, as the CPU does; runtime/mod_neverland.c is the thread that writes the byte.
+ *     L15b960:{ kh_mod_site_15b960(g); goto L15b963; }
+ * `add r/m32,imm8` sign-extends the immediate, writes the 32-bit sum (upper half of RBP cleared) and sets the flags of a 32-bit
+ * add (the next instruction, `inc edi`, keeps CF from here).  The two opcode bytes are checked: if anything ever rewrote them
+ * this model would be wrong, and that is a fault, not a guess.  The result is unused (one continuation address). */
+int kh_mod_site_15b960(KCtx *g){
+    if(LD(u16,KH_IMAGE_BASE+0x15b960ull)!=0xc583) kh_fault(g,KH_IMAGE_BASE+0x15b960,"mod-static-sites: exe 0x15b960 is no longer `add ebp,imm8`");
+    u32 imm=(u32)(s32)(s8)LD(u8,KH_IMAGE_BASE+0x15b962ull), a=(u32)KH_RBP(g);
+    PUT(u64,KO_CC_OP,(u64)(CC_ADD+2)); PUT(u64,KO_CC_DEP1,(u64)a); PUT(u64,KO_CC_DEP2,(u64)imm); PUT(u64,KO_CC_NDEP,(u64)0);
+    KH_RBP(g)=(u64)(u32)(a+imm);
+    return 1;
+}

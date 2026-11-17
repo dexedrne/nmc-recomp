@@ -47,6 +47,21 @@ FILE_HOOKS += $(MOD_STATIC_FUNCS)
 CFLAGS += -I$(GEN)
 LIFTOBJ += obj/mod_static_lifted.o
 LIFT_CFLAGS = -std=gnu11 -O1 -w -fno-strict-aliasing -fwrapv -fno-delete-null-pointer-checks -fno-math-errno -ffp-contract=off -I$(ROOT)/lifter-rt -I$(LIFTED)/gen
+# ---- Task 19: NeverlandFly.dll (runtime/mod_neverland.c) --------------------------------------------------------------------------
+# The mod's third DLL installs no detour: it writes 54 bytes of code/data into three exe functions (and into the 0xCC padding behind
+# two of them) and starts a thread that rewrites one immediate byte.  The three functions are re-lifted from the patched image by the
+# Task 12 mechanism (same alias list, same generated C file, own table), with the DLL's edits applied on top of the main mod DLL's:
+#   424570  YS::ACTION_LM::vfn7  motion ids of the swim/flight action (entry jump into a code cave behind the function)
+#   306400  menu 3D model setup  two calls replaced by one (model y offset -25.0)
+#   15b6d0  dk::COMMAND_DRAW     `add ebp,imm8` whose immediate the DLL thread rewrites (site handler kh_mod_site_15b960)
+# $(GEN)/mod_neverland_edits.json and mod_neverland_table.h are decoded statically from the DLL by tools/gen_mod_neverland.py.
+MOD_NEVERLAND_HOOKS = 424570 306400 15b6d0
+MOD_NEVERLAND_DLL ?= /home/user/projects/SillyBillyMod1/dll/NeverlandFly.dll
+MOD_NEVERLAND_EDITS = $(GEN)/mod_neverland_edits.json
+MOD_LIFT_FUNCS = $(MOD_STATIC_FUNCS) $(MOD_NEVERLAND_HOOKS)
+# runtime/mod_neverland.c owns f_<rva> of all three (call counters) and forwards to the re-lifted mod_f_<rva>
+MOD_LIFT_CHAINED = $(MOD_STATIC_CHAINED) $(MOD_NEVERLAND_HOOKS)
+FILE_HOOKS += $(MOD_NEVERLAND_HOOKS)
 all: khnmc
 # Optional vkd3d graphics backend (KHNMC_GFX=vkd3d, runtime/gfx_vkd3d.c): compiled in when the vkd3d libraries exist under VKD3D_PREFIX
 # (make GFX_VKD3D=0 compiles it out: KHNMC_GFX=vkd3d is then a named fatal).  Only gfx_vkd3d.o depends on the switch; the stamp relinks.
@@ -93,22 +108,36 @@ arm64check:
 $(GEN)/mod_static_table.h: tools/gen_mod_static.py $(MOD_EDITS) Makefile
 	python3 tools/gen_mod_static.py --edits $(MOD_EDITS) --exe $(MOD_EXE) --universe $(KH_UNIVERSE) --funcs "$(MOD_STATIC_FUNCS)" \
 	    --inline "$(MOD_STATIC_INLINE)" --chained "$(MOD_STATIC_CHAINED)" --out $@ --report $(GEN)/mod_static_classify.json
-$(GEN)/mod_static_lifted.c: tools/mod_static_lift.py $(MOD_EDITS) $(LIFTED)/shards.json Makefile
-	KH_UNIVERSE=$(KH_UNIVERSE) $(KHLIFT_PY) tools/mod_static_lift.py --khlift $(KHLIFT) --edits $(MOD_EDITS) --exe $(MOD_EXE) \
-	    --funcs "$(MOD_STATIC_FUNCS)" --chained "$(MOD_STATIC_CHAINED)" --vanilla-shards $(LIFTED)/shards --out $@ --report $(GEN)/mod_static_lift.json
+GEN_MOD_NEVERLAND = python3 tools/gen_mod_neverland.py --dll $(MOD_NEVERLAND_DLL) --exe $(MOD_EXE) --universe $(KH_UNIVERSE) --edits $(MOD_EDITS) \
+	    --out-json $(MOD_NEVERLAND_EDITS) --out-h $(GEN)/mod_neverland_table.h
+$(MOD_NEVERLAND_EDITS): tools/gen_mod_neverland.py tools/gen_mod_static.py $(MOD_NEVERLAND_DLL) $(MOD_EDITS) Makefile
+	$(GEN_MOD_NEVERLAND)
+# one run writes both files; the header rule only regenerates when the header alone went missing
+$(GEN)/mod_neverland_table.h: $(MOD_NEVERLAND_EDITS)
+	@test -f $@ || $(GEN_MOD_NEVERLAND)
+obj/mod_neverland.o obj/mod_neverland_test.o: $(GEN)/mod_neverland_table.h
+$(GEN)/mod_static_lifted.c: tools/mod_static_lift.py $(MOD_EDITS) $(MOD_NEVERLAND_EDITS) $(LIFTED)/shards.json Makefile
+	KH_UNIVERSE=$(KH_UNIVERSE) $(KHLIFT_PY) tools/mod_static_lift.py --khlift $(KHLIFT) --edits $(MOD_EDITS) --exe $(MOD_EXE) --extra-edits $(MOD_NEVERLAND_EDITS) \
+	    --funcs "$(MOD_LIFT_FUNCS)" --chained "$(MOD_LIFT_CHAINED)" --vanilla-shards $(LIFTED)/shards --out $@ --report $(GEN)/mod_static_lift.json
 obj/mod_static.o: $(GEN)/mod_static_table.h
 obj/mod_static_lifted.o: $(GEN)/mod_static_lifted.c
 	@mkdir -p obj && $(CC) $(LIFT_CFLAGS) -c $< -o $@
 all: obj/mod_static_link.ok
 obj/mod_static_link.ok: khnmc tools/check_mod_static_link.py
-	python3 tools/check_mod_static_link.py --bin khnmc --obj obj --funcs "$(MOD_STATIC_FUNCS)" --chained "$(MOD_STATIC_CHAINED)" && touch $@
+	python3 tools/check_mod_static_link.py --bin khnmc --obj obj --funcs "$(MOD_LIFT_FUNCS)" --chained "$(MOD_LIFT_CHAINED)" && touch $@
 # native-oracle differential of the re-lifted functions against the patched bytes (x86-64 Linux dev host; not part of `all`).
 # CPU-heavy: runs niced, MOD_STATIC_DIFFTEST_JOBS processes at a time (keep it low on a shared desktop).
 MOD_STATIC_DIFFTEST_JOBS ?= 4
 mod-static-difftest:
 	KH_UNIVERSE=$(KH_UNIVERSE) nice -n 10 $(KHLIFT_PY) tools/mod_static_difftest.py --jobs $(MOD_STATIC_DIFFTEST_JOBS) --khlift $(KHLIFT) --edits $(MOD_EDITS) --exe $(MOD_EXE) \
-	    --funcs "$(MOD_STATIC_FUNCS)" --chained "$(MOD_STATIC_CHAINED)" --vanilla-shards $(LIFTED)/shards --lifted $(GEN)/mod_static_lifted.c \
-	    --sites $(ROOT)/runtime/mod_static_sites.c --work obj/mod_static_difftest --out $(GEN)/mod_static_difftest.json
+	    --extra-edits $(MOD_NEVERLAND_EDITS) --funcs "$(MOD_LIFT_FUNCS)" --chained "$(MOD_LIFT_CHAINED)" --vanilla-shards $(LIFTED)/shards --lifted $(GEN)/mod_static_lifted.c \
+	    --sites $(ROOT)/runtime/mod_static_sites.c --work obj/mod_static_difftest --out $(GEN)/mod_static_difftest.json $(MOD_STATIC_DIFFTEST_ARGS)
+# the three NeverlandFly functions only (Task 19): same tool, own result file
+mod-neverland-difftest: $(MOD_NEVERLAND_EDITS)
+	KH_UNIVERSE=$(KH_UNIVERSE) nice -n 10 $(KHLIFT_PY) tools/mod_static_difftest.py --jobs $(MOD_STATIC_DIFFTEST_JOBS) --khlift $(KHLIFT) --edits $(MOD_EDITS) --exe $(MOD_EXE) \
+	    --extra-edits $(MOD_NEVERLAND_EDITS) --funcs "$(MOD_LIFT_FUNCS)" --chained "$(MOD_LIFT_CHAINED)" --vanilla-shards $(LIFTED)/shards --lifted $(GEN)/mod_static_lifted.c \
+	    --sites $(ROOT)/runtime/mod_static_sites.c --work obj/mod_static_difftest --only "$(shell echo $(MOD_NEVERLAND_HOOKS) | tr ' ' ',')" \
+	    --out $(GEN)/mod_neverland_difftest.json $(MOD_STATIC_DIFFTEST_ARGS)
 clean:
 	rm -rf obj khnmc
-.PHONY: all clean arm64check mod-static-difftest
+.PHONY: all clean arm64check mod-static-difftest mod-neverland-difftest

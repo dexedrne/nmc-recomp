@@ -4,7 +4,8 @@
   mod_static_difftest.py --khlift DIR --edits edit_list.json --exe kh2fm.exe --funcs "RVA ..." --chained "RVA ..."
         --vanilla-shards lifted/shards --lifted gen/mod_static_lifted.c --sites runtime/mod_static_sites.c
         --work DIR --out result.json [--tests 48] [--mid-tests 12] [--blk-tests 16] [--native-ms 20] [--jobs 4] [--seed 1234]
-        [--only RVA,RVA] [--mutate-vanilla]      (debug: MSDT_DEBUG=<seconds>|trace, MSDT_ONE=<block hex>:<seed>)
+        [--only RVA,RVA] [--mutate-vanilla] [--extra-edits gen/mod_neverland_edits.json]
+        (debug: MSDT_DEBUG=<seconds>|trace, MSDT_ONE=<block hex>:<seed>)
 
 Method (the lifter's tools/difftest.py --oracle native, reused: test generation, state compare, image diff, INT3 callee stubs):
   oracle  the patched image is mapped at its own address and the function's ORIGINAL (patched) x86 bytes run on this CPU;
@@ -29,6 +30,12 @@ Additions needed for these functions (they sit deep in game logic; a random func
     each edited instruction, and which successors were taken.
   * the two inline detour sites: the oracle traps at the site and runs the same C handler as the lifted code
     (tools/mod_static_oracle.c).  No DLL code is executed.
+  * Task 19 (--extra-edits, NeverlandFly.dll): its edits are part of the patched image, so the oracle runs the patched function bytes
+    INCLUDING the 13-byte code cave behind f_424570 (they are bytes of the patched exe image, like every other edit; the DLL file
+    is never mapped or run), and the lifted side is the function re-lifted with the cave as a block.  The site of kind 'imm'
+    (`add ebp,imm8`, immediate rewritten by the DLL's thread) is NOT trapped: the oracle executes the real instruction and the
+    lifted side the handler that fetches the immediate from the image byte, and every test of that function runs with one of the
+    thread's two immediates poked into the image (by seed), so the handler is tested against the instruction for both.
 Not counted as valid tests (each is a named skip in the result file): the oracle faulted or ran past its CPU-time limit; a
 single-block test entered a jump-table dispatch block behind the function's bounds check with an index outside the table (the
 lifted switch faults by policy, the oracle jumps wild); a run that changed more than 64 image pages.  The arena and the stack are
@@ -154,6 +161,7 @@ def main():
     ap.add_argument('--jobs', type=int, default=4); ap.add_argument('--seed', type=int, default=1234); ap.add_argument('--only')
     ap.add_argument('--native-ms', type=int, default=20, help='CPU-time limit of one oracle run (a useful run takes microseconds; long loops over random data are cut here)')
     ap.add_argument('--mutate-vanilla', action='store_true', help='sensitivity check: test the VANILLA lifted text against the patched oracle; mismatches are expected')
+    ap.add_argument('--extra-edits', help='NeverlandFly edit list (tools/gen_mod_neverland.py), applied on top of the main mod DLL edits')
     a = ap.parse_args()
     os.makedirs(a.work, exist_ok=True)
     K = MSL.setup(a.khlift, a.exe); BASE = K.BASE
@@ -285,13 +293,18 @@ def main():
     KLUDGE = re.compile(r'=\(u64\)\(\(u64\)t\d+ - \(u64\)\(\(u64\)0x120ull\)\);\nPUT\(u64,48,t\d+\);\n')
     def run_function(rva):
         """runs in a forked child; returns the result dict"""
-        f = G.by_rva[rva]; site = MSL.SITES.get(rva); text = TXT[rva][1].text
+        f = G.by_rva_p[rva]; site = MSL.SITES.get(rva); text = TXT[rva][1].text
+        trap = site if site and site.get('kind', 'detours') == 'detours' else None      # Detours site: INT3 + the C handler on the oracle side
+        imm = site if site and site.get('kind') == 'imm' else None                      # immediate site: the oracle runs the real instruction
+        def set_imm(val):
+            va = BASE + imm['imm_rva']; pg = va & ~0xfff
+            libc.mprotect(pg, 0x1000, 7); ctypes.memmove(va, bytes([val]), 1); libc.mprotect(pg, 0x1000, 5)
         if os.environ.get('MSDT_DEBUG'):                                  # where is a slow child? (python stack every N seconds)
             import faulthandler; faulthandler.dump_traceback_later(int(os.environ['MSDT_DEBUG']) if os.environ['MSDT_DEBUG'].isdigit() else 600, repeat=True, file=sys.stderr)
         depth, bts, why = stack_depths(K, G.pat, f, site)
         res = dict(rva='%x' % rva, depth_analysis=why, entry=dict(run=0, valid=0, mismatch=0), mid=dict(run=0, valid=0, mismatch=0),
                    blk=dict(run=0, valid=0, mismatch=0), skips=collections.Counter(),
-                   examples=[], site_hits=0, bt_sites=[], bt_scratch_tests=0)
+                   examples=[], site_hits=0, bt_sites=[], bt_scratch_tests=0, imm_tests=collections.Counter())
         # VEX lifts `bt/bts/btr/btc reg,reg` through a scratch store of the operand at [rsp-288] (rsp is lowered and restored inside
         # the instruction).  The original writes nothing.  Those bytes, and only those, are excused in the stack compare and counted.
         nk = len(KLUDGE.findall(text)); exempt = []
@@ -310,7 +323,7 @@ def main():
         hits = collections.Counter(); succ = collections.defaultdict(set); entered = collections.Counter()
         bhits = collections.Counter(); bsucc = collections.defaultdict(set); bmis = collections.Counter()
         lib.khtest_init(); DT.patch_int3(env, rva)
-        if site:
+        if trap:
             pg = (BASE + site['site']) & ~0xfff
             libc.mprotect(pg, 0x2000, 7); ctypes.memmove(BASE + site['site'], b'\xcc', 1); libc.mprotect(pg, 0x2000, 5)
             lib.kn_site_clear()
@@ -346,6 +359,8 @@ def main():
                     t[nme] = v if k < 0.5 else (v | (0xffffffff00000000 if v & 0x80000000 else 0)) if k < 0.75 else (v | (rr.getrandbits(32) << 32))
             if mid and (entry_va - BASE) in SITE_DIRECTED and (seed & 1): SITE_DIRECTED[entry_va - BASE](DT, t, _random.Random(seed ^ 0x51fe))
             if mid: t['rsp'] = RSP0 - d                                   # the return address slot stays at RSP0
+            immv = None
+            if imm: immv = imm['imm_values'][(seed >> 1) & 1]; set_imm(immv)   # one of the two bytes the DLL thread stores, for both sides
             setup(t, seed)
             inn = DT.NState(); outn = DT.NState()
             for i, n in enumerate(R64): inn.gpr[i] = t[n]
@@ -421,6 +436,7 @@ def main():
                 return
             if excused: res['bt_scratch_tests'] += 1
             if one_block:
+                if imm and entry_va - BASE == imm['site']: res['imm_tests']['%x' % immv] += 1      # the site block itself, per immediate
                 bhits[entry_va - BASE] += 1; bsucc[entry_va - BASE].add('%x' % (nstop - BASE) if nstop else 'ret'); return
             seen = set()
             for i, b in enumerate(trace):
@@ -444,9 +460,9 @@ def main():
             pg = va & ~0xfff; libc.mprotect(pg, 0x1000, 7); ctypes.memmove(va, byte, 1); libc.mprotect(pg, 0x1000, 5)
         orig = {b: G.pat[b:b + 1] for b in blocks[rva]}
         for b in blocks[rva]:
-            if not (site and b == site['site']): poke(BASE + b, b'\xcc')
+            if not (trap and b == trap['site']): poke(BASE + b, b'\xcc')
         for blk in blocks[rva]:
-            is_site = bool(site and blk == site['site'])
+            is_site = bool(trap and blk == trap['site'])
             if not is_site: poke(BASE + blk, orig[blk])
             lib.kn_stop_clear()
             for b in blocks[rva]:
@@ -457,7 +473,8 @@ def main():
                 one(sd, BASE + blk, dz.get(BASE + blk, 0), True)
             if not is_site: poke(BASE + blk, b'\xcc')
         lib.kn_stop_clear(); single.value = 0
-        res['skips'] = dict(res['skips']); res['hits'] = {('%x' % k): v for k, v in hits.items()}
+        res['skips'] = dict(res['skips']); res['hits'] = {('%x' % k): v for k, v in hits.items()}; res['imm_tests'] = dict(res['imm_tests'])
+        if imm: set_imm(imm['imm_values'][0])
         res['bhits'] = {('%x' % k): v for k, v in bhits.items()}; res['bsucc'] = {('%x' % k): sorted(v) for k, v in bsucc.items()}
         res['bmis'] = {('%x' % k): v for k, v in bmis.items()}
         res['succ'] = {('%x' % k): sorted('%x' % x for x in v) for k, v in succ.items()}
@@ -507,6 +524,11 @@ def main():
     bad = [r for r in results.values() if r.get('error') or r['entry']['mismatch'] or r['mid']['mismatch'] or r['blk']['mismatch']]
     novalid = [r for r in results.values() if not r.get('error') and r['entry']['valid'] + r['mid']['valid'] + r['blk']['valid'] == 0]
     uncovered = [e for e in edits if e['path_hits'] + e['block_hits'] == 0]
+    for rva in want:                                                      # an immediate site must be exercised with every byte the thread stores
+        st = MSL.SITES.get(rva)
+        if st and st.get('kind') == 'imm' and not a.mutate_vanilla:
+            for v in st['imm_values']:
+                if not results[rva].get('imm_tests', {}).get('%x' % v, 0): uncovered.append(dict(func='%x' % rva, kind='imm-value', rva='%x' % st['imm_rva'], value='%x' % v))
     summ = dict(functions=len(want), entry_tests=sum(r.get('entry', {}).get('run', 0) for r in results.values()),
                 entry_valid=sum(r.get('entry', {}).get('valid', 0) for r in results.values()),
                 mid_tests=sum(r.get('mid', {}).get('run', 0) for r in results.values()), mid_valid=sum(r.get('mid', {}).get('valid', 0) for r in results.values()),
@@ -537,7 +559,9 @@ def main():
         print('%-7x entry %3d/%3d valid, %d mismatch | mid-entry %4d/%4d valid, %d mismatch | single-block %4d/%4d valid, %d mismatch | blocks: %3d/%3d on a valid path, %3d/%3d single | stubs %d%s%s' % (
             rva, R['entry']['valid'], R['entry']['run'], R['entry']['mismatch'], R['mid']['valid'], R['mid']['run'], R['mid']['mismatch'],
             R['blk']['valid'], R['blk']['run'], R['blk']['mismatch'], hb, nb, len(R['bhits']), nb, R['stub_calls'],
-            (' | site traps %d' % R['site_hits']) if rva in MSL.SITES else '', (' | depth analysis: %s' % R['depth_analysis']) if R['depth_analysis'] else '')
+            (' | site traps %d' % R['site_hits']) if rva in MSL.SITES and MSL.SITES[rva].get('kind', 'detours') == 'detours' else
+            (' | immediate-site block: valid matching single-block tests per image byte %s' % json.dumps(R.get('imm_tests', {}), sort_keys=True)) if rva in MSL.SITES else '',
+            (' | depth analysis: %s' % R['depth_analysis']) if R['depth_analysis'] else '')
             + ((' | bt scratch excused in %d tests (sites %s)' % (R['bt_scratch_tests'], ','.join(R['bt_sites']))) if R.get('bt_sites') else '') + ((' | ' + R['bt_note']) if R.get('bt_note') else ''))
         for ex in R['examples'][:2]: print('          example:', json.dumps(ex)[:400])
     for e in edits: print('%s %s in f_%s block %s: single-block %d valid matching tests -> %s | on %d valid matching paths -> %s%s' % (

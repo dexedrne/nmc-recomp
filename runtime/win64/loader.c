@@ -104,6 +104,8 @@ static void *guest_main(void *arg){
     /* Task 12: mod static edits + buffer.  PC order: the mod DLL patches the image from its DllMain, loaded by Panacea's DllMain (a static
      * import of the exe), i.e. before the exe's TLS callbacks, CRT initialisers and entry point. */
     { extern void kh_mod_static_init(KCtx *); kh_mod_static_init(g); }
+    /* Task 19: NeverlandFly.dll, the DLL Panacea loads after the main mod DLL (file-name order): signatures, 54 bytes, the row-step thread */
+    { extern void kh_mod_neverland_init(KCtx *); kh_mod_neverland_init(g); }
     kh_run_tls_callbacks(g,1);
     kh_mod_syscalls_init(g);
     { extern void kh_mod_difficulty_init(KCtx *); kh_mod_difficulty_init(g); }

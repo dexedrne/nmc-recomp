@@ -1,0 +1,339 @@
+/* Task 19 selftest: NeverlandFly.dll port (mod_neverland.c, kh_mod_site_15b960, the three re-lifted functions).
+ * Every expected value below is written from the DLL listing (DLL 0x1070 / 0x1290 / 0x12d0 / 0x15a0) and from the exe code the
+ * DLL patches, NOT from the code under test.  The function-level proof of the re-lifted bodies against the patched x86 bytes is
+ * the lifter differential (make mod-neverland-difftest); here: the image, the signatures, the edits, the motion choice of
+ * f_424570 on every branch, the menu-model slot the DLL writes, the immediate site, the thread step, the named fatals. */
+#include "mod_config.h"
+#include <unistd.h>
+#include <time.h>
+#include <math.h>
+#include <sys/wait.h>
+static int checks, failures;
+#define T(c) do { checks++; if(!(c)){ failures++; fprintf(stderr,"mod neverland selftest FAIL line %d: %s\n",__LINE__,#c); } } while(0)
+
+KhFn kh_lookup(u64 target);
+struct kh_mod_static_fn { u32 rva; KhFn mod, orig; int chained; };
+extern const struct kh_mod_static_fn kh_mod_neverland_fn_table[]; extern const u32 kh_mod_neverland_fn_count;
+void f_424570(KCtx *); void f_306400(KCtx *); void f_15b6d0(KCtx *);
+
+/* exe addresses the DLL's five signatures resolve to (static scan of the pinned exe; S5 has two matches, the DLL takes the lower) */
+enum { S1=0x2e5380, S2=0x424570, S3=0x30660a, S4=0x2ffa30, S5=0x15b6d0, S5_SECOND=0x1a05a0 };
+#define SAVE_FLAGS (GS_BASE+0x9a98b0+0x41a4)    /* GAME_SAVE (exe 0x152380 returns 0x9a98b0) + 0x41a4: the dword f_2e5380 tests */
+#define ROW_IMM    (GS_BASE+0x15b962)           /* S5+0x292: imm8 of `add ebp,imm8` at 0x15b960 */
+
+static int run_child(KCtx *g,void (*body)(KCtx *),int fd,char *out,size_t cap){
+    FILE *log=tmpfile(); if(!log) kh_fatal(g,"mod neverland selftest: tmpfile failed");
+    fflush(stdout); fflush(stderr);
+    pid_t child=fork(); if(child<0) kh_fatal(g,"mod neverland selftest: fork failed");
+    if(!child){ if(dup2(fileno(log),fd)<0) _exit(98); body(g); fflush(stdout); _exit(99); }
+    int status=0; if(waitpid(child,&status,0)!=child) kh_fatal(g,"mod neverland selftest: waitpid failed");
+    rewind(log); size_t n=fread(out,1,cap-1,log); out[n]=0; fclose(log);
+    return WIFEXITED(status)?WEXITSTATUS(status):-1;
+}
+/* guest-ABI call of a host function: return address pushed, registers left as the callee left them */
+static void call_raw(KCtx *g,KhFn fn,u64 a0,u64 a1,u64 a2,u64 a3){
+    u64 save=KH_RSP(g), sp=((save-0x100)&~0xFull)-8;
+    wr64(g,sp,0x7ff7ffff0000ull); KH_RSP(g)=sp; KH_RCX(g)=a0; KH_RDX(g)=a1; KH_R8(g)=a2; KH_R9(g)=a3;
+    fn(g);
+    T(KH_RSP(g)==sp+8);
+    KH_RSP(g)=save;
+}
+static void set_f(KCtx *g,u64 a,float f){ u32 v; memcpy(&v,&f,4); wr32(g,a,v); }
+static v128 vec_f(float f){ v128 o=VZ; memcpy(&o,&f,4); return o; }
+static v128 vec_seed(u8 b){ v128 o; memset(&o,b,sizeof o); return o; }
+static int vec_eq(v128 a,v128 b){ return !memcmp(&a,&b,sizeof a); }
+static s32 rel32(KCtx *g,u64 at){ return (s32)rd32(g,at); }
+
+/* ---- the image after init: what the six edits ARE (DLL 0x1620..0x1687 through r8 = S2, DLL 0x1530..0x158d through rbp = S3) ------ */
+static void test_image(KCtx *g){
+    u32 rva,len,func; int pad; const u8 *o,*nw; int n=kh_mod_neverland_nedits(); u32 total=0, prev_end=0, npad=0;
+    T(n==6);
+    for(int i=0;kh_mod_neverland_edit(i,&rva,&len,&pad,&func,&o,&nw);i++){
+        T(len>=1&&len<=32); T(rva>=prev_end); prev_end=rva+len; total+=len; npad+=(u32)pad;
+        T(memcmp(o,nw,len)!=0); T(!memcmp(hp(g,GS_BASE+rva),nw,len));
+        T(rva>=0x1000&&rva+len<=0x1000+0x5773f3);                        /* .text */
+        T(func==0x424570||func==0x306400);
+        if(pad){ int cc=1; for(u32 k=0;k<len;k++) if(o[k]!=0xcc) cc=0; T(cc); T(rva==0x306784||rva==0x4245f2); }   /* padding: was all INT3 */
+    }
+    T(total==54); T(npad==2);
+    T(kh_mod_neverland_check(g,GS_BASE)==0);                             /* applied: edit 0 no longer shows its old bytes */
+    /* (1) exe 0x424570: S2+3 = jmp rel32 to the cave S2+0x82; cave = xorps xmm3,xmm3 ; xor edx,edx ; add edx,0x14 ; jmp S2+8 */
+    T(rd8(g,GS_BASE+S2+3)==0xe9&&S2+3+5+rel32(g,GS_BASE+S2+4)==S2+0x82);
+    T(rd32(g,GS_BASE+S2+0x82)==0x33db570f&&rd32(g,GS_BASE+S2+0x86)==0x14c283d2);
+    T(rd8(g,GS_BASE+S2+0x8a)==0xe9&&S2+0x8a+5+rel32(g,GS_BASE+S2+0x8b)==S2+8);
+    T(rd8(g,GS_BASE+S2+0x8f)==0xcc&&rd8(g,GS_BASE+S2+0x81)==0xc3);        /* 13 bytes exactly, behind the function's ret */
+    T(rd16(g,GS_BASE+S2+0x35)==0xc281&&rd32(g,GS_BASE+S2+0x37)==0x16);     /* add edx,0x9a -> add edx,0x16 */
+    T(rd32(g,GS_BASE+S2+0x5a)==0xc283d233&&rd8(g,GS_BASE+S2+0x5e)==0x15);  /* setbe dl ; inc edx -> xor edx,edx ; add edx,0x15 */
+    /* (2) exe 0x30661b = S3+0x11: movss xmm2,[S3+0x17a] ; mov edx,edi ; mov rcx,r14 ; mov rax,S4 ; call rax ; nop */
+    T(rd32(g,GS_BASE+S3+0x11)==0x15100ff3&&S3+0x11+8+rel32(g,GS_BASE+S3+0x15)==S3+0x17a);
+    T(rd32(g,GS_BASE+S3+0x17a)==0xc1c80000);                              /* -25.0f */
+    T(rd32(g,GS_BASE+S3+0x19)==0x8b49d78b&&rd16(g,GS_BASE+S3+0x1d)==0x48ce&&rd8(g,GS_BASE+S3+0x1f)==0xb8);
+    T(rd64(g,GS_BASE+S3+0x20)==GS_BASE+S4);                               /* the run-time address of S4: this image's base */
+    T(rd16(g,GS_BASE+S3+0x28)==0xd0ff&&rd8(g,GS_BASE+S3+0x2a)==0x90&&rd8(g,GS_BASE+S3+0x2b)==0x48);
+    T(kh_lookup(rd64(g,GS_BASE+S3+0x20))!=NULL&&kh_lookup(rd64(g,GS_BASE+S3+0x20))==kh_lookup(GS_BASE+0x2ffa30));
+    /* (3) the row-step instruction itself is vanilla; its immediate is one of the thread's two values */
+    T(rd16(g,GS_BASE+0x15b960)==0xc583); { u8 b=rd8(g,ROW_IMM); T(b==0x16||b==0x1c); }
+}
+
+/* ---- signatures -------------------------------------------------------------------------------------------------------------- */
+static void restore_old(KCtx *g,u64 base){
+    u32 rva,len,func; int pad; const u8 *o,*nw;
+    for(int i=0;kh_mod_neverland_edit(i,&rva,&len,&pad,&func,&o,&nw);i++) memcpy(hp(g,base+rva),o,len);
+}
+static const u8 pat_s3[12]={@KHINPUT(array,pc/kh2fm.exe,3168778,12,f27f512cb225d6fdaf4afff9229cc24a1ad65e5bc766b54604b0e4d4de6db29c)@};                /* DLL .rdata 0x9260 */
+static const u8 pat_s1[24]={@KHINPUT(array,mod/dll/NeverlandFly.dll,32768,24,534601dadcee80dec29468933240191d624d956b14fa60f3c1afc3692050f3bf)@};   /* 0x9200, mask xxxxx??x... */
+static void test_signatures(KCtx *g){
+    u32 n=0;
+    /* live image, after the DLL's own writes: S2's bytes 3..7 are now the jmp, so S2 no longer matches anywhere; the others do */
+    T(kh_mod_neverland_scan(g,GS_BASE,IMG_SIZE,0,&n)==S1&&n==1);
+    n=7; T(kh_mod_neverland_scan(g,GS_BASE,IMG_SIZE,1,&n)==0&&n==0);
+    T(kh_mod_neverland_scan(g,GS_BASE,IMG_SIZE,2,&n)==S3&&n==1);
+    T(kh_mod_neverland_scan(g,GS_BASE,IMG_SIZE,3,&n)==S4&&n==1);
+    T(kh_mod_neverland_scan(g,GS_BASE,IMG_SIZE,4,&n)==S5&&n==2);
+    T(kh_mod_neverland_scan(g,GS_BASE+S5+1,IMG_SIZE-S5-1,4,&n)==S5_SECOND-S5-1&&n==1);       /* the match the DLL does not take */
+    { u32 f=1,c=1; T(kh_mod_neverland_sig_check(g,GS_BASE,IMG_SIZE,&f,&c)==1&&f==0&&c==0); }
+    /* the image as the DLL found it (old bytes back): all five match as the generator recorded, the edits verify; then re-apply */
+    restore_old(g,GS_BASE);
+    T(kh_mod_neverland_sig_check(g,GS_BASE,IMG_SIZE,NULL,NULL)==-1);
+    T(kh_mod_neverland_scan(g,GS_BASE,IMG_SIZE,1,&n)==S2&&n==1);
+    T(kh_mod_neverland_check(g,GS_BASE)==-1);
+    kh_mod_neverland_apply(g,GS_BASE);
+    T(kh_mod_neverland_check(g,GS_BASE)==0);
+    /* scan rules on a scratch block: lowest address wins; the last candidate is size-2 (DLL: `cmp pos,end-1 ; jae not-found`) and
+     * the compare reads past it; `?` bytes are not compared, `x` bytes are */
+    u64 blk=ga_calloc(1,0x200);
+    memcpy(hp(g,blk+0x40),pat_s3,12); memcpy(hp(g,blk+0x90),pat_s3,12);
+    T(kh_mod_neverland_scan(g,blk,0x200,2,&n)==0x40&&n==2);
+    T(kh_mod_neverland_scan(g,blk+0x41,0x1bf,2,&n)==0x4f&&n==1);
+    T(kh_mod_neverland_scan(g,blk,0x92,2,&n)==0x40&&n==2);                /* candidate 0x90 = size-2: still tested */
+    T(kh_mod_neverland_scan(g,blk,0x91,2,&n)==0x40&&n==1);                /* size-1 is not a candidate */
+    T(kh_mod_neverland_scan(g,blk,0x41,2,&n)==0&&n==0); T(kh_mod_neverland_scan(g,blk,0x42,2,&n)==0x40&&n==1);
+    memset(hp(g,blk),0,0x200); memcpy(hp(g,blk+0x10),pat_s1,24); wr8(g,blk+0x15,0x5a); wr8(g,blk+0x16,0xa5);
+    T(kh_mod_neverland_scan(g,blk,0x200,0,&n)==0x10&&n==1);               /* the call displacement bytes are wildcards */
+    wr8(g,blk+0x17,0xe7); T(kh_mod_neverland_scan(g,blk,0x200,0,&n)==0&&n==0);
+    wr8(g,blk+0x17,0xe6); wr8(g,blk+0x10+23,0x82); T(kh_mod_neverland_scan(g,blk,0x200,0,&n)==0&&n==0);   /* last byte counts */
+    ga_free(blk);
+}
+
+/* ---- check / apply on a scratch image, named fatals -------------------------------------------------------------------------------- */
+static u64 scratch, scratch_base; static u32 span_lo, span_hi;
+static void scratch_fill(KCtx *g){ memset(hp(g,scratch),0,span_hi-span_lo); restore_old(g,scratch_base); }
+static int fatal_edit;
+static void fatal_old(KCtx *g){ u32 rva,len,func; int pad; const u8 *o,*nw; kh_mod_neverland_edit(fatal_edit,&rva,&len,&pad,&func,&o,&nw);
+    scratch_fill(g); wr8(g,scratch_base+rva+len-1,(u8)(o[len-1]^0x40)); kh_mod_neverland_apply(g,scratch_base); }
+static void fatal_reinit(KCtx *g){ kh_mod_neverland_init(g); }
+static void fatal_sig_live(KCtx *g){ kh_mod_neverland_sig_verify(g,GS_BASE,IMG_SIZE); }                              /* S2: gone since the DLL patched it */
+static void fatal_sig_s4(KCtx *g){ restore_old(g,GS_BASE); wr8(g,GS_BASE+S4+27,0xc2); kh_mod_neverland_sig_verify(g,GS_BASE,IMG_SIZE); }
+static void fatal_sig_s5(KCtx *g){ restore_old(g,GS_BASE); wr8(g,GS_BASE+S5_SECOND,0x45); kh_mod_neverland_sig_verify(g,GS_BASE,IMG_SIZE); }
+static void fatal_sig_first(KCtx *g){ restore_old(g,GS_BASE); memcpy(hp(g,GS_BASE+0x1000),pat_s3,12); kh_mod_neverland_sig_verify(g,GS_BASE,IMG_SIZE); }
+static void fatal_site(KCtx *g){ wr8(g,GS_BASE+0x15b961,0xc3); kh_mod_site_15b960(g); }
+static void child_banner(KCtx *g){ (void)g; kh_mod_neverland_banner(); }
+static void test_apply(KCtx *g){
+    u32 rva,len,func; int pad; const u8 *o,*nw; int n=kh_mod_neverland_nedits(); char out[8192];
+    kh_mod_neverland_edit(0,&rva,&len,&pad,&func,&o,&nw); span_lo=rva&~0xfffu;
+    kh_mod_neverland_edit(n-1,&rva,&len,&pad,&func,&o,&nw); span_hi=(rva+len+0xfff)&~0xfffu;
+    scratch=ga_calloc(1,span_hi-span_lo); T(scratch!=0); if(!scratch) return;
+    scratch_base=scratch-span_lo;
+    scratch_fill(g);
+    T(kh_mod_neverland_check(g,scratch_base)==-1);
+    kh_mod_neverland_apply(g,scratch_base);
+    u64 written=0, nz=0, nz_new=0;
+    for(int i=0;kh_mod_neverland_edit(i,&rva,&len,&pad,&func,&o,&nw);i++){ T(!memcmp(hp(g,scratch_base+rva),nw,len)); written+=len; for(u32 k=0;k<len;k++) nz_new+=nw[k]!=0; }
+    { const u8 *p=hp(g,scratch); for(u64 i=0;i<span_hi-span_lo;i++) nz+=p[i]!=0; }
+    T(written==54); T(nz==nz_new);                                       /* nothing outside the six ranges was touched */
+    T(kh_mod_neverland_check(g,scratch_base)==0);                        /* a second application is refused at edit 0 */
+    scratch_fill(g);
+    for(int i=0;kh_mod_neverland_edit(i,&rva,&len,&pad,&func,&o,&nw);i++){
+        u32 at=(i&1)?len-1:0; u8 keep=rd8(g,scratch_base+rva+at);
+        wr8(g,scratch_base+rva+at,(u8)(keep^0x01)); T(kh_mod_neverland_check(g,scratch_base)==i); wr8(g,scratch_base+rva+at,keep);
+    }
+    T(kh_mod_neverland_check(g,scratch_base)==-1);
+    const int probe[]={0,3,n-1};
+    for(unsigned k=0;k<3;k++){
+        fatal_edit=probe[k]; kh_mod_neverland_edit(fatal_edit,&rva,&len,&pad,&func,&o,&nw);
+        char want[80]; snprintf(want,sizeof want,"mod-neverland-old-bytes: edit %d of 6 at rva 0x%x ",fatal_edit,rva);
+        T(run_child(g,fatal_old,STDERR_FILENO,out,sizeof out)==3); T(strstr(out,want)!=NULL); T(strstr(out,"nothing was written")!=NULL);
+    }
+    T(run_child(g,fatal_reinit,STDERR_FILENO,out,sizeof out)==3); T(strstr(out,"mod-neverland-reinit:")!=NULL);
+    T(run_child(g,fatal_sig_live,STDERR_FILENO,out,sizeof out)==3); T(strstr(out,"mod-neverland-signature: S2 (19 bytes")!=NULL&&strstr(out,"would use address 0")!=NULL);
+    T(run_child(g,fatal_sig_s4,STDERR_FILENO,out,sizeof out)==3); T(strstr(out,"mod-neverland-signature: S4 (28 bytes")!=NULL&&strstr(out,"no match")!=NULL);
+    T(run_child(g,fatal_sig_s5,STDERR_FILENO,out,sizeof out)==3); T(strstr(out,"mod-neverland-signature: S5 (16 bytes")!=NULL&&strstr(out,"first match 0x15b6d0 of 1, the pinned kh2fm.exe has 0x15b6d0 of 2")!=NULL);
+    T(run_child(g,fatal_sig_first,STDERR_FILENO,out,sizeof out)==3); T(strstr(out,"mod-neverland-signature: S3 (12 bytes")!=NULL&&strstr(out,"first match 0x1000 of 2, the pinned kh2fm.exe has 0x30660a of 1")!=NULL);
+    T(run_child(g,fatal_site,STDERR_FILENO,out,sizeof out)==5); T(strstr(out,"exe 0x15b960 is no longer `add ebp,imm8`")!=NULL);
+    T(run_child(g,child_banner,STDOUT_FILENO,out,sizeof out)==99); T(!strcmp(out,"flytest\n"));       /* DLL 0x1692: printf to stdout, once */
+    ga_free(scratch);
+}
+
+/* ---- (1) f_424570, YS::ACTION_LM::vfn7(this, obj): the motion id it leaves in EDX --------------------------------------------------
+ * Listing (patched; vanilla in brackets):
+ *   424570 mov r8,rdx ; jmp cave: xorps xmm3,xmm3 ; xor edx,edx ; add edx,0x14 ; jmp 424578        [xorps ; xor edx,edx]
+ *   424578 movss xmm1,[r8+0x1c] ; comiss xmm1,xmm3 ; jbe 4245cf                                    speed <= 0 or NaN: id stays 0x14 [0]
+ *   424583 [r8+0x10] == 0 and [r8+0x18] == 0 (ucomiss; NaN is "not equal"):
+ *              comiss xmm3,[r8+0x14] ; setbe dl ; add edx,0x16                                     0x16 + (0 <= y or NaN)   [0x9a + ...]
+ *   4245ad else xmm0 = ([r8+0x12c] + [r8+0x128]) * 0.5 ; xor edx,edx ; add edx,0x15                0x15   [1 + (xmm0 <= speed or NaN)]
+ *   4245cf eax = [r8+0x18c] >> 2 ; test al,1 ; jz ret ; xmm2 = 20.0 ; rcx = r8+0x158 ; jmp 0x3c6dc0   (the motion start; not run here)
+ * The test keeps bit 2 of [obj+0x18c] clear, so the function returns with the id in EDX; the tail call's arguments are covered by
+ * the differential (stub calls whose effect depends on the argument registers). */
+static const struct lm_case { float speed, x, y, z, a128, a12c; u32 mod_id, van_id; } lm_cases[]={
+    {  0.0f,       5.0f,  5.0f, 5.0f, 1.0f, 1.0f, 0x14, 0    },   /* not moving */
+    { -1.0f,       0.0f,  0.0f, 0.0f, 1.0f, 1.0f, 0x14, 0    },
+    { -0.0f,       1.0f,  1.0f, 1.0f, 1.0f, 1.0f, 0x14, 0    },   /* -0 <= 0 */
+    {  NAN,        1.0f,  1.0f, 1.0f, 1.0f, 1.0f, 0x14, 0    },   /* comiss unordered: jbe taken */
+    {  1.0f,       0.0f, -2.0f, 0.0f, 9.0f, 9.0f, 0x16, 0x9a },   /* straight up (y < 0) */
+    {  1.0f,       0.0f,  0.0f, 0.0f, 9.0f, 9.0f, 0x17, 0x9b },   /* 0 <= 0 */
+    {  1.0f,       0.0f,  3.0f, 0.0f, 9.0f, 9.0f, 0x17, 0x9b },   /* straight down */
+    {  1.0f,       0.0f,  NAN,  0.0f, 9.0f, 9.0f, 0x17, 0x9b },   /* comiss unordered: setbe = 1 */
+    {  1.0f,      -0.0f, -1.0f,-0.0f, 9.0f, 9.0f, 0x16, 0x9a },   /* -0 == 0: still the vertical branch */
+    {  1.0f,       0.0f, -0.0f, 0.0f, 9.0f, 9.0f, 0x17, 0x9b },
+    {  INFINITY,   0.0f,-INFINITY,0.0f,9.0f,9.0f, 0x16, 0x9a },
+    {  1e-45f,     0.0f,  1.0f, 0.0f, 9.0f, 9.0f, 0x17, 0x9b },   /* a denormal speed is > 0 */
+    {  1.0f,       2.0f,  0.0f, 0.0f, 1.0f, 1.0f, 0x15, 2    },   /* horizontal: (1+1)*0.5 <= 1 -> vanilla "fast" */
+    {  1.0f,       2.0f,  0.0f, 0.0f, 2.0f, 1.0f, 0x15, 1    },   /* 1.5 <= 1 is false -> vanilla "slow" */
+    {  1.0f,       0.0f,  0.0f, 3.0f, 0.5f, 0.5f, 0x15, 2    },   /* z alone */
+    {  1.0f,       NAN,   0.0f, 0.0f, 4.0f, 4.0f, 0x15, 1    },   /* jp: NaN x is "moving" */
+    {  1.0f,       0.0f,  0.0f, NAN,  0.0f, 0.0f, 0x15, 2    },
+    {  1.0f,       1.0f,  1.0f, 1.0f, NAN,  1.0f, 0x15, 2    },   /* vanilla comiss unordered: setbe = 1 */
+    {  0.25f,     -7.0f, -9.0f, 2.0f, 0.25f,0.5f, 0x15, 1    },
+};
+static void test_action_lm(KCtx *g){
+    const struct kh_mod_static_fn *fe=NULL;
+    for(u32 i=0;i<kh_mod_neverland_fn_count;i++) if(kh_mod_neverland_fn_table[i].rva==0x424570) fe=&kh_mod_neverland_fn_table[i];
+    T(fe!=NULL); if(!fe) return;
+    KhFn cur=kh_lookup(GS_BASE+0x424570);
+    u64 obj=ga_calloc(1,0x200), calls0=0, calls1=0; u8 copy[0x200];
+    const u32 flagv[]={0,0xfffffffbu,0x3};                               /* bit 2 clear: the function returns instead of starting the motion */
+    kh_mod_neverland_counts(0,&calls0);
+    for(unsigned c=0;c<sizeof lm_cases/sizeof *lm_cases;c++) for(unsigned fv=0;fv<3;fv++) for(int which=0;which<2;which++){
+        const struct lm_case *k=&lm_cases[c];
+        memset(hp(g,obj),0x5a,0x200);
+        set_f(g,obj+0x10,k->x); set_f(g,obj+0x14,k->y); set_f(g,obj+0x18,k->z); set_f(g,obj+0x1c,k->speed);
+        set_f(g,obj+0x128,k->a128); set_f(g,obj+0x12c,k->a12c); wr32(g,obj+0x18c,flagv[fv]);
+        memcpy(copy,hp(g,obj),0x200);
+        KH_XMM(g,1)=vec_seed(0x11); KH_XMM(g,2)=vec_seed(0x22); KH_XMM(g,3)=vec_seed(0x33); KH_RAX(g)=0xaaaaaaaaaaaaaaaaull;
+        u64 rbx=KH_RBX(g), rsi=KH_RSI(g), rdi=KH_RDI(g), rbp=KH_RBP(g);
+        call_raw(g,which?fe->orig:cur,GS_BASE+0x750b30,obj,0x8888888888888888ull,0x9999999999999999ull);   /* rcx = the ACTION_LM object (unused) */
+        T(KH_RDX(g)==(which?k->van_id:k->mod_id));                       /* 32-bit result, upper half clear */
+        T(KH_R8(g)==obj); T(KH_RAX(g)==(flagv[fv]>>2));
+        T(vec_eq(KH_XMM(g,3),VZ)); T(vec_eq(KH_XMM(g,1),vec_f(k->speed))); T(vec_eq(KH_XMM(g,2),vec_seed(0x22)));
+        T(KH_RCX(g)==GS_BASE+0x750b30&&KH_R9(g)==0x9999999999999999ull&&KH_RBX(g)==rbx&&KH_RSI(g)==rsi&&KH_RDI(g)==rdi&&KH_RBP(g)==rbp);
+        T(!memcmp(copy,hp(g,obj),0x200));
+    }
+    kh_mod_neverland_counts(0,&calls1);
+    T(calls1-calls0==3*sizeof lm_cases/sizeof *lm_cases);                 /* only the dispatch-table entry counts, not the vanilla body */
+    ga_free(obj);
+}
+
+/* ---- (2) what the patched block of f_306400 calls: exe 0x2ffa30(hud, member, xmm2) and the two calls it replaces ------------------
+ *   2ffa30 movsxd rax,edx ; movzx edx,byte [rax+rcx+0xf44] ; imul rax,rdx,0x1c0 ; movss [rax+rcx+0x854],xmm2 ; ret
+ * +0xf44 = member index -> model slot; a slot is 0x1c0 bytes; the menu draw (exe 0x3001b0) builds each model's matrix from
+ * rotation = slot+0x840 (degrees x,y,z), translation = slot+0x850 (x,y,z), scale = slot+0x860.  Vanilla 0x306400 calls 0x2ffa50
+ * (translation z = -100), 0x2ff890 and 0x2ff8b0 (rotation x and y = 0); the DLL keeps the first and replaces the other two by
+ * 0x2ffa30 with -25.0 (translation y).  These four are vanilla exe functions, run here on a synthetic block. */
+static void test_menu_slot(KCtx *g){
+    static const struct { u32 rva, field; } setters[]={ {0x2ffa30,0x854}, {0x2ff890,0x840}, {0x2ff8b0,0x844}, {0x2ffa50,0x858} };
+    static const u8 slot_of[4]={2,0,3,1};
+    u64 hud=ga_calloc(1,0x2000); u8 *copy=malloc(0x2000);
+    for(unsigned s=0;s<4;s++) for(u32 member=0;member<5;member++){
+        memset(hp(g,hud),0,0x2000); for(int i=0;i<4;i++) wr8(g,hud+0xf44+(u64)i,slot_of[i]); wr8(g,hud+0xf43,1);
+        memcpy(copy,hp(g,hud),0x2000);
+        u64 m=member<4?member:0xffffffffull;                             /* movsxd: member -1 reads the byte in front of the table */
+        u32 slot=member<4?slot_of[member]:1; u64 at=hud+setters[s].field+0x1c0ull*slot;
+        KH_XMM(g,2)=vec_f(-25.0f);
+        call_raw(g,kh_lookup(GS_BASE+setters[s].rva),hud,m,0,0);
+        T(rd32(g,at)==0xc1c80000); T(KH_RAX(g)==0x1c0ull*slot&&KH_RDX(g)==slot&&KH_RCX(g)==hud);
+        memcpy(copy+(at-hud),hp(g,at),4); T(!memcmp(copy,hp(g,hud),0x2000));   /* four bytes, nothing else */
+    }
+    free(copy); ga_free(hud);
+}
+
+/* ---- (3a) the immediate site: `83 c5 ib  add ebp,imm8`, immediate = image byte 0x15b962 -------------------------------------------- */
+static int state_same_except_rbp(const KCtx *a,const KCtx *b){
+    for(int off=0;off<KH_ST_SIZE;off++){
+        if(off>=KO_CC_OP&&off<KO_CC_NDEP+8) continue;
+        if(off>=KO_RBP&&off<KO_RBP+8) continue;
+        if(a->st[off]!=b->st[off]) return 0;
+    }
+    return 1;
+}
+static void test_site(KCtx *g){
+    static KCtx before;
+    const u8 imms[]={0x16,0x1c,0x00,0x01,0x7f,0x80,0xea,0xff};            /* the thread stores only the first two; the instruction takes any byte */
+    const u64 rbps[]={0,1,0x16,0x7fffffeaull,0x7fffffffull,0x80000000ull,0xffffffeaull,0xffffffffull,0x1234567800000010ull,0xffffffff7ffffff0ull};
+    u8 keep=rd8(g,ROW_IMM); u64 rbp0=KH_RBP(g);
+    for(unsigned i=0;i<sizeof imms;i++) for(unsigned j=0;j<sizeof rbps/sizeof *rbps;j++){
+        wr8(g,ROW_IMM,imms[i]); KH_RBP(g)=rbps[j];
+        PUT(u64,KO_CC_OP,(u64)0x2a); PUT(u64,KO_CC_DEP1,(u64)0x1111); PUT(u64,KO_CC_DEP2,(u64)0x2222); PUT(u64,KO_CC_NDEP,(u64)0x3333);
+        memcpy(&before,g,sizeof before);
+        kh_mod_site_15b960(g);
+        u32 a=(u32)rbps[j], imm=(u32)(s32)(s8)imms[i];                   /* imm8 is sign-extended to the operand size */
+        T(KH_RBP(g)==(u64)(u32)(a+imm));                                  /* 32-bit destination: the upper half of RBP is cleared */
+        T(GET(u64,KO_CC_OP)==3&&GET(u64,KO_CC_DEP1)==a&&GET(u64,KO_CC_DEP2)==imm&&GET(u64,KO_CC_NDEP)==0);   /* flags of a 32-bit add (VEX ADDL thunk) */
+        T(state_same_except_rbp(&before,g)); T(rd8(g,ROW_IMM)==imms[i]);
+    }
+    wr8(g,ROW_IMM,keep); KH_RBP(g)=rbp0;
+}
+
+/* ---- (3b) the thread, DLL 0x1290: [S5+0x292] = (S1()==1) ? 0x16 : 0x1c ; Sleep(250) ------------------------------------------------
+ * S1 = exe 0x2e5380: AL = ~([GAME_SAVE+0x41a4] >> 6) & 1.  The caller holds the thread. */
+static void test_thread(KCtx *g){
+    const u32 vals[]={0,0x40,0xffffffbfu,0xffffffffu,0x80,0x20,0x3f,0x7f,0xc0,0x12345678u,0x12345638u,0x40,0};
+    u32 keep=rd32(g,SAVE_FLAGS); u8 keep_imm=rd8(g,ROW_IMM); u64 p0,p1,gap;
+    T(kh_call(g,GS_BASE+0x152380,0,0,0,0)==GS_BASE+0x9a98b0);            /* the block S1 reads (GAME_SAVE::instance) */
+    for(unsigned i=0;i<sizeof vals/sizeof *vals;i++){
+        u8 al_guest=9,al_direct=9, want_al=(u8)(~(vals[i]>>6)&1), want=want_al==1?0x16:0x1c;
+        u32 found=rd32(g,SAVE_FLAGS);
+        T(kh_mod_neverland_s1_agrees(g,vals[i],&al_guest,&al_direct)==1); T(al_guest==want_al&&al_direct==want_al);
+        T(rd32(g,SAVE_FLAGS)==found);                                     /* the comparison restores the flags it found */
+        wr32(g,SAVE_FLAGS,vals[i]); wr8(g,ROW_IMM,i&1?0x16:0x1c);         /* the step stores even when the value does not change */
+        kh_mod_neverland_thread_stats(&p0,&gap);
+        T(kh_mod_neverland_step()==want); T(rd8(g,ROW_IMM)==want);
+        kh_mod_neverland_thread_stats(&p1,&gap); T(p1==p0+1);
+        T(rd32(g,SAVE_FLAGS)==vals[i]);                                   /* the step only reads the save block */
+        /* thread -> site: the row step the command menu now uses */
+        u64 rbp=KH_RBP(g); KH_RBP(g)=100; kh_mod_site_15b960(g); T(KH_RBP(g)==100u+want); KH_RBP(g)=rbp;
+    }
+    wr32(g,SAVE_FLAGS,keep); wr8(g,ROW_IMM,keep_imm);
+}
+/* the real thread: released, it must step at least twice, never closer together than the DLL's Sleep(250), and leave the byte
+ * the live save flags call for */
+static void test_thread_live(KCtx *g){
+    u64 p0,p1,gap; kh_mod_neverland_thread_stats(&p0,&gap); p1=p0;
+    u32 flags=rd32(g,SAVE_FLAGS);
+    kh_mod_neverland_hold(0);
+    for(int i=0;i<4000&&p1<p0+2;i++){ struct timespec ts={0,5000000}; nanosleep(&ts,0); kh_mod_neverland_thread_stats(&p1,&gap); }
+    kh_mod_neverland_hold(1);
+    kh_mod_neverland_thread_stats(&p1,&gap);
+    T(p1>=p0+2); T(gap>=250000000ull); T(rd8(g,ROW_IMM)==((flags&0x40)?0x1c:0x16)); T(rd32(g,SAVE_FLAGS)==flags);
+}
+
+/* ---- link ------------------------------------------------------------------------------------------------------------------------ */
+static void test_link(KCtx *g){
+    static const u32 want[3]={0x15b6d0,0x306400,0x424570}; static const KhFn own[3]={f_15b6d0,f_306400,f_424570};
+    T(kh_mod_neverland_fn_count==3); if(kh_mod_neverland_fn_count!=3) return;
+    for(u32 i=0;i<3;i++){
+        const struct kh_mod_static_fn *f=&kh_mod_neverland_fn_table[i]; KhFn cur=kh_lookup(GS_BASE+f->rva);
+        T(f->rva==want[i]); T(f->chained==1); T(f->mod!=NULL&&f->orig!=NULL&&f->mod!=f->orig);
+        T(cur==own[i]&&cur!=f->mod&&cur!=f->orig);                        /* guest callers reach this file's counter, then the re-lifted body */
+    }
+    u64 c; T(kh_mod_neverland_counts(0,&c)==1&&kh_mod_neverland_counts(2,&c)==1&&kh_mod_neverland_counts(3,&c)==0&&kh_mod_neverland_counts(-1,&c)==0);
+    (void)g;
+}
+
+int kh_mod_neverland_selftest(KCtx *g){
+    u64 sp=KH_RSP(g);
+    kh_mod_neverland_hold(1);                                             /* the thread is parked while the image and the save flags are test data */
+    test_link(g);
+    test_image(g);
+    test_signatures(g);
+    test_apply(g);
+    test_action_lm(g);
+    test_menu_slot(g);
+    test_site(g);
+    test_thread(g);
+    test_thread_live(g);
+    test_image(g);                                                        /* everything is as init left it */
+    kh_mod_neverland_hold(0);
+    T(KH_RSP(g)==sp);
+    fprintf(stderr,"kh: mod neverland selftest: %d checks, %d failures\n",checks,failures);
+    return failures;
+}
