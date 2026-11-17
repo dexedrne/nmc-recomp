@@ -15,5 +15,6 @@ void f_1505a0(KCtx *g){
 }
 void kh_mod_hooks_dump(void){
     kh_mod_hooks_a_dump();
+    kh_mod_params_dump();
     fprintf(stderr,"kh: mod hooks gummi-blocks=%llu\n",(unsigned long long)atomic_load(&gummi_blocks));
 }

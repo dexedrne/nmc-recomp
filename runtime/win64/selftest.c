@@ -227,6 +227,8 @@ int kh_selftest(KCtx *g){
     fails+=kh_mod_hooks_selftest(g);
     extern int kh_mod_hooks_a_selftest(KCtx *);
     fails+=kh_mod_hooks_a_selftest(g);
+    extern int kh_mod_params_selftest(KCtx *);
+    fails+=kh_mod_params_selftest(g);
     input_selftest(g);
     /* allocator */
     u64 p[64]; for(int i=0;i<64;i++){ p[i]=ga_alloc((u64)(i*37+1),(i%5==0)?64:16); CHECK(p[i]&&!(p[i]&15)); if(i%5==0) CHECK(!(p[i]&63)); memset(hp(g,p[i]),0xA5,(size_t)(i*37+1)); }
