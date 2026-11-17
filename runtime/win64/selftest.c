@@ -63,6 +63,7 @@ static u64 audio_call(KCtx *g,u64 obj,int slot,u64 a1,u64 a2,u64 a3){
 }
 static int audio_selftest(KCtx *g){
     int fails=0,checks=0;
+    extern int kh_audio_test_mode(int); int saved_mode=kh_audio_test_mode(0);   /* these checks describe the null backend, whatever KHNMC_AUDIO says */
     static const u8 mmcls[16]={0x95,0x03,0xde,0xbc,0x2f,0xe5,0x7c,0x46,0x8e,0x3d,0xc4,0x57,0x92,0x91,0x69,0x2e};
     u64 clsid=ga_alloc(16,16),out=ga_calloc(1,96);
     memcpy(hp(g,clsid),mmcls,16);
@@ -162,6 +163,7 @@ static int audio_selftest(KCtx *g){
     CHECK(KH_RAX(g)==0x80004002u && rd64(g,out)==0);
     ga_free(clsid); ga_free(out);
 done:
+    kh_audio_test_mode(saved_mode);
     fprintf(stderr,"kh: audio selftest: %d checks, %d failures\n",checks,fails);
     return fails;
 }
@@ -268,6 +270,6 @@ int kh_selftest(KCtx *g){
     float c; u32 cu=rd32(g,GS_BASE+0x717480); memcpy(&c,&cu,4); float x1=2.5f; memcpy(&KH_XMM(g,1),&x1,4); do_call(g,rt_hook_fiber_yield_150080,task,0,0,0,0,0); float r; u32 ru=rd32(g,P+0x20); memcpy(&r,&ru,4); CHECK(r==2.5f-c);
     fprintf(stderr,"kh: selftest: %d checks, %d failures\n",checks,fails);
     if(getenv("KH_SELFTEST_FATAL")){ extern void rt_imp_gdi32__MoveToEx(KCtx*); do_call(g,rt_imp_gdi32__MoveToEx,1,2,3,4,0,0); }   /* demonstrates the loud failure of an unimplemented import */
-    extern int kh_gfx_selftest(KCtx *); extern int kh_hd_selftest(KCtx *); extern int kh_native_selftest(KCtx *);
-    return fails + io_selftest(g) + audio_selftest(g) + kh_file_selftest(g) + kh_hd_selftest(g) + kh_gfx_selftest(g) + kh_native_selftest(g);
+    extern int kh_gfx_selftest(KCtx *); extern int kh_hd_selftest(KCtx *); extern int kh_native_selftest(KCtx *); extern int kh_audio_mix_selftest(void); extern int kh_audio_soft_selftest(KCtx *); extern int kh_stream_selftest(KCtx *);
+    return fails + io_selftest(g) + audio_selftest(g) + kh_audio_mix_selftest() + kh_audio_soft_selftest(g) + kh_stream_selftest(g) + kh_file_selftest(g) + kh_hd_selftest(g) + kh_gfx_selftest(g) + kh_native_selftest(g);
 }

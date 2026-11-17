@@ -87,6 +87,13 @@ static FILE *open_loose(KCtx *g,const char *path,int *size){
     }
     return f;
 }
+/* For the stream-fd layer (stream_layer.c): the same tree-relative mapping and the same file log as the loaders. */
+int kh_file_loose_path(KCtx *g,const char *path,char *host,size_t cap){
+    char rel[2048]; const char *root=getenv("KHNMC_DATA"); if(!root) root="data";
+    return relative(g,path,rel,sizeof rel)&&strlen(root)+strlen(rel)+2<cap&&kh_resolve_ci(root,rel,host,cap);
+}
+void kh_file_log_entry(KCtx *g,const char *path,const char *source,long long size){ file_log(g,path,source,size>INT_MAX?INT_MAX:(int)size); }
+int kh_file_package_fallback(const char *path){ return package_fallback(path); }
 static int register_resource(KCtx *g,u64 path,int n,u64 dst){
     /* HD sidecars: the lifted ResourceEntry constructor runs inside SetResourceItem on this thread and pulls GetRemasteredCount/Entry/Asset (hd_assets.c). */
     char rel[2048]; const char *root=getenv("KHNMC_DATA"); if(!root) root="data";
