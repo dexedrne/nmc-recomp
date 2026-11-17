@@ -514,6 +514,7 @@ void f_106460(KCtx *g){
     fclose(f);
     wr32(g,sizeptr,(u32)e->size);
     st_assets++; st_asset_bytes+=(u64)e->size; note_asset(hp(g,buf),(u32)e->size);
+    { extern void kh_file_live_note(u64,u64,const char *); char what[200]; snprintf(what,sizeof what,"%s#%d:%s",t->key,i,e->name); kh_file_live_note(buf,alloc,what); }   /* task 31: who holds the id zone */
     SET_RAX(g,buf); KH_RET(g);
 }
 

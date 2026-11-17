@@ -117,7 +117,33 @@ const KhRouteCondInfo kh_route_cond_info[KR_NCOND]={
     [KR_PAUSE_MENU]    ={"pause-menu",0,0,0,"the pause screen (system menu 50) takes input"},
     [KR_PAUSE_ID]      ={"pause-id",1,0,65535,"the pause screen's cursor is on the row with id N (6 continue, 5 skip the event)"},
     [KR_PAUSE_HAS]     ={"pause-has",1,0,65535,"the pause screen has a row with id N"},
+    [KR_MISSION_ID]    ={"mission-id",1,0,65535,"the running mission's id is N"},
+    [KR_OBJECTIVE]     ={"objective",1,0,65535,"the running mission's objective (the text of its pause screen) is message N"},
+    [KR_INFORMATION]   ={"information",1,0,65535,"the running mission's INFORMATION bar line is message N"},
+    [KR_REACTION]      ={"reaction",0,0,0,"the command menu offers a reaction command"},
+    [KR_REACTION_ID]   ={"reaction-id",1,0,65535,"the command menu offers reaction command N"},
+    [KR_REACTION_ON]   ={"reaction-on",2,0,0,"the command menu offers a reaction command of the object with this model name"},
+    [KR_LOCK_ON]       ={"lock-on",0,0,0,"the player is locked on to a target"},
+    [KR_MESSAGE_CHOICE]={"message-choice",1,0,15,"a field message window asks for a choice and its cursor is on row N"},
+    [KR_MENU_ID]       ={"menu-id",1,0,255,"a system menu runs and its id is N (50 = the pause screen)"},
+    [KR_MENU_LOCKED]   ={"menu-locked",0,0,0,"START would not open the camp menu (a mission record, the flag that closes it, the save's gate, ...)"},
+    [KR_ITEM_SLOT]     ={"item-slot",1,1,65535,"one of the player's item slots holds item N (1 = Potion, 3 = Ether)"},
+    [KR_MENU_PAGE]     ={"menu-page",1,0,255,"the camp menu (system menu 8) takes input on its page N (0 = the main list)"},
+    [KR_MENU_TEXT]     ={"menu-text",1,1,32767,"the running menu looked up message N on the page it shows now (a row's label: 0x44b Items, 0x451 Customize)"},
+    [KR_PROGRESS_FLAG] ={"progress-flag",1,0,0x7fff,"the save's progress flag N is set (N = world << 10 | index: 0x834 = Twilight Town #52, the menu tutorial)"},
+    [KR_MENU_FLAG]     ={"menu-flag",1,0,255,"the save's menu flag N is set (0x70: the camp menu shows Items, 0x72: Customize, 0x71: Party)"},
+    [KR_MISSION_COUNT1]={"mission-count1",1,0,100000,"the running mission's first counter is at least N"},
+    [KR_MISSION_COUNT2]={"mission-count2",1,0,100000,"the running mission's second counter is at least N"},
 };
+/* names used as condition arguments (object model names): the condition's `arg` is the name's index here */
+static char cond_names[32][40]; static int cond_nnames;
+int kh_route_name_intern(const char *s){
+    if(!s || !*s || strlen(s)>=sizeof cond_names[0]) return -1;
+    for(int i=0;i<cond_nnames;i++) if(!strcmp(cond_names[i],s)) return i;
+    if(cond_nnames==(int)(sizeof cond_names/sizeof cond_names[0])) return -1;
+    strcpy(cond_names[cond_nnames],s); return cond_nnames++;
+}
+const char *kh_route_name(int i){ return i>=0&&i<cond_nnames?cond_names[i]:NULL; }
 int kh_route_cond_lookup(const char *name){ for(int i=0;i<KR_NCOND;i++) if(!strcmp(name,kh_route_cond_info[i].name)) return i; return -1; }
 
 #define T_LAYOUT   (GS_BASE+0xb1d5d0ull)   /* title layout object (sequence at +0xe0) */
@@ -259,6 +285,54 @@ int kh_route_pause_menu(KCtx *g,KhPauseMenu *o){
     int c=rd16(g,cp); o->cursor=c<o->rows?c:-1;
     return 1;
 }
+/* Task 31: what START (0x1572b0) opens.  It asks 0x3ad540 for a mission record: the highest of the six records that is set (as
+ * 0x3ad500), and when none is set, the "slct" record of kind 6 if 0x14ead0 says so: bit 25 of the flag dword [0x140749804] (the
+ * mod's FIELD_COMMAND port reads the same bit for its second menu).  With a record START opens the pause screen (0x2e4c20, menu 50),
+ * without one the camp menu (0x2e4950(0, -1)), unless 0x3a0a30 ([0x142a0d628] != 0).  So with that bit set the camp menu stays
+ * closed in a field without any mission (traced: tt13 after the Seifer fight, run-Q31/x18: `mission=no`, START opened menu 50). */
+#define SYS_FLAGS (GS_BASE+0x749804ull)
+u64 kh_route_mission(KCtx *g); static u64 decode_id(KCtx *g,u32 id);
+/* Why START would not open the camp menu now ("" and 0 = it would), as far as plain memory says it: the mission record, bit 25, and
+ * the checks of 0x3abbb0 (which 0x3ad540 also asks when no record is set; true = the pause screen): a weapon object of the player
+ * ([player+0xd60], +0xd68) that has a model ([w+0x158]) whose id at +0x6a0 does not decode (0x3eff70 / 0x3da520), the flag dword
+ * [0x142a10504] not 0 (0x3a57f0), 0x39a8a0 false = the save's dword [0x1409ab580] has bit 23 while [0x1409ab584] lacks bit 20, the
+ * player's form [player+0xde0] 12 or his flag [player+0x18c] bit 14; then 0x3a0a30 ([0x142a0d628] not 0).  Not read: the same
+ * weapon test for the two partners (0x3c3270 is code) and the list walk 0x3c5bd0. */
+int kh_route_camp_menu_closed(KCtx *g,char *why,size_t cap){
+    if(cap) why[0]=0;
+#define WHY(...) do{ if(cap) snprintf(why,cap,__VA_ARGS__); return 1; }while(0)
+    if(kh_route_mission(g)) WHY("a-mission-record-is-set");
+    if((rd32(g,SYS_FLAGS)>>25)&1) WHY("flag-bit-25-of-0x140749804");
+    u64 pl=rd64(g,GS_BASE+0x2a105d0ull);
+    if(!readable(pl,0xe00)) WHY("no-player-object");
+    for(int j=0;j<2;j++){ u64 w=rd64(g,pl+0xd60+8ull*(u64)j); if(!readable(w,0x6a8) || !rd64(g,w+0x158)) continue;
+        u32 id=rd32(g,w+0x6a0); if(!(id&0x80000000u) || !decode_id(g,id)) WHY("weapon-%d-of-the-player-is-not-ready",j); }
+    if(rd32(g,GS_BASE+0x2a10504ull)) WHY("flag-dword-0x142a10504=%#x",rd32(g,GS_BASE+0x2a10504ull));
+    if((rd32(g,GS_BASE+0x9ab580ull)&0x800000u) && !(rd32(g,GS_BASE+0x9ab584ull)&0x100000u)) WHY("save-flags:0x1409ab580-has-bit-23-and-0x1409ab584-lacks-bit-20");
+    if(rd32(g,pl+0xde0)==0xc) WHY("player-form-12");
+    if((rd32(g,pl+0x18c)>>14)&1) WHY("player-flag-18c-bit-14");
+    if(rd64(g,GS_BASE+0x2a0d628ull)) WHY("0x142a0d628-is-set");
+#undef WHY
+    return 0;
+}
+int kh_route_menu_locked(KCtx *g){ char w[8]; return kh_route_camp_menu_closed(g,w,sizeof w); }
+/* Task 31: the save's flags.  Progress flags: 0x39afc0 sets flag N (bit N&31 of the dword [0x1409ab540 + 4*(((N&0x3ff)>>5) + 8*(N>>10))])
+ * and runs the progress script of N from 00progress.bin (per world: u16 offsets by N&0x3ff, then {u8 opcode, u8 count, u16 args}):
+ * opcode 8 sets menu flags, 9 clears them, 12 sets more progress flags, 7 clears some.  Menu flags: bits of [0x1409abc40] (0x3e38f0 tests,
+ * 0x3e3930 sets, 0x3e3910 clears).  The camp menu's main list (0x304c40 over the eight rows at 0x1405badb0) shows Items only with menu flag
+ * 0x70 and Customize only with 0x72 (Party 0x71, Jiminy's Journal 0x73, Roxas's Journal without 0x73); in Twilight Town only the progress
+ * script of 0x84a (TT #74, set by ard/us/tt32.ard's evt program: the Station of Awakening) sets 0x70 and 0x72. */
+#define PROGRESS_FLAGS (GS_BASE+0x9ab540ull)
+#define MENU_FLAGS     (GS_BASE+0x9abc40ull)
+int kh_route_progress_flag(KCtx *g,int flag){
+    if(flag<0 || flag>0x7fff) return -1;
+    u64 dw=PROGRESS_FLAGS+4ull*(u64)(((flag&0x3ff)>>5)+8*(flag>>10));
+    return (int)((rd32(g,dw)>>(flag&31))&1);
+}
+int kh_route_menu_flag(KCtx *g,int flag){
+    if(flag<0 || flag>255) return -1;
+    return (int)((rd32(g,MENU_FLAGS+4ull*(u64)(flag>>5))>>(flag&31))&1);
+}
 #define MISSIONS (GS_BASE+0x2a114a0ull)    /* six mission records of 0x40 bytes; 0x3ad500 returns the highest whose first word is not 0 */
 u64 kh_route_mission(KCtx *g){ for(int i=5;i>=0;i--){ u64 r=MISSIONS+0x40ull*(u64)i; if(rd16(g,r)) return r; } return 0; }
 /* The object list: head [0x142a171c8], next = the object id at +0xa90 (0x3bfb70 walks it).  [obj+0] is the id of the object's
@@ -293,10 +367,12 @@ int kh_route_cursor(KCtx *g,int kind){
     if(kind==KR_NEWGAME_CHOICE) return newgame_choice(g);
     if(kind==KR_COMMAND_ROW || kind==KR_COMMAND_ID){ KhCommandMenu m; return kh_route_command_menu(g,&m)?m.cursor:-1; }
     if(kind==KR_PAUSE_ID){ KhPauseMenu p; return kh_route_pause_menu(g,&p)?p.cursor:-1; }
+    if(kind==KR_MESSAGE_CHOICE){ KhMessageWindow m; return kh_route_message_window(g,&m) && m.mode==2 && m.takes ? m.cursor : -1; }
     return -1;
 }
 int kh_route_cursor_target(KCtx *g,int kind,int arg){
     if(kind==KR_PAUSE_ID){ KhPauseMenu p; if(!kh_route_pause_menu(g,&p)) return -1; for(int i=0;i<p.rows;i++) if(p.id[i]==arg) return i; return -1; }
+    if(kind==KR_MESSAGE_CHOICE){ KhMessageWindow m; return kh_route_message_window(g,&m) && m.mode==2 && arg>=0 && arg<m.rows ? arg : -1; }
     if(kind!=KR_COMMAND_ID) return arg;
     KhCommandMenu m; if(!kh_route_command_menu(g,&m)) return -1;
     for(int i=0;i<m.rows;i++) if(m.cmd[i]==arg) return i;
@@ -318,14 +394,15 @@ int kh_route_cond_eval(KCtx *g,int kind,int arg,u64 n,const KhRouteBase *b){
     case KR_HITS:           return kh_phase_damage_hits()-b->hits>=(u64)arg;
     case KR_MESSAGE:        return message(g);
     case KR_FRAMES:         return n-b->frame>=(u64)arg;
-    case KR_HP_BELOW_MAX:   return kh_route_player_sheet(g,&ps) && ps.hp<ps.hp_max;
-    case KR_MP_BELOW_MAX:   return kh_route_player_sheet(g,&ps) && ps.mp<ps.mp_max;
-    case KR_HP_AT_MOST:     return kh_route_player_sheet(g,&ps) && ps.hp<=arg;
-    case KR_MP_AT_MOST:     return kh_route_player_sheet(g,&ps) && ps.mp<=arg;
-    case KR_COMMAND_DEPTH:  return kh_route_command_menu(g,&cm)==arg;
-    case KR_COMMAND_ROW:    return kh_route_command_menu(g,&cm) && cm.cursor==arg;
-    case KR_COMMAND_ID:     return kh_route_command_menu(g,&cm) && cm.cmd_under==arg;
-    case KR_COMMAND_HAS:    if(!kh_route_command_menu(g,&cm)) return 0; for(int i=0;i<cm.rows;i++) if(cm.cmd[i]==arg && cm.state[i]<4) return 1; return 0;
+    /* (review of task 31) no sheet / no command menu: KR_UNREADABLE, so that `not hp-below-max` cannot pass on a sheet nobody read */
+    case KR_HP_BELOW_MAX:   if(!kh_route_player_sheet(g,&ps)) return KR_UNREADABLE; return ps.hp<ps.hp_max;
+    case KR_MP_BELOW_MAX:   if(!kh_route_player_sheet(g,&ps)) return KR_UNREADABLE; return ps.mp<ps.mp_max;
+    case KR_HP_AT_MOST:     if(!kh_route_player_sheet(g,&ps)) return KR_UNREADABLE; return ps.hp<=arg;
+    case KR_MP_AT_MOST:     if(!kh_route_player_sheet(g,&ps)) return KR_UNREADABLE; return ps.mp<=arg;
+    case KR_COMMAND_DEPTH:  return kh_route_command_menu(g,&cm)==arg;              /* depth 0 = no command menu: a state of its own */
+    case KR_COMMAND_ROW:    if(!kh_route_command_menu(g,&cm)) return KR_UNREADABLE; return cm.cursor==arg;
+    case KR_COMMAND_ID:     if(!kh_route_command_menu(g,&cm)) return KR_UNREADABLE; return cm.cmd_under==arg;
+    case KR_COMMAND_HAS:    if(!kh_route_command_menu(g,&cm)) return KR_UNREADABLE; for(int i=0;i<cm.rows;i++) if(cm.cmd[i]==arg && cm.state[i]<4) return 1; return 0;
     case KR_WORLD:          return kh_route_world(g)==arg;
     case KR_AREA:           return kh_route_area(g)==arg;
     case KR_MENU_OPEN:      return rd8(g,MENU_RUN)!=0;
@@ -339,6 +416,21 @@ int kh_route_cond_eval(KCtx *g,int kind,int arg,u64 n,const KhRouteBase *b){
     case KR_PAUSE_MENU: { KhPauseMenu p; return kh_route_pause_menu(g,&p); }
     case KR_PAUSE_ID:   { KhPauseMenu p; return kh_route_pause_menu(g,&p) && p.cursor>=0 && p.id[p.cursor]==arg; }
     case KR_PAUSE_HAS:  { KhPauseMenu p; if(!kh_route_pause_menu(g,&p)) return 0; for(int i=0;i<p.rows;i++) if(p.id[i]==arg) return 1; return 0; }
+    case KR_MISSION_ID: case KR_OBJECTIVE: case KR_INFORMATION: { KhObjective o; if(!kh_route_objective(g,&o)) return 0;
+        return (kind==KR_MISSION_ID?o.id:kind==KR_OBJECTIVE?o.objective:o.information)==arg; }
+    case KR_REACTION:    { KhReaction r; return kh_route_reaction(g,&r)>0; }
+    case KR_REACTION_ID: { KhReaction r; return kh_route_reaction(g,&r) && r.cmd==arg; }
+    case KR_REACTION_ON: { KhReaction r; char nm[40]; const char *want=kh_route_name(arg); return want && kh_route_reaction(g,&r) && kh_route_reaction_target(g,&r,nm,sizeof nm) && !strcmp(nm,want); }
+    case KR_LOCK_ON:     return kh_route_lock_on(g,NULL);
+    case KR_MESSAGE_CHOICE: { KhMessageWindow m; return kh_route_message_window(g,&m) && m.mode==2 && m.takes && m.cursor==arg; }
+    case KR_MENU_ID:     return rd8(g,MENU_RUN)!=0 && (s32)rd32(g,MENU_ID)==arg;
+    case KR_MENU_LOCKED: return kh_route_menu_locked(g);
+    case KR_ITEM_SLOT:   { int it[8],n=kh_route_item_slots(g,it,NULL,NULL); if(n<0) return KR_UNREADABLE; for(int i=0;i<n;i++) if(it[i]==arg) return 1; return 0; }
+    case KR_MENU_PAGE:   return kh_route_menu_page(g)==arg;
+    case KR_MENU_TEXT:   return kh_route_menu_text_seen(g,arg);
+    case KR_PROGRESS_FLAG: return kh_route_progress_flag(g,arg)==1;
+    case KR_MENU_FLAG:   return kh_route_menu_flag(g,arg)==1;
+    case KR_MISSION_COUNT1: case KR_MISSION_COUNT2: { int v[3],t[3],k=kind==KR_MISSION_COUNT1?0:1; return kh_route_mission_counters(g,v,t)>k && v[k]>=arg; }
     }
     kh_fatal(g,"route-condition-unknown: condition kind %d",kind);
 }
@@ -355,13 +447,29 @@ void kh_route_state_summary(KCtx *g,u64 n,char *out,size_t cap){
     if(kh_route_player_sheet(g,&ps)) o+=(size_t)snprintf(out+o,cap-o," player=char%d hp=%d/%d mp=%d/%d",(int)ps.chr,(int)ps.hp,(int)ps.hp_max,(int)ps.mp,(int)ps.mp_max);
     else o+=(size_t)snprintf(out+o,cap-o," player=none");
     if(o>=cap) return;
+    { int it[8],ns=kh_route_item_slots(g,it,NULL,NULL);             /* review of task 31: what `item-slot N` reads */
+      if(ns<0) o+=(size_t)snprintf(out+o,cap-o," item-slots=unreadable");
+      else { o+=(size_t)snprintf(out+o,cap-o," item-slots=%d:",ns); for(int i=0;i<ns && o<cap;i++) o+=(size_t)snprintf(out+o,cap-o,"%s%d",i?",":"",it[i]); }
+      if(o>=cap) return; }
     if(kh_route_command_menu(g,&cm)){ o+=(size_t)snprintf(out+o,cap-o," command-menu=depth%d/type%d/row%d/cmd%d rows=",cm.depth,cm.type,cm.cursor,cm.cmd_under);
         for(int i=0;i<cm.rows && o<cap;i++) o+=(size_t)snprintf(out+o,cap-o,"%s%u%s",i?",":"",(unsigned)cm.cmd[i],cm.state[i]<4?"":"(off)"); }
     else o+=(size_t)snprintf(out+o,cap-o," command-menu=none");
     if(o>=cap) return;
     o+=(size_t)snprintf(out+o,cap-o," mission=%s enemies=%d",kh_route_mission(g)?"yes":"no",kh_route_enemies(g,0,0,NULL,NULL,NULL));
     if(o>=cap) return;
+    { KhObjective ob; KhReaction rc;                         /* task 31 */
+      if(kh_route_objective(g,&ob)){ o+=(size_t)snprintf(out+o,cap-o," mission-id=%#x objective=%#x information=%#x",ob.id,ob.objective,ob.information);
+          int cv[3],ct[3],cn=kh_route_mission_counters(g,cv,ct); if(cn && o<cap){ o+=(size_t)snprintf(out+o,cap-o," counters="); for(int i=0;i<cn && o<cap;i++) o+=(size_t)snprintf(out+o,cap-o,"%s%d/%d",i?",":"",cv[i],ct[i]); } }
+      else o+=(size_t)snprintf(out+o,cap-o," mission-id=none");
+      if(o>=cap) return;
+      kh_route_reaction(g,&rc); if(rc.offered) o+=(size_t)snprintf(out+o,cap-o," reaction=%d%s",rc.cmd,rc.usable?"":"(not-answerable)"); else o+=(size_t)snprintf(out+o,cap-o," reaction=none");
+      if(o>=cap) return; }
+    if(rd8(g,MENU_RUN)){ o+=(size_t)snprintf(out+o,cap-o," menu-id=%d",(int)(s32)rd32(g,MENU_ID)); if(o>=cap) return;
+        if((s32)rd32(g,MENU_ID)==8){ o+=(size_t)snprintf(out+o,cap-o," menu-page=%d",kh_route_menu_page(g)); if(o>=cap) return; } }
+    { char why[96]; if(kh_route_camp_menu_closed(g,why,sizeof why)) o+=(size_t)snprintf(out+o,cap-o," camp-menu=closed(%s)",why); else o+=(size_t)snprintf(out+o,cap-o," camp-menu=open"); if(o>=cap) return; }
+    if(kh_route_lock_on(g,NULL)){ o+=(size_t)snprintf(out+o,cap-o," lock-on=yes"); if(o>=cap) return; }
     if(t){ int ws,wm; first_window(g,&ws,&wm); o+=(size_t)snprintf(out+o,cap-o," window0=state%d/mode%d",ws,wm); if(o>=cap) return; }
+    { KhMessageWindow mw; if(kh_route_message_window(g,&mw) && mw.mode==2){ o+=(size_t)snprintf(out+o,cap-o," choice=row%d/of%d%s",mw.cursor,mw.rows,mw.takes?"":"(answered)"); if(o>=cap) return; } }
     { KhPauseMenu pm; if(kh_route_pause_menu(g,&pm)){ o+=(size_t)snprintf(out+o,cap-o," pause-menu=row%d ids=",pm.cursor); for(int i=0;i<pm.rows && o<cap;i++) o+=(size_t)snprintf(out+o,cap-o,"%s%u",i?",":"",(unsigned)pm.id[i]); if(o>=cap) return; } }
     snprintf(out+o,cap-o," hits=%llu last-hit-frame=%s battle=%d items=%llu",(unsigned long long)hits,last,battle(n),(unsigned long long)kh_mod_item_obs(NULL));
 }
@@ -389,6 +497,7 @@ void kh_route_map_report(KCtx *g,FILE *f,const char *what){
             what,(unsigned long long)kh_input_game_frames(),rd8(g,NOW_WORLD),rd8(g,NOW_WORLD+1),door,mp,bp,ep,used,most,(unsigned long long)((bump-lo)>>20),(unsigned long long)(live>>20),
             (unsigned long long)((fbump-flo)>>20),(unsigned long long)(flive>>20),now,peak,kh_phase_files_seen(),(unsigned long long)tc,(unsigned long long)te,(unsigned long long)tr);
     { extern void kh_gfx_mem_report(FILE*); kh_gfx_mem_report(f); }          /* task 30: the null device's live resources and buffer data */
+    { extern void kh_file_live_report(FILE*,int); kh_file_live_report(f,0); }   /* task 31: the loaded files the game still holds */
     const char *e=getenv("KHNMC_IDTABLE_REPORT"); if(e&&*e&&*e!='0') kh_idtable_report_now(f,what);
 }
 
@@ -398,12 +507,32 @@ void kh_route_map_report(KCtx *g,FILE *f,const char *what){
  *               registered item), as 0x3f3300 reads them to build the Items list (FC+0x128).
  *   the bag     item table [0x142a25370] (count +4, records of 0x18 bytes from +8: id word +0, command word +0x10, stock index
  *               +0x12; 0x3e39a0 looks ids up), stock byte save [0x1409a98b0 + 0x3580 + index] (0x3c4720). */
+/* Task 31.  The player's item slots: his equipment record (see trace_carry below): armor slot count byte +0x10, accessory slot
+ * count +0x11, item slot count +0x12, the item slots' words from +0x34 (the item id each holds, 0 = empty). */
+int kh_route_item_slots(KCtx *g,int item[8],int *armor,int *acc){
+    KhPlayerSheet ps; for(int i=0;i<8;i++) item[i]=0;
+    if(!kh_route_player_sheet(g,&ps)) return -1;
+    u32 rid=rd32(g,ps.sheet+0x250); u64 rec=rid&0x80000000u?decode_id(g,rid):0; if(!readable(rec,0x114)) return -1;
+    int n=(int)(s8)rd8(g,rec+0x12); if(n<0) n=0; if(n>8) n=8;
+    for(int i=0;i<n;i++) item[i]=rd16(g,rec+0x34+2*(u64)i);
+    if(armor) *armor=(int)(s8)rd8(g,rec+0x10); if(acc) *acc=(int)(s8)rd8(g,rec+0x11);
+    return n;
+}
+/* The camp menu.  START (0x1572b0 -> 0x2e4950(0, -1)) starts system menu 10 of the table 0x1405ba170, whose running id
+ * [0x140900724] is 8: the shell that hosts the camp menu's pages (0x2e4abf: 0x31ad30 remembers the page set wanted, then
+ * 0x151770(8)).  The page that is up is [0x140bee64c] with its phase [0x140bee650] (1 = it takes input, 0 = coming, 2 = leaving;
+ * 0x2f6240 copies the requested page [0x1407435d8] there); traced (run-Q31/x36): 0 after START, 0xf after A on the main list's
+ * first row, 0x10 after A there, and B back through 0xf and 0 to the field. */
+int kh_route_menu_page(KCtx *g){
+    if(!rd8(g,MENU_RUN) || (s32)rd32(g,MENU_ID)!=8) return -1;
+    return (s32)rd32(g,GS_BASE+0xbee650ull)==1 ? (int)(s32)rd32(g,GS_BASE+0xbee64cull) : -1;
+}
 static void trace_carry(KCtx *g){
     static char prev[600]; char cur[600]; size_t o=0; KhPlayerSheet ps;
     if(!kh_route_player_sheet(g,&ps)) return;
     u32 rid=rd32(g,ps.sheet+0x250); u64 rec=rid&0x80000000u?decode_id(g,rid):0;
     o+=(size_t)snprintf(cur+o,sizeof cur-o,"char %d equipment record %llx",(int)ps.chr,(unsigned long long)rec);
-    if(readable(rec,0x114)){ o+=(size_t)snprintf(cur+o,sizeof cur-o," item slots %d: current",(int)(s8)rd8(g,rec+0x12));
+    if(readable(rec,0x114)){ o+=(size_t)snprintf(cur+o,sizeof cur-o," armor slots %d accessory slots %d item slots %d: current",(int)(s8)rd8(g,rec+0x10),(int)(s8)rd8(g,rec+0x11),(int)(s8)rd8(g,rec+0x12));
         for(int j=0;j<8;j++) o+=(size_t)snprintf(cur+o,sizeof cur-o," %x",rd16(g,rec+0x34+2*(u64)j));
         o+=(size_t)snprintf(cur+o,sizeof cur-o," registered"); for(int j=0;j<8;j++) o+=(size_t)snprintf(cur+o,sizeof cur-o," %x",rd16(g,rec+0x44+2*(u64)j)); }
     u64 it=rd64(g,GS_BASE+0x2a25370ull);
@@ -499,6 +628,7 @@ static void trace_menu(KCtx *g,u64 n){
 void kh_route_state_tick(KCtx *g,u64 n){
     { extern void kh_music_tick(KCtx *,u64); kh_music_tick(g,n); }      /* task 32: KHNMC_MUSICLOG, a line when the music manager's state changes (readers only) */
     trace_menu(g,n);
+    kh_route_objective_tick(g,n);                            /* task 31: `kh: objective:` when the mission or its texts change */
     u64 fc=kh_phase_field_cmds(); fc_frame=fc-fc_prev; fc_prev=fc;
     { int w=kh_route_world(g), a=kh_route_area(g), m=w>=0&&a>=0?(w<<8|a):-1;
       if(m>=0 && m!=map_prev){ char what[64]; if(map_prev<0) snprintf(what,sizeof what,"map %02x:%02x entered",w,a);
@@ -506,7 +636,7 @@ void kh_route_state_tick(KCtx *g,u64 n){
           kh_route_map_report(g,stderr,what); map_prev=m; place_until=n+600; } }
     if(trace<0){ const char *e=getenv("KHNMC_ROUTE_TRACE"); trace=e&&!strcmp(e,"1")?1:e&&!strcmp(e,"2")?2:0; }
     if(!trace) return;
-    if(trace==2){ trace2(g,n); trace_objs(g,n); trace_carry(g); }
+    if(trace==2){ trace2(g,n); trace_objs(g,n); trace_carry(g); kh_route_objective_trace(g,n); }
     char cur[1200]; kh_route_state_summary(g,n,cur,sizeof cur);
     char *h=strstr(cur," hits="); if(h) *h=0;      /* the hit counters change with every hit: only the screens decide a trace line */
     { char *p=strstr(cur," player="); char *q=p?strstr(p," command-menu="):NULL; if(p&&q) memmove(p,q,strlen(q)+1); }   /* nor HP / MP */

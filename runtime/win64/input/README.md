@@ -53,7 +53,8 @@ frame in which that state was seen. `input/route-field-battle.txt` is the route 
                                                press BUTTONS for H of every P game frames (default 2 of 8) until COND
 @select title-choice|newgame-choice N [timeout N]
                                                move that menu's cursor to row N with DPAD_UP / DPAD_DOWN, one row per press
-@expect COND                                   COND must hold now, else a named fatal (route-expect-failed)
+@expect COND                                   COND must hold now, else a named fatal (route-expect-failed; route-condition-
+                                               unreadable when its reader cannot read the state: see task 31 below)
 +A +B BUTTONS [lx ly]                          after a step: press during game frames A..B after the frame in which the
                                                step's state was seen (A >= 1; +1 = the next frame; later lines win)
 @timeout N                                     time-out (game frames) of the following steps (default 3600)
@@ -79,6 +80,12 @@ COND is `[not] NAME [N]`:
 | `message` | a field message window (YS::WINDOW_BASE list [0x142a16310]) waits for a button: state [+0xa0] 2, mode [+0x260] 1 or 2 |
 | `frames N` | N game frames since the step started (a delay in game frames) |
 
+"Since the step started" (`frames N`, `hits N`, `item-uses N`, `item-drain`, `item-heal`): every step takes the baseline of these
+counters when it starts, EXCEPT `@expect`, which reads in the very tick it starts and so keeps the baseline of the last step before
+it that is not an `@expect` (task 31, the 2026-11-17 review: before, `@expect item-drain` could never pass and `@expect not
+item-drain` never fail).  `@press A until item-uses 1` then `@expect item-drain` checks the use that press brought about; with no
+such step before it, the baseline is the start of the run.
+
 A step that does not see its state within its time-out ends the run with a named fatal:
 `kh: FATAL: route-wait-timeout: <file> line N `<step>`: <state> never came within T game frames (step k of n, started at game
 frame F, now game frame G, present P); game state now: <every state>`. The run's end prints
@@ -95,6 +102,13 @@ InitSave). `KHNMC_DIFFICULTY` still forces the save's dword after InitSave and S
 set KHNMC_ROUTE_DIFFICULTY for a route script and KHNMC_DIFFICULTY for a frame-numbered one.
 
 A file is either frame-numbered (`FROM TO`, `@hold`, `@clock`) or a route; mixing the two is a named fatal at load.
+
+**An input script that is not played to its end is no success (task 31, the 2026-11-17 review).** When the run ends with status 0
+while a route has steps left, a `@hold` was never released, or a frame-numbered script's clock never reached its last frame, the
+status becomes 3 with `kh: FATAL: input-script-unfinished: <why>` (not for `--selftest`).  `@hold FRAME until initial-state N
+[timeout T]` has a time-out: a hold not released by present FRAME-1+T (default 6,000 presents) ends the run with
+`kh: FATAL: input-hold-timeout: <file> line L ...: the Initial Settings screen did not reach state N within T presents ...`
+(before, it waited for ever and the run still exited 0).  A state already seen counts as the release even before the next poll.
 
 ## Route scripts, task 29: walking, the command menu, the player, the map, items
 
@@ -134,7 +148,10 @@ There is no path finding: a route walks around walls with intermediate points (i
 Every item application prints `kh: item apply #k ... HP a -> b of max (amount x) ...` with the command's +0x2f byte and the
 multiplier, so a route's numbers can be checked against the formula. Every map change prints `kh: map report (map ww:aa -> ww:aa)`
 with the id table's slots, the arena zones' high-water marks, RSS, files opened and threads (with `KHNMC_IDTABLE_REPORT=1` the
-whole id table follows). `KHNMC_ROUTE_TRACE=2` adds the player's sheet, position, facing and the camera yaw every 8 game frames
+whole id table follows). Task 31: each map report and the exit add `kh: file buffers: K of the N file and HD-asset buffers
+handed to the game are still held by it: X MiB of Y MiB handed out (MiB by kind: obj/hd ..., map/hd ..., ...)` (the file and
+GetRemasteredAsset buffers the game has not freed, by directory, HD asset or plain file); the exit lists the 40 largest by name (all
+of them with `KHNMC_IDTABLE_REPORT=1`, which also lists the game's resource cache, `kh: moose cache: entry ...`). `KHNMC_ROUTE_TRACE=2` adds the player's sheet, position, facing and the camera yaw every 8 game frames
 and the object list with the running mission every 64: what the coordinates in a route come from.
 
 ## Route scripts, task 30: fighting until something happens, the place's programs
@@ -185,3 +202,90 @@ first message window's state and mode).
 id, position, facing) and every set_pos / set-rotation call during the 600 game frames after a map change; `KHNMC_TRACE_MENU=1`
 (diagnostic) prints every dword of the menu globals and of the camp menu's two blocks that changed during a game frame while a
 system menu runs. Both only read.
+
+## Route scripts, task 31: what the game tells the player, reaction commands, named objects
+
+A route is now written from the game's own words.  The runtime prints them as they come (readers only; `runtime/route_objective.c`):
+
+| line | when | from |
+|---|---|---|
+| `kh: objective: game frame N: mission NAME (id, flags, pause kind): objective message 0x..: "..."; INFORMATION message 0x..: "..."` | a mission starts, ends (`no mission`), its texts change, or one of its two messages becomes readable (at a mission's start its table may not be loaded yet: the line says `(message 0x.. is in no loaded message table)` and comes again with the text) | the mission object `[0x142a0ff68]`, its header `[obj+8]` (id word +2, flags +4, INFORMATION message +6, pause kind byte +8, objective message +0xa = the text of the mission's pause screen), the message through the three tables `[0x142a11668 + 0x10*i]` (the lookup of 0x3ad9a0) |
+| `kh: objective: ... mission id 0x.. counters: a of A, b of B` | a counter of the mission changes | up to three gauges of 0x50 bytes at mission+0x160 (layout +8, target +0x24, value +0x38) |
+| `kh: information: game frame N: "..." (message 0x..[, the id the game looked up; the same text is message 0x.. = 0x..])` | a line goes into the INFORMATION bar | a pass-through hook on 0x17b710 (Makefile `INFO_HOOKS`); the id is the one the game looked up with 0x3ad9a0 right before (same thread, same game frame, same pointer: the mission's own line, 0x3a3f60 / 0x3a41c1). Without such a lookup and a text several ids share, all of them are named (`message 0x3f56 = 0x3f59: ... which one it named is not known`) |
+| `kh: message: game frame N: "..." (message 0x.., page at +K[; a choice of R rows, cursor on row C])` | a field message window starts to wait with another page | the window list (as `message`); text object at window+0x10: the message's first byte +0x10, the page shown +0x18, choice rows +0x3c; a page ends at byte 0x10 |
+
+In the texts a colour change is `<<`...`>>` (the game highlights what to do that way), a button icon `(icon 0xNN)`: seen so far 0xda
+attack (A), 0xdb jump (B), 0xde guard (X), 0xdf the reaction button (Y), 0xe1 lock-on (RB), 0xe3 the modifier of Reversal (RT),
+0xe5 camera reset, 0xe7 START, 0xe8 / 0xe9 the left / right stick.  Texts are deduplicated: several ids may share one text
+(msg/us/eh.bar 0x3f56 = 0x3f59, tt.bar 0x375b = 0x375c = 0x375e); where a line can only see a text pointer it names every id of it.
+
+```
+@react [id N] [on NAME] until COND [every P] [hold H] [timeout N]
+                                               answer the reaction command the command menu offers: Y for H of every P game
+                                               frames (default 2 of 20), only while a command is offered and can be answered
+                                               (and it is command N / belongs to the object with the model name NAME, when the
+                                               step says so: an NPC who walks by offers "Talk" too); until COND.  The game picks
+                                               its entry again at the start of the frame the press lands in: when the entry of
+                                               that frame is another answerable command than the step names, the press may have
+                                               answered it: the named fatal `route-react-other-command`.  The time-out says how
+                                               many frames an offer was answerable / seen but not answerable, and why not
+@goto object NAME [radius R] [until COND] [stall N] [timeout N]
+                                               walk to the nearest object whose objentry model name is NAME (the names are in
+                                               `kh: route names` of KHNMC_ROUTE_TRACE=2, e.g. N_EX690_TT_TUTOR_RTN, SAVE_POINT).
+                                               No such object: he stands, and the stall is the named fatal `route-goto-stalled`
+                                               ("no object named ..."); an object that moves on is followed (a guide who keeps
+                                               his distance is no stall)
+@press BUTTONS [lx ly] held BUTTONS until COND [every P] [hold H] [timeout N]
+                                               as @press, with the `held` buttons down for the whole step (a modifier: the mod's
+                                               Reversal is R2 held and then X; both pressed in the same frame is a Guard)
+@select message-choice N [timeout N]           a choice window: its cursor to row N (DPAD_DOWN = next row), then press A
+@if-difficulty N STEP                          STEP exists only in a run of difficulty N (what a use of an item does differs)
+```
+
+`@skip` and `@fight` now answer a message PAGE that waits (START does nothing while one waits; a tutorial page can come in a
+fight after the last enemy fell) with A; a CHOICE window is the named fatal `route-skip-choice` / `route-fight-choice`: the route
+answers choices itself (`@talk until message-choice 0 stable 1`, `@select message-choice N`, `+1 +3 A`).
+
+| condition | true when |
+|---|---|
+| `mission-id N`, `objective N`, `information N` | the running mission's id / objective message / INFORMATION message is N |
+| `mission-count1 N`, `mission-count2 N` | the running mission's first / second counter is at least N |
+| `reaction`, `reaction-id N`, `reaction-on NAME` | the command menu offers a reaction command that can be answered (/ command N / of the object named NAME): the entry the reaction handler 0x408520 keeps at FC+0xb40 (command word +2, state byte +5 below 4, parameters at FC+0xb28: the target's id first).  NOT the seven rows at FC+0x9b0: the field command's update 0x3b2340 empties them every frame.  "Can be answered" also reads the gates of 0x3b2340 / 0x408520 (review of task 31): the pad record `[FC+0xae8]` set, FC+0x24 bits 0 and 1 clear, `[0x142a10500]` 0, and the entry fresh (0x408520 picks one only while 0x39a8c0 is true, i.e. not progress flag 0x817 without 0x81c, and `[FC+0xb3c]` bit 0 is set; otherwise the entry is stale).  Not read: the player class's virtual +0x78 (code). The state line shows `reaction=N(not-answerable)`, KHNMC_ROUTE_TRACE=2 the reason |
+| `lock-on` | the player is locked on to a target (his target record `[player+0xdc8]` is of kind 2) |
+| `message-choice N` | a message window asks for a choice (mode 2, input phase `[w+0x408]` 1) and its cursor `[w+0x40c]` is on row N |
+| `menu-id N` | a system menu runs and its id `[0x140900724]` is N: 50 the pause screen, 3 the save menu, 8 the camp menu (the shell 0x2e4950 starts for menu 0) |
+| `menu-page N` | the camp menu takes input on its page N (`[0x140bee64c]`, phase `[0x140bee650]` 1): 0 = its main list |
+| `menu-locked` | START would not open the camp menu: a mission record is set, or 0x3ad540 / 0x3abbb0 say no (bit 25 of `[0x140749804]`; the save's progress flag 0x817 set while 0x834 is clear: the prologue before the main-menu unlock; a weapon not ready; ...).  The state line names the reason: `camp-menu=closed(<reason>)` / `camp-menu=open` |
+| `item-slot N` | one of the player's item slots holds item N (1 Potion, 3 Ether); the state line shows them: `item-slots=3:0,0,0` |
+| `menu-text N` | the running menu looked up message N on the page it shows now (`kh: menu text:` lines, a pass-through hook on 0x3ad9a0): the labels of the rows it shows (0x44b Items, 0x44d Abilities, 0x451 Customize, 0x44f Status, 0x4539 Roxas's Journal, 0x3617 Config) |
+| `progress-flag N` | the save's progress flag N is set (N = world << 10 \| index, as 0x39afc0 sets it: bit N&31 of the dword 0x1409ab540 + 4*(((N&0x3ff)>>5) + 8*(N>>10))); 0x817 = TT #23, 0x834 = TT #52 (the menu tutorial), 0x84a = TT #74 |
+| `menu-flag N` | the save's menu flag N is set (bit N&31 of the dword 0x1409abc40 + 4*(N>>5), as 0x3e38f0 tests it): 0x70 makes the camp menu show Items, 0x72 Customize, 0x71 Party |
+
+**What the camp menu shows** (exe 0x304c40 over the eight row descriptors at 0x1405badb0, 36 bytes each: label +0x12, help +0x14,
+two lists of menu flags at +0x1c and +0x20): a row is shown when every flag of its first list is set and none of its second list:
+Items needs menu flag 0x70, Party 0x71, Customize 0x72, Jiminy's Journal 0x73, Roxas's Journal needs 0x73 clear; Abilities is decided
+apart (0x304cbc: a party member with abilities, progress flag 0x817 and not 0x849); Status and Config always.  Menu flags are set by
+the progress scripts of `00progress.bin` (per world: u16 offsets by flag index, then `{u8 opcode, u8 count, u16 args}` up to opcode
+0; opcode 8 sets menu flags, 9 clears them, 12 sets further progress flags), which 0x39afc0 runs when a progress flag is set.  In
+Twilight Town only the script of 0x84a sets 0x70 and 0x72, and only `ard/us/tt32.ard`'s evt program sets 0x84a (the Station of
+Awakening, the second day after the odd jobs, the station and the old mansion; `ard/us/tt08.ard` sets the next flag, 0x835).
+
+**A state no reader can read is neither true nor false** (review of task 31).  `hp-below-max`, `mp-below-max`, `hp-at-most N`,
+`mp-at-most N` without the player's status sheet, `command-row N`, `command-id N`, `command-has N` without the command menu, and
+`item-slot N` without the item slots are UNREADABLE: then neither the condition nor its `not` holds.  A waiting step goes on waiting
+(its time-out says `its reader cannot read the state now`), an `@expect` is the named fatal `route-condition-unreadable` (before,
+`@expect not item-slot 1` passed when the slots could not be read).  Every `@expect` that passes prints what it read:
+`kh: route: @expect line L read at game frame N: <the state line>` (player HP / MP, item slots, command menu rows, ...).
+
+Idiom for "the mission is over, go on to the next control": `@skip until <the next mission, area or program>` and then
+`@wait field` (right at a mission's end the field is still up for a few frames: `@skip until field` would be met at once).
+
+Diagnostics (read-only): `KHNMC_ROUTE_TRACE=2` also prints the reaction command and the lock-on when they change, the pad records'
+held words, and every 64 game frames the objects with their model names (`kh: route names`); `KHNMC_TRACE_MISSION=1` prints every
+dword of the mission object that changed (how the counters were found); `KHNMC_SELFTEST_ONLY=route31` runs the task 31 suite
+alone (said to be a PARTIAL RUN; not a pass of the selftest).
+
+`input/route-camp.txt` is the route from a new game to the first camp menu (the second day of the Twilight Town prologue,
+Station Heights): 164 steps; START opens the camp menu at game frame 22,378 on difficulty 3 and 24,363 on difficulty 1, the route
+ends at 22,624 / 24,609 (run-Q31/last-camp-d3, last-camp-d1; the frames vary by a few hundred from run to run).  Its main list has no Items and no Customize row there (menu flags
+0x70 / 0x72 clear: the route checks them), so a Potion can neither go into an item slot nor be used from the menu yet.

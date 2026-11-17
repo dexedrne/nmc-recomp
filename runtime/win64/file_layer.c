@@ -122,6 +122,56 @@ void f_1063d0(KCtx *g){
         file_log(g,gstr(g,A1(g)),n>0?"LOOSE":NULL,n); }
     pthread_mutex_unlock(&files_lock); SET_RAX(g,n); KH_RET(g);
 }
+/* Task 31: which loaded files the game still holds.  Every file read with allocation (0x106870: the buffer is the game's to free)
+ * and every HD asset handed out by GetRemasteredAsset (0x106460, hd_assets.c: the `file` source of the arena is these two) is noted
+ * (buffer, size, path, game frame); the report asks the arena whether that buffer is still the live `file` block of that
+ * size (ga_describe) and forgets the notes of buffers that are gone.  Read-only for the game; `kh: file buffers` lines at every
+ * map report and at exit (the largest ones by name).  What the id zone's growth through Twilight Town is made of. */
+typedef struct { u64 dst, frame; int n; char path[100]; } LiveFile;
+static LiveFile *livef; static size_t nlivef, caplivef; static u64 livef_loads, livef_bytes;
+/* its own lock, taken last: GetRemasteredAsset runs inside a load that already holds files_lock on the same thread (the first
+ * version took files_lock here and both final route runs hung at boot, run-Q31/final-camp-d3: 0 presents, ended by the watchdog) */
+static pthread_mutex_t live_lock=PTHREAD_MUTEX_INITIALIZER;
+u64 kh_game_frames(void); int ga_describe(u64 a,char *out,size_t cap);
+static void live_note(u64 dst,int n,const char *path){
+    pthread_mutex_lock(&live_lock);
+    size_t i=0; for(;i<nlivef;i++) if(livef[i].dst==dst) break;    /* a buffer handed out again replaces its old note */
+    if(i==nlivef){ if(nlivef==caplivef){ size_t nc=caplivef?caplivef*2:256; LiveFile *nl=realloc(livef,nc*sizeof *nl); if(!nl){ pthread_mutex_unlock(&live_lock); return; } livef=nl; caplivef=nc; } nlivef++; }
+    size_t l=strlen(path); livef[i].dst=dst; livef[i].n=n; livef[i].frame=kh_game_frames(); snprintf(livef[i].path,sizeof livef[i].path,"%s",l>=sizeof livef[i].path?path+l-(sizeof livef[i].path-1):path);
+    livef_loads++; livef_bytes+=(u64)n;
+    pthread_mutex_unlock(&live_lock);
+}
+void kh_file_live_note(u64 dst,u64 n,const char *what){ live_note(dst,n>INT_MAX?INT_MAX:(int)n,what); }   /* hd_assets.c: the HD asset buffers */
+static int live_cmp(const void *a,const void *b){ const LiveFile *x=a,*y=b; return x->n<y->n?1:x->n>y->n?-1:0; }
+/* the kind of a held buffer, for the totals: its directory (obj, map, menu, event, effect, ...) and whether it is an HD asset (an HD
+ * asset's note is `<archive>#<index>:<name>`, a plain file's note its path) */
+static void live_kind(const char *path,char *out,size_t cap){
+    const char *s=strchr(path,'/'); size_t l=s?(size_t)(s-path):0; if(l==0||l>12){ snprintf(out,cap,"other"); }
+    else snprintf(out,cap,"%.*s",(int)l,path);
+    if(cap>8 && strlen(out)+3<cap) strcat(out,strchr(path,'#')?"/hd":"/sd");
+}
+/* top > 0: the `top` largest buffers by name; top < 0: every held buffer (KHNMC_IDTABLE_REPORT at exit) */
+void kh_file_live_report(FILE *f,int top){
+    pthread_mutex_lock(&live_lock);
+    size_t k=0; u64 bytes=0;
+    for(size_t i=0;i<nlivef;i++){ char d[240], want[80]; ga_describe(livef[i].dst,d,sizeof d);
+        snprintf(want,sizeof want,"file block 0x%llx (%llu bytes) +0x0",(unsigned long long)livef[i].dst,(unsigned long long)(u64)livef[i].n);
+        if(strstr(d,want) && !strstr(d,"FREED")){ bytes+=(u64)livef[i].n; livef[k++]=livef[i]; } }
+    nlivef=k;
+    /* task 31: the held bytes by kind (at most 16 kinds; more go to "other/*") */
+    char kinds[16][24]; u64 kb[16]={0}; int kn=0, nk=0;
+    for(size_t i=0;i<k;i++){ char kd[24]; live_kind(livef[i].path,kd,sizeof kd); int j=0; for(;j<nk;j++) if(!strcmp(kinds[j],kd)) break;
+        if(j==nk){ if(nk<16){ snprintf(kinds[nk],sizeof kinds[nk],"%s",kd); nk++; } else { j=15; snprintf(kinds[15],sizeof kinds[15],"other/*"); } }
+        kb[j]+=(u64)livef[i].n; }
+    char by[600]; size_t bo=0; by[0]=0;
+    for(int j=0;j<nk && bo<sizeof by;j++){ bo+=(size_t)snprintf(by+bo,sizeof by-bo,"%s%s %.1f",kn++?", ":"",kinds[j],(double)kb[j]/1048576.0); }
+    fprintf(f,"kh: file buffers: %zu of the %llu file and HD-asset buffers handed to the game are still held by it: %llu MiB of %llu MiB handed out (MiB by kind: %s)\n",
+            k,(unsigned long long)livef_loads,(unsigned long long)(bytes>>20),(unsigned long long)(livef_bytes>>20),nk?by:"none");
+    if(top!=0 && k){ LiveFile *c=malloc(k*sizeof *c); if(c){ memcpy(c,livef,k*sizeof *c); qsort(c,k,sizeof *c,live_cmp);
+        for(size_t i=0;i<k && (top<0 || (int)i<top);i++) fprintf(f,"kh: file buffers:   %8.1f MiB held since game frame %llu  %s\n",(double)c[i].n/1048576.0,(unsigned long long)c[i].frame,c[i].path);
+        free(c); } }
+    pthread_mutex_unlock(&live_lock);
+}
 static void load(KCtx *g,int bounded,int allocate){
     u64 path=A1(g),dst=A2(g),sizeptr=A2(g); int hd=bounded?A4(g):A3(g);
     s32 oldsize=allocate?(s32)rd32(g,sizeptr):0;
@@ -145,6 +195,7 @@ static void load(KCtx *g,int bounded,int allocate){
         goto close;
     }
     result=allocate?dst:n;
+    if(allocate) live_note(dst,n,gstr(g,path));
     if(hd&&n&&!register_resource(g,path,n,dst)){ if(allocate) ga_free(dst); result=0; }
 close:
     fclose(f);
@@ -212,5 +263,24 @@ int kh_file_selftest(KCtx *g){
     if(root) setenv("KHNMC_DATA",root,1); else unsetenv("KHNMC_DATA");
     if(log) setenv("KHNMC_FILELOG",log,1); else unsetenv("KHNMC_FILELOG");
     free(root); free(log); unlink(path); unlink(lp); rmdir(dir);
+    /* task 31: the held-buffer report: a noted `file` block is listed while it lives and forgotten when it is freed; a note taken
+     * while files_lock is held does not wait for it (an asset is handed out inside a load: a regression here hangs this test) */
+    { u64 b1=ga_alloc_src(3u<<20,16,GA_SRC_FILE), b2=ga_alloc_src(5000,16,GA_SRC_FILE); char l[4096]; size_t nr; FILE *tf;
+      pthread_mutex_lock(&files_lock); kh_file_live_note(b1,3u<<20,"selftest/big.asset"); pthread_mutex_unlock(&files_lock); kh_file_live_note(b2,5000,"selftest/small.asset");
+      tf=kh_tmpfile(); TEST(tf!=NULL);
+      if(tf){ kh_file_live_report(tf,40); rewind(tf); nr=fread(l,1,sizeof l-1,tf); l[nr]=0; fclose(tf);
+          TEST(strstr(l,"kh: file buffers: ") && strstr(l,"3.0 MiB held since game frame") && strstr(l,"selftest/big.asset") && strstr(l,"selftest/small.asset"));
+          TEST(strstr(l,"(MiB by kind: selftest/sd 3.0)") != NULL);                                       /* the totals by kind */
+          { u64 b3=ga_alloc_src(1u<<20,16,GA_SRC_FILE); kh_file_live_note(b3,1u<<20,"obj/T31.mdlx#0:-0.dds"); FILE *t3=kh_tmpfile(); TEST(t3!=NULL);
+            if(t3){ kh_file_live_report(t3,1); rewind(t3); nr=fread(l,1,sizeof l-1,t3); l[nr]=0; fclose(t3);
+                TEST(strstr(l,"(MiB by kind: selftest/sd 3.0, obj/hd 1.0)") && strstr(l,"selftest/big.asset") && !strstr(l,"obj/T31.mdlx"));   /* top 1: the largest only */
+                t3=kh_tmpfile(); if(t3){ kh_file_live_report(t3,-1); rewind(t3); nr=fread(l,1,sizeof l-1,t3); l[nr]=0; fclose(t3);
+                    TEST(strstr(l,"selftest/big.asset") && strstr(l,"selftest/small.asset") && strstr(l,"obj/T31.mdlx#0:-0.dds")); }   /* -1: all */
+                t3=kh_tmpfile(); if(t3){ kh_file_live_report(t3,0); rewind(t3); nr=fread(l,1,sizeof l-1,t3); l[nr]=0; fclose(t3); TEST(!strstr(l,"held since")); } }   /* 0: the summary only */
+            ga_free(b3); }
+          ga_free(b1); tf=kh_tmpfile(); if(tf){ kh_file_live_report(tf,40); rewind(tf); nr=fread(l,1,sizeof l-1,tf); l[nr]=0; fclose(tf);
+              TEST(!strstr(l,"selftest/big.asset") && strstr(l,"selftest/small.asset")); }
+          ga_free(b2); tf=kh_tmpfile(); if(tf){ kh_file_live_report(tf,40); rewind(tf); nr=fread(l,1,sizeof l-1,tf); l[nr]=0; fclose(tf); TEST(!strstr(l,"selftest/small.asset")); } }
+      else { ga_free(b1); ga_free(b2); } }
     fprintf(stderr,"kh: file selftest: %d checks, %d failures\n",checks,bad); return bad;
 }
