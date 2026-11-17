@@ -16,7 +16,11 @@ _Atomic u64 gfx_draws, gfx_clears, gfx_barriers, gfx_execs, gfx_presents, gfx_co
 void kh_gfx_report(FILE *f);
 void kh_gfx_tex_report(FILE *f);
 static int log_gfx;
-static _Atomic u64 gfx_bundles, gfx_pso_binds;
+_Atomic u64 gfx_bundles, gfx_pso_binds;
+/* KHNMC_GFX=vkd3d (gfx_vkd3d.c): the device is a host vkd3d device; only the DXGI objects below stay ours, and the swap chain gets real back buffers */
+extern int kh_gfx_vkd3d_on;
+void kh_gfx_vkd3d_init(void); void kh_vkd3d_create_device(KCtx *g); void kh_vkd3d_serialize_rootsig(KCtx *g); void kh_vkd3d_swap_attach(KCtx *g,u64 sc,u64 queue,u64 desc);
+void kh_vkd3d_swap_getbuffer(KCtx *g,u64 o); void kh_vkd3d_swap_resize(KCtx *g,u64 o,u32 w,u32 h); void kh_vkd3d_present(KCtx *g,u64 o,u64 n); void kh_gfx_vkd3d_report(FILE *f); int kh_gfx_vkd3d_selftest(KCtx *g);
 /* texture recorder: sampled textures (no RT/DS flag) by DXGI format and by size class, and the footprint uploads that fill them (CopyTextureRegion) */
 static _Atomic u64 tx_res[128], tx_res_bytes[128], tx_up[128], tx_up_bytes[128], tx_distinct_up, tx_rtds, tx_sized[8], tx_up_sized[8], tx_up_total_bytes, tx_up_calls, tx_other_up;
 static const char *size_names[8]={"<=64","128","256","512","1024","2048",">2048","1D/3D"};
@@ -73,6 +77,7 @@ static int h_factory(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) retur
     case 15: { /* CreateSwapChainForHwnd(this, queue, hwnd, desc, fsdesc, restrict, **pp) */
         u64 sc=new_obj(C_swap,96); u64 d=ARG(g,3); wr32(g,sc+32,d?rd32(g,d):1280); wr32(g,sc+36,d?rd32(g,d+4):720); wr32(g,sc+40,0);
         KWaitObj *w=NULL; (void)w; extern u64 kh_mk_event_h(int manual,int initial); wr64(g,sc+48,kh_mk_event_h(1,1));
+        if(kh_gfx_vkd3d_on) kh_vkd3d_swap_attach(g,sc,A1(g),d);
         out_obj(g,ARG(g,6),sc); SET_RAX(g,0); return 1; }
     default: return 0; } }
 static int h_adapter(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)o;(void)c;
@@ -93,12 +98,16 @@ static int h_swap(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1
         fprintf(stderr,"kh: gfx frame=%llu bundles=%llu pso-binds=%llu ",(unsigned long long)gfx_presents,(unsigned long long)gfx_bundles,(unsigned long long)gfx_pso_binds);
         kh_gfx_report(stderr);
         if(gfx_presents%300==0) kh_gfx_tex_report(stderr);
+        if(kh_gfx_vkd3d_on) kh_vkd3d_present(g,o,gfx_presents);            /* optional image dump of the buffer being presented */
         wr32(g,o+40,rd32(g,o+40)+1); SET_RAX(g,0); return 1;                 /* Present / Present1 */
-    case 9: { u32 i=(u32)A1(g)%3; u64 b=rd64(g,o+56+8*i); if(!b){ u64 desc=ga_alloc(56,16); memset(hp(g,desc),0,56); wr32(g,desc,3); wr64(g,desc+16,rd32(g,o+32)); wr32(g,desc+24,rd32(g,o+36)); wr16(g,desc+28,1); wr16(g,desc+30,1); wr32(g,desc+32,0x57); wr32(g,desc+36,1);
+    case 9: if(kh_gfx_vkd3d_on){ kh_vkd3d_swap_getbuffer(g,o); return 1; }
+            { u32 i=(u32)A1(g)%3; u64 b=rd64(g,o+56+8*i); if(!b){ u64 desc=ga_alloc(56,16); memset(hp(g,desc),0,56); wr32(g,desc,3); wr64(g,desc+16,rd32(g,o+32)); wr32(g,desc+24,rd32(g,o+36)); wr16(g,desc+28,1); wr16(g,desc+30,1); wr32(g,desc+32,0x57); wr32(g,desc+36,1);
             b=new_resource(g,desc,3); ga_free(desc); wr64(g,o+56+8*i,b); } out_obj(g,A3(g),b); SET_RAX(g,0); return 1; }   /* GetBuffer(idx, riid, **pp) */
     case 10: SET_RAX(g,0); return 1;                                                                        /* SetFullscreenState */
     case 12: { u64 d=A1(g); memset(hp(g,d),0,0x48); wr32(g,d,rd32(g,o+32)); wr32(g,d+4,rd32(g,o+36)); wr32(g,d+0x10,0x57); wr32(g,d+0x1c,1); wr32(g,d+0x24,0x30); wr32(g,d+0x28,3); wr32(g,d+0x38,1); wr32(g,d+0x3c,3); wr32(g,d+0x40,0x42); SET_RAX(g,0); return 1; } /* GetDesc */
-    case 13: wr32(g,o+32,(u32)A2(g)?(u32)A2(g):rd32(g,o+32)); wr32(g,o+36,(u32)A3(g)?(u32)A3(g):rd32(g,o+36)); SET_RAX(g,0); return 1;     /* ResizeBuffers(count,w,h,fmt,flags) */
+    case 13: if(kh_gfx_vkd3d_on){ u32 nw=(u32)A2(g)?(u32)A2(g):rd32(g,o+32), nh=(u32)A3(g)?(u32)A3(g):rd32(g,o+36); kh_vkd3d_swap_resize(g,o,nw,nh);
+                 if(!(u32)KH_RAX(g)){ wr32(g,o+32,nw); wr32(g,o+36,nh); wr32(g,o+40,0); } return 1; }       /* real buffers: new size, back-buffer index restarts at 0 */
+             wr32(g,o+32,(u32)A2(g)?(u32)A2(g):rd32(g,o+32)); wr32(g,o+36,(u32)A3(g)?(u32)A3(g):rd32(g,o+36)); SET_RAX(g,0); return 1;     /* ResizeBuffers(count,w,h,fmt,flags) */
     case 15: out_obj(g,A1(g),o_output); SET_RAX(g,0); return 1;                                             /* GetContainingOutput */
     case 18: { u64 d=A1(g); memset(hp(g,d),0,0x30); wr32(g,d,rd32(g,o+32)); wr32(g,d+4,rd32(g,o+36)); wr32(g,d+8,0x57); wr32(g,d+16,1); wr32(g,d+24,0x30); wr32(g,d+28,3); wr32(g,d+36,3); wr32(g,d+44,0x42); SET_RAX(g,0); return 1; }   /* GetDesc1 */
     case 19: { u64 d=A1(g); memset(hp(g,d),0,20); wr32(g,d+16,1); SET_RAX(g,0); return 1; }            /* GetFullscreenDesc: Windowed=TRUE */
@@ -207,6 +216,9 @@ static u64 mk_blob(KCtx *g,u64 src,u64 size){ u64 b=new_obj(C_blob,16); u64 d=ga
 
 void kh_seam_gfx_init(void){
     const char *e=getenv("KH_LOG_GFX"); log_gfx=e&&*e=='1'; (void)log_gfx;
+    e=getenv("KHNMC_GFX");                                                    /* graphics backend: unset / "null" = this recorder, "vkd3d" = gfx_vkd3d.c */
+    if(e&&!strcmp(e,"vkd3d")) kh_gfx_vkd3d_init();
+    else if(e&&*e&&strcmp(e,"null")) kh_fatal(NULL,"gfx-backend-unknown: KHNMC_GFX=%s (known backends: null, vkd3d)",e);
     C_factory=kh_com_class("dxgi:IDXGIFactory4",44,STRICT,h_factory); C_adapter=kh_com_class("dxgi:IDXGIAdapter3",24,STRICT,h_adapter); C_output=kh_com_class("dxgi:IDXGIOutput",24,STRICT,h_output);
     C_swap=kh_com_class("dxgi:IDXGISwapChain3",44,STRICT,h_swap); C_dev=kh_com_class("d3d12:ID3D12Device",48,STRICT,h_dev); C_queue=kh_com_class("d3d12:ID3D12CommandQueue",20,STRICT,h_queue);
     C_alloc=kh_com_class("d3d12:ID3D12CommandAllocator",12,STRICT,h_alloc); C_list=kh_com_class("d3d12:ID3D12GraphicsCommandList",72,STRICT,h_list); C_res=kh_com_class("d3d12:ID3D12Resource",16,STRICT,h_res);
@@ -218,6 +230,7 @@ void kh_seam_gfx_init(void){
 void kh_gfx_report(FILE *f){ fprintf(f,"kh: gfx: draws=%llu clears=%llu barriers=%llu execs=%llu presents=%llu copies=%llu psos=%llu resources=%llu upload/buffer bytes=%llu\n",(unsigned long long)gfx_draws,(unsigned long long)gfx_clears,(unsigned long long)gfx_barriers,(unsigned long long)gfx_execs,(unsigned long long)gfx_presents,(unsigned long long)gfx_copies,(unsigned long long)gfx_psos,(unsigned long long)gfx_resources,(unsigned long long)gfx_buffers_bytes); }
 
 void kh_gfx_tex_report(FILE *f){
+    if(kh_gfx_vkd3d_on){ kh_gfx_vkd3d_report(f); return; }                    /* vkd3d owns the textures: no recorder statistics, the backend line instead */
     u64 tr=0,trb=0,tu=0,tub=0; for(int i=0;i<128;i++){ tr+=tx_res[i]; trb+=tx_res_bytes[i]; tu+=tx_up[i]; tub+=tx_up_bytes[i]; }
     fprintf(f,"kh: gfx tex: sampled-textures-created=%llu (%llu GPU bytes) rt/ds-created=%llu; footprint uploads=%llu (%llu bytes) into %llu distinct textures; other texture copies=%llu\n",(unsigned long long)tr,(unsigned long long)trb,(unsigned long long)tx_rtds,(unsigned long long)tu,(unsigned long long)tub,(unsigned long long)tx_distinct_up,(unsigned long long)tx_other_up);
     fprintf(f,"kh: gfx tex: created by format:"); for(int i=0;i<128;i++) if(tx_res[i]) fprintf(f," %s=%llu(%llu B)",fmt_name((u32)i),(unsigned long long)tx_res[i],(unsigned long long)tx_res_bytes[i]);
@@ -229,8 +242,8 @@ void kh_gfx_tex_report(FILE *f){
 
 /* ---- free functions (imports) ------------------------------------------------------------------------------------------- */
 IMP(dxgi,CreateDXGIFactory1){ kh_cnt_gfx_calls++; u64 fct=kh_com_obj(C_factory,0); wr64(g,A1(g),fct); SET_RAX(g,0); }
-IMP(d3d12,ord101){ kh_cnt_gfx_calls++; /* D3D12CreateDevice(adapter, featureLevel, riid, **ppDevice) */ u64 pp=A3(g); if(!o_device) o_device=kh_com_obj(C_dev,0); if(pp){ wr64(g,pp,o_device); } SET_RAX(g,0); }
-IMP(d3d12,D3D12SerializeRootSignature){ kh_cnt_gfx_calls++; u64 b=mk_blob(g,A0(g),0x40); wr64(g,A2(g),b); if(A3(g)) wr64(g,A3(g),0); SET_RAX(g,0); }
+IMP(d3d12,ord101){ kh_cnt_gfx_calls++; /* D3D12CreateDevice(adapter, featureLevel, riid, **ppDevice) */ if(kh_gfx_vkd3d_on){ kh_vkd3d_create_device(g); return; } u64 pp=A3(g); if(!o_device) o_device=kh_com_obj(C_dev,0); if(pp){ wr64(g,pp,o_device); } SET_RAX(g,0); }
+IMP(d3d12,D3D12SerializeRootSignature){ kh_cnt_gfx_calls++; if(kh_gfx_vkd3d_on){ kh_vkd3d_serialize_rootsig(g); return; } u64 b=mk_blob(g,A0(g),0x40); wr64(g,A2(g),b); if(A3(g)) wr64(g,A3(g),0); SET_RAX(g,0); }
 IMP(d3dcompiler_47,D3DStripShader){ kh_cnt_gfx_calls++; u64 b=mk_blob(g,A0(g),A1(g)); wr64(g,A3(g),b); SET_RAX(g,0); }
 
 int kh_gfx_selftest(KCtx *g){
@@ -245,5 +258,6 @@ int kh_gfx_selftest(KCtx *g){
     fail+=rd32(g,out+16)!=1 || rd32(g,out+20)!=0xa5a5a5a5u || rd64(g,out+24)!=0xa5a5a5a5a5a5a5a5ull;
     ga_free(out);
     fprintf(stderr,"kh: gfx selftest: 2 checks, %d failures\n",fail);
+    if(kh_gfx_vkd3d_on) fail+=kh_gfx_vkd3d_selftest(g);                       /* KHNMC_GFX=vkd3d ./khnmc --selftest: device, clear, present, image dump */
     return fail;
 }

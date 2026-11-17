@@ -18,6 +18,22 @@ HD_HOOKS = 106440 106460 106480
 MOD_PARAMS_HOOKS = 40d810 40dd70
 FILE_HOOKS = 1f9a80 3a9cf0 131ef0 106000 1063d0 106700 106790 106870 $(HD_HOOKS) $(PHASE_HOOKS) $(DIFFICULTY_HOOKS) $(MOD_A_HOOKS) $(MOD_PARAMS_HOOKS)
 all: khnmc
+# Optional vkd3d graphics backend (KHNMC_GFX=vkd3d, runtime/gfx_vkd3d.c): compiled in when the vkd3d libraries exist under VKD3D_PREFIX
+# (make GFX_VKD3D=0 compiles it out: KHNMC_GFX=vkd3d is then a named fatal).  Only gfx_vkd3d.o depends on the switch; the stamp relinks.
+VKD3D_PREFIX ?= /home/user/work/khnmc-deps/vkd3d/usr
+VKHEADERS_PREFIX ?= /home/user/work/khnmc-deps/vkheaders/usr
+ifneq ($(wildcard $(VKD3D_PREFIX)/lib/libvkd3d.so),)
+GFX_VKD3D ?= 1
+else
+GFX_VKD3D ?= 0
+endif
+ifeq ($(GFX_VKD3D),1)
+obj/gfx_vkd3d.o: CFLAGS += -DKH_GFX_VKD3D=1 -DWIDL_C_INLINE_WRAPPERS -I$(VKD3D_PREFIX)/include/vkd3d -I$(VKHEADERS_PREFIX)/include
+GFX_LDFLAGS = -L$(VKD3D_PREFIX)/lib -lvkd3d-utils -lvkd3d -ldl -Wl,--disable-new-dtags -Wl,-rpath,$(VKD3D_PREFIX)/lib
+endif
+obj/.gfx-vkd3d-$(GFX_VKD3D):
+	@mkdir -p obj && rm -f obj/.gfx-vkd3d-* && touch $@
+obj/gfx_vkd3d.o khnmc: obj/.gfx-vkd3d-$(GFX_VKD3D)
 # Weak definitions also allow same-shard relocations to bind to the runtime hooks.
 obj/libkh2loose.a: $(LIFTED)/lib/x86/libkh2lifted.a Makefile tools/alias_file_hooks.py
 	@mkdir -p obj
@@ -39,7 +55,7 @@ obj/nep_stubs.c: $(LIFTED)/gen/nep_stubs.c $(ROOT)/tools/gen_nep.sh
 obj/nep_stubs.o: obj/nep_stubs.c
 	$(CC) $(CFLAGS) -c $< -o $@
 khnmc: $(RTOBJ) $(LIFTOBJ) obj/libkh2loose.a
-	$(CC) -o $@ $(RTOBJ) $(LIFTOBJ) obj/libkh2loose.a -lm -lpthread -rdynamic $(WRAP)
+	$(CC) -o $@ $(RTOBJ) $(LIFTOBJ) obj/libkh2loose.a -lm -lpthread -rdynamic $(WRAP) $(GFX_LDFLAGS)
 # arm64 compile check of the hand-written runtime only (no lifted shards): clang -arch arm64 on macOS
 arm64check:
 	@for f in $(RTSRC) $(ROOT)/lifter-rt/khrt_cpu.c $(ROOT)/lifter-rt/rt_libm.c; do echo CC $$f; clang -arch arm64 -std=gnu11 -O1 -w -fno-strict-aliasing -fwrapv -fno-math-errno -ffp-contract=off -I$(ROOT)/lifter-rt -I$(ROOT)/runtime -I$(LIFTED)/gen -DKH_XLATE_MODE=2 -c $$f -o /tmp/khnmc_arm_chk.o || exit 1; done

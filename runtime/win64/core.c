@@ -253,9 +253,10 @@ KhFn kh_lookup(u64 target){
     d=target-KH_HOSTFN_BASE; if(d<16ull*nhost && !(d&15)) return hostfns[d>>4].fn;
     return 0;
 }
+int kh_native_try(KCtx *g,u64 target);                 /* native_call.c: registered native Windows-ABI ranges (vkd3d), else 0 */
 void kh_dispatch(KCtx *g,u64 target){
     KhFn f=kh_lookup(target);
-    if(!f) kh_fault(g,target,"dispatch: not a function start");
+    if(!f){ if(kh_native_try(g,target)) return; kh_fault(g,target,"dispatch: not a function start"); }
     g->aux[0]=target; f(g);
 }
 void kh_fault(KCtx *g,u64 va,const char *kind){

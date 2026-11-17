@@ -227,6 +227,7 @@ IMPN(CRTR,_endthread){ thread_end(g,0); }
 IMPN(K32,ExitProcess){ extern void kh_exit_process(int); kh_exit_process((int)A0(g)); }
 
 /* ---- fibers ---------------------------------------------------------------------------------------------------------- */
+u64 kh_fiber_host_stack=2ull<<20;            /* host stack of a fiber (lazily committed); the vkd3d backend raises it because native graphics code runs on it */
 struct KFiber { KCtx *g; void *hstack; size_t hsize; void *sp; u64 start, param, handle, gstack_lo, gstack_sz; KThread *owner; int is_thread_fiber, finished; };
 #define FIBER_MAGIC 0x46494245ull
 static KFiber *fiber_of(KCtx *g,u64 h){ if(!GA_OK(h)||rd64(g,h+8)!=FIBER_MAGIC){ kh_fatal(g,"bad fiber handle %llx",(unsigned long long)h); } return (KFiber*)rd64(g,h); }
@@ -238,7 +239,7 @@ void kh_fiber_main(KFiber *f){
 u64 kh_fiber_create(KCtx *g,u64 stack_size,u64 start,u64 param){
     KFiber *f=calloc(1,sizeof *f); f->g=kh_new_ctx(); f->start=start; f->param=param;
     u64 gs=stack_size<(1ull<<20)?(1ull<<20):stack_size; f->gstack_sz=gs; u64 top=kh_new_guest_stack(gs,&f->gstack_lo); kh_ctx_set_stack(f->g,top);
-    f->hsize=2ull<<20; f->hstack=mmap(0,f->hsize,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0); if(f->hstack==MAP_FAILED) kh_fatal(g,"fiber host stack mmap failed");
+    f->hsize=kh_fiber_host_stack; f->hstack=mmap(0,f->hsize,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0); if(f->hstack==MAP_FAILED) kh_fatal(g,"fiber host stack mmap failed");
     f->sp=make_frame((char*)f->hstack+f->hsize,f); return fiber_handle(g,f);
 }
 u64 kh_fiber_convert(KCtx *g,u64 param){

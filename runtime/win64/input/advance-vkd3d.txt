@@ -1,0 +1,10 @@
+# Scripted pad for the TITLE route on the vkd3d backend (KHNMC_GFX=vkd3d, CPU Vulkan driver).
+# Inclusive present ranges; gaps are released.  Same logical sequence as advance.txt, other frame numbers: asset loading takes wall-clock
+# time while the CPU renderer presents about half as many frames per second as the null recorder, so the Initial Settings page is reached
+# at a lower present count (state 3 at present 84 in the reference run, 156 on the null backend).
+# 200: A on the Keyboard Layout page (QWERTY) -> "Begin with these settings?" dialog, cursor on No (state 14 about 50 presents later).
+200 202 A
+# 300: move the cursor to Yes.
+300 302 DPAD_UP+DPAD_LEFT
+# 360: confirm.  Initial Settings then finishes about 115 presents later and the title loads.
+360 362 A

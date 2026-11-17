@@ -268,6 +268,6 @@ int kh_selftest(KCtx *g){
     float c; u32 cu=rd32(g,GS_BASE+0x717480); memcpy(&c,&cu,4); float x1=2.5f; memcpy(&KH_XMM(g,1),&x1,4); do_call(g,rt_hook_fiber_yield_150080,task,0,0,0,0,0); float r; u32 ru=rd32(g,P+0x20); memcpy(&r,&ru,4); CHECK(r==2.5f-c);
     fprintf(stderr,"kh: selftest: %d checks, %d failures\n",checks,fails);
     if(getenv("KH_SELFTEST_FATAL")){ extern void rt_imp_gdi32__MoveToEx(KCtx*); do_call(g,rt_imp_gdi32__MoveToEx,1,2,3,4,0,0); }   /* demonstrates the loud failure of an unimplemented import */
-    extern int kh_gfx_selftest(KCtx *); extern int kh_hd_selftest(KCtx *);
-    return fails + io_selftest(g) + audio_selftest(g) + kh_file_selftest(g) + kh_hd_selftest(g) + kh_gfx_selftest(g);
+    extern int kh_gfx_selftest(KCtx *); extern int kh_hd_selftest(KCtx *); extern int kh_native_selftest(KCtx *);
+    return fails + io_selftest(g) + audio_selftest(g) + kh_file_selftest(g) + kh_hd_selftest(g) + kh_gfx_selftest(g) + kh_native_selftest(g);
 }
