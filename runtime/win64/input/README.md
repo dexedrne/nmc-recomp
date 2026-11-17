@@ -95,3 +95,44 @@ InitSave). `KHNMC_DIFFICULTY` still forces the save's dword after InitSave and S
 set KHNMC_ROUTE_DIFFICULTY for a route script and KHNMC_DIFFICULTY for a frame-numbered one.
 
 A file is either frame-numbered (`FROM TO`, `@hold`, `@clock`) or a route; mixing the two is a named fatal at load.
+
+## Route scripts, task 29: walking, the command menu, the player, the map, items
+
+```
+@goto X Z [radius R] [until COND] [stall N] [timeout N]
+                                               walk the player toward the map point (X, Z) with the left stick until he is
+                                               within R (default 100) of it, or until COND holds (e.g. `until not area 2`
+                                               for a map exit: the transition starts before the point is reached)
+@goto enemy [radius R] [until COND] [stall N] [timeout N]
+                                               the same toward the nearest enemy object; met at once when there is none
+@select command-row N | command-id N [timeout N]
+                                               the field command menu: move the cursor of the list on top of its stack to
+                                               row N, or to the row that holds command N (23 Potion, 21 Ether, 3 Items, 1 Attack)
+```
+
+`@goto` steers every game frame: heading to the target = atan2(dx, dz) of the player's position [obj+0x670]; the stick angle
+atan2(lx, ly) = that heading minus the camera's yaw (eye record+0x48 -> look-at record+0x58 of the camera record 0x19ce40
+returns): movement is camera-relative, traced in four directions. Full stick, 0.6 of it within 2R. A walk whose distance has not
+shrunk by 10 map units for N game frames (`stall`, default 240) ends the run with the named fatal `route-goto-stalled` (where the
+player is, how far, the closest he got, the camera yaw): a wall or a barricade, never a silent wait. `timeout` as everywhere.
+There is no path finding: a route walks around walls with intermediate points (input/route-leave-eh02.txt).
+
+| condition | true when (runtime/route_state.c has the details) |
+|---|---|
+| `hp-below-max`, `mp-below-max` | the field player's HP / MP is below its maximum (his status sheet: FIELD_COMMAND [0x142a10620+0xae0] -> [obj+0x5c0], a record of the sheet pool 0x142a17290; HP +0, max +4, MP +0x180, max +0x184) |
+| `hp-at-most N`, `mp-at-most N` | HP / MP at most N |
+| `command-depth N` | the field command menu's stack is N lists deep (1 the main list, 2 a sub-list such as Items is open, 0 none) |
+| `command-row N`, `command-id N` | the cursor of the top list is on row N / on a row of command N |
+| `command-has N` | the top list has a row of command N that can be chosen (state byte below 4; Items with an empty item list is state 5) |
+| `world N`, `area N` | the current world / area ([0x140717008], [0x140717009]; the first field is world 18 (0x12, eh) area 2) |
+| `menu-open` | a system menu runs (MENU::isRunning [0x1409006b0]): START opens the camp menu only when no mission runs, else the mission's pause screen |
+| `mission` | a mission runs (0x3ad500: one of the six records at 0x142a114a0); the first field's EH_NOKILL mission bars its exits with a barricade |
+| `enemies-at-most N` | at most N enemy objects (class records with the BTLOBJ vtables of YS::ZAKO / ENEMY / BOSS / LARGEZAKO / LARGEBOSS) are in the object list [0x142a171c8] |
+| `item-uses N` | the mod's item handler (exe 0x3c4b80 = DLL 0x31260, kind 0) applied N items since the step started |
+| `item-drain`, `item-heal` | an item applied since the step started lowered / raised the target's HP or MP (the sheet read right before and right after the DLL's adds) |
+
+Every item application prints `kh: item apply #k ... HP a -> b of max (amount x) ...` with the command's +0x2f byte and the
+multiplier, so a route's numbers can be checked against the formula. Every map change prints `kh: map report (map ww:aa -> ww:aa)`
+with the id table's slots, the arena zones' high-water marks, RSS, files opened and threads (with `KHNMC_IDTABLE_REPORT=1` the
+whole id table follows). `KHNMC_ROUTE_TRACE=2` adds the player's sheet, position, facing and the camera yaw every 8 game frames
+and the object list with the running mission every 64: what the coordinates in a route come from.

@@ -79,6 +79,7 @@ void f_4f94b0(KCtx *g){
     }
     orig_f_4f94b0(g);
 }
+size_t kh_phase_files_seen(void){ pthread_mutex_lock(&phase_lock); size_t n=nseen; pthread_mutex_unlock(&phase_lock); return n; }   /* task 29: distinct paths opened */
 void kh_phase_file(KCtx *g,const char *path){
     pthread_mutex_lock(&phase_lock);
     for(size_t i=0;i<nseen;i++) if(!strcmp(seen[i],path)){ pthread_mutex_unlock(&phase_lock); return; }

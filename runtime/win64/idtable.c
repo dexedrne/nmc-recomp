@@ -123,6 +123,9 @@ static void report(FILE *f,const char *when){
     fprintf(f,"kh: idtable:   %d windows inside [image + id zone] (at most %d by construction), %d outside it (%d slots are spare for those)\n",in_range,GA_ID_WINDOWS,foreign,NSLOT-GA_ID_WINDOWS);
     ga_report(f);
 }
+/* task 29: the map reports of runtime/route_state.c */
+int kh_idtable_slots(int *most){ int used=table_live()?slots_used():0, hw=atomic_load(&hw_slots); if(most) *most=hw>used?hw:used; return used; }
+void kh_idtable_report_now(FILE *f,const char *when){ report(f,when); }
 void kh_idtable_exit_report(FILE *f){
     if(report_on){ report(f,"exit"); return; }
     if(atomic_load(&c_overflow)) fprintf(f,"kh: idtable: %llu registrations of a 65th window were %s\n",(unsigned long long)c_overflow,guard_on?"refused":"ALIASED to slot 0 (guard off): ids of those windows decode to wrong addresses");

@@ -259,6 +259,11 @@ static u64 item_enter(KCtx *g){
     item_call(g,0x152380,0,0,0,0);
     return sheet;
 }
+/* Task 29: the last application as the target's sheet saw it (read-only; kh_mod_item_obs).  Written on the game thread only. */
+static struct kh_item_obs item_obs; static pthread_mutex_t item_obs_lock=PTHREAD_MUTEX_INITIALIZER;
+u64 kh_mod_item_obs(struct kh_item_obs *out){ pthread_mutex_lock(&item_obs_lock); if(out) *out=item_obs; u64 s=item_obs.seq; pthread_mutex_unlock(&item_obs_lock); return s; }
+void kh_mod_item_obs_test_set(const struct kh_item_obs *in){ pthread_mutex_lock(&item_obs_lock); item_obs=*in; pthread_mutex_unlock(&item_obs_lock); }   /* selftest only */
+u64 kh_input_game_frames(void);
 static void item_hp(KCtx *g,u64 sheet,s32 amount,int flag){ item_hp_calls++; item_last_hp=amount; item_call(g,0x3c0c30,sheet,(u32)amount,0,(u64)flag); }
 static void item_mp(KCtx *g,u64 sheet,s32 amount,int flag){ item_mp_calls++; item_last_mp=amount; item_call(g,0x3c0cd0,sheet,(u32)amount,(u64)flag,0); }
 static void item_stock_apply(KCtx *g,int difficulty){
@@ -273,6 +278,11 @@ static void item_stock_apply(KCtx *g,int difficulty){
     if(!cmd) kh_fatal(g,"mod item effect: no cmd record for command %d of item 0x%x; shipped DLL 0x31482 reads byte [0+0x2f]",(int)(s16)rd16(g,rec+0x10),id);
     int reversed=rd8(g,cmd+0x2f)==2;
     s32 hp_amount=item_div(hp_n,reversed),mp_amount=item_div(mp_n,reversed);
+    struct kh_item_obs ob={0};
+    ob.id=id; ob.target=(u32)A1(g); ob.user=user; ob.mult=mult; ob.pct=pct; ob.cmd=rd16(g,rec+0x10); ob.byte2f=rd8(g,cmd+0x2f); ob.reversed=reversed;
+    ob.hp_before=(s32)rd32(g,sheet); ob.hp_max=(s32)rd32(g,sheet+4); ob.mp_before=(s32)rd32(g,sheet+0x180); ob.mp_max=(s32)rd32(g,sheet+0x184);
+    ob.hp_call=(!((id-1)&0xfffa) && id!=6) || id==4 || id==7 || id==0x83; ob.mp_call=id==3 || id==6 || id==4 || id==7 || id==0x83;
+    ob.hp_amount=ob.hp_call?hp_amount:0; ob.mp_amount=ob.mp_call?mp_amount:0;
     item_apply[difficulty][item_slot(id)]++;
     if(reversed && id>=1 && id<=7) item_reversed[difficulty]++;
     /* 314e0..31557: (id-1)&0xfffa==0 selects 1,2,5,6 and 6 is then excluded. */
@@ -289,6 +299,13 @@ static void item_stock_apply(KCtx *g,int difficulty){
     if(id==0x115) item_call(g,0x3c0e30,sheet,pct,0,0);
     if(id==0x116) item_call(g,0x3c0a50,sheet,pct,0,0);
     if(id==0x117) item_call(g,0x3c0950,sheet,pct,0,0);
+    /* the sheet after the adds, before 0x3c07e0 drops the reference (the engine's add writes the sheet itself) */
+    ob.hp_after=(s32)rd32(g,sheet); ob.mp_after=(s32)rd32(g,sheet+0x180); ob.game_frame=kh_input_game_frames();
+    pthread_mutex_lock(&item_obs_lock); ob.seq=item_obs.seq+1; item_obs=ob; pthread_mutex_unlock(&item_obs_lock);
+    if(!kh_item_mock_sink)
+        fprintf(stderr,"kh: item apply #%llu game-frame=%llu id=%u cmd=%u cmd+0x2f=%u (%s) target=%u user=%u mult=%u pct=%u: HP %d -> %d of %d (amount %d%s), MP %d -> %d of %d (amount %d%s)\n",
+                (unsigned long long)ob.seq,(unsigned long long)ob.game_frame,id,ob.cmd,ob.byte2f,reversed?"REVERSED: / -10000":"/ 10000",ob.target,user,mult,pct,
+                ob.hp_before,ob.hp_after,ob.hp_max,ob.hp_amount,ob.hp_call?"":", no HP call",ob.mp_before,ob.mp_after,ob.mp_max,ob.mp_amount,ob.mp_call?"":", no MP call");
     KH_RAX(g)=item_call(g,0x3c07e0,sheet,0,0,0);
     KH_RET(g);
 }

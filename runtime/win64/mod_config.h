@@ -161,3 +161,16 @@ void kh_mod_b_check_options(KCtx *g,const char *root);             /* named fata
 void kh_mod_b_icons(u8 *c8,u8 *c9,u8 *ca,int set);                  /* the DLL's three icon bytes 0x1800817c8..ca: read (set = 0) or write */
 void kh_mod_hooks_b_dump(void);
 int  kh_mod_hooks_b_selftest(KCtx *g);
+
+/* Task 29: a read-only record of the last kind-0 item application (f_3c4b80 -> item_stock_apply): what the target's status sheet
+ * held right before and right after the DLL's HP / MP calls, and what the DLL's formula gave (scripted routes `@expect` on it). */
+struct kh_item_obs {
+    u64 seq;                       /* applications so far (0 = none yet) */
+    u64 game_frame;                /* game frame of the last one */
+    u32 id, target, user, mult, pct, cmd; u8 byte2f; int reversed;
+    s32 hp_before, hp_after, hp_max, mp_before, mp_after, mp_max;   /* the target's sheet: +0, +4, +0x180, +0x184 */
+    s32 hp_amount, mp_amount;      /* the amounts the DLL's formula handed to 0x3c0c30 / 0x3c0cd0 (0 when that call was not made) */
+    int hp_call, mp_call;          /* whether the HP / MP add was called for this id */
+};
+u64  kh_mod_item_obs(struct kh_item_obs *out);                     /* copies the last record, returns seq */
+void kh_mod_item_obs_test_set(const struct kh_item_obs *in);       /* selftest only */

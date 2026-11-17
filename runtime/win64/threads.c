@@ -424,6 +424,13 @@ void kh_dump_threads(FILE *f){
     if(locked) pthread_mutex_unlock(&tlist_m);
 }
 
+/* task 29: threads created / ended so far (the map reports of runtime/route_state.c); never blocks */
+void kh_threads_counts(u64 *created,u64 *ended,u64 *released){
+    int locked=(pthread_mutex_trylock(&tlist_m)==0); u64 d=0;
+    for(u32 i=0;i<ntlist;i++) if(tlist[i]->done) d++;
+    if(locked) pthread_mutex_unlock(&tlist_m);
+    *created=ntlist; *ended=d; *released=atomic_load(&cnt_thread_stacks_released);
+}
 void kh_sync_report(FILE *f){
     fprintf(f,"kh: threads: %u created, stacks of %llu ended threads released\n",ntlist,(unsigned long long)cnt_thread_stacks_released);
     fprintf(f,"kh: sync report: self-suspends=%llu refused-suspends-of-other-threads=%llu fibers-created=%llu fiber-switches=%llu switches-to-a-fiber-below-the-thread-stack=%llu sync-chaos=%u hits=%llu\n",
