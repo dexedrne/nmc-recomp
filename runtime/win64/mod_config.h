@@ -10,3 +10,6 @@ static const struct kh_mod_difficulty_config {
     {200,125,1.5f,0.5f,0.5f},
     {200,125,1.5f,0.5f,0.5f},
 };
+
+/* GAME_MODE descriptor, not a DLL option. */
+#define KH_MOD_GUMMI_TASK 0x716c10u

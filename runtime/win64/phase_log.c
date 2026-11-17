@@ -7,7 +7,7 @@ static size_t nseen,reported;
 static _Atomic u64 entries[11];
 static const char *names[]={"1505a0:GAME_MODE.start","5111d0:InitialSetting.ctor","5122e0:InitialSetting.vfn1","511300:InitialSetting.dtor","13da10:movie.open","13d260:movie.prepare","405440:EVENT.MapEvent","3f29e0:FIELD_COMMAND.execute","3c12f0:BATTLE.calc_damage","2b4590:title.Layout.task","4f94b0:SettingMenu.vfn1"};
 #define PHASE(RVA,I) void orig_f_##RVA(KCtx *); void f_##RVA(KCtx *g){ entries[I]++; orig_f_##RVA(g); }
-PHASE(1505a0,0)
+void kh_phase_mode_entry(void){ entries[0]++; }
 PHASE(5111d0,1)
 void orig_f_5122e0(KCtx *);
 static _Atomic int initial_state=-1,initial_choice=-1;
