@@ -101,6 +101,10 @@ Counts after the judge's corrections: After my corrections: 133 features. Presen
   original `HB38_FM_MAR`, and Larxene's object in nm11). The game itself has 32 area files without a map file of the same name,
   among them its own rooms hb35, hb36, hb37, hb39..hb45 and eh30..eh40, so a room evidently can use another room's map. Which
   map each of these rooms loads has not been read from the code yet; a sweep that enters every room (task 33) will show it.
+- **Lua.** OpenKH's mod manager can run Lua scripts (through LuaBackend), and many PC mods use it. The PC form of NMC ships
+  none: its manifest names no script, and in its history a Lua framework (`dll/starseeker/`: a title skip, event / object /
+  motion id tables, settings) was added in a commit called "Testing" and removed the same day ("Remove starseeker",
+  2026-08-15). Lua mods installed NEXT to NMC in someone's mod manager would add behaviour this port does not have.
 - **Flight in Neverland.** The PC mod's text describes a Flight Mode and `NeverlandFly.dll` is ported, but nothing in the
   public mod data puts the player into the flight action (`runtime/win64/implementation notes`).
 
