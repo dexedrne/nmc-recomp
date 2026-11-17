@@ -68,8 +68,8 @@ static void bg_lock(KCtx *g){
     if(t->depth++) return;
     if(kh_tmutex_trylock(&bg_m)!=0){
         atomic_fetch_add(&c_contended,1); u64 t0=kh_host_ns();
-        int rc=kh_tmutex_lock_timeout_ms(&bg_m,BG_LOCK_WAIT_MAX_S*1000u);
-        if(rc) kh_fatal(g,"bgload: waited %d s for the load-list lock (held by thread %u, pthread rc %d): a holder is blocked, which the design excludes",BG_LOCK_WAIT_MAX_S,atomic_load(&bg_owner_tid),rc);
+        int rc=kh_tmutex_lock_stuck(&bg_m,BG_LOCK_WAIT_MAX_S);                 /* in slices (kh_compat.h): a stopped process loses one slice, not the budget */
+        if(rc) kh_fatal(g,"bgload: waited %d slices (about that many seconds of this process running) for the load-list lock (held by thread %u, pthread rc %d): a holder is blocked, which the design excludes",BG_LOCK_WAIT_MAX_S,atomic_load(&bg_owner_tid),rc);
         u64 w=kh_host_ns()-t0, m=atomic_load(&c_wait_ns_max); while(w>m && !atomic_compare_exchange_weak(&c_wait_ns_max,&m,w)){}
     }
     KThread *th=cur_thread(); atomic_store(&bg_owner_tid,th?th->tid:1);

@@ -2,6 +2,7 @@
  * guest XAPOs reach this file through the KmxHost function table (null_audio.c provides it), the tests use plain host callbacks. */
 #define _GNU_SOURCE
 #include "khnmc_mix.h"
+#include "kh_compat.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -183,8 +184,8 @@ static int wait_idle(KmxVoice *v){
     KmxEngine *e = v->e;
     if(!v->busy) return KMX_OK;
     if(on_pass_thread(e)) return KMX_E_UNSUPPORTED;
-    struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += 10;
-    while(v->busy) if(pthread_cond_timedwait(&e->cv, &e->m, &dl) == ETIMEDOUT) return KMX_E_TIMEOUT;
+    unsigned stuck = 0;                                              /* 10 slices (kh_compat.h): a stopped process loses one slice, not the budget */
+    while(v->busy) if(kh_cond_wait_stuck_rt(&e->cv, &e->m, &stuck, 10) == ETIMEDOUT) return KMX_E_TIMEOUT;
     return KMX_OK;
 }
 static void op_drop_voice(KmxEngine *e, KmxVoice *v);

@@ -256,11 +256,11 @@ void kh_vclock_on_vblank(void (*fn)(KCtx *g,u64 vblank,u64 vnow_ns)){ for(int i=
 static void advance_locked(KCtx *g,u64 target){
     for(;;){
         u64 now=atomic_load(&v_now);
-        struct timespec dl; abs_in(&dl,(u64)VC_CLIENT_WAIT_S*1000000000ull);
+        unsigned stuck=0;                                                               /* slices that expired (kh_compat.h: a stopped process loses one slice, not the budget) */
         for(;;){ int behind=-1; for(int i=0;i<MAXCLIENTS;i++) if(clients[i].used&&clients[i].due<=now){ behind=i; break; }
             if(behind<0) break;
-            if(kh_cond_wait_until(&vcv,&vm,&dl)==ETIMEDOUT){ const char *nm=clients[behind].name; u64 due=clients[behind].due; pthread_mutex_unlock(&vm);
-                kh_fatal(g,"vclock-client-stuck: clock client '%s' did not finish its work due at virtual time %llu ns within %d s of host time (the clock is at %llu ns)",nm,(unsigned long long)due,VC_CLIENT_WAIT_S,(unsigned long long)now); } }
+            if(kh_cond_wait_stuck(&vcv,&vm,&stuck,VC_CLIENT_WAIT_S)==ETIMEDOUT){ const char *nm=clients[behind].name; u64 due=clients[behind].due; pthread_mutex_unlock(&vm);
+                kh_fatal(g,"vclock-client-stuck: clock client '%s' did not finish its work due at virtual time %llu ns in %d slices of waiting, about that many seconds of this process running (the clock is at %llu ns)",nm,(unsigned long long)due,VC_CLIENT_WAIT_S,(unsigned long long)now); } }
         if(now>=target) return;
         if(kh_vclock_sync){                                                             /* nothing may still be running at `now` */
             u64 q0=0; char who[64]="";

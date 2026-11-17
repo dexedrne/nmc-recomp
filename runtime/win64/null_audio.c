@@ -532,8 +532,8 @@ static void soft_engine_release(KCtx *g,u64 obj){                               
     SoftEngine *e=soft_engine_of(g,obj); if(!e) return;
     pthread_mutex_lock(&soft_m);
     for(SoftEngine **pp=&engines;*pp;pp=&(*pp)->next) if(*pp==e){ *pp=e->next; break; }
-    struct timespec dl; clock_gettime(CLOCK_REALTIME,&dl); dl.tv_sec+=10;
-    while(e->inuse) if(pthread_cond_timedwait(&soft_cv,&soft_m,&dl)==ETIMEDOUT){ pthread_mutex_unlock(&soft_m); kh_fatal(g,"audio: IXAudio2::Release waited 10 s for the running processing pass (called from a callback, or a guest lock is held)"); }
+    unsigned stuck=0;                                                                /* 10 slices (kh_compat.h): a stopped process loses one slice, not the budget */
+    while(e->inuse) if(kh_cond_wait_stuck_rt(&soft_cv,&soft_m,&stuck,10)==ETIMEDOUT){ pthread_mutex_unlock(&soft_m); kh_fatal(g,"audio: IXAudio2::Release waited 10 slices (about 10 s of this process running) for the running processing pass (called from a callback, or a guest lock is held)"); }
     pthread_mutex_unlock(&soft_m);
     for(;;){ pthread_mutex_lock(&soft_m); SoftVoice *sv=e->voices; pthread_mutex_unlock(&soft_m); if(!sv) break;
         Voice *st=voice_state(g,sv->obj); if(!st||st->soft!=sv) kh_fatal(g,"audio: voice list corrupted at engine release");

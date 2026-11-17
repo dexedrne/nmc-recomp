@@ -97,6 +97,26 @@ static inline int kh_cond_wait_until(pthread_cond_t *cv,pthread_mutex_t *m,const
 #endif
 }
 
+/* ---- "a peer is stuck": a budget that a stopped process cannot use up ----
+ * A few waits that should be short become a named fatal when they are not (a client of the frames clock, the load-list lock, two
+ * waits for the audio pass).  Host time also passes while the WHOLE process is stopped (a debugger, SIGSTOP / Ctrl-Z, an app
+ * suspended by iOS, a sleeping machine), and then the peer has not run either: one long deadline expires at the moment of resume
+ * and kills a healthy run (review 2026-11-17).  So such a wait is cut into slices of kh_stuck_slice_ms, and the budget is the
+ * number of slices that EXPIRED: a stop of any length costs the one slice it interrupts, the peer gets every remaining slice to
+ * finish in.  A forward step of the wall clock costs one slice too.  The caller looks at its condition again after every call. */
+__attribute__((weak)) unsigned kh_stuck_slice_ms=1000;      /* one definition for the program (weak in every unit); the selftest shortens it */
+/* one slice on a kh_cond_init condition (monotonic).  0 = look again; ETIMEDOUT = `slices` slices have expired */
+static inline int kh_cond_wait_stuck(pthread_cond_t *cv,pthread_mutex_t *m,unsigned *expired,unsigned slices){
+    struct timespec dl; kh_mono_deadline_ms(&dl,kh_stuck_slice_ms);
+    if(kh_cond_wait_until(cv,m,&dl)==ETIMEDOUT && ++*expired>=slices) return ETIMEDOUT;
+    return 0; }
+/* the same on a default condition (PTHREAD_COND_INITIALIZER / pthread_cond_init(cv,NULL)): its deadline is REALTIME on every host */
+static inline int kh_cond_wait_stuck_rt(pthread_cond_t *cv,pthread_mutex_t *m,unsigned *expired,unsigned slices){
+    struct timespec dl; clock_gettime(CLOCK_REALTIME,&dl); dl.tv_sec+=(time_t)(kh_stuck_slice_ms/1000u); dl.tv_nsec+=(long)(kh_stuck_slice_ms%1000u)*1000000L;
+    if(dl.tv_nsec>=1000000000L){ dl.tv_sec++; dl.tv_nsec-=1000000000L; }
+    if(pthread_cond_timedwait(cv,m,&dl)==ETIMEDOUT && ++*expired>=slices) return ETIMEDOUT;
+    return 0; }
+
 /* ---- sleep to an absolute monotonic time ---- */
 static inline void kh_sleep_until(const struct timespec *deadline){
 #if KH_DARWIN
@@ -129,3 +149,6 @@ static inline int kh_tmutex_lock_timeout_ms(kh_tmutex *t,unsigned ms){
     return pthread_mutex_timedlock(t,&dl); }
 static inline int kh_tmutex_unlock(kh_tmutex *t){ return pthread_mutex_unlock(t); }
 #endif
+/* lock t in slices: 0, another error of the lock, or ETIMEDOUT after `slices` slices have expired (see "a peer is stuck" above) */
+static inline int kh_tmutex_lock_stuck(kh_tmutex *t,unsigned slices){
+    for(unsigned n=0;;){ int rc=kh_tmutex_lock_timeout_ms(t,kh_stuck_slice_ms); if(rc!=ETIMEDOUT) return rc; if(++n>=slices) return ETIMEDOUT; } }
