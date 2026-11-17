@@ -201,7 +201,9 @@ static void syscall_handler(KCtx *g){
         p=call(g,0x3b3e80,0,0); require_mem(g,p,0xdd8);
         p=rd64(g,p+0xdd0); require_mem(g,p,0xb43);
         wr32(g,args,rd8(g,p+0xb42)); break;
-    case 69: p=decode(g,a); require_mem(g,p,1); wr8(g,p,(u8)b); break;
+    case 69: p=decode(g,a); require_mem(g,p,1);
+        { extern void kh_mod_item_writebyte(KCtx *,u64,u8); kh_mod_item_writebyte(g,p,(u8)b); } /* Task 16 counter only */
+        wr8(g,p,(u8)b); break;
     case 78: wr32(g,args,(u32)call(g,0x3c4720,a,0)); break;
     case 80: call(g,0x3e4530,a,0); break;
     case 87: wr32(g,drive_multiplier,a); break;

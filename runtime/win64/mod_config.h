@@ -69,3 +69,32 @@ int kh_mod_params_selftest(KCtx *g);
 size_t kh_mod_params_map_size(int which);                     /* 0 = minimum HP (64), 1 = resistance byte (65) */
 int kh_mod_params_map_get(int which, u64 actor, s32 *saved);  /* 1 if present */
 void kh_mod_params_map_clear(void);
+
+/* ---- Task 16: DLL 0x31260 kind 0 (the stock item path, DLL 0x3143b..0x31618) and the fall-through of DLL 0x30f60, both in
+ * runtime/mod_difficulty.c; runtime/mod_difficulty_items_test.c holds the selftest and runtime/mod_item_cases.h the reference
+ * arithmetic shared with tools/native_item_oracle.c.
+ * The sink replaces every outgoing guest call of the apply path by a recorded tuple (arguments the DLL leaves unset are 0);
+ * NULL in normal runs. */
+#define KH_ITEM_MAXCALLS 12
+struct kh_item_call { u32 rva; u64 a[4]; };
+struct kh_item_mock {
+    int ncalls, overflow;
+    struct kh_item_call c[KH_ITEM_MAXCALLS];
+    u64 (*fake)(void *user, const struct kh_item_call *call);   /* value returned to the handler for a recorded call */
+    void *user;
+};
+extern struct kh_item_mock *kh_item_mock_sink;
+enum { KH_ITEM_SLOTS = 15 };                                    /* ids 1..7, 0x83, 0x112..0x117, any other id */
+struct kh_item_counts {
+    u64 apply[4][KH_ITEM_SLOTS];      /* kind-0 applications per difficulty and id slot (one per target of a party-wide item) */
+    u64 reversed[4];                  /* of those, ids 1..7 whose command Reserve byte was 2 */
+    u64 noop[4], usable[4];           /* DLL no-op apply kinds (25..29, >31); usability fall-throughs to the original */
+    u64 hp_calls, mp_calls;           /* calls of exe 0x3c0c30 / 0x3c0cd0 made by the kind-0 path */
+    u64 cmd2f_writes, cmd2f_two, cmd2f_zero, cmd2f_other;   /* WriteByte stores that hit +0x2f of a cmd record, by value */
+};
+void kh_mod_items_counts(struct kh_item_counts *out);
+void kh_mod_items_reset(void);
+void kh_mod_item_writebyte(KCtx *g, u64 p, u8 value);          /* observer called by the WriteByte syscall before it stores */
+void kh_mod_items_dump(void);
+int kh_mod_items_selftest(KCtx *g, u64 sheet);                 /* runs inside the caps fixture (character-2 sheet registry) */
+u64 kh_mod_items_test_cmds(KCtx *g);                           /* synthetic sorted cmd table for exe 0x3b68b0 (test only) */

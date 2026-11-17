@@ -193,24 +193,158 @@ void f_3edf90(KCtx *g){
     KH_RSP(g)=stack; KH_RET(g);
 }
 
-/* Difficulty-only slices of DLL 31260/30f60; other effect kinds retain vanilla.
- * DLL 31569 is an internal item-0x83 branch, not another detour. */
+/* DLL 31260/30f60 (replacing exe 3c4b80/3c3da0).  Ported: kinds 11/12 (the max-HP/MP caps, Task 7), kind 0 (the stock item
+ * path with the command-byte reversal, Task 16), the DLL's no-op apply kinds and its usability fall-through.  Every other
+ * active kind is a named fatal.  DLL 31569 is an internal item-0x83 branch, not another detour. */
 #include "khnmc_rt.h"
 void orig_f_3c4b80(KCtx *g);
 void orig_f_3c3da0(KCtx *g);
 static _Atomic u64 caps_apply[4],caps_usable[4];
-/* Vanilla has no action for custom IDs; do not silently discard other DLL extensions. */
+/* A nonzero kind makes the DLL skip the id switch for every id (31433 jne 31618), stock ids included, so the vanilla function
+ * is never an answer for an active kind: no silent success, whatever the id. */
 static void caps_require_scope(KCtx *g,u64 effect,unsigned kind,int apply){
     unsigned id=rd16(g,effect);
-    int stock=(id>=1&&id<=7)||id==0x83||(id>=0x112&&id<=0x117);
     int active=apply?((kind>=1&&kind<=24)||kind==30||kind==31):((kind>=1&&kind<=24)&&kind!=22);
-    if(!stock&&active) kh_fatal(g,"unimplemented mod item effect DLL RVA=0x%x exe RVA=0x%x id=0x%x kind=%u",apply?0x31260:0x30f60,apply?0x3c4b80:0x3c3da0,id,kind);
+    if(active) kh_fatal(g,"unimplemented mod item effect DLL RVA=0x%x exe RVA=0x%x id=0x%x kind=%u",apply?0x31260:0x30f60,apply?0x3c4b80:0x3c3da0,id,kind);
 }
+
+/* ---- Task 16: DLL 31260 kind 0, its stock path 3143b..31618 (the replacement of the vanilla id switch of exe 3c4b80).
+ * Arguments: rcx item record (id word +0, percent byte +4, kind byte +5, command word +10), edx target character, r8d using
+ * character (0 from the menus), r9d multiplier in percent (the DLL's console calls it "RATIO": 100 from the menus,
+ * 100 + u16[user sheet+224] from the battle command 3f6d00).
+ * It is not the vanilla function even when the command byte is 0:
+ *   - the "used by another character" flag is r8d!=0 (31445/31457); vanilla also requires r8d!=edx (3c4bbd..3c4bca);
+ *   - every kind-0 item looks up its command through 3b68b0 and reads byte +2f of the result (3147c/31482);
+ *   - byte==2 divides both amounts by -10000 (magic 97247453), anything else by 10000 (magic 68db8bad);
+ *   - item 83 passes flag 1 and an MP amount that is NOT divided (31569..31590);
+ *   - a null sheet is passed to 3c07e0 (31367 -> 31bb6), which faults; vanilla returns.
+ * The DLL's console output (RATIO, TEST! Battle Type Item, CureRate, Effect, ACTOR FAKE/REAL POINTER) is dropped. */
+struct kh_item_mock *kh_item_mock_sink;
+static _Atomic u64 item_apply[4][KH_ITEM_SLOTS],item_reversed[4],item_noop[4],item_usable[4],item_hp_calls,item_mp_calls;
+static _Atomic s32 item_last_hp,item_last_mp;
+static _Atomic u64 cmd2f_writes,cmd2f_two,cmd2f_zero,cmd2f_other,cmd2f_unlisted;
+static struct { _Atomic u32 id_plus1,last; _Atomic u64 n; } cmd2f_seen[16];
+static int item_slot(unsigned id){ return id>=1&&id<=7?(int)id-1:id==0x83?7:id>=0x112&&id<=0x117?8+(int)(id-0x112):KH_ITEM_SLOTS-1; }
+static u64 item_call(KCtx *g,u32 rva,u64 a0,u64 a1,u64 a2,u64 a3){
+    struct kh_item_mock *m=kh_item_mock_sink;
+    if(!m) return kh_call(g,GS_BASE+rva,a0,a1,a2,a3);
+    if(m->ncalls>=KH_ITEM_MAXCALLS) kh_fatal(g,"item call sink overflow at exe RVA=0x%x",rva);
+    struct kh_item_call *c=&m->c[m->ncalls++];
+    c->rva=rva; c->a[0]=a0; c->a[1]=a1; c->a[2]=a2; c->a[3]=a3;
+    return m->fake(m->user,c);
+}
+/* DLL 31488..314b3 and 314b5..314dd: imul by the magic, high dword, sar 12, add the sign bit of the shifted quotient. */
+static s32 item_div(s32 n,int reversed){
+    s32 q=(s32)(((s64)(reversed?(s32)0x97247453:(s32)0x68db8bad)*(s64)n)>>32)>>12;
+    return (s32)((u32)q+((u32)q>>31));
+}
+/* DLL 31351..31436 without the console: acquire, decode the sheet's actor id, fetch the save block. */
+static u64 item_enter(KCtx *g){
+    u32 target=(u32)A1(g);
+    u64 sheet=item_call(g,0x3c04c0,target,0xffffffffu,0,0);
+    if(!sheet) kh_fatal(g,"mod item effect: no sheet for character %u; shipped DLL 0x31367 jumps to 0x31bb6 and faults in exe 0x3c07e0(null)",target);
+    item_call(g,0x4ad270,rd32(g,sheet+0x268),0,0,0);
+    item_call(g,0x152380,0,0,0,0);
+    return sheet;
+}
+static void item_hp(KCtx *g,u64 sheet,s32 amount,int flag){ item_hp_calls++; item_last_hp=amount; item_call(g,0x3c0c30,sheet,(u32)amount,0,(u64)flag); }
+static void item_mp(KCtx *g,u64 sheet,s32 amount,int flag){ item_mp_calls++; item_last_mp=amount; item_call(g,0x3c0cd0,sheet,(u32)amount,(u64)flag,0); }
+static void item_stock_apply(KCtx *g,int difficulty){
+    u64 rec=A0(g); u32 user=(u32)A2(g),mult=(u32)A3(g);
+    u64 sheet=item_enter(g);
+    unsigned id=rd16(g,rec),pct=rd8(g,rec+4);
+    int flag=user!=0;
+    /* Both numerators are formed before the command lookup, from the maxima as they are at that point. */
+    s32 mp_n=damage_add(damage_mul(damage_mul((s32)pct,(s32)rd32(g,sheet+0x184)),(s32)mult),9999);
+    s32 hp_n=damage_add(damage_mul(damage_mul((s32)pct,(s32)mult),(s32)rd32(g,sheet+4)),9999);
+    u64 cmd=item_call(g,0x3b68b0,(u32)(s32)(s16)rd16(g,rec+0x10),0,0,0);
+    if(!cmd) kh_fatal(g,"mod item effect: no cmd record for command %d of item 0x%x; shipped DLL 0x31482 reads byte [0+0x2f]",(int)(s16)rd16(g,rec+0x10),id);
+    int reversed=rd8(g,cmd+0x2f)==2;
+    s32 hp_amount=item_div(hp_n,reversed),mp_amount=item_div(mp_n,reversed);
+    item_apply[difficulty][item_slot(id)]++;
+    if(reversed && id>=1 && id<=7) item_reversed[difficulty]++;
+    /* 314e0..31557: (id-1)&0xfffa==0 selects 1,2,5,6 and 6 is then excluded. */
+    if(!((id-1)&0xfffa) && id!=6) item_hp(g,sheet,hp_amount,flag);
+    if(id==3 || id==6) item_mp(g,sheet,mp_amount,flag);
+    if(id==4 || id==7){ item_hp(g,sheet,hp_amount,flag); item_mp(g,sheet,mp_amount,0); }
+    if(id==0x83){
+        item_hp(g,sheet,(s32)rd32(g,sheet+4),1);
+        /* As shipped: no +9999 and no division, and max MP is read again after the HP call. */
+        item_mp(g,sheet,damage_mul(damage_mul((s32)pct,(s32)rd32(g,sheet+0x184)),(s32)mult),0);
+    }
+    if(id==0x112 || id==0x113) item_call(g,0x3c0ad0,sheet,(u32)damage_mul((s32)pct,100),0,0);
+    if(id==0x114) item_call(g,0x3c09d0,sheet,pct,0,0);
+    if(id==0x115) item_call(g,0x3c0e30,sheet,pct,0,0);
+    if(id==0x116) item_call(g,0x3c0a50,sheet,pct,0,0);
+    if(id==0x117) item_call(g,0x3c0950,sheet,pct,0,0);
+    KH_RAX(g)=item_call(g,0x3c07e0,sheet,0,0,0);
+    KH_RET(g);
+}
+/* The WriteByte syscall (mod_syscalls.c index 69) is how the scripts arm the reversal: count stores to +2f of a cmd record. */
+void kh_mod_item_writebyte(KCtx *g,u64 p,u8 value){
+    u64 table=rd64(g,GS_BASE+0x2a161e8);
+    if(!GA_OK(table)) return;
+    s64 count=(s32)rd32(g,table+4); u64 first=table+8;
+    if(count<=0 || p<first || p-first>=0x30ull*(u64)count || (p-first)%0x30!=0x2f) return;
+    cmd2f_writes++;
+    if(value==2) cmd2f_two++; else if(!value) cmd2f_zero++; else cmd2f_other++;
+    u32 key=(u32)rd16(g,p-0x2f)+1;
+    for(int i=0;i<16;i++){
+        u32 cur=atomic_load(&cmd2f_seen[i].id_plus1);
+        if(!cur){ u32 expect=0; cur=atomic_compare_exchange_strong(&cmd2f_seen[i].id_plus1,&expect,key)?key:expect; }
+        if(cur==key){ cmd2f_seen[i].n++; cmd2f_seen[i].last=value; return; }
+    }
+    cmd2f_unlisted++;
+}
+void kh_mod_items_counts(struct kh_item_counts *out){
+    for(int d=0;d<4;d++){
+        for(int s=0;s<KH_ITEM_SLOTS;s++) out->apply[d][s]=item_apply[d][s];
+        out->reversed[d]=item_reversed[d]; out->noop[d]=item_noop[d]; out->usable[d]=item_usable[d];
+    }
+    out->hp_calls=item_hp_calls; out->mp_calls=item_mp_calls;
+    out->cmd2f_writes=cmd2f_writes; out->cmd2f_two=cmd2f_two; out->cmd2f_zero=cmd2f_zero; out->cmd2f_other=cmd2f_other;
+}
+void kh_mod_items_reset(void){
+    for(int d=0;d<4;d++){
+        for(int s=0;s<KH_ITEM_SLOTS;s++) item_apply[d][s]=0;
+        item_reversed[d]=item_noop[d]=item_usable[d]=0;
+    }
+    item_hp_calls=item_mp_calls=0; item_last_hp=item_last_mp=0;
+    cmd2f_writes=cmd2f_two=cmd2f_zero=cmd2f_other=cmd2f_unlisted=0;
+    for(int i=0;i<16;i++){ cmd2f_seen[i].id_plus1=0; cmd2f_seen[i].last=0; cmd2f_seen[i].n=0; }
+}
+void kh_mod_items_dump(void){
+    for(int d=0;d<4;d++){
+        fprintf(stderr,"kh: item stock slot=%d uses",d);
+        for(int s=0;s<7;s++) fprintf(stderr," id%d=%llu",s+1,(unsigned long long)item_apply[d][s]);
+        fprintf(stderr," id83=%llu",(unsigned long long)item_apply[d][7]);
+        for(int s=8;s<14;s++) fprintf(stderr," id%x=%llu",0x112+s-8,(unsigned long long)item_apply[d][s]);
+        fprintf(stderr," other=%llu reversed=%llu noop_kinds=%llu usable_fallthrough=%llu\n",(unsigned long long)item_apply[d][14],
+            (unsigned long long)item_reversed[d],(unsigned long long)item_noop[d],(unsigned long long)item_usable[d]);
+    }
+    fprintf(stderr,"kh: item stock helper calls hp=%llu mp=%llu last_hp=%d last_mp=%d\n",(unsigned long long)item_hp_calls,
+        (unsigned long long)item_mp_calls,(int)item_last_hp,(int)item_last_mp);
+    fprintf(stderr,"kh: WriteByte cmd+0x2f writes=%llu value2=%llu value0=%llu other=%llu unlisted=%llu commands(id=last_value x writes):",
+        (unsigned long long)cmd2f_writes,(unsigned long long)cmd2f_two,(unsigned long long)cmd2f_zero,(unsigned long long)cmd2f_other,
+        (unsigned long long)cmd2f_unlisted);
+    for(int i=0;i<16;i++) if(cmd2f_seen[i].id_plus1)
+        fprintf(stderr," %u=%ux%llu",(unsigned)cmd2f_seen[i].id_plus1-1,(unsigned)cmd2f_seen[i].last,(unsigned long long)cmd2f_seen[i].n);
+    fprintf(stderr,"\n");
+}
+
 void f_3c4b80(KCtx *g){
     int difficulty=(int)rd32(g,GS_BASE+0x9abd48);
     u64 effect=A0(g); unsigned kind=rd8(g,effect+5);
     if((unsigned)difficulty>3){ orig_f_3c4b80(g); return; }
-    if(kind!=11 && kind!=12){ caps_require_scope(g,effect,kind,1); orig_f_3c4b80(g); return; }
+    if(!kind){ item_stock_apply(g,difficulty); return; }
+    if(kind!=11 && kind!=12){
+        caps_require_scope(g,effect,kind,1);
+        /* DLL table 31bdc kinds 25..29 and 3161e kind>31: acquire, release, nothing else.  The vanilla id switch does not run. */
+        item_noop[difficulty]++;
+        u64 held=item_enter(g);
+        KH_RAX(g)=item_call(g,0x3c07e0,held,0,0,0);
+        KH_RET(g); return;
+    }
     caps_apply[difficulty]++;
     u64 sheet=kh_call(g,GS_BASE+0x3c04c0,(u32)A1(g),0xffffffffu,0,0);
     if(sheet){
@@ -228,7 +362,15 @@ void f_3c3da0(KCtx *g){
     int difficulty=(int)rd32(g,GS_BASE+0x9abd48);
     u64 effect=A0(g); unsigned kind=rd8(g,effect+5);
     if((unsigned)difficulty>3){ orig_f_3c3da0(g); return; }
-    if(kind!=11 && kind!=12){ caps_require_scope(g,effect,kind,0); orig_f_3c3da0(g); return; }
+    if(kind!=11 && kind!=12){
+        caps_require_scope(g,effect,kind,0);
+        /* Task 16.  DLL 30f60 never calls the command lookup 3b68b0 (slot 82150) and has no +2f test: usability of a reversed
+         * item is the vanilla predicate.  Kind 0, 22 and >24 (30fb7..30fc0, table 311f4) tail-call the original at 310b9, and
+         * as on every path of this handler the sheet it acquired at 30fa9 is not released; a null sheet goes there as well. */
+        item_usable[difficulty]++;
+        kh_call(g,GS_BASE+0x3c04c0,(u32)A1(g),0xffffffffu,0,0);
+        orig_f_3c3da0(g); return;
+    }
     caps_usable[difficulty]++;
     u64 sheet=kh_call(g,GS_BASE+0x3c04c0,(u32)A1(g),0xffffffffu,0,0);
     if(sheet){
@@ -255,6 +397,8 @@ int kh_mod_caps_selftest(KCtx *g){
     u8 codec[512]; memcpy(codec,hp(g,GS_BASE+0x2b0d720),512);
     u32 guard=rd32(g,GS_BASE+0x2b0d920);
     memset(hp(g,GS_BASE+0x2b0d720),0xff,512); wr32(g,GS_BASE+0x2b0d920,0x80000000);
+    /* Task 16: every kind-0 apply now performs the DLL's command lookup, so the fixture needs a cmd table. */
+    u64 oldcmds=rd64(g,GS_BASE+0x2a161e8),cmds=kh_mod_items_test_cmds(g); wr64(g,GS_BASE+0x2a161e8,cmds);
     u64 effect=ga_calloc(1,0x18),sp=KH_RSP(g);
     u64 orig_apply=kh_host_fn("caps-test-original-apply",orig_f_3c4b80);
     u64 orig_usable=kh_host_fn("caps-test-original-usable",orig_f_3c3da0);
@@ -301,9 +445,12 @@ int kh_mod_caps_selftest(KCtx *g){
     }
     extern int kh_mod_rewards_selftest(KCtx *,u64);
     failures+=kh_mod_rewards_selftest(g,sheet);
+    failures+=kh_mod_items_selftest(g,sheet);
     memcpy(hp(g,sheet),backup,sizeof backup); wr32(g,count,oldcount); wr32(g,GS_BASE+0x9abd48,olddiff);
     memcpy(hp(g,GS_BASE+0x2b0d720),codec,512); wr32(g,GS_BASE+0x2b0d920,guard); ga_free(effect);
+    wr64(g,GS_BASE+0x2a161e8,oldcmds); ga_free(cmds);
     for(int d=0;d<4;d++) caps_apply[d]=caps_usable[d]=0;
+    kh_mod_items_reset();
     fprintf(stderr,"kh: difficulty caps selftest: %d checks, %d failures\n",checks,failures);
 #undef CAP_T
     return failures;
@@ -348,7 +495,7 @@ void kh_mod_add_exp(KCtx *g,u64 args){
     KH_RSP(g)=stack;
 }
 void kh_mod_difficulty_dump(void){
-    kh_mod_difficulty_damage_dump(); kh_mod_caps_dump();
+    kh_mod_difficulty_damage_dump(); kh_mod_caps_dump(); kh_mod_items_dump();
     for(int d=0;d<4;d++) fprintf(stderr,"kh: difficulty rewards slot=%d popup=%llu bons=%llu AddExp=%llu\n",d,
         (unsigned long long)reward_hits[0][d],(unsigned long long)reward_hits[1][d],(unsigned long long)exp_hits[d]);
 }
