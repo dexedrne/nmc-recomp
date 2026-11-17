@@ -21,14 +21,14 @@ static u64 kh_cmdline_ga;
 /* ======================================================================================================================
  * heap (malloc family -> guest arena)
  * ==================================================================================================================== */
-IMP(CRTH,malloc){ SET_RAX(g,ga_alloc(A0(g),16)); }
-IMP(CRTH,calloc){ SET_RAX(g,ga_calloc(A0(g),A1(g))); }
+IMP(CRTH,malloc){ SET_RAX(g,ga_alloc_src(A0(g),16,GA_SRC_CRT)); }
+IMP(CRTH,calloc){ SET_RAX(g,ga_calloc_src(A0(g),A1(g),GA_SRC_CRT)); }
 IMP(CRTH,realloc){ SET_RAX(g,ga_realloc(A0(g),A1(g))); }
 IMP(CRTH,free){ ga_free(A0(g)); }
 IMP(CRTH,_recalloc){ u64 p=A0(g),n=A1(g)*A2(g); u64 old=p?ga_usable(p):0; u64 q=ga_realloc(p,n); if(q&&n>old) memset(hp(g,q+old),0,n-old); SET_RAX(g,q); }
-IMP(CRTH,_aligned_malloc){ u64 al=A1(g); if(al<16) al=16; SET_RAX(g,ga_alloc(A0(g),al)); }
-IMP(CRTH,_aligned_realloc){ u64 p=A0(g),n=A1(g),al=A2(g); if(al<16) al=16; if(!p){ SET_RAX(g,ga_alloc(n,al)); return; }
-    u64 old=ga_usable(p); u64 q=ga_alloc(n,al); if(q){ memcpy(hp(g,q),hp(g,p),old<n?old:n); ga_free(p);} SET_RAX(g,q); }
+IMP(CRTH,_aligned_malloc){ u64 al=A1(g); if(al<16) al=16; SET_RAX(g,ga_alloc_src(A0(g),al,GA_SRC_CRT)); }
+IMP(CRTH,_aligned_realloc){ u64 p=A0(g),n=A1(g),al=A2(g); if(al<16) al=16; if(!p){ SET_RAX(g,ga_alloc_src(n,al,GA_SRC_CRT)); return; }
+    u64 old=ga_usable(p); u64 q=ga_alloc_src(n,al,GA_SRC_CRT); if(q){ memcpy(hp(g,q),hp(g,p),old<n?old:n); ga_free(p);} SET_RAX(g,q); }
 IMP(CRTH,_aligned_free){ ga_free(A0(g)); }
 IMP(CRTH,_callnewh){ SET_RAX(g,0); }
 IMP(CRTH,_set_new_mode){ SET_RAX(g,0); }

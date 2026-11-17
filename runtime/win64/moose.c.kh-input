@@ -1,0 +1,367 @@
+/* moose.c : the heap-size part of the mod's second DLL, KH2Moose.dll ("KH2 Memory Origin Overhauling System Enhancement"), which the
+ * NMC mod ships with KH2Moose.ini next to it.  Everything below was read from the DLL's and the exe's disassembly (objdump; no
+ * DLL code was executed); nothing here is copied from either.
+ *
+ * What the exe does (vanilla):
+ *   cache  a static 30 MiB array in .bss, [0x140bf33c0, 0x1429f33c0).  Its start is a code constant at two sites
+ *          (lea reg,[rip+0x140bf33c0]); the top-of-free pointer is the global [0x140749740] (initial value 0x1429f33c0).
+ *          Entries (resources: +1 state byte, +0x44 flags, +0x48 kind, +0x50 size, +0x58 address, +0x60 saved address, +0x70 id of
+ *          the next entry; list head [0x1429f33c8], tail [0x1429f33d0]) are laid out bottom-up by 0x39d590 after every change;
+ *          0x39d300 cuts temporary chunks from the top.  Kinds 1010 / 2300..2399 / 2410..2419 / 2420..2429 / 5000..5099 /
+ *          5100..5199 live in reserved blocks whose sizes are the ints [0x1429fb428 + 4*index] (index 1 magic, 2 player, 3 and 4
+ *          the two friends, 5 drive, 6 menu), set by 0x39e260 (index, size) and 0x39e270 (player, friend).
+ *   data   a static 768 KiB array in .bss, [0x142a254c0, 0x142ae54c0), a bump heap: next free byte in [0x142a25488]; 0x3e5f90
+ *          resets it (lea rax,[pool]), 0x3e5f30 releases every block from the pool start (lea rbx,[pool]).  The allocators
+ *          (0x3e5ee0, 0x3e5fa0, 0x3e6010) never check the end of the pool.
+ *
+ * What KH2Moose does to it (ini keys in KiB; the sites are found by byte patterns, each must match exactly once):
+ *   [kh2.cache] size   buffer = operator new(size, align 0x2000000) = _aligned_malloc(size, 32 MiB): one window of the object-id
+ *                      table per 32 MiB, aligned (512 MiB = 16 windows).  Writes: [0x140bf33c0] = buffer (the first 8 bytes of the
+ *                      old static pool now hold the pointer), [0x140749740] = buffer + size.  Code: 0x39d719 `lea r14,[0x140bf33c0]`
+ *                      (4c 8d 35 a0 5c 85 00) and 0x39dac1 `lea rdi,[0x140bf33c0]` (48 8d 3d f8 58 85 00) are re-encoded as
+ *                      `mov reg,[0x140bf33c0]`: the base is read from the pointer.  A missing key means 122,880 KiB, 0 = leave it.
+ *   [kh2.data] size    buffer as above; [0x142a254c0] = buffer; 0x3e5f90 `lea rax,[0x142a254c0]` (48 8d 05 29 f5 63 02) and
+ *                      0x3e5f3d `lea rbx,[0x142a254c0]` (48 8d 1d 7c f5 63 02) become `mov reg,[0x142a254c0]`.  Missing or 0 = leave it.
+ *   [kh2.cache] magic / player / friend / drive / menu  ("reserved block size increases", each at most 0x1fffff KiB): inline hooks
+ *                      at the entry of 0x39e260 (size += increase of that index: 1 magic, 2 player, 3 and 4 friend, 5 drive,
+ *                      6 menu) and of 0x39e270 (player += player increase, friend += friend increase); signed saturating adds.
+ *   Not handled here, left as the original: [kh2.fixes] scd_priority (bit 1: the 5-byte call at 0x927e2, the lookup in the sound
+ *   priority table for voices, becomes `xor eax,eax`; bit 2: a patch at 0x92758 for sound effects), [kh2.hacks] fast_title (0x2b46eb
+ *   `lea edi,[r12-0xc]` becomes `mov edi,0`), attempt_continue_after_exception_... (a vectored exception handler), no_death,
+ *   test_crash.
+ *
+ * What this file does: the same data writes at start-up, with the buffers taken from the id zone as 32 MiB-aligned page runs
+ * (ga_pages_aligned: committed on demand, deterministic addresses).  A lifted function cannot have one instruction re-encoded, so
+ * the four functions that contain the patched instructions are replaced by hand-written equivalents that take the pool start as a
+ * parameter: 0x39d590 (cache layout), 0x39dab0 (free cache bytes), 0x3e5f30 and 0x3e5f90 (data heap).  Each is checked against the
+ * untouched lifted original in the selftest (same inputs, the vanilla pool start: identical memory afterwards).  The two block-size
+ * functions are wrapper hooks.  KHNMC_MOOSE_HEAPS=0 keeps the vanilla sizes (every hook passes through to the lifted original);
+ * without $KHNMC_DATA/dll/KH2Moose.ini (or $KHNMC_MOOSE_INI) nothing is changed either, and the start-up line says so. */
+#include "khnmc_rt.h"
+#include <errno.h>
+#include <unistd.h>
+
+#define CACHE_STATIC  (GS_BASE+0xbf33c0ull)       /* start of the static cache pool; with Moose: holds the pointer to the new one */
+#define CACHE_STATIC_SIZE 0x1e00000ull
+#define CACHE_TOP     (GS_BASE+0x749740ull)       /* top of the free part of the cache */
+#define LIST_HEAD     (GS_BASE+0x29f33c8ull)
+#define LIST_TAIL     (GS_BASE+0x29f33d0ull)
+#define TMP_HEAD      (GS_BASE+0x29f33d8ull)
+#define TMP_TAIL      (GS_BASE+0x29f33e0ull)
+#define EVICT_OBJ     (GS_BASE+0x29f33e8ull)      /* object whose vtable slot 2 takes an evicted entry */
+#define LAYOUT_TOP    (GS_BASE+0x29f33f0ull)
+#define BLK           (GS_BASE+0x29fb428ull)      /* 7 ints: reserved block sizes */
+#define DATA_STATIC   (GS_BASE+0x2a254c0ull)
+#define DATA_STATIC_SIZE 0xc0000ull
+#define DATA_PTR      (GS_BASE+0x2a25488ull)
+#define F_PTR2ID      (GS_BASE+0x4ad240ull)
+#define F_ID2PTR      (GS_BASE+0x4ad270ull)
+#define F_REINSERT    (GS_BASE+0x39dd70ull)
+#define F_UNLINK      (GS_BASE+0x39e2a0ull)
+#define F_BAR_RELEASE (GS_BASE+0x3a6a10ull)
+void orig_f_39d590(KCtx *g); void orig_f_39dab0(KCtx *g); void orig_f_3e5f30(KCtx *g); void orig_f_3e5f90(KCtx *g); void orig_f_39e260(KCtx *g); void orig_f_39e270(KCtx *g);
+
+typedef struct { s64 cache_kib, data_kib, add_kib[5]; int has_cache, has_data; char err[160]; } MooseCfg;   /* add_kib: magic, player, friend, drive, menu */
+static int cache_moved, data_moved, blocks_on;          /* which parts are applied */
+static int force_static;                                 /* selftest: run the replacements on the vanilla pools */
+static u64 cache_base, cache_size, data_base, data_size;
+static s32 add_bytes[5];
+static char ini_path[1024]; static const char *state="not initialised";
+static _Atomic u64 c_layout, c_free_q, c_data_reset, c_data_release, c_blk_set, c_party_set, c_evict;
+static u64 hw_cache_bottom, hw_cache_top_used, hw_data, hw_entries;     /* high-water marks (bytes), sampled once per game frame and at every layout */
+
+/* ---- the DLL's arithmetic -------------------------------------------------------------------------------------------------------- */
+static s32 sat_add(s32 a,s32 b){                         /* 0x180003470 */
+    if(a>=0) return b>=0x7fffffff-a?0x7fffffff:a+b;
+    return b<=(s32)(0x80000000u-(u32)a)?(s32)0x80000000u:a+b;
+}
+static s32 blk_add_for(int index){                       /* 0x180003010: the table starts one int before `magic`; indices 4.. use the entry before */
+    int k=index-(index>=4); return (k>=1&&k<=5)?add_bytes[k-1]:0;
+}
+
+/* ---- the four functions with a patched instruction, pool start as a parameter ----------------------------------------------------- */
+static u64 id2p(KCtx *g,u32 id){ return kh_call(g,F_ID2PTR,id,0,0,0); }
+static u32 p2id(KCtx *g,u64 p){ return p?(u32)kh_call(g,F_PTR2ID,p,0,0,0):0; }      /* 0x4ad240 returns 0 for NULL without touching the table */
+/* 0x39d590: lay the cache out again */
+static void cache_layout(KCtx *g,u64 base){
+    wr64(g,TMP_TAIL,0); wr64(g,TMP_HEAD,0);
+    /* 1. entries of kind >= 10000 leave the list and are queued, in list order */
+    for(u64 e=rd64(g,LIST_HEAD),next;e;e=next){
+        next=id2p(g,rd32(g,e+0x70)); u64 head=rd64(g,LIST_HEAD), prev;
+        if((s32)rd32(g,e+0x48)<10000) continue;
+        if(e==head){ wr64(g,LIST_HEAD,id2p(g,rd32(g,e+0x70))); prev=0; }
+        else { prev=head; while(id2p(g,rd32(g,prev+0x70))!=e) prev=id2p(g,rd32(g,prev+0x70)); wr32(g,prev+0x70,p2id(g,id2p(g,rd32(g,e+0x70)))); }
+        if(rd64(g,LIST_TAIL)==e) wr64(g,LIST_TAIL,prev);
+        wr32(g,e+0x70,0);
+        if(!rd64(g,TMP_TAIL)){ wr64(g,TMP_TAIL,e); wr64(g,TMP_HEAD,e); }
+        else { wr32(g,rd64(g,TMP_TAIL)+0x70,p2id(g,e)); wr32(g,e+0x70,0); wr64(g,TMP_TAIL,e); }
+    }
+    /* 2. ... and are inserted again by 0x39dd70 (sorted by kind) */
+    for(u64 e=rd64(g,TMP_HEAD),next;e;e=next){ next=id2p(g,rd32(g,e+0x70)); kh_call(g,F_REINSERT,e,0,0,0); }
+    /* 3. addresses: negative kinds from the top down, the others bottom-up; a reserved block is opened at the running pointer when
+     *    its first entry comes by.  An entry of kind >= 10000 that ends above the top, or is the 129th or later, is evicted. */
+    u64 top=rd64(g,CACHE_TOP), G=base, P[7]={0,0,0,0,0,0,0}; u32 count=0;
+    for(u64 e=rd64(g,LIST_HEAD),next;e;e=next,count++){
+        next=id2p(g,rd32(g,e+0x70));
+        wr32(g,e+0x44,0);
+        s32 kind=(s32)rd32(g,e+0x48);
+        if(kind<0){ top-=rd64(g,e+0x50); wr64(g,e+0x58,top); continue; }
+        int b=0;
+        if(kind==0x3f2) b=1; else if((u32)(kind-0x8fc)<=0x63u) b=2; else if((u32)(kind-0x96a)<=9u) b=3; else if((u32)(kind-0x974)<=9u) b=4;
+        else if((u32)(kind-0x1388)<=0x63u) b=5; else if((u32)(kind-0x13ec)<=0x63u && (s32)rd32(g,BLK+24)>0) b=6;
+        u64 *slot=b?&P[b]:&G;
+        if(!*slot){ *slot=G; G+=(u64)(s64)(s32)rd32(g,BLK+4ull*(u64)b); }               /* the block starts at the running pointer, which skips its reserved size */
+        u64 addr=*slot, end=addr+rd64(g,e+0x50);
+        wr64(g,e+0x58,addr); *slot=end; if(end>G) G=end;
+        if(kind>=10000 && (end>top || (s32)count>=0x80)){
+            u64 saved=rd64(g,e+0x60); wr64(g,e+0x58,saved);
+            if(rd8(g,e+1)==3){
+                atomic_fetch_add(&c_evict,1);
+                kh_call(g,F_BAR_RELEASE,saved,1,0,0); kh_call(g,F_UNLINK,e,0,0,0);
+                u64 obj=rd64(g,EVICT_OBJ); kh_call(g,rd64(g,rd64(g,obj)+0x10),obj,e,0,0);
+            }
+        }
+    }
+    wr64(g,LAYOUT_TOP,top);
+}
+/* 0x39dab0: bytes between the highest bottom entry and the lowest top entry (32-bit, as the original computes it) */
+static u32 cache_free_bytes(KCtx *g,u64 base){
+    u64 hi=rd64(g,CACHE_TOP), lo=base;
+    for(u64 e=rd64(g,LIST_HEAD);e;e=id2p(g,rd32(g,e+0x70))){
+        s32 kind=(s32)rd32(g,e+0x48); if(kind>=10000) continue;
+        u64 addr=rd64(g,e+0x58); if(kind<0) hi=addr; else lo=rd64(g,e+0x50)+addr;
+    }
+    return (u32)hi-(u32)lo;
+}
+/* 0x3e5f30: release every block of the data heap (header: +0 size, +8 "is an archive" flag), then mark the heap closed */
+static void data_release_all(KCtx *g,u64 base){
+    u64 end=rd64(g,DATA_PTR);
+    for(u64 b=base;b<end;){ if(rd32(g,b+8)){ kh_call(g,F_BAR_RELEASE,b+0x10,1,0,0); end=rd64(g,DATA_PTR); } b+=0x10+(u64)rd32(g,b); }
+    wr64(g,DATA_PTR,0);
+}
+static u64 cur_cache_base(KCtx *g){ return force_static?CACHE_STATIC:cache_moved?rd64(g,CACHE_STATIC):0; }   /* the patched code reads the pointer every time */
+static u64 cur_data_base(KCtx *g){ return force_static?DATA_STATIC:data_moved?rd64(g,DATA_STATIC):0; }
+static void sample(KCtx *g);
+void f_39d590(KCtx *g){ atomic_fetch_add(&c_layout,1); u64 b=cur_cache_base(g); if(!b){ orig_f_39d590(g); sample(g); return; } cache_layout(g,b); sample(g); KH_RET(g); }
+void f_39dab0(KCtx *g){ atomic_fetch_add(&c_free_q,1); u64 b=cur_cache_base(g); if(!b){ orig_f_39dab0(g); return; } SET_RAX(g,cache_free_bytes(g,b)); KH_RET(g); }
+void f_3e5f30(KCtx *g){ atomic_fetch_add(&c_data_release,1); u64 b=cur_data_base(g); if(!b){ orig_f_3e5f30(g); return; } data_release_all(g,b); KH_RET(g); }
+void f_3e5f90(KCtx *g){ atomic_fetch_add(&c_data_reset,1); u64 b=cur_data_base(g); if(!b){ orig_f_3e5f90(g); return; } wr64(g,DATA_PTR,b); SET_RAX(g,b); KH_RET(g); }
+/* the two inline hooks of cache_adjust_blocks */
+void f_39e260(KCtx *g){ atomic_fetch_add(&c_blk_set,1); if(blocks_on) KH_RDX(g)=(u64)(u32)sat_add((s32)KH_RDX(g),blk_add_for((int)(s32)KH_RCX(g))); orig_f_39e260(g); }
+void f_39e270(KCtx *g){ atomic_fetch_add(&c_party_set,1); if(blocks_on){ KH_RDX(g)=(u64)(u32)sat_add((s32)KH_RDX(g),add_bytes[2]); KH_RCX(g)=(u64)(u32)sat_add((s32)KH_RCX(g),add_bytes[1]); } orig_f_39e270(g); }
+
+/* ---- usage statistics (both modes): how much of the pools the game really uses --------------------------------------------------- */
+static u64 tab_id2p(u32 id){ if(!id) return 0; u64 b; u32 v=id&0x7fffffffu; memcpy(&b,(void*)((uintptr_t)(GS_BASE+0x2b0d720ull+8ull*(v>>25))+gs_bias),8); return b|(v&0x1ffffffu); }   /* read-only decode: no guest call from a statistics path */
+static void sample(KCtx *g){
+    u64 base=cache_moved?rd64(g,CACHE_STATIC):CACHE_STATIC, size=cache_moved?cache_size:CACHE_STATIC_SIZE, top=rd64(g,CACHE_TOP);
+    if(top>=base && top<=base+size && base+size-top>hw_cache_top_used) hw_cache_top_used=base+size-top;
+    u64 n=0; for(u64 e=rd64(g,LIST_HEAD);e&&GA_OK(e)&&GA_OK(e+0x78)&&n<100000;e=tab_id2p(rd32(g,e+0x70)),n++){
+        s32 kind=(s32)rd32(g,e+0x48); u64 addr=rd64(g,e+0x58), end=addr+rd64(g,e+0x50);
+        if(kind>=0 && addr>=base && end<=base+size && end-base>hw_cache_bottom) hw_cache_bottom=end-base; }
+    if(n>hw_entries) hw_entries=n;
+    u64 db=data_moved?rd64(g,DATA_STATIC):DATA_STATIC, dp=rd64(g,DATA_PTR); if(dp>db && dp-db>hw_data && dp-db<(1ull<<40)) hw_data=dp-db;
+}
+void kh_moose_game_frame(KCtx *g){ sample(g); }
+
+/* ---- the ini --------------------------------------------------------------------------------------------------------------------- */
+static int ini_parse(const char *path,MooseCfg *c){     /* 1 = read; 0 = no such file; -1 = c->err says what is wrong */
+    memset(c,0,sizeof *c); FILE *f=fopen(path,"r"); if(!f) return 0;
+    char line[512], sec[64]=""; int rc=1;
+    while(fgets(line,sizeof line,f)){
+        char *s=line; while(*s==' '||*s=='\t') s++; size_t n=strlen(s); while(n&&(s[n-1]=='\n'||s[n-1]=='\r'||s[n-1]==' '||s[n-1]=='\t')) s[--n]=0;
+        if(!*s||*s==';'||*s=='#') continue;
+        if(*s=='['){ char *e=strchr(s,']'); if(e){ *e=0; snprintf(sec,sizeof sec,"%s",s+1); } continue; }
+        char *eq=strchr(s,'='); if(!eq) continue; *eq=0; char *key=s, *val=eq+1; size_t kn=strlen(key); while(kn&&(key[kn-1]==' '||key[kn-1]=='\t')) key[--kn]=0; while(*val==' '||*val=='\t') val++;
+        static const char *const blk[5]={"magic","player","friend","drive","menu"}; s64 *dst=NULL; int *flag=NULL;
+        if(!strcmp(sec,"kh2.cache")){ if(!strcmp(key,"size")){ dst=&c->cache_kib; flag=&c->has_cache; } else for(int i=0;i<5;i++) if(!strcmp(key,blk[i])) dst=&c->add_kib[i]; }
+        else if(!strcmp(sec,"kh2.data")&&!strcmp(key,"size")){ dst=&c->data_kib; flag=&c->has_data; }
+        if(!dst) continue;
+        char *end; errno=0; long long v=strtoll(val,&end,0);
+        if(end==val||errno){ snprintf(c->err,sizeof c->err,"[%s] %s=%s is not a number",sec,key,val); rc=-1; break; }
+        *dst=v; if(flag) *flag=1;
+    }
+    fclose(f);
+    if(rc==1) for(int i=0;i<5;i++) if((u64)c->add_kib[i]>0x1fffffull){ snprintf(c->err,sizeof c->err,"invalid block size %lld KiB (the DLL accepts 0..0x1fffff)",(long long)c->add_kib[i]); rc=-1; }
+    if(rc==1 && (c->cache_kib<0||c->data_kib<0||c->cache_kib>(64ll<<20)||c->data_kib>(64ll<<20))){ snprintf(c->err,sizeof c->err,"pool size out of range (cache %lld KiB, data %lld KiB)",(long long)c->cache_kib,(long long)c->data_kib); rc=-1; }
+    if(rc==1 && !c->has_cache) c->cache_kib=0x7800000>>10;      /* the DLL's default when the key is missing: 122,880 KiB */
+    return rc;
+}
+/* the exe must be the build the DLL's patterns match: the same bytes at the same places, else nothing is applied */
+static const struct { u32 rva; u8 n; u8 b[19]; } sites[]={
+    {0x39daba,16,{@KHINPUT(array,pc/kh2fm.exe,3788474,16,a90542efbf86d226419e95913448de15e9faa892b9105eb0c4d4add193728a20)@}},
+    {0x39d719,11,{@KHINPUT(array,pc/kh2fm.exe,3787545,11,d0f2101ca8af436a2aa0f5b0327303bb72c06ce9439734651a758598a4b295d7)@}},
+    {0x3e5f90,15,{@KHINPUT(array,pc/kh2fm.exe,4084624,15,529e2118c17468e51bed744f737b2fdd7e4ef4e90c1c2e22316ea9adbc19d969)@}},
+    {0x3e5f36,17,{@KHINPUT(array,pc/kh2fm.exe,4084534,17,35a5f7269d259c18af7860ff237d33cee9cd0bd2fb044c49cd7db3b76dceb42e)@}},
+    {0x39e260,14,{@KHINPUT(array,pc/kh2fm.exe,3790432,14,8c9a2bac633f4dc90ef028d66ebd5ebf5732e1e206e4dfd6526f287d7f4775f1)@}},
+    {0x39e270,19,{@KHINPUT(array,pc/kh2fm.exe,3790448,19,37b3f887f877777574279084e350d321f026bd0b599a1c116dab509e333dac6f)@}},
+};
+static int sites_ok(KCtx *g,u32 *bad){ for(unsigned i=0;i<sizeof sites/sizeof*sites;i++) if(memcmp(hp(g,GS_BASE+sites[i].rva),sites[i].b,sites[i].n)){ if(bad) *bad=sites[i].rva; return 0; } return 1; }
+static void apply(KCtx *g,const MooseCfg *c){
+    if(c->cache_kib){
+        if(rd64(g,CACHE_TOP)!=CACHE_STATIC+CACHE_STATIC_SIZE||rd64(g,CACHE_STATIC)||rd64(g,LIST_HEAD))
+            kh_fatal(g,"moose: the cache is not in its initial state (top %llx, first pool bytes %llx, list head %llx): the pool can only be replaced before the game uses it",(unsigned long long)rd64(g,CACHE_TOP),(unsigned long long)rd64(g,CACHE_STATIC),(unsigned long long)rd64(g,LIST_HEAD));
+        cache_size=(u64)c->cache_kib<<10; cache_base=ga_pages_aligned(cache_size,GA_WIN,GA_SRC_POOL);
+        if(!cache_base) kh_fatal(g,"moose: no room for a cache of %llu bytes",(unsigned long long)cache_size);
+        wr64(g,CACHE_STATIC,cache_base); wr64(g,CACHE_TOP,cache_base+cache_size); cache_moved=1;
+    }
+    if(c->data_kib){
+        if(rd64(g,DATA_STATIC)||rd64(g,DATA_PTR)) kh_fatal(g,"moose: the data heap is not in its initial state (first pool bytes %llx, pointer %llx)",(unsigned long long)rd64(g,DATA_STATIC),(unsigned long long)rd64(g,DATA_PTR));
+        data_size=(u64)c->data_kib<<10; data_base=ga_pages_aligned(data_size,GA_WIN,GA_SRC_POOL);
+        if(!data_base) kh_fatal(g,"moose: no room for a data heap of %llu bytes",(unsigned long long)data_size);
+        wr64(g,DATA_STATIC,data_base); data_moved=1;
+    }
+    for(int i=0;i<5;i++){ add_bytes[i]=(s32)((u32)c->add_kib[i]<<10); if(add_bytes[i]) blocks_on=1; }
+}
+static void unapply(KCtx *g){                             /* selftest only: back to the vanilla image state */
+    if(cache_moved){ wr64(g,CACHE_STATIC,0); wr64(g,CACHE_TOP,CACHE_STATIC+CACHE_STATIC_SIZE); ga_pages_free_src(cache_base,cache_size,GA_SRC_POOL); }
+    if(data_moved){ wr64(g,DATA_STATIC,0); ga_pages_free_src(data_base,data_size,GA_SRC_POOL); }
+    cache_moved=data_moved=blocks_on=0; cache_base=cache_size=data_base=data_size=0; memset(add_bytes,0,sizeof add_bytes);
+}
+void kh_moose_init(KCtx *g){
+    const char *e=getenv("KHNMC_MOOSE_HEAPS");
+    if(e&&*e=='0'){ state="off (KHNMC_MOOSE_HEAPS=0): vanilla pool sizes"; fprintf(stderr,"kh: moose: %s\n",state); return; }
+    if((e=getenv("KHNMC_MOOSE_INI"))&&*e) snprintf(ini_path,sizeof ini_path,"%s",e);
+    else { const char *root=getenv("KHNMC_DATA"); snprintf(ini_path,sizeof ini_path,"%s/dll/KH2Moose.ini",root?root:"data"); }
+    MooseCfg c; int rc=ini_parse(ini_path,&c);
+    if(rc==0){ state="off (no KH2Moose.ini): vanilla pool sizes"; fprintf(stderr,"kh: moose: no ini at %s: vanilla pool sizes (cache 30 MiB, data 768 KiB)\n",ini_path); return; }
+    if(rc<0) kh_fatal(g,"moose: %s: %s",ini_path,c.err);
+    u32 bad=0; if(!sites_ok(g,&bad)) kh_fatal(g,"moose: the exe does not have the expected bytes at rva 0x%x (the DLL's \"Pattern not found.\"): pool sizes cannot be applied to this build",bad);
+    apply(g,&c); state="on";
+    fprintf(stderr,"kh: moose: %s: cache %llu MiB at 0x%llx..0x%llx (was 30 MiB static at 0x140bf33c0), data heap %llu MiB at 0x%llx (was 768 KiB static at 0x142a254c0), "
+                   "reserved block increases (KiB): magic %lld player %lld friend %lld drive %lld menu %lld\n",ini_path,(unsigned long long)(cache_size>>20),(unsigned long long)cache_base,(unsigned long long)(cache_base+cache_size),
+            (unsigned long long)(data_size>>20),(unsigned long long)data_base,(long long)c.add_kib[0],(long long)c.add_kib[1],(long long)c.add_kib[2],(long long)c.add_kib[3],(long long)c.add_kib[4]);
+}
+void kh_moose_report(FILE *f){
+    u64 csz=cache_moved?cache_size:CACHE_STATIC_SIZE, dsz=data_moved?data_size:DATA_STATIC_SIZE;
+    fprintf(f,"kh: moose report: heaps=%s; cache %llu KiB (%s): most used from the bottom %llu KiB, from the top %llu KiB, most entries %llu, layouts=%llu evictions=%llu free-queries=%llu; "
+              "data heap %llu KiB (%s): most used %llu KiB%s; block-size calls: set=%llu party=%llu, data resets=%llu releases=%llu\n",
+            state,(unsigned long long)(csz>>10),cache_moved?"moved":"static, in the image",(unsigned long long)(hw_cache_bottom>>10),(unsigned long long)(hw_cache_top_used>>10),(unsigned long long)hw_entries,
+            (unsigned long long)c_layout,(unsigned long long)c_evict,(unsigned long long)c_free_q,(unsigned long long)(dsz>>10),data_moved?"moved":"static, in the image",(unsigned long long)(hw_data>>10),
+            hw_data>dsz?"  <== BEYOND THE POOL: the original has no check there, the globals behind the pool were overwritten":"",
+            (unsigned long long)c_blk_set,(unsigned long long)c_party_set,(unsigned long long)c_data_reset,(unsigned long long)c_data_release);
+}
+
+/* ==============================================================================================================================
+ * selftest.  The replacements run on the VANILLA pool start against the untouched lifted originals: same list, same globals, the
+ * real callees (0x39dd70 reinsert, 0x39e2a0 unlink, 0x3a6a10 archive release, the eviction object's method): the memory afterwards
+ * must be identical byte for byte.  Then the mod's sizes are applied and removed again.
+ * ============================================================================================================================ */
+#define CHECK(c) do{ checks++; if(!(c)){ fails++; fprintf(stderr,"moose selftest FAIL: %s (line %d)\n",#c,__LINE__); } }while(0)
+#define ENT 0x80u
+#define MAXENT 200
+static u32 rs=0x2545f491u; static u32 mrnd(void){ rs^=rs<<13; rs^=rs>>17; rs^=rs<<5; return rs; }
+static struct { int n; u64 obj[64], ent[64]; } evlog;
+static void st_evict(KCtx *g){ if(evlog.n<64){ evlog.obj[evlog.n]=A0(g); evlog.ent[evlog.n]=A1(g); } evlog.n++; KH_RET(g); }
+typedef struct { u8 glob[0x30], blk[28]; u64 top, dataptr; } Globals;
+static void glob_get(KCtx *g,Globals *s){ memset(s,0,sizeof *s); memcpy(s->glob,hp(g,LIST_HEAD),sizeof s->glob); memcpy(s->blk,hp(g,BLK),sizeof s->blk); s->top=rd64(g,CACHE_TOP); s->dataptr=rd64(g,DATA_PTR); }
+static void glob_put(KCtx *g,const Globals *s){ memcpy(hp(g,LIST_HEAD),s->glob,sizeof s->glob); memcpy(hp(g,BLK),s->blk,sizeof s->blk); wr64(g,CACHE_TOP,s->top); wr64(g,DATA_PTR,s->dataptr); }
+int kh_moose_selftest(KCtx *g){
+    int checks=0,fails=0;
+    /* 0. the ini as shipped (CRLF, comments, commented-out keys) and the DLL's rules */
+    { char p[]="/tmp/khnmc-moose-XXXXXX"; int fd=mkstemp(p); FILE *f=fd>=0?fdopen(fd,"w"):NULL; CHECK(f!=NULL);
+      if(f){ fputs("; All sizes are KiB.\r\n\r\n[kh2.cache]\r\n; Game default: 30720; 0 to skip replacement\r\nsize=524288\r\n; Reserved block size increases\r\nplayer=32768\r\n;menu=0\r\n;magic=0\r\nfriend=32768\r\n;drive=0\r\n\r\n"
+                   "[kh2.data]\r\n;size=0\r\nsize=131072\r\n\r\n[kh2.fixes]\r\nscd_priority=1\r\n\r\n[kh2.hacks]\r\nfast_title=1\r\n",f); fclose(f);
+        MooseCfg c; CHECK(ini_parse(p,&c)==1 && c.cache_kib==524288 && c.data_kib==131072 && c.add_kib[0]==0 && c.add_kib[1]==32768 && c.add_kib[2]==32768 && c.add_kib[3]==0 && c.add_kib[4]==0 && c.has_cache && c.has_data);
+        f=fopen(p,"w"); fputs("[kh2.cache]\nplayer = 0x100\n[kh2.data]\n",f); fclose(f); CHECK(ini_parse(p,&c)==1 && c.cache_kib==122880 && !c.has_data && c.data_kib==0 && c.add_kib[1]==256);   /* missing cache size: the DLL's 120 MiB */
+        f=fopen(p,"w"); fputs("[kh2.cache]\nsize=0\nmenu=2097151\n",f); fclose(f); CHECK(ini_parse(p,&c)==1 && c.cache_kib==0 && c.add_kib[4]==0x1fffff);                                     /* 0 = leave the pool alone */
+        f=fopen(p,"w"); fputs("[kh2.cache]\nfriend=2097152\n",f); fclose(f); CHECK(ini_parse(p,&c)==-1 && strstr(c.err,"invalid block size"));
+        f=fopen(p,"w"); fputs("[kh2.data]\nsize=lots\n",f); fclose(f); CHECK(ini_parse(p,&c)==-1 && strstr(c.err,"not a number"));
+        unlink(p); CHECK(ini_parse(p,&c)==0); } }
+    CHECK(sat_add(5,7)==12 && sat_add(0x7ffffff0,0x100)==0x7fffffff && sat_add(-5,3)==-2 && sat_add(-0x7ffffff0,-0x100)==(s32)0x80000000u && sat_add(0xc0000,32768<<10)==0x20c0000 && sat_add(0,0)==0);
+    { u32 bad=0; CHECK(sites_ok(g,&bad) && bad==0); }                                  /* this exe is the build the DLL's patterns match */
+    if(cache_moved||data_moved){ fprintf(stderr,"kh: moose selftest: the mod's pools are applied in this process: the comparison with the vanilla originals is skipped (%d checks, %d failures)\n",checks,fails); return fails; }
+
+    /* saved image state */
+    Globals sv; glob_get(g,&sv); u64 sv_tab[64]; memcpy(sv_tab,hp(g,GS_BASE+0x2b0d720ull),sizeof sv_tab); u32 sv_guard=rd32(g,GS_BASE+0x2b0d920ull);
+    u64 sv_cs=rd64(g,CACHE_STATIC), sv_ds=rd64(g,DATA_STATIC); static u8 sv_dpool[0x1000]; memcpy(sv_dpool,hp(g,DATA_STATIC),sizeof sv_dpool);
+    u64 hw_sv[4]={hw_cache_bottom,hw_cache_top_used,hw_data,hw_entries};
+    for(int i=0;i<64;i++) wr64(g,GS_BASE+0x2b0d720ull+8ull*i,~0ull); wr32(g,GS_BASE+0x2b0d920ull,0x80000000u);
+    u64 mem=ga_calloc_src(MAXENT+1,ENT+0x20,GA_SRC_CRT), bars=mem+(u64)MAXENT*ENT; size_t memsz=(MAXENT+1)*(ENT+0x20);
+    u64 obj=ga_calloc(1,0x40), vt=ga_calloc(1,0x40); wr64(g,obj,vt); wr64(g,vt+0x10,kh_host_fn("moose_selftest_evict",st_evict));
+    u8 *init=malloc(memsz), *resA=malloc(memsz); Globals g0, gA, gB; u64 tabA[64];
+    static const s32 kinds[]={-1,-7,0,5,999,0x3f2,0x3f3,2299,2300,2399,2400,2410,2419,2420,2429,2430,4999,5000,5099,5100,5199,5200,9999,10000,10001,12000,20000,0x7fffffff};
+    int trials=0, same=0, with_evict=0, with_blocks=0, with_tmp=0, frees_same=0, over128=0, limits_ok=0;
+    for(int t=0;t<400;t++){
+        /* a random cache: entries, reserved block sizes, a top that some entries do not fit under */
+        int n=(t<3)?t:(int)(mrnd()%(t%7==0?MAXENT:40)); memset(hp(g,mem),0,memsz);
+        for(int i=0;i<n;i++){ u64 e=mem+(u64)i*ENT; s32 k=kinds[mrnd()%(sizeof kinds/sizeof*kinds)]; if(mrnd()%5==0) k=(s32)(mrnd()%14000)-500;
+            wr8(g,e+1,(u8)((mrnd()%3)?3:mrnd()%4)); wr32(g,e+0x44,mrnd()); wr32(g,e+0x48,(u32)k); wr64(g,e+0x50,(mrnd()%6==0)?(u64)(mrnd()%0x300000):(u64)(mrnd()%0x8000)&~15ull);
+            wr64(g,e+0x58,0x1111000000000000ull|mrnd()); wr64(g,e+0x60,bars+(u64)i*0x20); snprintf((char*)hp(g,e+4),32,"ent%03d",i); }
+        /* trials 3..8: the two limits, exactly: an entry of kind >= 10000 that ends AT the top stays (3: plain, 5: behind a reserved
+         * block), one byte less of room evicts it (4, 6); the 129th entry is evicted whatever the room (7), the 128th is not (8) */
+        u64 sp_top=0;
+        if(t>=3&&t<=8){ memset(hp(g,mem),0,memsz); n=(t<=4)?1:(t<=6)?2:(t==7?129:128);
+            for(int i=0;i<n;i++){ u64 e=mem+(u64)i*ENT; wr8(g,e+1,3); wr64(g,e+0x50,0x10); wr64(g,e+0x60,bars+(u64)i*0x20); }
+            u64 last=mem+(u64)(n-1)*ENT; wr32(g,last+0x48,10000);
+            if(t<=4){ wr64(g,last+0x50,0x1000); sp_top=CACHE_STATIC+(t==3?0x1000u:0xfffu); }
+            else if(t<=6){ wr32(g,mem+0x48,2300); wr64(g,mem+0x50,0x800); wr64(g,last+0x50,0x1000); sp_top=CACHE_STATIC+(t==5?0x4000u:0x3fffu); }
+            else sp_top=CACHE_STATIC+0x1000000; }
+        for(int i=0;i<n;i++) wr32(g,mem+(u64)i*ENT+0x70,i+1<n?(u32)kh_call(g,F_PTR2ID,mem+(u64)(i+1)*ENT,0,0,0):0);
+        wr64(g,LIST_HEAD,n?mem:0); wr64(g,LIST_TAIL,n?mem+(u64)(n-1)*ENT:0); wr64(g,TMP_HEAD,mrnd()); wr64(g,TMP_TAIL,mrnd()); wr64(g,EVICT_OBJ,obj); wr64(g,LAYOUT_TOP,mrnd());
+        for(int i=0;i<7;i++) wr32(g,BLK+4ull*(u64)i,(mrnd()%4==0)?0u:(u32)(mrnd()%0x80000)); if(mrnd()%4==0) wr32(g,BLK+24,(u32)-(s32)(mrnd()%100));
+        wr64(g,CACHE_TOP,CACHE_STATIC+0x100000+(u64)(mrnd()%(t%3?0x800000u:0x1d00000u)));
+        if(sp_top){ for(int i=0;i<7;i++) wr32(g,BLK+4ull*(u64)i,0x3000); wr64(g,CACHE_TOP,sp_top); }
+        memcpy(init,hp(g,mem),memsz); glob_get(g,&g0); u64 tab0[64]; memcpy(tab0,hp(g,GS_BASE+0x2b0d720ull),sizeof tab0);
+        /* A: the lifted original */
+        force_static=0; evlog.n=0; kh_call(g,GS_BASE+0x39d590,0,0,0,0); u32 freeA=(u32)kh_call(g,GS_BASE+0x39dab0,0,0,0,0);
+        memcpy(resA,hp(g,mem),memsz); glob_get(g,&gA); memcpy(tabA,hp(g,GS_BASE+0x2b0d720ull),sizeof tabA); int evA=evlog.n; u64 evAe[64]; memcpy(evAe,evlog.ent,sizeof evAe);
+        /* B: the replacement, on the same start state */
+        memcpy(hp(g,mem),init,memsz); glob_put(g,&g0); memcpy(hp(g,GS_BASE+0x2b0d720ull),tab0,sizeof tab0);
+        force_static=1; evlog.n=0; kh_call(g,GS_BASE+0x39d590,0,0,0,0); u32 freeB=(u32)kh_call(g,GS_BASE+0x39dab0,0,0,0,0); force_static=0;
+        glob_get(g,&gB);
+        int ok=!memcmp(resA,hp(g,mem),memsz) && !memcmp(&gA,&gB,sizeof gA) && !memcmp(tabA,hp(g,GS_BASE+0x2b0d720ull),sizeof tabA) && evA==evlog.n && !memcmp(evAe,evlog.ent,sizeof(u64)*(size_t)(evA<64?evA:64));
+        trials++; same+=ok; frees_same+=(freeA==freeB); if(evA) with_evict++; if(n>0x80) over128++;
+        if(sp_top) limits_ok+=(evA==((t==4||t==6||t==7)?1:0)) && (evA==0||evAe[0]==mem+(u64)(n-1)*ENT);       /* the lifted ORIGINAL behaves as read from the disassembly */
+        { int blk=0, big=0; for(int i=0;i<n;i++){ s32 k; memcpy(&k,init+(size_t)i*ENT+0x48,4); if(k==0x3f2||(k>=2300&&k<2400)||(k>=5000&&k<5200)) blk=1; if(k>=10000) big=1; } with_blocks+=blk; with_tmp+=big; }
+        if(!ok&&trials-same<=3) fprintf(stderr,"moose selftest: layout differs from the lifted original in trial %d (%d entries, evictions %d vs %d)\n",t,n,evA,evlog.n);
+    }
+    CHECK(trials==400 && same==400);                                                 /* 0x39d590: identical memory, same evictions in the same order */
+    CHECK(frees_same==400);                                                          /* 0x39dab0: the same 32-bit result */
+    CHECK(with_evict>=60 && with_blocks>=200 && with_tmp>=100 && over128>=5);        /* the trials did reach the eviction, reserved-block, re-queue and 129th-entry paths */
+    CHECK(limits_ok==6);                                                             /* ends-at-top stays, one byte over goes; the 129th entry goes, the 128th stays */
+    /* data heap: reset and release-all on the vanilla pool, original against replacement */
+    { int ok=1; for(int t=0;t<40;t++){ static u8 poolA[0x1000]; u64 pA=0, pB=0; u32 rA=0, rB=0;
+        for(int v=0;v<2;v++){ force_static=v; wr64(g,DATA_PTR,0x1234); u64 r=kh_call(g,GS_BASE+0x3e5f90,0,0,0,0); if(rd64(g,DATA_PTR)!=DATA_STATIC||r!=DATA_STATIC) ok=0;
+            rs=0x9e3779b9u+(u32)t; memset(hp(g,DATA_STATIC),0,sizeof sv_dpool); u64 b=DATA_STATIC; int nb=(int)(mrnd()%9);
+            for(int i=0;i<nb;i++){ u32 sz=(mrnd()%3+1)*0x40; wr32(g,b,sz); wr32(g,b+4,0x23234141u); wr32(g,b+8,mrnd()%2); b+=0x10+sz; }       /* blocks as 0x3e5ee0 / 0x3e6010 write them; archives with no entries */
+            wr64(g,DATA_PTR,b); kh_call(g,GS_BASE+0x3e5f30,0,0,0,0);
+            if(v==0){ memcpy(poolA,hp(g,DATA_STATIC),sizeof poolA); pA=rd64(g,DATA_PTR); rA=(u32)nb; } else { pB=rd64(g,DATA_PTR); rB=(u32)nb; if(memcmp(poolA,hp(g,DATA_STATIC),sizeof poolA)||pA!=pB||pA!=0||rA!=rB) ok=0; } }
+        force_static=0; } CHECK(ok); }
+    memcpy(hp(g,DATA_STATIC),sv_dpool,sizeof sv_dpool);
+    /* the hooks pass through while nothing is applied: block sizes arrive unchanged */
+    kh_call(g,GS_BASE+0x39e260,6,0xc0000,0,0); CHECK(rd32(g,BLK+24)==0xc0000);
+    kh_call(g,GS_BASE+0x39e270,0x111000,0x222000,0,0); CHECK(rd32(g,BLK+8)==0x111000 && rd32(g,BLK+16)==0x222000 && rd32(g,BLK+12)==0x222000);
+    glob_put(g,&sv); memcpy(hp(g,GS_BASE+0x2b0d720ull),sv_tab,sizeof sv_tab); wr32(g,GS_BASE+0x2b0d920ull,sv_guard); wr64(g,CACHE_STATIC,sv_cs); wr64(g,DATA_STATIC,sv_ds);
+
+    /* the mod's sizes, applied to the vanilla image and removed again */
+    if(rd64(g,CACHE_TOP)==CACHE_STATIC+CACHE_STATIC_SIZE && !rd64(g,CACHE_STATIC) && !rd64(g,LIST_HEAD) && !rd64(g,DATA_STATIC) && !rd64(g,DATA_PTR)){
+        MooseCfg c; memset(&c,0,sizeof c); c.cache_kib=524288; c.data_kib=131072; c.add_kib[1]=32768; c.add_kib[2]=32768; apply(g,&c);
+        u64 idlo=0,idhi=0; extern int ga_zone_get(int,u64*,u64*,u64*,u64*,u64*); ga_zone_get(0,&idlo,&idhi,NULL,NULL,NULL);
+        CHECK(cache_moved && data_moved && blocks_on && cache_size==(512ull<<20) && data_size==(128ull<<20));
+        CHECK(!(cache_base&(GA_WIN-1)) && !(data_base&(GA_WIN-1)) && cache_base>=idlo && cache_base+cache_size<=idhi && data_base>=idlo && data_base+data_size<=idhi);   /* 16 + 4 whole windows of the id zone */
+        CHECK(rd64(g,CACHE_STATIC)==cache_base && rd64(g,CACHE_TOP)==cache_base+cache_size && rd64(g,DATA_STATIC)==data_base);
+        CHECK((u32)kh_call(g,GS_BASE+0x39dab0,0,0,0,0)==(u32)cache_size);                                       /* empty cache: all 512 MiB free */
+        kh_call(g,GS_BASE+0x3e5f90,0,0,0,0); CHECK(rd64(g,DATA_PTR)==data_base); wr64(g,DATA_PTR,0);
+        kh_call(g,GS_BASE+0x39e260,6,0xc0000,0,0); CHECK(rd32(g,BLK+24)==0xc0000);                               /* menu: no increase in the ini */
+        kh_call(g,GS_BASE+0x39e260,2,0x100000,0,0); CHECK(rd32(g,BLK+8)==0x100000+(32768u<<10));                 /* player */
+        kh_call(g,GS_BASE+0x39e260,3,0x100000,0,0); kh_call(g,GS_BASE+0x39e260,4,0x200000,0,0); CHECK(rd32(g,BLK+12)==0x100000+(32768u<<10) && rd32(g,BLK+16)==0x200000+(32768u<<10));   /* both friends */
+        kh_call(g,GS_BASE+0x39e260,1,0x1000,0,0); kh_call(g,GS_BASE+0x39e260,5,0x2000,0,0); kh_call(g,GS_BASE+0x39e260,0,0x3000,0,0); CHECK(rd32(g,BLK+4)==0x1000 && rd32(g,BLK+20)==0x2000 && rd32(g,BLK)==0x3000);
+        kh_call(g,GS_BASE+0x39e270,0x111000,0x222000,0,0); CHECK(rd32(g,BLK+8)==0x111000+(32768u<<10) && rd32(g,BLK+16)==0x222000+(32768u<<10) && rd32(g,BLK+12)==0x222000+(32768u<<10));
+        /* a small list is laid out inside the new pool: a plain entry at its start, a player entry opens its (enlarged) block, a top entry hangs from the new top */
+        for(int i=0;i<64;i++) wr64(g,GS_BASE+0x2b0d720ull+8ull*i,~0ull); wr32(g,GS_BASE+0x2b0d920ull,0x80000000u);
+        memset(hp(g,mem),0,3*ENT); wr32(g,mem+0x48,7); wr64(g,mem+0x50,0x1000); wr32(g,mem+ENT+0x48,2300); wr64(g,mem+ENT+0x50,0x2000); wr32(g,mem+2*ENT+0x48,(u32)-3); wr64(g,mem+2*ENT+0x50,0x4000);
+        wr32(g,mem+0x70,(u32)kh_call(g,F_PTR2ID,mem+ENT,0,0,0)); wr32(g,mem+ENT+0x70,(u32)kh_call(g,F_PTR2ID,mem+2*ENT,0,0,0));
+        wr64(g,LIST_HEAD,mem); wr64(g,LIST_TAIL,mem+2*ENT); wr32(g,BLK,0); wr32(g,BLK+8,0x111000+(32768u<<10));
+        kh_call(g,GS_BASE+0x39d590,0,0,0,0);
+        CHECK(rd64(g,mem+0x58)==cache_base && rd64(g,mem+ENT+0x58)==cache_base+0x1000 && rd64(g,mem+2*ENT+0x58)==cache_base+cache_size-0x4000 && rd64(g,LAYOUT_TOP)==cache_base+cache_size-0x4000);
+        CHECK((u32)kh_call(g,GS_BASE+0x39dab0,0,0,0,0)==(u32)(cache_size-0x4000-0x3000));                        /* lowest top entry minus the end of the last bottom entry */
+        glob_put(g,&sv); memcpy(hp(g,GS_BASE+0x2b0d720ull),sv_tab,sizeof sv_tab); wr32(g,GS_BASE+0x2b0d920ull,sv_guard);
+        u64 cb=cache_base; unapply(g);
+        CHECK(!cache_moved && rd64(g,CACHE_STATIC)==0 && rd64(g,CACHE_TOP)==CACHE_STATIC+CACHE_STATIC_SIZE && rd64(g,DATA_STATIC)==0 && cb);
+    } else { fails++; fprintf(stderr,"moose selftest FAIL: the image's pool globals are not in their initial state\n"); }
+    hw_cache_bottom=hw_sv[0]; hw_cache_top_used=hw_sv[1]; hw_data=hw_sv[2]; hw_entries=hw_sv[3];
+    atomic_store(&c_layout,0); atomic_store(&c_free_q,0); atomic_store(&c_data_reset,0); atomic_store(&c_data_release,0); atomic_store(&c_blk_set,0); atomic_store(&c_party_set,0); atomic_store(&c_evict,0);
+    free(init); free(resA); ga_free(mem); ga_free(obj); ga_free(vt);
+    fprintf(stderr,"kh: moose selftest: %d checks, %d failures (layout trials: %d identical of %d; %d with evictions, %d with reserved blocks, %d with re-queued entries)\n",checks,fails,same,trials,with_evict,with_blocks,with_tmp);
+    return fails;
+}

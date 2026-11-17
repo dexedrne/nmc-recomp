@@ -118,6 +118,10 @@ for i in $(seq 1 "$started"); do
 done
 column -t -s "$(printf '\t')" "$S" 2>/dev/null || cat "$S"
 grep -ah '^kh: bgload' "$OUT"/r*/run.out 2>/dev/null | grep -a 'report' | sort | uniq -c | sort -rn | head -3
+# object-id table (64 slots) and the id zone's high-water mark of every run: the numbers task 17 keeps bounded
+for i in $(seq 1 "$started"); do tag=$(printf 'r%02d' "$i"); o="$OUT/$tag/run.out"
+  printf '%s  %s | %s\n' "$tag" "$(grep -a '^kh: object-id table' "$o" 2>/dev/null | tail -1 | sed 's/^kh: //')" "$(grep -a '^kh: guest arena: id zone' "$o" 2>/dev/null | tail -1 | sed -n 's/.*high-water \(0x[0-9a-f]*\) = \([0-9]* MiB\).*in use \([0-9]* MiB\).*/id zone high-water \2 (\1), in use \3/p')"
+done
 echo "route_batch: $started of $N runs made, $((started-fails)) ok, $fails failed of which $diverged diverged (binary sha256 $BINSUM...); details in $OUT (summary.tsv, rNN/run.out)"
 if [ "$fails" -eq 0 ] && [ "$cut" -eq 0 ]; then [ "$KEEP" = 1 ] || rm -f "$OUT/khnmc.bin"; exit 0; fi
 exit 1

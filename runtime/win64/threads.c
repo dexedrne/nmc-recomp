@@ -72,14 +72,14 @@ static KThread *tlist[4096]; static u32 ntlist; static _Atomic u32 next_tid=1000
 u64 kh_tls_tmpl_lo, kh_tls_tmpl_hi, kh_tls_index_va, kh_tls_callbacks_va;
 
 KCtx *kh_new_ctx(void){ KCtx *g=aligned_alloc(64,(sizeof(KCtx)+63)&~63ull); memset(g,0,sizeof *g); PUT(u64,176,1); g->bias=gs_bias; return g; }
-u64 kh_new_guest_stack(u64 size,u64 *lo){ u64 p=ga_pages(size); if(!p){ fprintf(stderr,"kh: out of guest space for stacks\n"); abort(); } if(lo)*lo=p; return p+size-0x80; }
+u64 kh_new_guest_stack(u64 size,u64 *lo){ u64 p=ga_pages_src(size,GA_SRC_STACK); if(!p){ fprintf(stderr,"kh: out of guest space for stacks\n"); abort(); } if(lo)*lo=p; return p+size-0x80; }
 void kh_ctx_set_stack(KCtx *g,u64 top){ KH_RSP(g)=top&~0xFull; }
 
 #define TEB_SIZE 0x1000
 u64 kh_make_teb(KThread *t){
-    KCtx *g=t->g; t->teb=ga_alloc(TEB_SIZE,16); memset(hp(g,t->teb),0,TEB_SIZE);
-    t->tlsarr=ga_alloc(64*8,16); memset(hp(g,t->tlsarr),0,64*8);
-    u64 sz=kh_tls_tmpl_hi-kh_tls_tmpl_lo; t->tlsblk=ga_alloc(sz+0x100,16); memset(hp(g,t->tlsblk),0,sz+0x100);
+    KCtx *g=t->g; t->teb=ga_alloc_src(TEB_SIZE,16,GA_SRC_TLS); memset(hp(g,t->teb),0,TEB_SIZE);
+    t->tlsarr=ga_alloc_src(64*8,16,GA_SRC_TLS); memset(hp(g,t->tlsarr),0,64*8);
+    u64 sz=kh_tls_tmpl_hi-kh_tls_tmpl_lo; t->tlsblk=ga_alloc_src(sz+0x100,16,GA_SRC_TLS); memset(hp(g,t->tlsblk),0,sz+0x100);
     if(sz) memcpy(hp(g,t->tlsblk),hp(g,kh_tls_tmpl_lo),sz);
     u32 idx=kh_tls_index_va?rd32(g,kh_tls_index_va):0; if(idx>=64) idx=0;
     wr64(g,t->tlsarr+8ull*idx,t->tlsblk);
@@ -233,6 +233,16 @@ IMP(K32,SwitchToThread){ sched_yield(); SET_RAX(g,1); }
 
 /* ---- threads --------------------------------------------------------------------------------------------------------- */
 static void thread_exit_notify(KThread *t){ pthread_mutex_lock(&t->m); t->done=1; pthread_cond_broadcast(&t->cv); pthread_mutex_unlock(&t->m); }
+/* Windows releases a thread's stack and TEB when the thread ends.  So must we: the engine starts a short-lived worker (0xfddd0)
+ * every few seconds of play, and a 2 MiB stack kept for each would fill the id zone (core.c) within the hour.  After this the
+ * thread's KThread stays in the list (handles, exit code), with no stack. */
+static _Atomic u64 cnt_thread_stacks_released;
+static void thread_release_memory(KThread *t){
+    KCtx *g=t->g; u64 err=t->teb?rd64(g,t->teb+0x700):0;                 /* the thread's errno cell (crt.c) */
+    pthread_mutex_lock(&tlist_m); u64 lo=t->stack_lo, hi=t->stack_hi, teb=t->teb, ta=t->tlsarr, tb=t->tlsblk; t->stack_lo=t->stack_hi=0; t->teb=t->tlsarr=t->tlsblk=0; pthread_mutex_unlock(&tlist_m);
+    if(err) ga_free(err); if(tb) ga_free(tb); if(ta) ga_free(ta); if(teb) ga_free(teb);
+    if(hi){ ga_pages_free_src(lo,hi-lo,GA_SRC_STACK); atomic_fetch_add(&cnt_thread_stacks_released,1); }
+}
 static __thread jmp_buf *tl_exit_jb;
 static void *thread_main(void *arg){
     KThread *t=arg; thread_bind(t); KCtx *g=t->g;
@@ -244,6 +254,7 @@ static void *thread_main(void *arg){
     }
     kh_run_tls_callbacks(g,3);
     thread_exit_notify(t);
+    thread_release_memory(t);
     return NULL;
 }
 static u64 thread_create(KCtx *g,u64 stack_size,u64 start,u64 param,int suspended,u32 *tid_out){
@@ -299,6 +310,24 @@ u64 kh_fiber_host_stack=2ull<<20;            /* host stack of a fiber (lazily co
 struct KFiber { KCtx *g; void *hstack; size_t hsize; void *sp; u64 start, param, handle, gstack_lo, gstack_sz; KThread *owner; int is_thread_fiber, finished; };
 #define FIBER_MAGIC 0x46494245ull
 static int fiber_teb_swap=1;                          /* 0 only inside the selftest's demonstration of the hazard */
+/* guest stacks by address, for reports (ga_describe): threads from the thread list, fibers from this small table */
+#define MAXFSTK 1024
+static struct { u64 lo, size, start; } fstk[MAXFSTK]; static pthread_mutex_t fstk_m=PTHREAD_MUTEX_INITIALIZER;
+static void fiber_stack_note(u64 lo,u64 size,u64 start){
+    pthread_mutex_lock(&fstk_m);
+    for(int i=0;i<MAXFSTK;i++) if(size?!fstk[i].size:(fstk[i].size&&fstk[i].lo==lo)){ fstk[i].lo=size?lo:0; fstk[i].size=size; fstk[i].start=start; break; }
+    pthread_mutex_unlock(&fstk_m);
+}
+int kh_describe_stack(u64 a,char *out,size_t cap){
+    int hit=0;
+    if(pthread_mutex_trylock(&tlist_m)==0){
+        for(u32 i=0;i<ntlist&&!hit;i++){ KThread *t=tlist[i]; if(t->stack_hi&&a>=t->stack_lo&&a<t->stack_hi){ snprintf(out,cap,"stack of thread %u ('%s', start rva 0x%llx) +0x%llx of 0x%llx",t->tid,t->name,(unsigned long long)(t->start?t->start-GS_BASE:0),(unsigned long long)(a-t->stack_lo),(unsigned long long)(t->stack_hi-t->stack_lo)); hit=1; } }
+        pthread_mutex_unlock(&tlist_m); }
+    if(!hit&&pthread_mutex_trylock(&fstk_m)==0){
+        for(int i=0;i<MAXFSTK&&!hit;i++) if(fstk[i].size&&a>=fstk[i].lo&&a<fstk[i].lo+fstk[i].size){ snprintf(out,cap,"stack of a fiber (start rva 0x%llx) +0x%llx of 0x%llx",(unsigned long long)(fstk[i].start-GS_BASE),(unsigned long long)(a-fstk[i].lo),(unsigned long long)fstk[i].size); hit=1; }
+        pthread_mutex_unlock(&fstk_m); }
+    return hit;
+}
 static KFiber *fiber_of(KCtx *g,u64 h){ if(!GA_OK(h)||rd64(g,h+8)!=FIBER_MAGIC){ kh_fatal(g,"bad fiber handle %llx",(unsigned long long)h); } return (KFiber*)rd64(g,h); }
 static u64 fiber_handle(KCtx *g,KFiber *f){ u64 h=ga_alloc(64,16); wr64(g,h,(u64)(uintptr_t)f); wr64(g,h+8,FIBER_MAGIC); f->handle=h; return h; }
 void kh_fiber_main(KFiber *f){
@@ -307,7 +336,7 @@ void kh_fiber_main(KFiber *f){
 }
 u64 kh_fiber_create(KCtx *g,u64 stack_size,u64 start,u64 param){
     KFiber *f=calloc(1,sizeof *f); f->g=kh_new_ctx(); f->start=start; f->param=param;
-    u64 gs=stack_size<(1ull<<20)?(1ull<<20):stack_size; f->gstack_sz=gs; u64 top=kh_new_guest_stack(gs,&f->gstack_lo); kh_ctx_set_stack(f->g,top);
+    u64 gs=stack_size<(1ull<<20)?(1ull<<20):stack_size; f->gstack_sz=gs; u64 top=kh_new_guest_stack(gs,&f->gstack_lo); kh_ctx_set_stack(f->g,top); fiber_stack_note(f->gstack_lo,gs,start);
     f->hsize=kh_fiber_host_stack; f->hstack=mmap(0,f->hsize,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0); if(f->hstack==MAP_FAILED) kh_fatal(g,"fiber host stack mmap failed");
     atomic_fetch_add(&cnt_fiber_create,1);
     f->sp=make_frame((char*)f->hstack+f->hsize,f); return fiber_handle(g,f);
@@ -342,7 +371,7 @@ void kh_fiber_delete(KCtx *g,u64 h){
     if(f==t->cur_fiber && !f->is_thread_fiber) kh_fatal(g,"DeleteFiber of the running fiber (ExitThread semantics) not supported");
     if(f->is_thread_fiber){ kh_warn("DeleteFiber on a thread fiber"); return; }
     if(f->hstack) munmap(f->hstack,f->hsize);
-    ga_pages_free(f->gstack_lo,f->gstack_sz); wr64(g,h+8,0); ga_free(h); free(f->g); free(f);
+    fiber_stack_note(f->gstack_lo,0,0); ga_pages_free_src(f->gstack_lo,f->gstack_sz,GA_SRC_STACK); wr64(g,h+8,0); ga_free(h); free(f->g); free(f);
 }
 int kh_fiber_convert_to_thread(KCtx *g){
     KThread *t=cur_thread(); KFiber *f=t->thread_fiber; if(!f) return 0; if(t->cur_fiber!=f){ kh_fatal(g,"ConvertFiberToThread while a non-thread fiber is running"); }
@@ -379,11 +408,14 @@ u64 kh_mk_event_h(int manual,int initial){ return mk_event(manual,initial); }
 void kh_dump_threads(FILE *f){
     /* also called from the fault paths: never block there (the list only grows, entries are never freed) */
     int locked=(pthread_mutex_trylock(&tlist_m)==0);
-    for(u32 i=0;i<ntlist;i++){ KThread *t=tlist[i]; fprintf(f,"kh: thread %u '%s' done=%d cur_fiber=%p start=%llx\n",t->tid,t->name,t->done,(void*)t->cur_fiber,(unsigned long long)(t->start>=GS_BASE&&t->start<GS_BASE+IMG_SIZE?t->start-GS_BASE:t->start)); kh_guest_bt(t->cur_fiber&&!t->cur_fiber->is_thread_fiber?t->cur_fiber->g:t->g,f); }
+    for(u32 i=0;i<ntlist;i++){ KThread *t=tlist[i]; fprintf(f,"kh: thread %u '%s' done=%d cur_fiber=%p start=%llx\n",t->tid,t->name,t->done,(void*)t->cur_fiber,(unsigned long long)(t->start>=GS_BASE&&t->start<GS_BASE+IMG_SIZE?t->start-GS_BASE:t->start));
+        if(t->done&&!t->stack_hi) continue;                                 /* ended: its stack went back to the arena */
+        kh_guest_bt(t->cur_fiber&&!t->cur_fiber->is_thread_fiber?t->cur_fiber->g:t->g,f); }
     if(locked) pthread_mutex_unlock(&tlist_m);
 }
 
 void kh_sync_report(FILE *f){
+    fprintf(f,"kh: threads: %u created, stacks of %llu ended threads released\n",ntlist,(unsigned long long)cnt_thread_stacks_released);
     fprintf(f,"kh: sync report: self-suspends=%llu refused-suspends-of-other-threads=%llu fibers-created=%llu fiber-switches=%llu switches-to-a-fiber-below-the-thread-stack=%llu sync-chaos=%u hits=%llu\n",
             (unsigned long long)cnt_self_suspend,(unsigned long long)cnt_foreign_suspend,(unsigned long long)cnt_fiber_create,(unsigned long long)cnt_fiber_switch,(unsigned long long)cnt_fiber_below,
             sync_chaos,(unsigned long long)sync_chaos_hits);

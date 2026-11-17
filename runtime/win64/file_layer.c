@@ -134,7 +134,7 @@ static void load(KCtx *g,int bounded,int allocate){
     }
     if(bounded&&(s32)A3(g)<n){ result=-6; goto close; }
     if(allocate){ s32 old=rd32(g,sizeptr); wr32(g,sizeptr,n); if(old==-1) goto close;
-        dst=ga_alloc(n,16); if(!dst){ wr32(g,sizeptr,-2); goto close; } }
+        dst=ga_alloc_src(n,16,GA_SRC_FILE); if(!dst){ wr32(g,sizeptr,-2); goto close; } }
     if(fread(hp(g,dst),1,n,f)!=(size_t)n){
         if(allocate){ ga_free(dst); wr32(g,sizeptr,-2); } else result=-2;
         goto close;

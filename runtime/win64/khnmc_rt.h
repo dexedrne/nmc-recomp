@@ -18,18 +18,46 @@
 extern uintptr_t gs_host_base;                     /* host address of guest address GS_BASE */
 extern u64 gs_size;                                /* bytes of guest space (image + arena) */
 extern uintptr_t gs_bias;                          /* host - guest (0 in identity mode) */
-#define GA_OK(a) ((u64)(a) >= GS_BASE && (u64)(a) < GS_BASE + gs_size)
+int  ga_ok(u64 a);                                 /* a is in the image or in a COMMITTED part of the guest arena (readable and writable) */
+#define GA_OK(a) ga_ok((u64)(a))
 
-u64  ga_alloc(u64 size, u64 align);                /* guest heap allocation (16-byte min alignment); 0 on exhaustion */
+/* Guest arena (core.c).  Every block carries the source that asked for it: the source decides the zone (see the layout comment in
+ * core.c: the ID ZONE holds everything the game can turn into a 32-bit object id and is capped so that the game's 64-slot id table
+ * cannot overflow; the FAR ZONE holds bulk data the game never encodes) and feeds the per-window report of idtable.c. */
+enum { GA_SRC_RT=0,                                /* runtime-internal objects (COM objects, small strings, test blocks) */
+       GA_SRC_CRT,                                 /* the game's malloc / calloc / realloc / _aligned_* (the UCRT heap on Windows) */
+       GA_SRC_HEAP,                                /* HeapAlloc(GetProcessHeap), CoTaskMemAlloc, SysAllocString */
+       GA_SRC_STACK,                               /* thread and fiber stacks */
+       GA_SRC_TLS,                                 /* TEB, TLS array, TLS blocks */
+       GA_SRC_FILE,                                /* file and HD-asset buffers the loose-tree layers hand to the game */
+       GA_SRC_GFX,                                 /* null D3D12 backend: data of buffer resources (driver / GPU memory on Windows) */
+       GA_SRC_AUDIO,                               /* software XAudio2 mixer */
+       GA_SRC_MAP,                                 /* CreateFileMapping views */
+       GA_SRC_POOL,                                /* the game's enlarged cache / data pools (moose.c) */
+       GA_NSRC };
+#define GA_WIN_SHIFT 25
+#define GA_WIN       (1ull<<GA_WIN_SHIFT)          /* 32 MiB: one window of the game's object-id table */
+#define GA_ID_WINDOWS 58                           /* [GS_BASE, GS_BASE + 58 windows) = image + id zone (1,856 MiB); 6 of the 64 table slots stay spare */
+u64  ga_alloc_src(u64 size, u64 align, int src);   /* guest heap allocation (16-byte min alignment); zone exhaustion is a named fatal */
+u64  ga_calloc_src(u64 n, u64 sz, int src);
+u64  ga_pages_src(u64 size, int src);              /* page-granular zeroed run without a block header (stacks, mappings) */
+void ga_pages_free_src(u64 p, u64 size, int src);
+u64  ga_pages_aligned(u64 size, u64 align, int src); /* zeroed run whose start is a multiple of align (a power of two >= 4096) */
+u64  ga_strdup_src(const char *s, int src);
+#define ga_alloc(n,a)     ga_alloc_src((n),(a),GA_SRC_RT)
+#define ga_calloc(n,s)    ga_calloc_src((n),(s),GA_SRC_RT)
+#define ga_pages(n)       ga_pages_src((n),GA_SRC_RT)
+#define ga_pages_free(p,n) ga_pages_free_src((p),(n),GA_SRC_RT)
+#define ga_strdup(s)      ga_strdup_src((s),GA_SRC_RT)
 void ga_free(u64 p);
-u64  ga_realloc(u64 p, u64 size);
-u64  ga_calloc(u64 n, u64 sz);
+u64  ga_realloc(u64 p, u64 size);                  /* a moved block keeps its source */
 u64  ga_usable(u64 p);
-u64  ga_pages(u64 size);                           /* page-granular zeroed run (stacks, VirtualAlloc) */
-void ga_pages_free(u64 p, u64 size);
-u64  ga_strdup(const char *s);
 void ga_stats(u64 *live_bytes, u64 *allocs);
-extern int ga_deterministic;                       /* oracle mode: bump allocator, no reuse */
+extern int ga_deterministic;                       /* oracle mode: bump allocator, no reuse, legacy single-zone layout */
+int  ga_describe(u64 addr, char *out, size_t cap); /* what an address is (image / stack / heap block and its source / not guest memory); 1 = inside guest space */
+void ga_window_sources(u64 base, char *out, size_t cap);   /* live bytes per source inside the 32 MiB window at base */
+void ga_report(FILE *f);                           /* zones: range, extent, committed, peak, live, free */
+const char *ga_src_name(int src);
 
 /* host-side access to guest memory. g may be NULL in identity mode only; always pass it. */
 static inline void *hp(KCtx *g, u64 a){ return (void*)XL(g,a); }
@@ -210,6 +238,7 @@ extern _Atomic int kh_gx_reached;                    /* set when an import is ca
 typedef int (*KhComHandler)(KCtx *g,u64 obj,int slot,const char *cls);
 #define COM_STRICT 1      /* unknown slot = named fatal (else returns 0) */
 #define COM_NOUNK  2      /* slots 0..2 are NOT IUnknown (XAudio2 voices) */
+#define COM_FREE   4      /* the default Release frees the object when its count reaches 0 (objects the game creates and drops every frame) */
 int  kh_com_class(const char *name,int nslots,int flags,KhComHandler h);   /* returns class id */
 void kh_com_dump(FILE *f);
 u64  kh_com_obj(int cls,u64 extra_bytes);                                      /* returns guest address of a new object (refcount 1) */

@@ -5,12 +5,14 @@
 
 #define MAXCLS 128
 #define MAXSLOTS 160
-typedef struct { char name[48]; int nslots, strict, noiunk; KhComHandler h; u64 vtbl; u64 slot_addr[MAXSLOTS]; _Atomic u32 cnt[MAXSLOTS]; int group; } Cls;
+typedef struct { char name[48]; int nslots, strict, noiunk, free0; KhComHandler h; u64 vtbl; u64 slot_addr[MAXSLOTS]; _Atomic u32 cnt[MAXSLOTS]; int group; } Cls;
 static Cls cls[MAXCLS]; static int ncls;
 static pthread_mutex_t cm=PTHREAD_MUTEX_INITIALIZER;
 static int log_com=-1;
 /* reverse map from host-fn index to (class,slot): host fn address = KH_HOSTFN_BASE + 16*idx */
 static struct { short c, s; } rmap[65536];
+static _Atomic u64 com_freed;
+u64 kh_com_freed(void){ return com_freed; }
 static void com_thunk(KCtx *g){
     u64 d=(g->aux[0]-KH_HOSTFN_BASE)>>4; int c=rmap[d].c,s=rmap[d].s; Cls *k=&cls[c]; u64 obj=KH_RCX(g);
     if(log_com<0){ const char *e=getenv("KH_LOG_COM"); log_com=e&&*e=="1"[0]; }
@@ -20,7 +22,8 @@ static void com_thunk(KCtx *g){
     if(!k->noiunk && (s==0||s==1||s==2)){                                    /* IUnknown defaults: QueryInterface (returns the same object), AddRef, Release */
         if(s==0){ if(KH_R8(g)){ wr64(g,KH_R8(g),obj); wr64(g,obj+16,rd64(g,obj+16)+1); } SET_RAX(g,0); }
         else if(s==1){ u64 r=rd64(g,obj+16)+1; wr64(g,obj+16,r); SET_RAX(g,r); }
-        else { u64 r=rd64(g,obj+16); if(r) r--; wr64(g,obj+16,r); SET_RAX(g,r); }
+        else { u64 r=rd64(g,obj+16); if(r) r--; wr64(g,obj+16,r); SET_RAX(g,r);
+               if(!r&&k->free0){ wr64(g,obj,0); wr64(g,obj+8,0); ga_free(obj); atomic_fetch_add(&com_freed,1); } }      /* the vtable pointer is cleared first: a use after the last Release faults instead of working by accident */
         KH_RET(g); return;
     }
     if(k->strict) kh_fatal(g,"unimplemented COM method %s slot %d (vtbl+0x%x) called (this=%llx)",k->name,s,s*8,(unsigned long long)obj);
@@ -30,7 +33,7 @@ int kh_com_class(const char *name,int nslots,int flags,KhComHandler h){
     pthread_mutex_lock(&cm);
     for(int i=0;i<ncls;i++) if(!strcmp(cls[i].name,name)){ pthread_mutex_unlock(&cm); return i; }
     if(ncls>=MAXCLS||nslots>MAXSLOTS){ fprintf(stderr,"kh: com class table full\n"); abort(); }
-    int id=ncls++; Cls *k=&cls[id]; snprintf(k->name,sizeof k->name,"%s",name); k->nslots=nslots; k->strict=flags&1; k->noiunk=(flags&2)!=0; k->h=h; k->group=!strncmp(name,"steam:",6)?1:!strncmp(name,"xa2:",4)?2:(!strncmp(name,"di:",3)||!strncmp(name,"xi:",3))?3:(!strncmp(name,"mf:",3)||!strncmp(name,"d3d11:",6))?4:0;
+    int id=ncls++; Cls *k=&cls[id]; snprintf(k->name,sizeof k->name,"%s",name); k->nslots=nslots; k->strict=flags&1; k->noiunk=(flags&2)!=0; k->free0=(flags&4)!=0; k->h=h; k->group=!strncmp(name,"steam:",6)?1:!strncmp(name,"xa2:",4)?2:(!strncmp(name,"di:",3)||!strncmp(name,"xi:",3))?3:(!strncmp(name,"mf:",3)||!strncmp(name,"d3d11:",6))?4:0;
     k->vtbl=ga_alloc(8ull*(u64)nslots,16);
     for(int s=0;s<nslots;s++){ char nm[96]; snprintf(nm,sizeof nm,"com:%s#%d",name,s); u64 a=kh_host_fn(nm,com_thunk); k->slot_addr[s]=a; u64 idx=(a-KH_HOSTFN_BASE)>>4; rmap[idx].c=(short)id; rmap[idx].s=(short)s; *(u64*)(k->vtbl+gs_bias+8ull*(u64)s)=a; }
     pthread_mutex_unlock(&cm); return id;

@@ -217,7 +217,7 @@ void f_106460(KCtx *g){
     if(!f) kh_fatal(g,"hd assets: cannot open %s (entry %d \"%s\" of %s): %s",e->host,i,e->name,t->key,strerror(errno));
     struct stat st;
     if(fstat(fileno(f),&st)||!S_ISREG(st.st_mode)||st.st_size!=e->size){ fclose(f); kh_fatal(g,"hd assets: %s changed after the scan (scanned %d bytes, now %lld)",e->host,e->size,(long long)st.st_size); }
-    u64 alloc=((u64)e->size+0xff)&~0xffull, buf=ga_alloc(alloc,16);
+    u64 alloc=((u64)e->size+0xff)&~0xffull, buf=ga_alloc_src(alloc,16,GA_SRC_FILE);
     if(!buf){ fclose(f); kh_fatal(g,"hd assets: guest arena exhausted for a %llu-byte asset (%s)",(unsigned long long)alloc,e->host); }
     memset(hp(g,buf),0,alloc);
     if(fread(hp(g,buf),1,(size_t)e->size,f)!=(size_t)e->size){ fclose(f); ga_free(buf); kh_fatal(g,"hd assets: short read of %s",e->host); }

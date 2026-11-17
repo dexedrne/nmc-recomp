@@ -57,7 +57,7 @@ static u64 new_resource(KCtx *g,u64 desc,int placed_dim_hint){
         else { u32 bw,bpb; fmt_info(fmt,&bw,&bpb); u64 sz=0; for(u32 m=0;m<mips;m++){ u64 W=w>>m; if(!W) W=1; u32 H=h>>m; if(!H) H=1; sz+=((W+bw-1)/bw)*bpb*((H+bw-1)/bw); }
                sz*=(dim==2||dim==3)?arr:1; if(fmt<128){ tx_res[fmt]++; tx_res_bytes[fmt]+=sz; } tx_sized[dim==3?size_class(w,h):7]++; }
     }
-    if(dim==1&&w){ u64 d=ga_alloc(w<16?16:w,256); if(!d) kh_fatal(g,"null d3d12: guest arena exhausted for a %llu-byte buffer",(unsigned long long)w); memset(hp(g,d),0,w); wr64(g,r+R_DATA,d); wr64(g,r+R_SIZE,w); gfx_buffers_bytes+=w; }
+    if(dim==1&&w){ u64 d=ga_alloc_src(w<16?16:w,256,GA_SRC_GFX); if(!d) kh_fatal(g,"null d3d12: guest arena exhausted for a %llu-byte buffer",(unsigned long long)w); memset(hp(g,d),0,w); wr64(g,r+R_DATA,d); wr64(g,r+R_SIZE,w); gfx_buffers_bytes+=w; }
     return r;
 }
 
@@ -221,7 +221,8 @@ void kh_seam_gfx_init(void){
     else if(e&&*e&&strcmp(e,"null")) kh_fatal(NULL,"gfx-backend-unknown: KHNMC_GFX=%s (known backends: null, vkd3d)",e);
     C_factory=kh_com_class("dxgi:IDXGIFactory4",44,STRICT,h_factory); C_adapter=kh_com_class("dxgi:IDXGIAdapter3",24,STRICT,h_adapter); C_output=kh_com_class("dxgi:IDXGIOutput",24,STRICT,h_output);
     C_swap=kh_com_class("dxgi:IDXGISwapChain3",44,STRICT,h_swap); C_dev=kh_com_class("d3d12:ID3D12Device",48,STRICT,h_dev); C_queue=kh_com_class("d3d12:ID3D12CommandQueue",20,STRICT,h_queue);
-    C_alloc=kh_com_class("d3d12:ID3D12CommandAllocator",12,STRICT,h_alloc); C_list=kh_com_class("d3d12:ID3D12GraphicsCommandList",72,STRICT,h_list); C_res=kh_com_class("d3d12:ID3D12Resource",16,STRICT,h_res);
+    /* the game creates and releases about 27 allocator + list pairs per frame (bundles): they are freed at their last Release, the other classes are few and kept */
+    C_alloc=kh_com_class("d3d12:ID3D12CommandAllocator",12,STRICT|COM_FREE,h_alloc); C_list=kh_com_class("d3d12:ID3D12GraphicsCommandList",72,STRICT|COM_FREE,h_list); C_res=kh_com_class("d3d12:ID3D12Resource",16,STRICT,h_res);
     C_dheap=kh_com_class("d3d12:ID3D12DescriptorHeap",12,STRICT,h_dheap); C_fence=kh_com_class("d3d12:ID3D12Fence",12,STRICT,h_fence); C_pso=kh_com_class("d3d12:ID3D12PipelineState",10,STRICT,h_misc);
     C_rootsig=kh_com_class("d3d12:ID3D12RootSignature",9,STRICT,h_misc); C_heap=kh_com_class("d3d12:ID3D12Heap",10,STRICT,h_misc); C_qheap=kh_com_class("d3d12:ID3D12QueryHeap",9,STRICT,h_misc);
     C_blob=kh_com_class("d3dcompiler:ID3DBlob",5,STRICT,h_blob);

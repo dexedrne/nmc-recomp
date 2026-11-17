@@ -46,7 +46,7 @@ IMP(K32,GetExitCodeProcess){ if(A1(g)) wr32(g,A1(g),259); SET_RAX(g,1); }
 IMP(K32,DecodePointer){ SET_RAX(g,A0(g)); }
 IMP(K32,InitializeSListHead){ memset(hp(g,A0(g)),0,16); }
 IMP(K32,GetProcessHeap){ SET_RAX(g,0x1000); }
-IMP(K32,HeapAlloc){ u64 p=ga_alloc(A2(g),16); if(p&&(A1(g)&8)) memset(hp(g,p),0,A2(g)); SET_RAX(g,p); }
+IMP(K32,HeapAlloc){ u64 p=ga_alloc_src(A2(g),16,GA_SRC_HEAP); if(p&&(A1(g)&8)) memset(hp(g,p),0,A2(g)); SET_RAX(g,p); }
 IMP(K32,HeapFree){ ga_free(A2(g)); SET_RAX(g,1); }
 IMP(K32,GlobalMemoryStatus){ u64 p=A0(g); wr32(g,p,56); wr32(g,p+4,25); wr64(g,p+8,8ull<<30); wr64(g,p+16,6ull<<30); wr64(g,p+24,16ull<<30); wr64(g,p+32,12ull<<30); wr64(g,p+40,1ull<<47); wr64(g,p+48,1ull<<46); }
 IMP(K32,GetDiskFreeSpaceExA){ if(A1(g)) wr64(g,A1(g),200ull<<30); if(A2(g)) wr64(g,A2(g),400ull<<30); if(A3(g)) wr64(g,A3(g),200ull<<30); SET_RAX(g,1); }
@@ -103,7 +103,7 @@ IMP(K32,CreateDirectoryA){ char p[2048]; kh_winpath(gstr(g,A0(g)),p,sizeof p); i
 IMP(K32,RemoveDirectoryA){ char p[2048]; kh_winpath(gstr(g,A0(g)),p,sizeof p); int r=rmdir(p); if(r) kh_set_last_error(3); SET_RAX(g,r==0); }
 IMP(K32,CreateFileMappingA){ /* (file, attrs, protect, hi, lo, name) : only anonymous (INVALID_HANDLE_VALUE) mappings are supported (exit-code mailbox) */
     if(A0(g)!=INVALID_HANDLE) kh_fatal(g,"CreateFileMappingA on a real file is not supported");
-    u64 size=((A3(g)&0xffffffffull)<<32)|(A4(g)&0xffffffffull); KMap *m=calloc(1,sizeof *m); m->size=size?size:4096; m->ga=ga_pages(m->size); if(ARG(g,5)) snprintf(m->name,sizeof m->name,"%s",gstr(g,ARG(g,5))); SET_RAX(g,h_new(HK_MAPPING,m)); }
+    u64 size=((A3(g)&0xffffffffull)<<32)|(A4(g)&0xffffffffull); KMap *m=calloc(1,sizeof *m); m->size=size?size:4096; m->ga=ga_pages_src(m->size,GA_SRC_MAP); if(ARG(g,5)) snprintf(m->name,sizeof m->name,"%s",gstr(g,ARG(g,5))); SET_RAX(g,h_new(HK_MAPPING,m)); }
 IMP(K32,MapViewOfFile){ KMap *m=h_get(A0(g),HK_MAPPING); if(!m){ kh_set_last_error(6); SET_RAX(g,0); return; } SET_RAX(g,m->ga); }
 IMP(K32,UnmapViewOfFile){ SET_RAX(g,1); }
 IMP(K32,FindFirstFileA){ char p[2048]; kh_winpath(gstr(g,A0(g)),p,sizeof p); char *sl=strrchr(p,'/'); KFind *f=calloc(1,sizeof *f); if(sl){ *sl=0; snprintf(f->dir,sizeof f->dir,"%s",p); snprintf(f->pat,sizeof f->pat,"%s",sl+1); } else { snprintf(f->dir,sizeof f->dir,"."); snprintf(f->pat,sizeof f->pat,"%s",p); }
@@ -171,9 +171,9 @@ IMP(ole32,CoInitialize){ SET_RAX(g,0); }
 IMP(ole32,CoInitializeEx){ SET_RAX(g,0); }
 IMP(ole32,CoUninitialize){ }
 IMP(ole32,CoSetProxyBlanket){ SET_RAX(g,0); }
-IMP(ole32,CoTaskMemAlloc){ SET_RAX(g,ga_alloc(A0(g),16)); }
+IMP(ole32,CoTaskMemAlloc){ SET_RAX(g,ga_alloc_src(A0(g),16,GA_SRC_HEAP)); }
 IMP(ole32,CoTaskMemFree){ ga_free(A0(g)); }
 IMP(ole32,PropVariantClear){ SET_RAX(g,0); }
 IMP(ole32,CoCreateInstance){ if(kh_audio_cocreate(g)) return; kh_warn("CoCreateInstance(clsid %08x-%04x...) -> REGDB_E_CLASSNOTREG (site rva 0x%llx)",rd32(g,A0(g)),rd16(g,A0(g)+4),(unsigned long long)(guest_return_addr(g)-GS_BASE)); if(ARG(g,4)) wr64(g,ARG(g,4),0); SET_RAX(g,0x80040154u); }
-IMP(oleaut32,SysAllocString){ u64 s=A0(g); if(!s){ SET_RAX(g,0); return; } size_t n=gw_len(g,s); u64 b=ga_alloc(4+2*n+2,16); wr32(g,b,(u32)(2*n)); memcpy(hp(g,b+4),hp(g,s),2*n+2); SET_RAX(g,b+4); }
+IMP(oleaut32,SysAllocString){ u64 s=A0(g); if(!s){ SET_RAX(g,0); return; } size_t n=gw_len(g,s); u64 b=ga_alloc_src(4+2*n+2,16,GA_SRC_HEAP); wr32(g,b,(u32)(2*n)); memcpy(hp(g,b+4),hp(g,s),2*n+2); SET_RAX(g,b+4); }
 IMP(oleaut32,SysFreeString){ if(A0(g)) ga_free(A0(g)-4); }

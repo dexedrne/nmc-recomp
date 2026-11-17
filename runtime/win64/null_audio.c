@@ -148,7 +148,7 @@ static int xapo_stat(KCtx *g,u64 vtbl){
     if(i==nxapos){ if(nxapos<32){ memset(&xapos[i],0,sizeof xapos[i]); xapos[i].vtbl=vtbl; rtti_name(g,vtbl,xapos[i].name,sizeof xapos[i].name); nxapos++; } else i=31; }
     xapos[i].chains++; pthread_mutex_unlock(&soft_m); return i;
 }
-static void *soft_alloc(size_t n){ u64 p=ga_alloc(n?n:64,64); if(!p) return NULL; void *h=(void*)(uintptr_t)(p+gs_bias); memset(h,0,n); return h; }
+static void *soft_alloc(size_t n){ u64 p=ga_alloc_src(n?n:64,64,GA_SRC_AUDIO); if(!p) return NULL; void *h=(void*)(uintptr_t)(p+gs_bias); memset(h,0,n); return h; }
 static void soft_release(void *p){ ga_free(GADDR(p)); }
 /* KMX_EV_* numbers are the IXAudio2VoiceCallback / IXAudio2EngineCallback vtable slots */
 static void soft_voice_event(void *ctx,void *vu,int ev,u64 arg){

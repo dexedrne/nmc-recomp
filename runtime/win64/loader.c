@@ -1,7 +1,8 @@
 /* loader.c : PE image loader + process driver (main).
  *
- * Address model (KH_XLATE_MODE 0, identity): one MAP_FIXED_NOREPLACE mapping of "guest space" at 0x140000000 holds the image at
- * its preferred base (so no relocation is ever needed) followed by the guest arena (heap, thread and fiber stacks, VirtualAlloc).
+ * Address model (KH_XLATE_MODE 0, identity): one MAP_FIXED_NOREPLACE reservation of "guest space" at 0x140000000 holds the image at
+ * its preferred base (so no relocation is ever needed) followed by the guest arena (heap, thread and fiber stacks; layout in core.c).
+ * The reservation is PROT_NONE; the image is committed here, the arena commits itself as it grows.
  * Fallback for hosts that cannot map that address (iOS): build with KH_XLATE_MODE=2 (host = guest + bias), map guest space anywhere,
  * set gs_bias = host - 0x140000000 in every KCtx; guest addresses (and so relocations, IAT values, vtables, saved pointers) never change.
  */
@@ -36,13 +37,16 @@ static int load_image(void){
     if(base!=GS_BASE||szimg!=IMG_SIZE){ fprintf(stderr,"unexpected image base/size %llx %x\n",(unsigned long long)base,szimg); return -1; }
     /* guest space */
     void *want=(void*)GS_BASE; int flags=MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE;
+    u64 image_hi=(GS_BASE+IMG_SIZE+0x100000+0xffffull)&~0xffffull;      /* image + 1 MiB of slack, 64 KiB aligned: the arena starts here */
 #if KH_XLATE_MODE==0
-    void *m=mmap(want,guest_space_size,PROT_READ|PROT_WRITE|PROT_EXEC,flags|MAP_FIXED_NOREPLACE,-1,0);
+    void *m=mmap(want,guest_space_size,PROT_NONE,flags|MAP_FIXED_NOREPLACE,-1,0);
     if(m!=want){ fprintf(stderr,"kh: cannot map guest space at 0x%llx (%s). Build with KH_XLATE_MODE=2 for bias mode.\n",(unsigned long long)GS_BASE,strerror(errno)); return -1; }
     gs_bias=0;
+    if(mprotect(m,image_hi-GS_BASE,PROT_READ|PROT_WRITE|PROT_EXEC)){ perror("kh: commit image"); return -1; }
 #else
-    void *m=mmap(0,guest_space_size,PROT_READ|PROT_WRITE,flags,-1,0);
+    void *m=mmap(0,guest_space_size,PROT_NONE,flags,-1,0);
     if(m==MAP_FAILED){ perror("mmap guest space"); return -1; } gs_bias=(uintptr_t)m-GS_BASE;
+    if(mprotect(m,image_hi-GS_BASE,PROT_READ|PROT_WRITE)){ perror("kh: commit image"); return -1; }
 #endif
     gs_host_base=(uintptr_t)m; gs_size=guest_space_size;
 #ifdef MADV_DONTDUMP
@@ -57,7 +61,7 @@ static int load_image(void){
     u32 tlsrva=RD32(oh+112+9*8); if(tlsrva){ const u8 *t=(const u8*)(gs_host_base+tlsrva);
         kh_tls_tmpl_lo=*(const u64*)t; kh_tls_tmpl_hi=*(const u64*)(t+8); kh_tls_index_va=*(const u64*)(t+16); kh_tls_callbacks_va=*(const u64*)(t+24); }
     munmap(f,st.st_size);
-    ga_init(GS_BASE+IMG_SIZE+0x100000, GS_BASE+guest_space_size);
+    ga_init(image_hi, GS_BASE+guest_space_size);
     return 0;
 }
 
@@ -67,6 +71,8 @@ void kh_exit_process(int code){
     { extern void kh_mod_difficulty_dump(void); kh_mod_difficulty_dump(); }
     { extern void kh_mod_hooks_dump(void); kh_mod_hooks_dump(); }
     { extern void kh_bgload_report(FILE*); kh_bgload_report(stderr); }
+    { extern void kh_moose_report(FILE*); kh_moose_report(stderr); }
+    { extern void kh_idtable_exit_report(FILE*); kh_idtable_exit_report(stderr); }
     { extern void kh_sync_report(FILE*); kh_sync_report(stderr); }
     { extern void kh_input_report(FILE*); kh_input_report(stderr); }
     kh_report_seams(stderr); { extern void kh_dump_threads(FILE*); if(getenv("KH_DUMP_THREADS")) kh_dump_threads(stderr); } fflush(stderr); fflush(stdout); _exit(code);
@@ -96,6 +102,7 @@ static void *guest_main(void *arg){
     kh_run_tls_callbacks(g,1);
     kh_mod_syscalls_init(g);
     { extern void kh_mod_difficulty_init(KCtx *); kh_mod_difficulty_init(g); }
+    { extern void kh_moose_init(KCtx *); kh_moose_init(g); }            /* the mod's pool sizes: before the game's own initialisation, like the DLL */
     if(selftest){ extern int kh_selftest(KCtx*); int f=kh_selftest(g); kh_exit_process(f?1:0); }
     u64 entry;
     if(!strcmp(entry_mode,"crt")) entry=GS_BASE+0x4393d0;            /* WinMainCRTStartup: security cookie, CRT init, __xi/__xc tables, WinMain */
@@ -130,7 +137,9 @@ int main(int argc,char **argv){
     mkdir(kh_docs,0755);
     kh_trace_init(); kh_install_signals();
     { extern void kh_bgload_init(void); kh_bgload_init(); }
+    { extern int ga_no_stress; ga_no_stress=selftest; }
     if(load_image()) return 1;
+    { extern void kh_idtable_init(void); kh_idtable_init(); }
     kh_seam_steam_init(); kh_seam_gfx_init(); kh_seam_audio_init(); kh_seam_input_init(); kh_seam_window_init(); kh_seam_mf_init();
     pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at,128ull<<20); pthread_t th;
     if(pthread_create(&th,&at,guest_main,0)){ perror("pthread_create"); return 1; }

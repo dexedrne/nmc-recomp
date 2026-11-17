@@ -276,5 +276,9 @@ int kh_selftest(KCtx *g){
     fprintf(stderr,"kh: selftest: %d checks, %d failures\n",checks,fails);
     if(getenv("KH_SELFTEST_FATAL")){ extern void rt_imp_gdi32__MoveToEx(KCtx*); do_call(g,rt_imp_gdi32__MoveToEx,1,2,3,4,0,0); }   /* demonstrates the loud failure of an unimplemented import */
     extern int kh_gfx_selftest(KCtx *); extern int kh_hd_selftest(KCtx *); extern int kh_native_selftest(KCtx *); extern int kh_audio_mix_selftest(void); extern int kh_audio_soft_selftest(KCtx *); extern int kh_stream_selftest(KCtx *);
-    return fails + io_selftest(g) + audio_selftest(g) + kh_audio_mix_selftest() + kh_audio_soft_selftest(g) + kh_stream_selftest(g) + kh_file_selftest(g) + kh_hd_selftest(g) + kh_gfx_selftest(g) + kh_native_selftest(g);
+    fails += io_selftest(g) + audio_selftest(g) + kh_audio_mix_selftest() + kh_audio_soft_selftest(g) + kh_stream_selftest(g) + kh_file_selftest(g) + kh_hd_selftest(g) + kh_gfx_selftest(g) + kh_native_selftest(g);
+    /* task 17, after everything else: these move the arena's high-water mark by hundreds of MiB (the enlarged pools, the stress placement), and
+     * some older fixtures assume the low heap addresses of an untouched arena (mod_syscalls_test splits a heap pointer into two halves) */
+    { extern int kh_ga_selftest(KCtx *); extern int kh_idtable_selftest(KCtx *); extern int kh_moose_selftest(KCtx *); fails += kh_ga_selftest(g) + kh_idtable_selftest(g) + kh_moose_selftest(g); }
+    return fails;
 }

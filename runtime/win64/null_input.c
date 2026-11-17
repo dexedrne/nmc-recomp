@@ -36,6 +36,7 @@ static u64 run_game_frames;
 void orig_f_105e10(KCtx *g);
 void f_105e10(KCtx *g){
     u64 n=atomic_fetch_add(&game_frames,1)+1;
+    { extern void kh_idtable_game_frame(u64); kh_idtable_game_frame(n); extern void kh_moose_game_frame(KCtx *); kh_moose_game_frame(g); }
     if(run_game_frames && n>=run_game_frames){ extern void kh_exit_process(int); kh_warn("input: KH_RUN_GAME_FRAMES=%llu reached, ending the run",(unsigned long long)run_game_frames); kh_exit_process(0); }
     orig_f_105e10(g);
 }
