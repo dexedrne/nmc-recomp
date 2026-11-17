@@ -46,3 +46,22 @@ signing with the owner's paid team, install on the Duo. Cutscenes/movies are out
 ## Not blocked on Apple, still open on Linux
 Task 12 (static edits) merge, task 17 (heap/id table + KH2Moose heap sizes), task 18 (field/battle rendering + video), task 19
 (NeverlandFly.dll), scripted item use on Less Than Nothing, the consumable-extension sites, save/load round trip, long-play soak.
+
+## Update 2026-11-17 01:55 (before task 20 handed back; its run folder shows the selftest passing on the Mac mini in bias mode)
+- **Bias mode changes the graphics bridge.** The Linux vkd3d backend hands HOST vkd3d objects straight to the lifted code and forwards
+  vtable calls through one trampoline. That only works when guest pointers are host pointers (identity). On Apple the runtime uses
+  bias mode (guest 0x140000000.. = host 0x300000000..): a host object's vtable pointer, read by lifted code, would be translated
+  again and miss. So the Apple backend needs GUEST-side COM objects (as the null recorder already has: 75 methods on 19 interfaces
+  with KH_HOSTFN vtables) whose methods translate pointers, unwrap/wrap interface arguments and call the real implementation in C.
+  What sits underneath can still be vkd3d over MoltenVK (first choice: same D3D12 semantics, proven backend logic) or Metal directly.
+  This wrapped bridge is also correct on Linux in bias mode, where it can be checked against the trampoline backend frame for frame
+  before any Mac is involved: task 21a (Linux), then 21b (Mac mini with MoltenVK, offscreen).
+- **Third-party pieces are downloaded and verified** on build-host (`~/work/khnmc-deps/apple/README.md`): vkd3d 2.1 source (good signature by
+  the Wine release key), MoltenVK 1.4.2 for macOS and iOS (digests match GitHub's), SPIRV-Headers. Owner approved them inside
+  `~/khnmc-work` on the Mac mini.
+- **MacBook Air is online** (owner, 01:52): Xcode 27.2, iPhoneOS SDK 27.2, Metal compiler present, 8 GB RAM, 21 GB free. Rules: own
+  folder `~/Developer/KHNMC`, shared lock `~/Developer/.mac-build.lock` (two conventions are in use on that Mac: an fcntl lock on the
+  file, and "file exists with a description = busy"; honour both and check `pgrep -x xcodebuild`), DEVELOPER_DIR per command, no Terminal
+  windows, mute before any simulator run, never touch the "iPhone Duo" simulator or the physical phone, no retry loops, windowless
+  launchd job for anything needing the login session; signing/installing on the phone stays owner-gated. Task 26: compile the runtime and
+  the lifted C for iOS there (2 jobs at most: 8 GB RAM), then boot the selftest inside an iOS Simulator of our own.
