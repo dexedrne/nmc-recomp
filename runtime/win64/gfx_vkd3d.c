@@ -135,6 +135,7 @@ static long long memlow_test=-1;   /* review X38 n=2: KHNMC_GFX_TEST_MEMORY_AVAI
 static _Atomic u64 n_bb_images_made, n_bb_images_freed, n_bb_drains;
 static char dump_dir[1024]; static u64 dump_every=300; static _Atomic u64 dumps_written; static u64 dump_from, dump_to=~0ull;
 static FILE *hash_f; static char hash_path[1024]; static _Atomic u64 hashes_written;
+static FILE *band_f; static char band_path[1024]; static _Atomic u64 bands_written;   /* task 40: KHNMC_GFX_BANDLOG */
 static char vk_dev_name[300]="(no Vulkan device created yet)";
 static struct vkd3d_instance *vk_inst; static pthread_mutex_t vm=PTHREAD_MUTEX_INITIALIZER;
 static _Atomic u64 n_devices, n_probe_devices, n_events_signalled, n_bundles_made, n_bundles_run, n_bundle_cmds, n_bundles_live, n_default_tables;
@@ -247,6 +248,11 @@ void kh_gfxc_init_common(const char *label){
     if(e&&*e){ if(snprintf(hash_path,sizeof hash_path,"%s",e)>=(int)sizeof hash_path) kh_fatal(NULL,"gfx-hashlog: KHNMC_GFX_HASHLOG is too long");
         hash_f=fopen(hash_path,"w"); if(!hash_f) kh_fatal(NULL,"gfx-hashlog: cannot create %s (%s)",hash_path,strerror(errno));
         setvbuf(hash_f,NULL,_IOLBF,0); fprintf(hash_f,"present\tgame_frame\tvblank\trgb_hash\tbgra_hash\tdraws_total\twidth\theight\n"); }
+    e=getenv("KHNMC_GFX_BANDLOG");                                          /* task 40 (the fill mode's GPU checks): per present, the 16:9 band and the strips */
+    if(e&&*e){ if(snprintf(band_path,sizeof band_path,"%s",e)>=(int)sizeof band_path) kh_fatal(NULL,"gfx-bandlog: KHNMC_GFX_BANDLOG is too long");
+        band_f=fopen(band_path,"w"); if(!band_f) kh_fatal(NULL,"gfx-bandlog: cannot create %s (%s)",band_path,strerror(errno));
+        setvbuf(band_f,NULL,_IOLBF,0);
+        fprintf(band_f,"present\tgame_frame\twidth\theight\tband_top_row\tband_rows\tband_hash\ttop_hash\tbottom_hash\tband_nonblack_pct\ttop_nonblack_pct\tbottom_nonblack_pct\tband_mean\ttop_mean\tbottom_mean\tedge_top\tedge_bottom\tband_step_p95\tedge_window_rows\tedge_top_max\tedge_bottom_max\n"); }
     video_setup();
     e=getenv("KHNMC_GFX_TRACE"); kh_native_trace=e&&*e=='1';
     kh_fiber_host_stack=16ull<<20;          /* vkd3d and the Vulkan driver run on the calling fiber's host stack */
@@ -255,6 +261,7 @@ void kh_gfxc_init_common(const char *label){
     fprintf(stderr,"kh: gfx backend: %s; address model: %s; frame dump: %s%s every %llu presents",label,KH_XLATE_MODE==0?"identity":"bias",dump_dir[0]?"to ":"off",dump_dir,P(dump_every));
     if(dump_from||dump_to!=~0ull) fprintf(stderr,", presents %llu..%llu only",P(dump_from),P(dump_to));
     if(hash_f) fprintf(stderr,"; picture hash of every present: %s",hash_path);
+    if(band_f) fprintf(stderr,"; 16:9 band and strips of every present: %s",band_path);
     fprintf(stderr,"; back buffers: %s",bb_names[bb_mode_env]);
     if(video_path[0]) fprintf(stderr,"; video stream: %s, %llu pictures from %s%s%llu, scale 1/%d%s",video_path,P(video_max),video_from_field?"the field":"virtual vblank ",video_from_field?" + ":"",P(video_from_field?video_lead:video_from),video_scale,video_exit?", then exit":"");
     fputc('\n',stderr);
@@ -1249,6 +1256,51 @@ static void hash_frame(KCtx *g,Swap *s,const u8 *base,u64 n){
         kh_fatal(g,"gfx-hashlog: writing %s failed at present %llu (%s)",hash_path,P(n),strerror(errno));
     atomic_fetch_add(&hashes_written,1);
 }
+/* task 40, KHNMC_GFX_BANDLOG=<file> (the fill mode's GPU checks, tools/fill_compare.py tallcheck / bandpairs): per present the picture
+ * split into the centred 16:9 band (ch = round(9w / 16) rows from row o = (h - ch) / 2) and the strips above and below it: the RGB
+ * hash of each part (hash_pixels), the share of pixels that are not pure black, the mean of the RGB bytes, the mean step across each
+ * band edge (|row o - row o-1| and |row o+ch - row o+ch-1| over the RGB bytes) and the 95th percentile of the steps between
+ * neighbouring band rows (fill_compare.py condition (c2)).  On a picture of 16:9 or wider the band is the whole picture and the strip
+ * columns read "-".
+ * Task 40 review (finding 3): the exe's full-screen quads overshoot the band (the fades are GS y -1..417, so at 1920x1350 they cover
+ * rows 132..1217, not 135..1214), so a fade over the band only makes its hard line 3 rows OUTSIDE the band edge, where edge_top /
+ * edge_bottom (one row pair each) never look.  Three more columns: edge_window_rows W = ceil(2 ch / 416) (two GS rows at the band's
+ * scale: 6 at 1920x1350) and the largest mean row step over the W row pairs at and beyond each band edge: edge_top_max over the pairs
+ * (y | y+1) for y = o-W .. o-1, edge_bottom_max for y = o+ch-1 .. o+ch-2+W.  Steps inside the band (HUD edges near the band edge,
+ * e.g. the command menu's at row 1210) are not in these windows: a band-only overlay always ends at or beyond the band edge. */
+static void part_stats(const u8 *base,u32 pitch,u32 w,u32 y0,u32 n,double *nonblack,double *mean){
+    u64 nb=0,sum=0; for(u32 y=y0;y<y0+n;y++){ const u8 *q=base+(u64)y*pitch; for(u32 x=0;x<w;x++){ u8 b=q[4*x],gc=q[4*x+1],r=q[4*x+2]; if(r|gc|b) nb++; sum+=(u64)r+gc+b; } }
+    double px=(double)w*n; *nonblack=px?100.0*nb/px:0; *mean=px?sum/(3.0*px):0; }
+static double row_step(const u8 *base,u32 pitch,u32 w,u32 y){            /* mean |row y+1 - row y| over the RGB bytes */
+    const u8 *a=base+(u64)y*pitch,*b=a+pitch; u64 s=0; for(u32 x=0;x<w;x++) for(int c=0;c<3;c++){ int d=(int)b[4*x+c]-(int)a[4*x+c]; s+=(u64)(d<0?-d:d); } return s/(3.0*w); }
+static int cmp_dbl(const void *a,const void *b){ double x=*(const double*)a,y=*(const double*)b; return x<y?-1:x>y; }
+typedef struct { u32 o,ch,win; u64 hb,ht,hbt; double bn,bm,tn,tm,on,om,et,eb,etw,ebw,p95; } BandSt;
+/* the band log's numbers for one w x h BGRA picture (pure; selftested in kh_gfxc_selftest_pure); 0 = out of host memory */
+static int band_stats(const u8 *base,u32 pitch,u32 w,u32 h,BandSt *b){
+    memset(b,0,sizeof *b); u32 ch=(u32)((9ull*w+8)/16); if(ch>h) ch=h; u32 o=(h-ch)/2; b->o=o; b->ch=ch;
+    u64 hx; hash_pixels(base+(u64)o*pitch,pitch,w,ch,&b->hb,&hx); part_stats(base,pitch,w,o,ch,&b->bn,&b->bm);
+    double *st=malloc(sizeof(double)*(ch?ch:1)); if(!st) return 0;
+    u32 ns=0; for(u32 y=o;y+1<o+ch;y++) st[ns++]=row_step(base,pitch,w,y); qsort(st,ns,sizeof *st,cmp_dbl);
+    b->p95=ns?st[(u32)(0.95*(ns-1)+0.5)]:0; free(st);
+    if(o>0){ hash_pixels(base,pitch,w,o,&b->ht,&hx); hash_pixels(base+(u64)(o+ch)*pitch,pitch,w,h-o-ch,&b->hbt,&hx);
+        part_stats(base,pitch,w,0,o,&b->tn,&b->tm); part_stats(base,pitch,w,o+ch,h-o-ch,&b->on,&b->om);
+        b->et=row_step(base,pitch,w,o-1); b->eb=row_step(base,pitch,w,o+ch-1);
+        b->win=(2*ch+415)/416; if(!b->win) b->win=1;
+        for(u32 y=o>b->win?o-b->win:0;y<o;y++){ double v=row_step(base,pitch,w,y); if(v>b->etw) b->etw=v; }
+        for(u32 y=o+ch-1;y<o+ch-1+b->win&&y+1<h;y++){ double v=row_step(base,pitch,w,y); if(v>b->ebw) b->ebw=v; } }
+    return 1;
+}
+static void band_frame(KCtx *g,Swap *s,const u8 *base,u64 n){
+    u32 w=s->w,h=s->h,pitch=s->fp.Footprint.RowPitch; BandSt b;
+    if(!band_stats(base,pitch,w,h,&b)) kh_fatal(g,"gfx-bandlog: out of memory");
+    char tail[480];
+    if(b.o>0) snprintf(tail,sizeof tail,"%016llx\t%016llx\t%.4f\t%.4f\t%.4f\t%.3f\t%.3f\t%.3f\t%.4f\t%.4f\t%.4f\t%u\t%.4f\t%.4f",P(b.ht),P(b.hbt),b.bn,b.tn,b.on,b.bm,b.tm,b.om,b.et,b.eb,b.p95,b.win,b.etw,b.ebw);
+    else snprintf(tail,sizeof tail,"-\t-\t%.4f\t-\t-\t%.3f\t-\t-\t-\t-\t%.4f\t-\t-\t-",b.bn,b.bm,b.p95);
+    u32 o=b.o, ch=b.ch; u64 hb=b.hb;
+    if(fprintf(band_f,"%llu\t%llu\t%u\t%u\t%u\t%u\t%016llx\t%s\n",P(n),P(kh_input_game_frames()),w,h,o,ch,P(hb),tail)<0)
+        kh_fatal(g,"gfx-bandlog: writing %s failed at present %llu (%s)",band_path,P(n),strerror(errno));
+    atomic_fetch_add(&bands_written,1);
+}
 /* BGRA rows -> RGB24, optionally the mean of each 2x2 block (rounded to nearest) */
 static void video_convert(u8 *out,const u8 *base,u32 pitch,u32 w,u32 h,int scale){
     if(scale==1){ for(u32 y=0;y<h;y++){ const u8 *q=base+(u64)y*pitch; u8 *o=out+3ull*w*y; for(u32 x=0;x<w;x++){ o[3*x]=q[4*x+2]; o[3*x+1]=q[4*x+1]; o[3*x+2]=q[4*x]; } } return; }
@@ -1312,10 +1364,11 @@ void kh_vkd3d_present(KCtx *g,u64 o,u64 n){
     kh_gfx_gate_park("Present (before the frame readback)");
     memlow_check(n);                                                    /* review X38 n=2: the gfx-memory-low soft stop, before a dump allocates */
     u32 idx=rd32(g,o+40)%NBUF;
-    int want_dump=dump_dir[0]&&n>=dump_from&&n<=dump_to&&n%dump_every==0, want_video=video_wanted(), want_hash=hash_f!=NULL;
-    if(want_dump||want_video||want_hash){
+    int want_dump=dump_dir[0]&&n>=dump_from&&n<=dump_to&&n%dump_every==0, want_video=video_wanted(), want_hash=hash_f!=NULL, want_band=band_f!=NULL;
+    if(want_dump||want_video||want_hash||want_band){
         u64 t0=kh_host_ns(); const u8 *base=readback(g,s,idx,n,"Present (frame readback)");
         if(want_hash) hash_frame(g,s,base,n);
+        if(want_band) band_frame(g,s,base,n);
         if(want_video) video_capture(g,s,base,n);
         if(want_dump) dump_frame(g,s,base,idx,n,t0);
         readback_done(s); }
@@ -1331,6 +1384,7 @@ void kh_gfx_vkd3d_finish(void){
      * (review 2026-11-17: fclose and hash_f=NULL raced with hash_frame, a fault at the end of a finished run).  The stream is
      * line-buffered, so a flush is all the exit needs. */
     if(hash_f){ if(fflush(hash_f)||ferror(hash_f)) fprintf(stderr,"kh: gfx hash log: ERROR: writing %s failed (%s)\n",hash_path,strerror(errno)); }
+    if(band_f){ if(fflush(band_f)||ferror(band_f)) fprintf(stderr,"kh: gfx band log: ERROR: writing %s failed (%s)\n",band_path,strerror(errno)); }
     if(!video_path[0]) return; pthread_mutex_lock(&vid_m); if(video_f){ vid_cut=!vid_done; video_close(); } else if(!vid_done) vid_cut=vid_armed; vid_done=1; pthread_mutex_unlock(&vid_m); }
 /* the stream's state in the report; caller holds vid_m.  kh_gfx_vkd3d_finish marks every stream done, so "complete" is every picture
  * written and a stream the run cut short reads INCOMPLETE (review U35 n=27: vid_done was checked first) */
@@ -1341,6 +1395,7 @@ void kh_gfx_vkd3d_report(FILE *f){
     fprintf(f,"kh: gfx vkd3d: bridge=%s device=%s driver-mode=%s devices-created=%llu (+%llu probes) native-calls=%llu fence-events-signalled=%llu bundles: recorded=%llu executed=%llu (%llu replayed calls) live=%llu; default-descriptor-tables=%llu on %d tracked command lists; frame-dumps=%llu%s%s\n",kh_gfx_wrap_on?"wrapped":"trampoline",vk_dev_name,drv_system?"system":"lavapipe",
             P(n_devices),P(n_probe_devices),P(kh_native_calls),P(n_events_signalled),P(n_bundles_made),P(n_bundles_run),P(n_bundle_cmds),P(n_bundles_live),P(n_default_tables),nlst,P(dumps_written),dump_dir[0]?" in ":"",dump_dir);
     if(hash_path[0]) fprintf(f,"kh: gfx hash log: %llu presents hashed into %s\n",P(hashes_written),hash_path);
+    if(band_path[0]) fprintf(f,"kh: gfx band log: %llu presents measured into %s\n",P(bands_written),band_path);
     fprintf(f,"kh: gfx vkd3d: back buffers %s: own images made %llu, destroyed %llu, drains %llu (wait slices not counted under the gate %llu); live Vulkan objects of the runtime %lld; gipa wrapper: %llu names, vkCreateInstance %llu, vkCreateDevice %llu\n",
             bb_names[bb_mode_env],P(n_bb_images_made),P(n_bb_images_freed),P(n_bb_drains),P(atomic_load(&n_bb_drain_free)),kh_vko_live_total(),P(gw_names),P(gw_inst_calls),P(gw_dev_calls));
     kh_present_report(f); kh_gfx_gate_report(f);
@@ -1452,8 +1507,24 @@ int kh_gfxc_selftest_pure(KCtx *g){
       video_f=NULL; vid_armed=1; vid_done=1; vid_cut=0; atomic_store(&vid_written,1000);
       kh_gfx_vkd3d_finish(); pthread_mutex_lock(&vid_m); st=video_state(); pthread_mutex_unlock(&vid_m); TP(strstr(st,"(complete)")!=NULL);
       pthread_mutex_lock(&vid_m); memcpy(video_path,sv_path,sizeof video_path); video_f=sv_f; video_ix=sv_ix; vid_armed=sv_armed; vid_done=sv_done; vid_cut=sv_cut; video_max=sv_max; atomic_store(&vid_written,sv_wr); pthread_mutex_unlock(&vid_m); }
+    /* task 40 review finding 3: the band log's edge windows.  A 1920x1350 picture of a smooth scene; a fade over the band only that
+     * overshoots it by 3 rows (rows 132..1217, as the exe's GS y -1..417 quad at 1920x1350, run-Z40/png/fade-in-...-H4-off-p952.png)
+     * is invisible to the one-row edges and seen by the windows; a HUD edge 5 rows inside the band (row 1210, as the command menu's)
+     * is not in a window; a 16:9 picture has no strips. */
+    { const u32 W=1920,H=1350,PI=4*W; u8 *px=malloc((size_t)PI*H); TP(px!=NULL);
+      if(px){ BandSt b;
+        #define SCENE() do{ for(u32 y=0;y<H;y++) for(u32 x=0;x<W;x++){ u8 *q=px+(size_t)y*PI+4ull*x; q[0]=(u8)(40+y/12+(x&7)); q[1]=(u8)(60+y/10); q[2]=(u8)(90+(x/64)); q[3]=255; } }while(0)
+        SCENE(); for(u32 y=132;y<=1217;y++) for(u32 x=0;x<W;x++){ u8 *q=px+(size_t)y*PI+4ull*x; q[0]=(u8)(q[0]*2/5); q[1]=(u8)(q[1]*2/5); q[2]=(u8)(q[2]*2/5); }
+        TP(band_stats(px,PI,W,H,&b)&&b.o==135&&b.ch==1080&&b.win==6);
+        TP(b.et<1.0&&b.eb<1.0&&b.etw>20.0&&b.ebw>20.0);                         /* the one-row edges miss the seam, the windows see it */
+        TP(b.etw>3.0*(b.p95>1?b.p95:1)&&b.ebw>3.0*(b.p95>1?b.p95:1));         /* fill_compare.py tallcheck (s) fails on it */
+        SCENE(); for(u32 y=1150;y<=1210;y++) for(u32 x=0;x<W;x++){ u8 *q=px+(size_t)y*PI+4ull*x; q[0]=q[1]=q[2]=230; }
+        TP(band_stats(px,PI,W,H,&b)&&row_step(px,PI,W,1210)>20.0&&b.ebw<1.0&&b.etw<1.0);   /* an edge inside the band is not a seam */
+        TP(band_stats(px,PI,W,1080,&b)&&b.o==0&&b.win==0&&b.etw==0&&b.ebw==0);          /* 16:9: no strips, no windows */
+        #undef SCENE
+        free(px); } }
 #undef TP
-    fprintf(stderr,"kh: gfx vkd3d shared-part selftest: %d checks, %d failures (bundle reference counts on 8 threads, fence events, video report)\n",n,f);
+    fprintf(stderr,"kh: gfx vkd3d shared-part selftest: %d checks, %d failures (bundle reference counts on 8 threads, fence events, video report, band-log edge windows)\n",n,f);
     return f;
 }
 int kh_gfx_vkd3d_selftest(KCtx *g){

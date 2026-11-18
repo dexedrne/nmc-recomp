@@ -36,6 +36,92 @@ static const char *size_names[8]={"<=64","128","256","512","1024","2048",">2048"
 int kh_screen_size(int *w,int *h); extern int kh_aspect_log;
 void kh_aspect_note_swapchain(KCtx *g,const char *what,u64 desc,u32 w,u32 h); void kh_aspect_note_texture(KCtx *g,u64 desc); void kh_aspect_note_present(KCtx *g,u64 present);
 int kh_screen_check_present(KCtx *g,u32 scw,u32 sch,u64 present);      /* KHNMC_SCREEN set: the presented size is the screen's (else screen-not-applied) */
+/* task 40, KHNMC_ASPECT_LOG=2 (the measurement M of NATIVE-FILL-PLAN.md step 4, runtime/aspect.c): per draw the kind of the bound
+ * pipeline's vertex shader and, for the three VS that read MagicScale.zw, the x / y range of its POSITION in the vertex buffer; the
+ * scissor rects.  The VS is identified by its DXBC checksum (bytes 4..19; D3DStripShader below is a copy) against the 26 vertex-shader
+ * blobs in the image (graphics-spec SHADERS.md).  Nothing here runs or is allocated without KHNMC_ASPECT_LOG=2. */
+extern int kh_aspect_m;
+typedef struct { int kind, have; float ymin,ymax,xmin,xmax; int have_off, src, mssrc, nocbv; float ox,oy,msy,msw; u64 list, pso; int indexed; u32 count, start; s32 base; } KhMDraw;   /* = runtime/aspect.c */
+void kh_aspect_m_draw(KCtx *g,const KhMDraw *d); void kh_aspect_m_rs_scissor(KCtx *g,u32 n,u64 rects);
+static _Atomic u64 m_dt_binds;                         /* SetGraphicsRootDescriptorTable calls (task 40 review: how f_1121d0 binds cbConstantVS) */
+static const u32 m_vs_rva[26]={0x586160,0x586710,0x586c80,0x5871b0,0x5877a0,0x588330,0x589080,0x589e70,0x58a980,0x58b530,0x58c0f0,0x58d7b0,0x58e3c0,
+                                0x58ed60,0x58f650,0x590610,0x5915d0,0x592d00,0x593b10,0x594650,0x5951b0,0x5963f0,0x5973a0,0x5987d0,0x599640,0x59ac40};
+static int m_vs_kind(KCtx *g,u64 bc,u64 n){            /* the kinds of runtime/aspect.c: 1..3 MagicScale 2D, 4 5871b0, 5 593b10, 6 59ac40, 7 3D, 8 unknown */
+    if(!bc||n<20||!GA_OK(bc)||!GA_OK(bc+19)||rd32(g,bc)!=0x43425844u) return 8;
+    for(int i=0;i<26;i++){ u64 b=GS_BASE+m_vs_rva[i]; if(rd32(g,b)!=0x43425844u) continue;
+        if(!memcmp(hp(g,bc+4),hp(g,b+4),16)){ switch(m_vs_rva[i]){ case 0x586160: return 1; case 0x586710: return 2; case 0x586c80: return 3; case 0x5871b0: return 4;
+                                                                    case 0x593b10: return 5; case 0x59ac40: return 6; default: return 7; } } }
+    return 8;
+}
+int kh_null_m_vs_kind_test(KCtx *g,u64 bc,u64 n){ return m_vs_kind(g,bc,n); }   /* runtime/aspect.c selftest */
+static u64 *m_res; static u64 m_res_n; static pthread_mutex_t m_res_mx=PTHREAD_MUTEX_INITIALIZER;   /* resource id (GPU VA >> 32) -> object */
+static void m_res_set(u64 id,u64 r){ pthread_mutex_lock(&m_res_mx);
+    if(id>=m_res_n){ u64 nn=m_res_n?m_res_n:4096; while(nn<=id) nn*=2; u64 *p=realloc(m_res,nn*8); if(!p) kh_fatal(NULL,"aspect M: out of host memory for the resource table"); memset(p+m_res_n,0,(nn-m_res_n)*8); m_res=p; m_res_n=nn; }
+    m_res[id]=r; pthread_mutex_unlock(&m_res_mx); }
+static u64 m_res_get(u64 id){ u64 r=0; pthread_mutex_lock(&m_res_mx); if(id<m_res_n) r=m_res[id]; pthread_mutex_unlock(&m_res_mx); return r; }
+typedef struct { u64 list, pso, vb, ib, cbv[8]; u32 vbsize, vbstride, ibsize, ibfmt; } MList;
+#define M_LISTS 128                                    /* per thread: the game records into about 27 bundles per frame, interleaved */
+static __thread MList m_ls[M_LISTS]; static __thread int m_ls_next;
+static MList *m_list(u64 list){ for(int i=0;i<M_LISTS;i++) if(m_ls[i].list==list) return &m_ls[i]; MList *l=&m_ls[m_ls_next]; m_ls_next=(m_ls_next+1)%M_LISTS; memset(l,0,sizeof *l); l->list=list; return l; }
+#define R_DATA 32
+#define R_SIZE 40
+static _Atomic u64 m_why[6];                           /* MagicScale draws without vertices: no VB bound, VB resource unknown, indexed without IB, first vertex out of range, IB resource unknown, read */
+void kh_aspect_m_null_report(FILE *f){ fprintf(f,"kh: aspect M: null backend, MagicScale draws: vertices read %llu; not read: no vertex buffer bound %llu, its resource unknown %llu, indexed without an index buffer %llu, index buffer resource unknown %llu, first vertex outside the buffer %llu; SetGraphicsRootDescriptorTable calls %llu\n",
+    (unsigned long long)m_why[5],(unsigned long long)m_why[0],(unsigned long long)m_why[1],(unsigned long long)m_why[2],(unsigned long long)m_why[4],(unsigned long long)m_why[3],(unsigned long long)m_dt_binds); }
+static void m_draw(KCtx *g,MList *l,int indexed,u32 count,u32 start,s32 base){
+    int kind=l->pso?(int)rd32(g,l->pso+32):0; int have=0; float y0=1e30f,y1=-1e30f,x0=1e30f,x1=-1e30f;
+    if(kind>=1&&kind<=3){ if(!l->vb||!l->vbstride) m_why[0]++; else if(!m_res_get(l->vb>>32)) m_why[1]++; else if(indexed&&!l->ib) m_why[2]++; else if(indexed&&!m_res_get(l->ib>>32)) m_why[4]++; }
+    if(kind>=1&&kind<=3&&l->vb&&l->vbstride){
+        u64 vr=m_res_get(l->vb>>32), vd=vr?rd64(g,vr+R_DATA):0, vn=vr?rd64(g,vr+R_SIZE):0, vo=l->vb&0xffffffffull; u32 po=rd32(g,l->pso+36);
+        u64 id=0,in=0,io=0; if(indexed&&l->ib){ u64 ir=m_res_get(l->ib>>32); id=ir?rd64(g,ir+R_DATA):0; in=ir?rd64(g,ir+R_SIZE):0; io=l->ib&0xffffffffull; }
+        if(vd&&(!indexed||id)){ u32 m=count<4096?count:4096;
+            for(u32 i=0;i<m;i++){ s64 v;
+                if(indexed){ u32 isz=l->ibfmt==42?4:2; u64 ia=io+(u64)(start+i)*isz; if(ia+isz>in||ia-io+isz>l->ibsize) break; v=(s64)base+(isz==4?(s64)rd32(g,id+ia):(s64)rd16(g,id+ia)); }
+                else v=(s64)start+i;
+                if(v<0) break; u64 a=vo+(u64)v*l->vbstride+po; if(a+8>vn||a+8>vo+l->vbsize) break;
+                u32 bx=rd32(g,vd+a), by=rd32(g,vd+a+4); float fx,fy; memcpy(&fx,&bx,4); memcpy(&fy,&by,4);
+                if(fx<x0) x0=fx; if(fx>x1) x1=fx; if(fy<y0) y0=fy; if(fy>y1) y1=fy; have=1; }
+            if(have) m_why[5]++; else m_why[3]++; } }
+    /* the GS offset (cbConstantVS row 1, xyOffset.xy, which the 2D VS subtracts from POSITION) and MagicScale (row 2).  Task 40 review
+     * (finding 4): f_1121d0 (this = rcx = the GX device) stages cbConstantVS in GX: row 0 at +0x59e0, row 1 (xyOffset; from +0x138 /
+     * +0x13c and +0x140 / +0x144) at +0x59f0, row 2 (MagicScale; copied from GX+0xa0, or from GX+0x90 under the test at 0x140112396)
+     * at +0x5a00 (shard_0021.c L11239d, L112fee), and binds the buffer through a descriptor table (SetGraphicsRootDescriptorTable,
+     * vtable +0x100), which the root-CBV search below never sees.  So: a bound root CBV holding exactly the staged rows confirms them
+     * (src 1); a bound root CBV with MagicScale = GX+0xa0 but other rows is the task-40 rule and its values are used (src 2); else the
+     * staged rows (src 3).  Each source is counted in the M report. */
+    KhMDraw d; memset(&d,0,sizeof d); d.kind=kind; d.have=have; d.ymin=y0; d.ymax=y1; d.xmin=x0; d.xmax=x1; d.list=l->list; d.pso=l->pso; d.indexed=indexed; d.count=count; d.start=start; d.base=base;
+    if(have){ const u64 gx=GS_BASE+0x8a0970ull, stg=gx+0x59f0; u32 sb[8]; memcpy(sb,hp(g,stg),32); int conf=0, old=-1; d.nocbv=1;
+        d.mssrc=!memcmp(hp(g,stg+16),hp(g,gx+0xa0),16)?1:!memcmp(hp(g,stg+16),hp(g,gx+0x90),16)?2:3;
+        for(int k=0;k<8;k++){ u64 c=l->cbv[k]; if(!c) continue; d.nocbv=0; u64 cr=m_res_get(c>>32), cd=cr?rd64(g,cr+R_DATA):0, cn=cr?rd64(g,cr+R_SIZE):0, co=c&0xffffffffull;
+            if(!cd||co+48>cn) continue;
+            if(!memcmp(hp(g,cd+co+16),sb,32)) conf=1; else if(old<0&&!memcmp(hp(g,cd+co+32),hp(g,gx+0xa0),16)) old=k; }
+        u32 b[4];
+        if(!conf&&old>=0){ u64 c=l->cbv[old], cr=m_res_get(c>>32), cd=rd64(g,cr+R_DATA), co=c&0xffffffffull; b[0]=rd32(g,cd+co+16); b[1]=rd32(g,cd+co+20); b[2]=rd32(g,cd+co+36); b[3]=rd32(g,cd+co+44); d.src=2; }
+        else { b[0]=sb[0]; b[1]=sb[1]; b[2]=sb[5]; b[3]=sb[7]; d.src=conf?1:3; }
+        memcpy(&d.ox,&b[0],4); memcpy(&d.oy,&b[1],4); memcpy(&d.msy,&b[2],4); memcpy(&d.msw,&b[3],4); d.have_off=1; }
+    kh_aspect_m_draw(g,&d);
+}
+static void m_list_call(KCtx *g,u64 o,int s){
+    switch(s){
+    case 10: case 11: { MList *l=m_list(o); u64 ls=l->list; memset(l,0,sizeof *l); l->list=ls; if(s==10) l->pso=A2(g); return; }   /* Reset(alloc, pso) / ClearState */
+    case 12: m_draw(g,m_list(o),0,(u32)A1(g),(u32)A3(g),0); return;                                              /* DrawInstanced(count, inst, start, startinst) */
+    case 13: m_draw(g,m_list(o),1,(u32)A1(g),(u32)A3(g),(s32)(u32)ARG(g,4)); return;                             /* DrawIndexedInstanced(count, inst, startidx, base, startinst) */
+    case 22: kh_aspect_m_rs_scissor(g,(u32)A1(g),A2(g)); return;                                                 /* RSSetScissorRects(n, rects) */
+    case 25: m_list(o)->pso=A1(g); return;                                                                        /* SetPipelineState */
+    case 32: m_dt_binds++; return;                                                                                /* SetGraphicsRootDescriptorTable (counted only) */
+    case 38: if((u32)A1(g)<8) m_list(o)->cbv[(u32)A1(g)]=A2(g); return;                                          /* SetGraphicsRootConstantBufferView(i, va) */
+    case 43: { MList *l=m_list(o); u64 v=A1(g); if(v&&GA_OK(v)){ l->ib=rd64(g,v); l->ibsize=rd32(g,v+8); l->ibfmt=rd32(g,v+12); } else l->ib=0; return; }   /* IASetIndexBuffer */
+    case 44: { MList *l=m_list(o); u64 v=A3(g); if((u32)A1(g)==0&&(u32)A2(g)>=1&&v&&GA_OK(v)){ l->vb=rd64(g,v); l->vbsize=rd32(g,v+8); l->vbstride=rd32(g,v+12); } return; }   /* IASetVertexBuffers(start, n, views) */
+    default: return; } }
+/* at CreateGraphicsPipelineState: the VS kind at pso+32 and the POSITION0 byte offset at pso+36 (input layout at desc+0x228 / +0x230,
+ * 32-byte D3D12_INPUT_ELEMENT_DESC: name, index +8, format +12, slot +16, offset +20) */
+static void m_pso(KCtx *g,u64 d,u64 pso){
+    wr32(g,pso+32,(u32)m_vs_kind(g,rd64(g,d+0x08),rd64(g,d+0x10))); wr32(g,pso+36,0);
+    u64 el=rd64(g,d+0x228); u32 ne=rd32(g,d+0x230);
+    for(u32 i=0;i<ne&&i<32&&el&&GA_OK(el+32ull*i+31);i++){ u64 e=el+32ull*i, nm=rd64(g,e); if(nm&&GA_OK(nm)&&!strncmp((const char*)hp(g,nm),"POSITION",9)&&rd32(g,e+8)==0&&rd32(g,e+16)==0){ wr32(g,pso+36,rd32(g,e+20)==0xffffffffu?0:rd32(g,e+20)); break; } }
+}
+#undef R_DATA
+#undef R_SIZE
 static const char *fmt_name(u32 f){ static __thread char b[16]; switch(f){ case 71: return "BC1_UNORM"; case 72: return "BC1_SRGB"; case 74: return "BC2_UNORM"; case 75: return "BC2_SRGB"; case 77: return "BC3_UNORM"; case 78: return "BC3_SRGB";
     case 87: return "B8G8R8A8_UNORM"; case 91: return "B8G8R8A8_SRGB"; case 28: return "R8G8B8A8_UNORM"; case 49: return "R8G8_UNORM"; case 61: return "R8_UNORM"; case 103: return "NV12"; case 98: return "BC7_UNORM"; default: snprintf(b,sizeof b,"fmt%u",f); return b; } }
 static int size_class(u64 w,u32 h){ u64 m=w>h?w:h; return m<=64?0:m<=128?1:m<=256?2:m<=512?3:m<=1024?4:m<=2048?5:6; }
@@ -62,7 +148,7 @@ static void fmt_info(u32 f,u32 *bw,u32 *bytes){
 static u64 new_resource(KCtx *g,u64 desc,int placed_dim_hint){
     u64 r=new_obj(C_res,128); u32 dim=desc?rd32(g,desc):placed_dim_hint; u64 w=desc?rd64(g,desc+16):0; u32 fmt=desc?rd32(g,desc+32):0;
     wr32(g,r+R_DIM,dim); wr32(g,r+R_FMT,fmt); if(desc) memcpy(hp(g,r+R_DESC),hp(g,desc),56);
-    wr64(g,r+R_VA,(atomic_fetch_add(&res_ids,1))<<32); gfx_resources++;
+    { u64 id=atomic_fetch_add(&res_ids,1); wr64(g,r+R_VA,id<<32); if(__builtin_expect(kh_aspect_m,0)) m_res_set(id,r); } gfx_resources++;   /* task 40: id -> object for M */
     if(desc&&dim>=2&&dim<=4){
         u32 h=rd32(g,desc+24); u32 mips=rd16(g,desc+30),arr=rd16(g,desc+28),flags=rd32(g,desc+48); if(!mips) mips=1; if(!arr) arr=1;
         if(__builtin_expect(kh_aspect_log,0)) kh_aspect_note_texture(g,desc);   /* task 37: render-target / depth-stencil / multisampled sizes */
@@ -166,8 +252,9 @@ static int h_dev(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1;
     switch(s){
     case 8: { u64 q=new_obj(C_queue,32); out_obj(g,ARG(g,3),q); SET_RAX(g,0); return 1; }                  /* CreateCommandQueue(desc, riid, **pp) */
     case 9: out_obj(g,ARG(g,3),new_obj(C_alloc,16)); SET_RAX(g,0); return 1;                               /* CreateCommandAllocator(type, riid, **pp) */
-    case 10: if(__builtin_expect(log_pso,0)) pso_log(g,A1(g));
-             out_obj(g,ARG(g,3),new_obj(C_pso,16)); gfx_psos++; SET_RAX(g,0); return 1;                    /* CreateGraphicsPipelineState(desc, riid, **pp) */
+    case 10: { if(__builtin_expect(log_pso,0)) pso_log(g,A1(g));
+             u64 p=new_obj(C_pso,16); if(__builtin_expect(kh_aspect_m,0)) m_pso(g,A1(g),p);                  /* task 40: M */
+             out_obj(g,ARG(g,3),p); gfx_psos++; SET_RAX(g,0); return 1; }                                   /* CreateGraphicsPipelineState(desc, riid, **pp) */
     case 12: out_obj(g,ARG(g,6),new_obj(C_list,16)); SET_RAX(g,0); return 1;                               /* CreateCommandList(node,type,alloc,pso,riid,**pp) */
     case 13: { u32 feat=(u32)A1(g); u64 d=A2(g); u32 sz=(u32)A3(g);
         if(feat==4){ u32 sc=rd32(g,d+4); wr32(g,d+12,sc<=8?1:0); }                                          /* MULTISAMPLE_QUALITY_LEVELS: NumQualityLevels */
@@ -213,6 +300,7 @@ static int h_fence(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 
     default: return 0; } }
 static int h_alloc(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)o;(void)c; if(s==8){ SET_RAX(g,0); return 1; } return 0; }
 static int h_list(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)o;(void)c;
+    if(__builtin_expect(kh_aspect_m,0)) m_list_call(g,o,s);                                                 /* task 40: M (records only) */
     switch(s){
     case 9: case 10: SET_RAX(g,0); return 1;                                                                /* Close / Reset */
     case 11: return 1;                                                                                      /* ClearState */
@@ -253,6 +341,7 @@ static void res_release(KCtx *g,u64 o){
     if(!last) return;
     u64 d=rd64(g,o+R_DATA), n=rd64(g,o+R_SIZE);
     if(d){ wr64(g,o+R_DATA,0); ga_free(d); gfx_buffers_freed++; gfx_buffers_freed_bytes+=n; }
+    if(__builtin_expect(kh_aspect_m,0)) m_res_set(rd64(g,o+R_VA)>>32,0);                                       /* task 40: M's id table */
     gfx_res_freed++; wr64(g,o,0); wr64(g,o+8,0); ga_free(o);
 }
 static int h_res(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)c;

@@ -196,12 +196,17 @@ EVENT_HOOKS = 3a1f70
 FILE_HOOKS += $(EVENT_HOOKS)
 # Task 37 (runtime/aspect.c, NATIVE-FILL-PLAN.md section 7): KHNMC_ASPECT=fill.  11c1e0 = H1, post-call: on a screen narrower than 16:9
 # the largest-16:9 fit keeps the full height, so 0x14e050 / 0x4ed940 draw no bars; 186920 = the map pass, a pass-through that records
-# the frame of the 3D view for H1's condition (H2b's m11 edit joins it in plan step 5).  Later plan steps add 2bd190 126500 156940
+# the frame of the 3D view for H1's condition (H2b's m11 edit joined it in task 40, below).  The plan listed 2bd190 126500 156940
 # 1569b0 156a70 156e20 126fd0 4b7530.  With KHNMC_ASPECT unset both are exact pass-throughs.
 ASPECT_HOOKS = 11c1e0 186920
 ifneq ($(shell grep -l '^void f_1948c0' $(ROOT)/runtime/aspect.c),)
 ASPECT_HOOKS += 1948c0
 endif
+# Task 40 (runtime/aspect.c; plan steps 4, 5 and the H4/H5 part of 7): 186920 also = H2b (cam+0x98 / r around the map pass), 2bd190 =
+# H2c (the same around the effect pass), 156f10 = H4a (the three full-screen fades, f_156940 / f_1569b0 / f_156a70, draw inside through
+# it), 156e20 = H4b (the event letterbox bars, after it), 126fd0 = H5 (full-height scissor rects); 126500 and 19d040 are pass-throughs
+# that record the measurement M with KHNMC_ASPECT_LOG=2 (the dk loop's setScreenMode, the cam+0x84 readers), as does bgload.c's 4ad270.
+ASPECT_HOOKS += 2bd190 156f10 156e20 126fd0 126500 19d040
 FILE_HOOKS += $(ASPECT_HOOKS)
 # ---- Task 12: mod static edits ---------------------------------------------------------------------------------------------------
 # The mod DLL patches code bytes in 28 exe functions and attaches two INLINE detours (inside 3c3fe0 and 360920).  Those 30 functions
