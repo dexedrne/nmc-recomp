@@ -20,9 +20,9 @@
 #     G="--env KHNMC_GFX=vkd3dw --env KHNMC_GFX_DRIVER=system --env VKD3D_DEBUG=warn --env VKD3D_SHADER_DEBUG=warn"
 #     P="--env KHNMC_CLOCK=frames --env KHNMC_GFX_DUMP=@OUT@/frames --env KHNMC_GFX_HASHLOG=@OUT@/hash.tsv --env KHNMC_GFX_DUMP_EVERY=40
 #        --env KHNMC_GFX_DUMP_FROM=880 --env KHNMC_GFX_DUMP_TO=1280 --env KHNMC_ASPECT_LOG=1"
-#     tools/darwin_route.sh run fill37-ref  --input input/route-field-battle.txt --difficulty 3 --game-frames 1400 $G $P
+#     tools/darwin_route.sh run fill37-ref  --input input/route-field-battle.txt --difficulty 3 --game-frames 2400 $G $P
 #           (with a FILL_SCREEN width W other than 1920 also --env KHNMC_SCREEN=Wx(9W/16): the REF must be W wide and 16:9)
-#     tools/darwin_route.sh run fill37-tall --input input/route-field-battle.txt --difficulty 3 --game-frames 1400 $G $P \
+#     tools/darwin_route.sh run fill37-tall --input input/route-field-battle.txt --difficulty 3 --game-frames 2400 $G $P \
 #           --env KHNMC_SCREEN=1920x1350 --env KHNMC_ASPECT=fill --env KHNMC_ASPECT_TEST_H1=unconditional
 #   fetch     tools/darwin_route.sh frames fill37-ref ; tools/darwin_route.sh frames fill37-tall          (the two index.tsv)
 #             python3 tools/fill_compare.py pick <ref index> <tall index>   -> the presents both runs dumped at the same game frame
@@ -38,7 +38,7 @@
 #             and their tolerances: tools/fill_compare.py --help.  Exit 0 only when every pair and both run checks pass.
 # Environment knobs: FILL_SCREEN (default 1920x1350; narrower than 16:9 and the band offset (H - 9W/16) / 2 a whole number of rows,
 # which also makes W a multiple of 16; with W other than 1920 the REF run gets KHNMC_SCREEN=Wx(9W/16)), FILL_FROM / FILL_TO /
-# FILL_EVERY, FILL_GAME_FRAMES (default 1400), KHNMC_MAC, KHNMC_MAC_MIN_FREE, KHNMC_MAC_NICE (as tools/darwin_route.sh).
+# FILL_EVERY, FILL_GAME_FRAMES (default 2400), KHNMC_MAC, KHNMC_MAC_MIN_FREE, KHNMC_MAC_NICE (as tools/darwin_route.sh).
 # Rules: one khnmc run at a time on the Mac mini (darwin_route.sh refuses otherwise), everything there stays in ~/$KHNMC_MAC_DIR, nothing
 # is deleted there by this script.  A TAG whose results exist (here: $RUN/mac-TAG-*; there: run/TAG-ref or run/TAG-tall) is refused:
 # the dump index is appended to, so an old index would mix two attempts.  Nothing is retried.  Raw dumps are 6.2 / 7.8 MB each.
@@ -49,7 +49,7 @@ die(){ echo "fill_first_test: $*" >&2; exit 1; }
 export KHNMC_RUN_DIR=${KHNMC_RUN_DIR:-$PWD/run-fill37}
 RUN=$KHNMC_RUN_DIR
 MAC=${KHNMC_MAC:-user@mac-mini}
-SCREEN=${FILL_SCREEN:-1920x1350}; FROM=${FILL_FROM:-880}; TO=${FILL_TO:-1280}; EVERY=${FILL_EVERY:-40}; GFR=${FILL_GAME_FRAMES:-1400}
+SCREEN=${FILL_SCREEN:-1920x1350}; FROM=${FILL_FROM:-880}; TO=${FILL_TO:-1280}; EVERY=${FILL_EVERY:-40}; GFR=${FILL_GAME_FRAMES:-2400}   # 2400: the route must also FINISH (its last battle step ran past 1400 on the Mac at difficulty 3, 11/18)
 for v in "$FROM" "$TO" "$EVERY" "$GFR"; do case "$v" in ''|*[!0-9]*) echo "fill_first_test: FILL_FROM / FILL_TO / FILL_EVERY / FILL_GAME_FRAMES must be numbers" >&2; exit 2;; esac; done
 [[ $SCREEN =~ ^[1-9][0-9]{0,4}x[1-9][0-9]{0,4}$ ]] || { echo "fill_first_test: FILL_SCREEN=$SCREEN is not WxH (decimal, no leading zero)" >&2; exit 2; }
 SW=${SCREEN%x*}; SH=${SCREEN#*x}
