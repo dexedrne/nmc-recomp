@@ -231,3 +231,12 @@ owner decides and the phone's own numbers exist (implementation notes section 6,
   DEVICE_LOCAL, with a HOST_VISIBLE + COHERENT + CACHED type (unified memory) and a LAZILY_ALLOCATED one; VK_EXT_memory_budget budget
   8,192 MiB. Presentation: surface, headless, metal, swapchain, display_timing, metal_objects, layer_settings all enabled.
   Memory: os_proc_available_memory 6,036 MiB at start, phys_footprint 107 MiB; the gfx-memory-low soft stop is armed (512 MiB margin).
+- **M1: the title sequence rendered by the A20** (offscreen, `GFX=1 DUMP_EVERY=40 FETCH="240 920 2000 2600" HASHLOG=1 CLOCK=frames
+  device_run.sh route input/title-i21-hold1.txt 2700 none`): exit 0, 2,702 presents in 66 s with 67 picture dumps, 0 vkd3d err
+  lines; memory peak phys_footprint 1,159 MiB with 4,985 MiB still available (gpuMemoryAllocated 809 MiB); the soft stop never fired.
+  **Against the same run on the Mac mini's M4 Pro (MoltenVK, same build sources): the four fetched frames (GAME SETTINGS, the title
+  intro, the NMC title menu twice) are 100.000 % identical pixels, and 2,693 of the 2,702 presents have the same picture hash at the
+  same game frame.** The 9 others are pacing, not drawing: around the two loads the phone shows each Mac picture one present earlier
+  (every Mac picture appears on the phone). 108 MoltenVK `[mvk-error]` lines, all the same: iOS refuses MTLCounterSampleBuffers for
+  vkd3d's timestamp query pools and MoltenVK falls back to emulated timestamps (benign; worth silencing later). Pictures (game-derived,
+  not committed): ~/Documents/khnmc/phone-frames/m1-20261118/.
