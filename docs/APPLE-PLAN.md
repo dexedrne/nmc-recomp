@@ -211,3 +211,23 @@ the Mac mini from `~/work/khnmc-build` (`run-Y39-mac/`, Mac build dir `~/khnmc-w
 
 Recommendation for the owner: build the Apple targets (Mac and iPhone) with `ORDERED_MEM=1` by default. The default stays 0 until the
 owner decides and the phone's own numbers exist (implementation notes section 6, "The phone"; needs the MacBook on power).
+
+## The graphics stack on the iPhone (2026-11-18, MAC-STEPS-38 steps 1-4)
+
+- **Build** (`KHNMC_IOS_MACBOOK_OK=1 GFX=1 tools/ios/build.sh device`): libkhnmc-rt.a with the graphics backend, OTHER_LDFLAGS
+  expanded to 26 words (4 vkd3d archives, libMoltenVK.a, libc++, Metal / QuartzCore / IOSurface / CoreGraphics), xcodebuild ok;
+  check_hook_link 118 hooks, check_mod_static_link 35 functions, check_ios_symbols: 578 imports, none forbidden (mktemp allowed for
+  MoltenVK); app 37 MB; one home-like string (the synthetic `/Users/khnmc/Documents`).
+- **Signed** (GFX=1, both memory entitlements, "the signed app has the graphics backend").
+- **Plain selftest on the phone** (graphics app, null backend): exit 0, 173,770 checks, 0 failures (406 fatal-path checks not run:
+  no child processes on iOS).
+- **The A20's GPU** (`GFX=1 device_run.sh selftest`, vkd3d 2.1 + MoltenVK 1.4.2): exit 0, 174,391 checks, 0 failures: vkd3d
+  223 / 0, the presenter 304 / 0 (222 presents on MoltenVK's headless surface, each compared with the D3D12 readback and a CPU-made
+  picture), the wrapped device 125 / 0. 0 vkd3d err lines, 0 MoltenVK errors (fixme 5, warn 25: the usual feature-level notes:
+  no geometry shader, stream output, depth clip, cull distance, pipeline statistics).
+- **Device report:** 'Apple A20 Pro GPU', Vulkan 1.1.357 through MoltenVK. **textureCompressionBC=1: BC1, BC2 and BC3 UNORM are
+  sampleable in optimal tiling, so the game's BC textures are used as they are** (no CPU decode, plan C1 not needed; ASTC and ETC2 are
+  offered too). B8G8R8A8 colour attachment + blend + blit, D32_FLOAT_S8X24 depth-stencil, MSAA 1/2/4/8. One heap, 11,570 MiB
+  DEVICE_LOCAL, with a HOST_VISIBLE + COHERENT + CACHED type (unified memory) and a LAZILY_ALLOCATED one; VK_EXT_memory_budget budget
+  8,192 MiB. Presentation: surface, headless, metal, swapchain, display_timing, metal_objects, layer_settings all enabled.
+  Memory: os_proc_available_memory 6,036 MiB at start, phys_footprint 107 MiB; the gfx-memory-low soft stop is armed (512 MiB margin).
