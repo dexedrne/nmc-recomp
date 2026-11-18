@@ -95,8 +95,8 @@ mkstemp / tmpfile in the app's TMPDIR work, /tmp not writable, and a 16.667 ms s
 the phone must follow the display link, not sleeps). Physical memory reported: 11,570 MiB.
 Conclusion: with the owner's paid team and both entitlements the port's address layout fits as it is, and its measured peak use
 (about 1.5 GiB of guest heap, 0.9 GB resident) leaves several GB of headroom. Reports: `run-J26/ios/probe/probe-{plain,ent}.txt`
-in the main work tree. How it was done: the probe project built with `CODE_SIGNING_ALLOWED=YES`, automatic signing for team
-<TEAM> and `-allowProvisioningUpdates` in a windowless `launchctl submit` job on the MacBook (the signing keychain is in the
+in the main work tree. How it was done: the probe project built with `CODE_SIGNING_ALLOWED=YES`, automatic signing for the owner's team
+(id only in the Mac's `~/Developer/KHNMC/state/device.env`) and `-allowProvisioningUpdates` in a windowless `launchctl submit` job on the MacBook (the signing keychain is in the
 GUI session), then `xcrun devicectl device install app / process launch / copy from` over the network to the paired phone.
 
 ## The game app on the iPhone itself, 2026-11-18
