@@ -47,4 +47,4 @@ if [ "$what" = route ] || [ "$what" = all ]; then
   [ "$L" = "$R" ] || { echo "ios/sync: the route data copy differs from the subset (content hash list here ${L:0:16}, there ${R:0:16})" >&2; exit 1; }
   echo "ios/sync: route data: $n files, content hash list ${L:0:16} equal on both sides; on the Mac: $(mac "du -sh ~/$IOS_RDIR/route-data | cut -f1")"
 fi
-mac "du -sh ~/$IOS_RDIR | sed 's/^/ios\/sync: ~\/$IOS_RDIR\/ now holds /'"
+mac "du -sh ~/$IOS_RDIR | sed 's|^|ios/sync: ~/$IOS_RDIR/ now holds |'"    # '|': the path holds '/' (BSD sed refused the old form)
