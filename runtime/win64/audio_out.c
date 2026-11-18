@@ -31,8 +31,15 @@ static _Atomic uint32_t c_min_fill; static _Atomic int c_min_valid;
 #define RLX memory_order_relaxed
 
 static _Atomic int device_attached;          /* a real output device pulls from the ring (kh_audio_out_attach_device) */
-void kh_audio_out_attach_device(int on){ atomic_store(&device_attached, on ? 1 : 0); }
+/* attach and rebuild exclude each other (review r9: a rebuild that had passed the check could free the ring while a device attached
+ * meanwhile pulled from it); the device's render thread never takes this lock */
+static pthread_mutex_t setup_m = PTHREAD_MUTEX_INITIALIZER;
+void kh_audio_out_attach_device(int on){ pthread_mutex_lock(&setup_m); atomic_store(&device_attached, on ? 1 : 0); pthread_mutex_unlock(&setup_m); }
+static void ring_setup_locked(int enable, uint32_t ring_frames, uint32_t target_frames);
 void kh_audio_ring_setup(int enable, uint32_t ring_frames, uint32_t target_frames){
+    pthread_mutex_lock(&setup_m); ring_setup_locked(enable, ring_frames, target_frames); pthread_mutex_unlock(&setup_m);
+}
+static void ring_setup_locked(int enable, uint32_t ring_frames, uint32_t target_frames){
     if(atomic_load(&device_attached)){ fprintf(stderr, "kh: FATAL: audio-ring-rebuilt-with-device: the pull ring would be %s while a real output device reads it (its next pull would read freed or test data)\n", enable ? "rebuilt" : "disabled"); abort(); }
     if(!enable){ atomic_store(&enabled, 0); atomic_store(&started, 0); return; }
     uint32_t c = 1; while(c < ring_frames) c <<= 1;

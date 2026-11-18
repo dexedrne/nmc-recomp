@@ -34,6 +34,7 @@
 #include "khnmc_rt.h"
 #include <unistd.h>
 #include <string.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 
@@ -242,6 +243,7 @@ void kh_host_env_init(int *argc,char ***argv){
      * one under @TMP@ through khnmc.conf: tools/ios/mac/device_run.sh route; the game's config there changes how it boots) */
     const char *gd=getenv("KH_DOCS"); struct stat gst; he_mkdirs(gd);
     if(stat(gd,&gst)||!S_ISDIR(gst.st_mode)) kh_fatal(NULL,"app-docs-not-writable: cannot create the game's Documents folder %s",gd);
+    if(access(gd,W_OK)) kh_fatal(NULL,"app-docs-not-writable: the game's Documents folder %s exists but cannot be written (%s)",gd,strerror(errno));
     fprintf(stderr,"kh: host dirs: working directory %s, game Documents %s\n",wd,gd);
 }
 

@@ -70,7 +70,8 @@ cp_to "$OUT/status.init" khnmc.status || { say "copy of the status file FAILED";
 tw=$SECONDS; n=0
 until xcrun devicectl device process launch --device "$DEVICE" --timeout 60 --terminate-existing "$BUNDLE_ID" >> "$OUT/devicectl.log" 2>&1; do
   n=$((n+1)); [ $n = 1 ] && say "launch refused (phone locked?): retrying every 20 s"
-  [ $((SECONDS-tw)) -ge "${WAIT_UNLOCK_S:-1800}" ] && { say "launch FAILED for $((SECONDS-tw)) s"; tail -5 "$OUT/devicectl.log"; exit 1; }
+  [ $((SECONDS-tw)) -ge "${WAIT_UNLOCK_S:-1800}" ] && { say "launch FAILED for $((SECONDS-tw)) s"; tail -5 "$OUT/devicectl.log"
+    cp_to "$OUT/play.conf" khnmc.conf || say "WARNING: the play configuration could not be put back"; exit 1; }   # review r9: the icon starts the game, not this test
   sleep 20
 done
 say "launched after $n refused attempts"

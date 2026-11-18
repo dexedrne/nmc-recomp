@@ -49,6 +49,8 @@ if [ "$what" = exe ] || [ "$what" = all ]; then
 fi
 if [ "$what" = route ] || [ "$what" = all ]; then
   [ -d "$SUB/data" ] && [ -d "$SUB/pkgdir" ] && [ -f "$SUB/MANIFEST.tsv" ] || { echo "ios/sync: $SUB is not a route subset (data/, pkgdir/, MANIFEST.tsv): run tools/make_route_subset.sh" >&2; exit 2; }
+  nl=$(cd "$SUB" && find data pkgdir -type f | wc -l | tr -d ' '); nm=$(awk -F'\t' 'NR>1 && ($2=="full" || $2=="ranges") {n++} END {print n+0}' "$SUB/MANIFEST.tsv")
+  [ "$nl" -gt 0 ] && [ "$nl" -ge "$nm" ] || { echo "ios/sync: $SUB has $nl data files, its MANIFEST.tsv lists $nm with content: refusing to mirror it over the Mac's copy (review r9: an empty subset would erase it and still verify)" >&2; exit 2; }
   mac "mkdir -p ~/$IOS_RDIR/route-data"
   rsync -a -z --delete -e "$IOS_RSH" "$SUB/" "$IOS_MAC:$IOS_RDIR/route-data/"
   L=$(cd "$SUB" && find data pkgdir -type f | LC_ALL=C sort | while read -r f; do printf '%s %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$f"; done | sha256sum | cut -d' ' -f1)

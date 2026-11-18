@@ -223,6 +223,9 @@ static void input_selftest(KCtx *g){
             && (s16)rd16(g,out+12)==32767 && (s16)rd16(g,out+14)==-32768);
       CHECK(kh_input_state(g,0,out,2)==0 && rd32(g,out)==p0);                                   /* unchanged: the same packet */
       kh_input_host_pad_set(0,0,0,0,0,100,0); CHECK(kh_input_state(g,0,out,3)==0 && rd32(g,out)==p0+1 && rd16(g,out+4)==0 && (s16)rd16(g,out+12)==100);
+      kh_input_host_pad_set(0x1000,0,0,0,0,100,0); kh_input_host_pad_set(0,0,0,0,0,100,0);              /* a tap between two polls */
+      CHECK(kh_input_state(g,0,out,4)==0 && rd16(g,out+4)==0x1000 && rd32(g,out)==p0+2);                 /* seen once ... */
+      CHECK(kh_input_state(g,0,out,5)==0 && rd16(g,out+4)==0 && rd32(g,out)==p0+3);                      /* ... then released */
       CHECK(kh_input_state(g,1,out,3)==1167);                                                   /* pad 0 only */
       kh_input_host_test(0); CHECK(kh_input_state(g,0,out,4)==1167);
       kh_input_host_test(was); }

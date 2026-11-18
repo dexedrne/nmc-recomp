@@ -31,13 +31,15 @@ for root,ds,fs in os.walk(data):
 for root,ds,fs in os.walk(pkg):
     for f in sorted(fs):
         p=os.path.join(root,f); files.append(('pkgdir',os.path.relpath(p,pkg),os.path.getsize(p)))
+big=[(k,r,s) for k,r,s in files if s>lim]
+if big: sys.exit('push: plan: %d file(s) are larger than a chunk (%s MiB): %s -- raise CHUNK_MB only if two of them fit the Mac folder\'s limit'%(len(big),cmb,', '.join('%s/%s %d MiB'%(k,r,s>>20) for k,r,s in big[:5])))
 chunks=[]; cur=[]; cs=0; kind=None
 for k,r,s in files:
     if cur and (cs+s>lim or k!=kind): chunks.append((kind,cur)); cur=[]; cs=0
     cur.append((r,s)); cs+=s; kind=k
 if cur: chunks.append((kind,cur))
-for f in os.listdir(out):
-    if f.startswith('chunk-') and f.endswith('.list'): os.remove(os.path.join(out,f))
+for f in os.listdir(out):   # old lists AND their done marks (review r9: a new chunk must not inherit an old number's mark)
+    if f.startswith('chunk-') and (f.endswith('.list') or f.endswith('.done') or f.endswith('.files')): os.remove(os.path.join(out,f))
 with open(os.path.join(out,'manifest.tsv'),'w') as m:
     for k,r,s in files: m.write('%s\t%s\t%d\n'%(k,r,s))
 for i,(k,c) in enumerate(chunks):
@@ -74,6 +76,7 @@ miss=[x for x in want if x not in have]; bad=[x for x in want if x in have and h
 with open(os.path.join(P,'verify.txt'),'w') as o:
     for tag,lst in (('MISSING',miss),('SIZE',bad),('EXTRA',extra)):
         for k,r in sorted(lst): o.write('%s\t%s/%s\n'%(tag,k,r))
+if extra: print('push: verify: WARNING: %d file(s) on the phone are not in the manifest (left from an earlier push; devicectl cannot delete them; the game does not read them): %s/verify.txt'%(len(extra),P))
 print('push: verify: %d of %d files on the phone with the right size (%.2f GB); missing %d, wrong size %d, extra %d (list: %s/verify.txt)'%(
     len(want)-len(miss)-len(bad),len(want),sum(want[x] for x in want if x in have and have[x]==want[x])/1e9,len(miss),len(bad),len(extra),P))
 sys.exit(0 if not miss and not bad else 1)
@@ -87,6 +90,24 @@ case "${1:-run}" in
 esac
 ls "$P"/chunk-*.list >/dev/null 2>&1 || plan | tee -a "$P/push.log"
 todo=(); for c in "$P"/chunk-*.list; do [ -f "${c%.list}.done" ] || todo+=("$c"); done
+if [ ${#todo[@]} = 0 ]; then
+  # review r9: local done marks alone said "nothing to do" after the phone's container had been wiped; the phone decides
+  log "run: every chunk is marked done here: checking the phone"
+  if verify | tee -a "$P/push.log"; then exit 0; fi
+  python3 - "$P" <<'PY'
+import glob,os,sys
+P=sys.argv[1]; bad=set()
+for l in open(os.path.join(P,'verify.txt')):
+    tag,path=l.rstrip('\n').split('\t',1)
+    if tag in ('MISSING','SIZE'): bad.add(path)
+for c in sorted(glob.glob(os.path.join(P,'chunk-*.list'))):
+    lines=open(c).read().split('\n'); kind=lines[0].split()[1]
+    if any(kind+'/'+r in bad for r in lines[1:] if r):
+        d=c[:-5]+'.done'
+        if os.path.exists(d): os.remove(d); print('push: %s will be sent again'%os.path.basename(c[:-5]))
+PY
+  todo=(); for c in "$P"/chunk-*.list; do [ -f "${c%.list}.done" ] || todo+=("$c"); done
+fi
 log "run: ${#todo[@]} chunks to send"
 [ ${#todo[@]} = 0 ] && exit 0
 stage "${todo[0]}" || { log "$(basename "${todo[0]}" .list): staging FAILED (see rsync.log)"; exit 1; }
@@ -98,4 +119,5 @@ for ((i=0;i<${#todo[@]};i++)); do
   else log "$n: devicectl copy FAILED (see devicectl.log)"; [ -n "$pid" ] && wait $pid; exit 1; fi
   if [ -n "$pid" ]; then wait $pid || { log "$(basename "$nx" .list): staging FAILED (see rsync.log)"; exit 1; }; fi
 done
-log "run: every chunk sent"
+log "run: every chunk sent; checking the phone"
+verify | tee -a "$P/push.log"; exit "${PIPESTATUS[0]}"

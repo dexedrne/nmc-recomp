@@ -50,33 +50,43 @@ static void pad_send(GCExtendedGamepad *p){
                           pad_axis(p.leftThumbstick.xAxis.value),pad_axis(p.leftThumbstick.yAxis.value),
                           pad_axis(p.rightThumbstick.xAxis.value),pad_axis(p.rightThumbstick.yAxis.value));
 }
-static void pad_attach(GCController *c){
+/* ONE controller drives pad 0 (review r9: a second controller, or the disconnect of another one, must not change or release it): the
+ * first connected controller with an extended gamepad profile; when it disconnects, the pad is released and the next connected one
+ * (if any) takes over.  Everything here runs on the main queue. */
+static GCController *pad_active;
+static int pad_attach(GCController *c){
     GCExtendedGamepad *p=c.extendedGamepad;
-    if(!p){ fprintf(stderr,"kh: ios: controller '%s' has no extended gamepad profile: not used\n",c.vendorName.UTF8String?:"?"); return; }
+    if(!p){ fprintf(stderr,"kh: ios: controller '%s' has no extended gamepad profile: not used\n",c.vendorName.UTF8String?:"?"); return 0; }
+    if(pad_active && pad_active!=c){ fprintf(stderr,"kh: ios: controller '%s' connected: not used (another controller is pad 0)\n",c.vendorName.UTF8String?:"?"); return 0; }
+    pad_active=c;
     p.valueChangedHandler=^(GCExtendedGamepad *gp,GCControllerElement *el){ (void)el; pad_send(gp); };
     pad_send(p);
-    fprintf(stderr,"kh: ios: controller connected: %s\n",c.vendorName.UTF8String?:"?");
+    fprintf(stderr,"kh: ios: controller connected: %s (pad 0)\n",c.vendorName.UTF8String?:"?");
+    return 1;
 }
 static void setup_controllers(void){
-    for(GCController *c in GCController.controllers) pad_attach(c);
+    for(GCController *c in GCController.controllers) if(pad_attach(c)) break;
     [[NSNotificationCenter defaultCenter] addObserverForName:GCControllerDidConnectNotification object:nil queue:NSOperationQueue.mainQueue
         usingBlock:^(NSNotification *n){ pad_attach((GCController *)n.object); }];
     [[NSNotificationCenter defaultCenter] addObserverForName:GCControllerDidDisconnectNotification object:nil queue:NSOperationQueue.mainQueue
-        usingBlock:^(NSNotification *n){ (void)n; kh_input_host_pad_set(0,0,0,0,0,0,0); fprintf(stderr,"kh: ios: controller disconnected: pad released\n"); }];
+        usingBlock:^(NSNotification *n){
+            GCController *c=(GCController *)n.object; if(c!=pad_active) return;
+            if(c.extendedGamepad) c.extendedGamepad.valueChangedHandler=nil;
+            pad_active=nil; kh_input_host_pad_set(0,0,0,0,0,0,0); fprintf(stderr,"kh: ios: controller disconnected: pad 0 released\n");
+            for(GCController *o in GCController.controllers) if(o!=c && pad_attach(o)) break; }];
 }
 
 /* Sound: the mixer runs in pull mode (KHNMC_AUDIO=pull unless khnmc.conf says otherwise) and the RemoteIO unit pulls from it.  The
  * session is SoloAmbient, the iOS default for games: it follows the ring/silent switch and stops other apps' audio while it plays.
  * A failed start is reported in the log and the game goes on without sound (the mixer keeps its own clock). */
+/* the session is taken only when sound really starts (review r9: a silent or selftest run must not stop another app's music) */
 static void start_sound(void){
-    if(kh_coreaudio_start()) fprintf(stderr,"kh: ios: the audio unit did not start: no sound in this run\n");
-}
-static void setup_sound_session(void){
     NSError *err=nil; AVAudioSession *as=[AVAudioSession sharedInstance];
     if(![as setCategory:AVAudioSessionCategorySoloAmbient error:&err]) fprintf(stderr,"kh: ios: audio session category: %s\n",err.localizedDescription.UTF8String);
     err=nil; if(![as setActive:YES error:&err]) fprintf(stderr,"kh: ios: audio session activation: %s\n",err.localizedDescription.UTF8String);
-    kh_audio_pull_ready=start_sound;
+    if(kh_coreaudio_start()) fprintf(stderr,"kh: ios: the audio unit did not start: no sound in this run\n");
 }
+static void setup_sound_session(void){ kh_audio_pull_ready=start_sound; }
 
 static void *game_thread(void *arg){
     (void)arg;

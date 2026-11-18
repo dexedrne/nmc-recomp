@@ -31,10 +31,14 @@
 #include <AudioToolbox/AudioToolbox.h>
 #include <TargetConditionals.h>
 #include <stdio.h>
+#include <stdatomic.h>
+#include <pthread.h>
 #include <string.h>
 #include "../khnmc_audio_out.h"
 
 static AudioComponentInstance kh_unit;
+static _Atomic unsigned long long kh_muted_blocks;   /* blocks the render callback muted as not a game mix (reported at stop) */
+static pthread_mutex_t kh_ca_m = PTHREAD_MUTEX_INITIALIZER;   /* start and stop one at a time (review r9); never on the render thread */
 static int kh_unit_running;
 
 static OSStatus kh_render(void *ref, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *io){
@@ -44,14 +48,13 @@ static OSStatus kh_render(void *ref, AudioUnitRenderActionFlags *flags, const Au
     UInt32 cap = io->mBuffers[0].mDataByteSize / (UInt32)(sizeof(float) * KH_AUDIO_OUT_CHANNELS);
     if(frames > cap) frames = cap;
     if(kh_audio_out_pull(dst, frames) == 0){ if(flags) *flags |= kAudioUnitRenderAction_OutputIsSilence; return noErr; }
-    /* a hard limit before the speaker: whatever reaches the ring, nothing beyond full scale and no NaN is ever played
-     * (2026-11-18: a test signal of sample counters reached the iPhone speaker as loud noise) */
-    for(UInt32 i = 0, n = frames * KH_AUDIO_OUT_CHANNELS; i < n; i++){
-        float v = dst[i];
-        if(!(v >= -1.0f)) v = (v != v) ? 0.0f : -1.0f;          /* NaN -> 0, below -1 -> -1 */
-        else if(v > 1.0f) v = 1.0f;
-        dst[i] = v;
-    }
+    /* before the speaker (2026-11-18: a test signal of sample counters reached the iPhone speaker as loud noise): a block with a NaN
+     * or a sample beyond 4.0 (12 dB over full scale: no game mix comes near that) is not a game mix: it is muted whole and counted
+     * (review r9: clamping such a block only turned it into full-scale noise); otherwise every sample is clamped to [-1, 1] */
+    UInt32 n = frames * KH_AUDIO_OUT_CHANNELS; int bad = 0;
+    for(UInt32 i = 0; i < n; i++){ float v = dst[i]; if(!(v >= -4.0f && v <= 4.0f)) { bad = 1; break; } }
+    if(bad){ memset(dst, 0, (size_t)n * sizeof(float)); atomic_fetch_add_explicit(&kh_muted_blocks, 1, memory_order_relaxed); return noErr; }
+    for(UInt32 i = 0; i < n; i++){ float v = dst[i]; dst[i] = v < -1.0f ? -1.0f : v > 1.0f ? 1.0f : v; }
     return noErr;
 }
 static int kh_ca_check(OSStatus st, const char *what){
@@ -61,8 +64,10 @@ static int kh_ca_check(OSStatus st, const char *what){
     fprintf(stderr, "kh: audio-coreaudio: %s failed: OSStatus %d ('%s')\n", what, (int)st, cc);
     return -1;
 }
-int kh_coreaudio_start(void){
-    if(kh_unit_running) return 0;
+static int coreaudio_start_locked(void);
+int kh_coreaudio_start(void){ pthread_mutex_lock(&kh_ca_m); int rc = coreaudio_start_locked(); pthread_mutex_unlock(&kh_ca_m); return rc; }
+static int coreaudio_start_locked(void){
+    if(kh_unit_running || kh_unit) return kh_unit_running ? 0 : -1;
     if(!kh_audio_ring_enabled()){ fprintf(stderr, "kh: audio-coreaudio: the pull ring does not exist: run with KHNMC_AUDIO=pull\n"); return -1; }
     AudioComponentDescription d; memset(&d, 0, sizeof d);
     d.componentType = kAudioUnitType_Output; d.componentManufacturer = kAudioUnitManufacturer_Apple;
@@ -113,10 +118,19 @@ int kh_coreaudio_start(void){
     return 0;
 }
 void kh_coreaudio_stop(void){
-    if(!kh_unit) return;
-    kh_ca_check(AudioOutputUnitStop(kh_unit), "AudioOutputUnitStop");
-    kh_audio_out_stop();
-    kh_audio_out_attach_device(0);                            /* the unit is stopped: it reads the ring no more */
-    AudioUnitUninitialize(kh_unit); AudioComponentInstanceDispose(kh_unit); kh_unit = NULL; kh_unit_running = 0;
+    pthread_mutex_lock(&kh_ca_m);
+    if(kh_unit){
+        if(kh_ca_check(AudioOutputUnitStop(kh_unit), "AudioOutputUnitStop")){
+            /* review r9: the unit may still be pulling: the ring stays guarded and the unit is kept (a later stop can try again) */
+            fprintf(stderr, "kh: audio-coreaudio: the unit did not stop: it keeps the ring attached\n");
+        } else {
+            kh_audio_out_stop();
+            kh_audio_out_attach_device(0);                    /* the unit is stopped: it reads the ring no more */
+            AudioUnitUninitialize(kh_unit); AudioComponentInstanceDispose(kh_unit); kh_unit = NULL; kh_unit_running = 0;
+            unsigned long long m = atomic_load(&kh_muted_blocks);
+            if(m) fprintf(stderr, "kh: audio-coreaudio: %llu block(s) were muted as not a game mix\n", m);
+        }
+    }
+    pthread_mutex_unlock(&kh_ca_m);
 }
 #endif /* KH_AUDIO_COREAUDIO */
