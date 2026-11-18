@@ -56,6 +56,47 @@
       nocull: as fill, but the TEST AID line names the no-cull reference and every H2 call divided by 2047/208.
       off: as fill, but the TEST AID line names exactly the hooks of LIST (KHNMC_ASPECT_TEST_OFF's value) and each of them passed every
       call through and wrote nothing (a test-aid run whose aid did not take effect would equal TALL and pass the picture checks).
+  task 42 (H3, the HUD anchored to the edges of the tall frame; compared by CONTENT, never by present number):
+  tools/fill_compare.py runcheck RUN.OUT h3 WxH | h3off WxH | h3169
+      the H3 exit-report lines of runtime/aspect.c.  h3: dk passes > 0, anchored passes > 0, objects anchored at the top > 0 and at the
+      bottom > 0, band mismatch 0, test aid off 0, passes begun inside another pass 0, next objects outside a pass 0, objects of a class
+      whose group disagrees 0, no `h3-band-mismatch` WARNING.  h3off (KHNMC_ASPECT_TEST_OFF=h3): every pass "test aid off", no object
+      anchored.  h3169 (fill on a 16:9 screen): every pass "o = 0, nothing written", no object anchored.  Task 42 review: every role
+      needs the line "H3 setScreenMode (f_126500) inside an object of an anchored pass": h3: 0 such calls in ANCHORED objects (centre
+      ones, the talk windows' zoom, are counted and allowed), h3off / h3169: 0 calls; no `h3-inner-mode-anchored` WARNING; and the
+      objects centred for want of a classification (a class not in the table, a generic child of a group not in the table) are printed
+      as a NOTE with their (class, group) pairs (not a condition: they stay centred by design).
+  tools/fill_compare.py h3pictures TALL_FRAMES OFF_FRAMES WxH [--min-pairs N] [--png DIR] [--elements LIST]
+      the dumps (KHNMC_GFX_DUMP) of a run with H3 (TALL) and of its control with KHNMC_ASPECT_TEST_OFF=h3 (OFF), the same route, screen
+      and clock.  A TALL dump and an OFF dump are the same moment when their SCENE region (GS x 92..356, y 75..295: the middle of the
+      picture, where no anchored element is drawn at either place) is byte-identical, not black and not mostly white (a flash: drifted
+      runs show the same flash at different moments), whatever their present numbers.
+      The elements (GS boxes from the measurement M, runtime/aspect.c; pixels by the exe's narrow-screen MagicScale: x * 3W/2048 + W/8,
+      y * 9W/16/416 + o): top: the INFORMATION bar (GS x -86..300, y 14..58; the D3D12 scissor of its text moves with it), the enemy
+      gauge (428..590, 26..44); bottom: the command menu (-80..90, 282..406), the player gauges and face (357..597, 296..410); centre:
+      the style rank (384..597, 130..280), a talk window (-47..507, 12..275), and everything else.  Per pair and per anchored element
+      present (at least 200 pixels of its box differ between OFF and TALL, i.e. the element is drawn there in OFF and not in TALL):
+      (e) its edge: the vertical shift at which most of those pixels reappear in TALL (exactly, all three channels) among the expected
+      one (-o top, +o bottom; floor and ceil when o is not whole) and +-1, 2, 4, 8 rows from it, 0 and the opposite edge is the
+      expected one, with at least 40 %% reappearing (the face's lower part is translucent: about 72 %% reappear on lavapipe) and 3
+      points more than at any other (the INFORMATION bar fading in: 0.76 against 0.69): GS y 0 at frame row 0 / GS y 416 at the last
+      row; (c) not cut: the moved box lies inside the frame, and for the one scissored element, the INFORMATION bar, at least 90 %%
+      of its WHITE pixels inside the bar (every channel >= 200 in OFF where TALL's own pixel there is not white, i.e. not a flash
+      behind it; not in its 4 border rows: its text on the dark bar) reappear exactly (a scissor left at the band would
+      cut the text above the band's first row); judged in pairs where it has at least 200 white pixels, at least 3 such pairs.  Per pair:
+      (r) outside the judged elements' boxes at both places (widened: GS x -86..310 / y 0..75, 380..620 / 10..60, -86..120 / 230..650,
+      330..620 / 240..650; only those of LIST with --elements) at most 0.01 %% of the pixels differ: the centred HUD (lock-on, damage numbers, style rank, talk and menu
+      windows) and the 3D are unchanged.  Exit 0 = PASS: at least N pairs (default 20), every anchored element of LIST (default all
+      four) present in at least 3 pairs, (e) and (c) at every pair where it is present, (r) at every pair; 1 = FAIL; 2 = usage;
+      3 = UNDECIDED (fewer than N shared moments and nothing failing in them).
+  tools/fill_compare.py h3static TALL_FRAMES OFF_FRAMES WxH [--elements LIST] [--presents FROM-TO]
+      the same runs WITHOUT shared moments (drifted GPU runs): per anchored element its footprint (the pixels OFF shows in at least
+      half of its sampled dumps and TALL does not show there) reappears in TALL exactly o rows higher / lower, the strict best of the
+      shifts tried; (c) the INFORMATION bar's text (its white pixels that are not the bar's static white, per dump where the bar is
+      drawn): TALL's median at least 0.8 of OFF's (a scissor left at the band cuts it); (r) the centred style rank (GS x 440..600, y
+      130..290) is found at shift 0, not at -o / +o.  Default elements: the four of h3pictures and the style rank.  LIST may also
+      name the camp route's elements (mission counter, radar, EXP and munny: top; reaction command: bottom; camp menu: centre), each
+      judged over the dumps of --presents FROM-TO (its window of the route).  Exit 0 = PASS, 1 = FAIL (a test not judged is a FAIL).
   tools/fill_compare.py selftest
       the checks below on synthetic pictures (a band shifted by 135 rows passes; black strips, a band off by one row, a misplaced
       element and a hard seam each fail the condition they should), and runcheck on synthetic report lines (14 cases: a pc run, a
@@ -509,7 +550,7 @@ H2_RE = re.compile(r'^kh: aspect report: (H2[bc]) \(0x[0-9a-f]+, [^)]*\): calls 
 H4_RE = re.compile(r'^kh: aspect report: H4 \(fades and event bars\): f_156e20 calls (\d+); r = 1, nothing written (\d+); test aid off (\d+);.*; totals: rewritten (\d+) \+ (\d+), already (\d+), other rect (\d+) \+ (\d+)$')
 H5_RE = re.compile(r'^kh: aspect report: H5 .*: calls (\d+): extended (\d+), other rects \(left\) (\d+), r = 1 (\d+), test aid off (\d+)$')
 AID_RE = re.compile(r'^kh: aspect: TEST AID: (.*)\(not for play\)$')
-OFF_NAMES = {'h2': ('H2b', 'H2c'), 'h2b': ('H2b',), 'h2c': ('H2c',), 'h4': ('H4',), 'h5': ('H5',)}
+OFF_NAMES = {'h2': ('H2b', 'H2c'), 'h2b': ('H2b',), 'h2c': ('H2c',), 'h3': ('H3',), 'h4': ('H4',), 'h5': ('H5',)}
 
 
 def fillcheck(run_out, role, screen, offlist=None):
@@ -535,7 +576,7 @@ def fillcheck(run_out, role, screen, offlist=None):
     for k in (offlist or []):
         off.update(OFF_NAMES[k])
     aid = [m.group(1) for m in (AID_RE.match(l) for l in text) if m]
-    want_aid = ''.join('%s off; ' % k for k in ('H2b', 'H2c', 'H4', 'H5') if k in off) + ('H2 divides m11 by 2047/208 instead of r (the no-cull reference); ' if role == 'nocull' else '')
+    want_aid = ''.join('%s off; ' % k for k in ('H2b', 'H2c', 'H3', 'H4', 'H5') if k in off) + ('H2 divides m11 by 2047/208 instead of r (the no-cull reference); ' if role == 'nocull' else '')
     if role in ('fill', 'fill169'):
         say(not aid, '%s: no TEST AID line (%s)' % (role, ('found: ' + aid[-1].strip()) if aid else 'none'))
     else:
@@ -586,6 +627,387 @@ def fillcheck(run_out, role, screen, offlist=None):
     warn = [l for l in text if 'WARNING:' in l and ('kh: screen' in l or 'kh: aspect' in l)]
     say(not warn, '%s: aspect / screen WARNING lines: %d%s' % (role, len(warn), (' (first: %s)' % warn[0][:200]) if warn else ''))
     return ok, lines
+
+
+# ---- task 42: H3 ------------------------------------------------------------------------------------------------------------------
+H3_RE = re.compile(r'^kh: aspect report: H3 \(HUD anchoring.*?\): passes (\d+): o = 0 \(16:9 or wider\), nothing written (\d+); the exe.s bars on \(no 3D view\), left centred (\d+); '
+                   r'band mismatch \(h3-band-mismatch\), left (\d+); test aid off (\d+); anchored (\d+) \(empty list (\d+)\); begun inside another pass (\d+); '
+                   r'objects: first \(H3a\) top (\d+) bottom (\d+) centre (\d+), next \(H3b\) top (\d+) bottom (\d+) centre (\d+); ends of the list \(rax = 0\) (\d+); next object outside a pass (\d+)$')
+H3W_RE = re.compile(r'^kh: aspect report: H3 objects by the reason of their anchor:.*; class and group disagree (\d+)$')
+# task 42 review finding 2: setScreenMode (f_126500) from inside an object of an anchored pass (f_126500 recomputes MagicScale)
+H3I_RE = re.compile(r'^kh: aspect report: H3 setScreenMode \(f_126500\) inside an object of an anchored pass \(.*?\): (\d+): the loop.s MagicScale back after it (\d+); '
+                    r'in anchored objects (\d+) \(the loop.s MagicScale back: the anchored MS\.w written again (\d+); another mode, left as the exe made it (\d+)\)$')
+# task 42 review finding 4: the objects centred for want of a classification (listed, not a condition: they stay centred by design)
+H3U_RE = re.compile(r'^kh: aspect report: H3 objects by the reason of their anchor:.*; class not in the table, centred \(its group is in the table\) (\d+); '
+                    r'class not in the table, centred \(its group is not in the table either\) (\d+); generic child of a group not in the table (\d+); class and group disagree \d+$')
+
+
+def h3check(run_out, role):
+    """runcheck roles h3 / h3off / h3169 (task 42) -> (ok, lines)"""
+    try:
+        text = open(run_out, 'rb').read().decode('utf-8', 'replace').splitlines()
+    except OSError as e:
+        return False, ['  run.out %s: cannot be read (%s): FAIL' % (run_out, e)]
+    lines, ok = [], True
+    def say(good, what):
+        nonlocal ok
+        ok = ok and good
+        lines.append('  %s: %s' % (what, 'PASS' if good else 'FAIL'))
+    m = [x for x in (H3_RE.match(l) for l in text) if x]
+    if not m:
+        say(False, '%s: no H3 report line (a build without task 42, or KHNMC_ASPECT is not fill)' % role); return ok, lines
+    v = [int(m[-1].group(i)) for i in range(1, 17)]
+    passes, ident, bars, mism, off, anch, empty, nested, ft, fb, fcen, nt, nb, ncen, ends, nopass = v
+    top, bot = ft + nt, fb + nb
+    wm = [x for x in (H3W_RE.match(l) for l in text) if x]
+    dis = int(wm[-1].group(1)) if wm else -1
+    desc = ('%s: H3: passes %d, o = 0 %d, bars on %d, band mismatch %d, test aid off %d, anchored %d; objects top %d, bottom %d, centre %d; nested %d, '
+            'outside a pass %d; class and group disagree %s' % (role, passes, ident, bars, mism, off, anch, top, bot, fcen + ncen, nested, nopass, dis if dis >= 0 else '(no line)'))
+    if role == 'h3':
+        say(passes > 0 and anch > 0 and top > 0 and bot > 0 and mism == 0 and off == 0 and nested == 0 and nopass == 0 and dis == 0 and ident == 0,
+            desc + ' (anchored passes with objects at both edges; no mismatch, test aid, nesting or disagreement; no pass at o = 0)')
+    elif role == 'h3off':
+        say(passes > 0 and off == passes and anch == 0 and top + bot + fcen + ncen == 0, desc + ' (the test aid passes every pass through)')
+    else:
+        say(passes > 0 and ident == passes and anch == 0 and top + bot + fcen + ncen == 0, desc + ' (16:9: every pass o = 0, nothing written)')
+    warn = [l for l in text if 'h3-band-mismatch' in l and 'WARNING' in l]
+    say(not warn, '%s: h3-band-mismatch WARNING lines: %d' % (role, len(warn)))
+    im = [x for x in (H3I_RE.match(l) for l in text) if x]
+    if not im:
+        say(False, '%s: no "H3 setScreenMode (f_126500) inside an object" line (a build without the task 42 review fix)' % role)
+    else:
+        ni, nback, nanch, nre, noth = (int(im[-1].group(i)) for i in range(1, 6))
+        if role == 'h3':
+            say(nanch == 0, '%s: setScreenMode inside an object of an anchored pass %d (the loop\'s MagicScale back after it %d), in ANCHORED objects %d (written '
+                            'again %d, another mode %d): 0 required (h3-inner-mode-anchored: such an object draws part of itself in a mode of its own, not anchored; '
+                            'only centre classes were measured doing it)' % (role, ni, nback, nanch, nre, noth))
+        else:
+            say(ni == 0, '%s: setScreenMode inside an object of an anchored pass %d (no pass is anchored in this role)' % (role, ni))
+    warn = [l for l in text if 'h3-inner-mode-anchored' in l and 'WARNING' in l]
+    say(not warn, '%s: h3-inner-mode-anchored WARNING lines: %d' % (role, len(warn)))
+    um = [x for x in (H3U_RE.match(l) for l in text) if x]
+    if um:
+        ul, uc, gu = (int(um[-1].group(i)) for i in range(1, 4))
+        cl = [l.split('H3 centred: ', 1)[1] for l in text if l.startswith('kh: aspect report: H3 centred: ')]
+        lines.append('  %s: NOTE (not a condition: they stay centred by design): objects centred for want of a classification: of a class not in the table %d '
+                     '(its group in the table %d, not %d), generic children of a group not in the table %d%s' % (role, ul + uc, ul, uc, gu, (': ' + '; '.join(cl)) if cl else ''))
+    return ok, lines
+
+
+# the element boxes in GS units (x0, x1, y0, y1) from the measurement M (M40/*-M-review.txt, run-B42/M/*): anchor -1 top, +1 bottom
+# the INFORMATION bar is the one scissored HUD element (M: the only partial scissors are its f_126fd0 rects from 0x140472bd0 and the
+# radar's 256x256 target): its text is the (c) test; the others can only be cut by the frame edge (the geometric test)
+H3_ELEMENTS = [('INFORMATION bar', -1, (-86, 300, 14, 58)), ('enemy gauge', -1, (428, 590, 26, 44)),
+               ('command menu', 1, (-80, 90, 282, 406)), ('player gauges', 1, (357, 597, 296, 410))]
+H3_SCISSORED = ('INFORMATION bar',)
+H3_WIDE = {'INFORMATION bar': (-1, (-86, 310, 0, 75)), 'enemy gauge': (-1, (380, 620, 10, 60)), 'command menu': (1, (-86, 120, 230, 650)),
+           'player gauges': (1, (330, 620, 240, 650))}                                # (r) leaves out these boxes of the judged elements
+H3_SCENE = (92, 356, 75, 295)
+# task 42 review finding 3: h3static's centred elements (drawn at the same place with and without H3): the mod's style rank at its
+# resting place (M: GS y mid-points 192..224, x 384..683 with its zoom; on lavapipe at rows 580..780 of 1920x1350, x 1600..1820)
+H3_CENTRED = [('style rank', (440, 600, 130, 290))]
+# task 42 review finding 1: the camp route's elements (input/route-camp.txt; run-B42/M/F-camp-fill1350-M.txt), judged by h3static with
+# --elements and --presents (each is drawn in a window of the route only): top: the mission counter (dk::COUNTER, group 8: its children
+# GS y -13.7..96.4, frames 9515-14004; the two counters "GUARD" / "REVERSAL" on lavapipe at GS x -75..200, y 15..60), the radar (dk::Radar: its scissor GS x 485..581, y 16..112, frames 20846+), the EXP and munny
+# lines (dk::NEXT_EXP / GET_MUNNY, group 7: x -61..-10, y 37..92, frames 19153-19425); bottom: the reaction command
+# (dk::ReactionDecideSprite, group 2: x -122..26, y 204.5..336.25, 25-frame windows); centre: the camp menu (Tz::, menu-id 8,
+# frames 21575-21817; Tz::MenuItem x -42..427, y 71..313)
+H3_CAMP = [('mission counter', -1, (-75, 200, 15, 60)), ('radar', -1, (485, 581, 16, 112)), ('EXP and munny', -1, (-61, -10, 37, 92)),
+           ('reaction command', 1, (-122, 26, 205, 336))]
+H3_CAMP_CENTRED = [('camp menu', (-42, 427, 71, 313))]
+
+
+def h3_geom(w, h):
+    """the exe's narrow-screen MagicScale (f_1433a0): x * 3W/2048 + W/8, y * 9W/16/416 + o"""
+    msx, msz = 3.0 * w / 2048.0, w / 8.0
+    msy = 9.0 * w / 16.0 / 416.0
+    o = (h - 9.0 * w / 16.0) / 2.0
+    def px(box, shift=0.0):
+        x0, x1, y0, y1 = box
+        rd = lambda v: int(np.floor(v + 0.5))
+        return (max(0, rd(x0 * msx + msz)), min(w, rd(x1 * msx + msz)), rd(y0 * msy + o + shift), rd(y1 * msy + o + shift))
+    return o, px
+
+
+def h3_pair(a, b, o, px, elements, lines, tag):
+    """one (TALL a, OFF b) pair: per element (present, e_ok, c_ok, detail); (r_ok, rest)"""
+    h, w = a.shape[:2]
+    res = {}
+    for name, s, box in elements:
+        x0, x1, y0, y1 = px(box)
+        y0c, y1c = max(0, y0), min(h, y1)
+        ob = b[y0c:y1c, x0:x1]
+        E = (ob != a[y0c:y1c, x0:x1]).any(axis=2)
+        ne = int(E.sum())
+        if ne < 200:
+            res[name] = (False, True, True, 'not drawn here (%d pixels differ)' % ne, False); continue
+        so = s * o
+        exp = sorted({int(np.floor(so)), int(np.ceil(so))})
+        cand = set(exp) | {0, -int(round(so))} | {exp[0] + d for d in (-1, -2, -4, -8)} | {exp[-1] + d for d in (1, 2, 4, 8)}
+        score, best_m = {}, {}
+        for t in sorted(cand):
+            if y0c + t < 0 or y1c + t > h:
+                score[t] = -1.0; continue
+            m = (a[y0c + t:y1c + t, x0:x1] == ob).all(axis=2) & E
+            score[t] = m.sum() / float(ne); best_m[t] = m
+        te = max(exp, key=lambda t: score[t])
+        others = max(v for t, v in score.items() if t not in exp)
+        e_ok = score[te] >= 0.4 and score[te] - others >= 0.03
+        inside = y0 + te >= 0 and y1 + te <= h
+        # (c): the moved box inside the frame, and the element's white pixels (text: every channel >= 200 in OFF) reappear exactly
+        # (a scissor left at the band would cut the INFORMATION text above the band's first row; translucent parts are never white)
+        sc = name in H3_SCISSORED
+        er = np.nonzero(E.sum(axis=1) >= 4)[0]
+        wht = E & (ob >= 200).all(axis=2) & ~(a[y0c:y1c, x0:x1] >= 200).all(axis=2)   # white in OFF, not white in TALL there: the
+        if len(er):                                                                    # element's own white, not a flash behind it                                                                    # the text lies inside the bar: not its 4 border rows
+            wht[:er[0] + 4] = False; wht[max(0, er[-1] - 3):] = False                   # (a flash seen through its antialiased edge is white)
+        nw = int(wht.sum())
+        wr = float((best_m[te] & wht).sum()) / nw if te in best_m and nw else 0.0
+        judged = sc and nw >= 200
+        c_ok = inside and (not judged or wr >= 0.9)
+        ext = ('element rows %d..%d -> %d..%d%s' % (y0c + er[0], y0c + er[-1], y0c + er[0] + te, y0c + er[-1] + te,
+               ('; text (white) pixels %d, %s' % (nw, ('%.3f reappear%s' % (wr, '' if wr >= 0.9 else ' [CUT]')) if judged else 'too few to judge')) if sc else '')) if len(er) else '-'
+        det = ('%d px; %.2f reappear at %+d (expected %s), best other %.2f%s; %s%s' % (ne, score[te], te, '/'.join('%+d' % t for t in exp), others,
+               '' if e_ok else ' [EDGE WRONG: best %+d]' % max(score, key=score.get), ext, '' if inside else ' [moved box outside the frame]'))
+        res[name] = (True, e_ok, c_ok, det, judged)
+    mask = np.ones((h, w), bool)
+    for name in [e[0] for e in elements]:
+        s, box = H3_WIDE[name]
+        for sh in (0.0, s * o):
+            x0, x1, y0, y1 = px(box, sh)
+            mask[max(0, y0):max(0, min(h, y1)), x0:x1] = False
+    rest = int(((a != b).any(axis=2) & mask).sum())
+    r_ok = rest <= 0.0001 * mask.sum()
+    lines.append('  %s: %s; rest: %d pixels differ%s' % (tag, '; '.join('%s: %s%s' % (k, v[3], '' if not v[0] else ' (e) %s (c) %s' % ('ok' if v[1] else 'FAIL', 'ok' if v[2] else 'FAIL'))
+                                                            for k, v in res.items()), rest, '' if r_ok else ' [(r) FAIL]'))
+    return res, r_ok, rest
+
+
+def read_dumps(d):
+    """index.tsv of KHNMC_GFX_DUMP, every row by present (read_index keys by game_frame and keeps one dump per game frame)"""
+    rows = {}
+    with open(os.path.join(d, 'index.tsv')) as f:
+        head = f.readline().rstrip('\n').split('\t')
+        for need in ('present', 'file'):
+            if need not in head:
+                raise SystemExit('fill_compare: %s/index.tsv: no column %s' % (d, need))
+        for ln in f:
+            c = dict(zip(head, ln.rstrip('\n').split('\t')))
+            if c.get('present'):
+                rows[int(c['present'])] = {'present': int(c['present']), 'file': c['file']}
+    return rows
+
+
+def h3pictures(tall_dir, off_dir, screen, min_pairs=20, png=None, only=None):
+    """-> (exit code, lines): 0 PASS, 1 FAIL, 3 UNDECIDED (fewer than min_pairs shared moments and nothing failing in them)"""
+    w, h = screen
+    o, px = h3_geom(w, h)
+    lines = []
+    ti = read_dumps(tall_dir); oi = read_dumps(off_dir)
+    els = [e for e in H3_ELEMENTS if not only or e[0] in only]
+    sx0, sx1, sy0, sy1 = px(H3_SCENE)
+    def key(arr):
+        reg = arr[sy0:sy1, sx0:sx1]
+        if not reg.any() or (reg >= 250).all(axis=2).mean() > 0.5:                      # black, or a white flash: says nothing about the moment
+            return None
+        return hash(reg.tobytes())
+    offs = {}
+    for r in sorted(oi.values(), key=lambda r: r['present']):
+        b = read_ppm(os.path.join(off_dir, r['file']))
+        if b.shape[:2] != (h, w):
+            return 2, ['  %s is %dx%d, not %dx%d' % (r['file'], b.shape[1], b.shape[0], w, h)]
+        k = key(b)
+        if k is not None and k not in offs:
+            offs[k] = (r['present'], os.path.join(off_dir, r['file']))
+    seen = {e[0]: 0 for e in els}; bad = {e[0]: 0 for e in els}; textj = {e[0]: 0 for e in els}; rbad = 0; npairs = 0; firstbad = []
+    for r in sorted(ti.values(), key=lambda r: r['present']):
+        a = read_ppm(os.path.join(tall_dir, r['file']))
+        if a.shape[:2] != (h, w):
+            return 2, ['  %s is %dx%d, not %dx%d' % (r['file'], a.shape[1], a.shape[0], w, h)]
+        k = key(a)
+        if k is None or k not in offs:
+            continue
+        q, bp = offs[k]; b = read_ppm(bp); npairs += 1
+        sub = []
+        res, r_ok, rest = h3_pair(a, b, o, px, els, sub, 'TALL present %d / OFF present %d' % (r['present'], q))
+        pair_bad = not r_ok
+        rbad += 0 if r_ok else 1
+        for name, v in res.items():
+            if v[0]:
+                seen[name] += 1; textj[name] += 1 if v[4] else 0
+                if not (v[1] and v[2]):
+                    bad[name] += 1; pair_bad = True
+        if pair_bad and len(firstbad) < 6:
+            firstbad += sub
+        if png and (npairs <= 2 or pair_bad):
+            os.makedirs(png, exist_ok=True)
+            save_png(os.path.join(png, 'h3-tall-p%d.png' % r['present']), a); save_png(os.path.join(png, 'h3-off-p%d.png' % q), b)
+        if npairs % 25 == 1:
+            lines += sub
+    ok = npairs >= min_pairs and rbad == 0
+    anybad = rbad > 0
+    lines.append('  pairs (the same moment by the scene region GS x %d..%d, y %d..%d): %d (at least %d)%s' % (H3_SCENE + (npairs, min_pairs, '' if npairs >= min_pairs else ': too few')))
+    for e in els:
+        name = e[0]; sc = name in H3_SCISSORED
+        good = seen[name] >= 3 and bad[name] == 0 and (not sc or textj[name] >= 3); ok = ok and good; anybad = anybad or bad[name] > 0
+        lines.append('  %-16s (%s): present in %d pairs%s, (e) or (c) failing in %d: %s' % (name, 'top' if e[1] < 0 else 'bottom', seen[name],
+                     ', its text judged in %d (at least 3)' % textj[name] if sc else '', bad[name], 'PASS' if good else 'FAIL'))
+    lines.append('  (r) the rest unchanged (lock-on, damage numbers, style rank, windows, 3D): failing in %d pairs: %s' % (rbad, 'PASS' if rbad == 0 else 'FAIL'))
+    if firstbad:
+        lines.append('  the first failing pairs:'); lines += firstbad
+    if npairs < min_pairs and not anybad:
+        lines.append('  => UNDECIDED: the two runs share only %d moments (GPU runs drift apart: fence timing); nothing failed in them. '
+                     'h3static judges the edges without shared moments' % npairs)
+        return 3, lines
+    return (0 if ok else 1), lines
+
+
+def h3static(tall_dir, off_dir, screen, only=None, samples=40, presents=None):
+    """the edges WITHOUT shared moments (GPU runs drift apart): a HUD element's opaque pixels are the same at every moment while the
+    scene behind it changes.  Per element: R = its box in OFF's middle sampled dump; its footprint F = the pixels of R that OFF shows
+    in at least half of its sampled dumps (the element, not the scene) and TALL shows at that place in at most a fifth of its (TALL
+    does not draw it there); score(t) = over TALL's sampled dumps, the mean share of F that TALL shows exactly at t rows away.  PASS:
+    the best t among the expected shift (-o top / +o bottom; floor and ceil when o is not whole), +-1, 2, 4, 8 rows from it, 0 and the
+    opposite edge is the expected one, score >= 0.5 and 0.1 above any other; F at least 500 pixels (at 1920x1350; scaled by the area).
+    Task 42 review finding 3 (what h3pictures judges at shared moments, here without them):
+    (c) the scissored element's TEXT (the INFORMATION bar): its white pixels (every channel >= 200) inside the box that are not the
+        bar's static white (F's white pixels: the title), counted per sampled dump where the bar is drawn (at least half of F shown at
+        that shift) in TALL at the expected shift and in OFF at its place: TALL's median at least 0.8 of OFF's (the scrolling text is
+        the same text in both runs, at other moments: their medians agree within a few %%; a scissor left at the band cuts the text
+        above the band's first row, about 9 tenths of it); judged when OFF's median is at least 200 white pixels (scaled by the area)
+        in at least 3 dumps of each run, otherwise FAIL (not judged).
+    (r) the CENTRED elements (H3_CENTRED: the style rank; with --elements also the camp menu) stay where the exe draws them: per element
+        the reference is the OFF dump whose box holds the most pixels (largest channel > 40) that OFF shows in at least a quarter of its
+        sampled dumps (it is drawn in a part of them only, the style rank in battle), its footprint those pixels; score(t) as above over
+        t = 0, -o, +o (and +-1, 2, 8): PASS when score(0) >= 0.2 and score(0) is 0.1 above score(-o) and score(+o); F at least 500
+        pixels, otherwise FAIL (not judged).  A background that stands still behind the element counts for the place it is at: the
+        element needs a moving scene behind it (the battle) to be judged by this test.
+    presents (FROM, TO): only the dumps of those presents (an element drawn in a window of the route).  -> (exit code, lines)"""
+    w, h = screen
+    o, px = h3_geom(w, h)
+    els = [e for e in H3_ELEMENTS + H3_CAMP if (e[0] in only if only else e in H3_ELEMENTS)]
+    cens = [e for e in H3_CENTRED + H3_CAMP_CENTRED if (e[0] in only if only else e in H3_CENTRED)]
+    def sample(d):
+        rs = sorted(read_dumps(d).values(), key=lambda r: r['present'])
+        if presents:
+            rs = [r for r in rs if presents[0] <= r['present'] <= presents[1]]
+        if not rs:
+            return []
+        idx = sorted(set(np.linspace(0, len(rs) - 1, min(len(rs), samples)).astype(int)))
+        out = []
+        for i in idx:
+            a = read_ppm(os.path.join(d, rs[i]['file']))
+            if a.shape[:2] != (h, w):
+                raise SystemExit('fill_compare: h3static: %s is %dx%d, not %dx%d' % (rs[i]['file'], a.shape[1], a.shape[0], w, h))
+            out.append(a)
+        return out
+    TA, OA = sample(tall_dir), sample(off_dir)
+    lines = ['  sampled dumps: TALL %d, OFF %d' % (len(TA), len(OA))]
+    if len(TA) < 8 or len(OA) < 8:
+        return 1, lines + ['  too few dumps (at least 8 per run): FAIL']
+    ref = OA[len(OA) // 2]; ok = True
+    minf = max(50, int(500.0 * w * h / (1920 * 1350)))                                  # 500 pixels at 1920x1350
+    for name, s_, box in els:
+        x0, x1, y0, y1 = px(box)
+        R = ref[y0:y1, x0:x1]
+        soff = np.mean([(b[y0:y1, x0:x1] == R).all(axis=2) for b in OA], axis=0)
+        t0 = np.mean([(a[y0:y1, x0:x1] == R).all(axis=2) for a in TA], axis=0)
+        F = (soff >= 0.5) & (t0 <= 0.2); nf = int(F.sum())
+        if nf < minf:
+            ok = False
+            lines.append('  %-16s: footprint %d pixels (at least %d): FAIL (OFF does not draw it in half of its dumps, or TALL draws it at the old place)' % (name, nf, minf)); continue
+        so = s_ * o
+        exp = sorted({int(np.floor(so)), int(np.ceil(so))})
+        cand = set(exp) | {0, -int(round(so))} | {exp[0] + d for d in (-1, -2, -4, -8)} | {exp[-1] + d for d in (1, 2, 4, 8)}
+        sc = {}
+        for t in sorted(cand):
+            if y0 + t < 0 or y1 + t > h:
+                continue
+            sc[t] = float(np.mean([((a[y0 + t:y1 + t, x0:x1] == R).all(axis=2) & F).sum() / float(nf) for a in TA]))
+        te = max(exp, key=lambda t: sc.get(t, -1.0)); other = max(v for t, v in sc.items() if t not in exp)
+        good = te in sc and sc[te] >= 0.5 and sc[te] - other >= 0.1; ok = ok and good
+        lines.append('  %-16s (%s): footprint %d pixels; %.3f at %+d (expected %s), best other %.3f (%+d), at 0 %.3f: %s' % (
+            name, 'top' if s_ < 0 else 'bottom', nf, sc.get(te, -1), te, '/'.join('%+d' % t for t in exp), other,
+            max((t for t in sc if t not in exp), key=lambda t: sc[t]), sc.get(0, -1), 'PASS' if good else 'FAIL'))
+        if name in H3_SCISSORED:                                                        # (c): its text not cut (review finding 3)
+            def whites(arrs, t):                                                        # the white masks of the dumps where the bar is drawn
+                v = []
+                for a in arrs:
+                    if y0 + t < 0 or y1 + t > h:
+                        continue
+                    sub = a[y0 + t:y1 + t, x0:x1]
+                    if ((sub == R).all(axis=2) & F).sum() >= 0.5 * nf:
+                        v.append((sub >= 200).all(axis=2))
+                return v
+            wo, wt = whites(OA, 0), whites(TA, te)
+            stw = (np.mean(wo, axis=0) >= 0.9) if wo else np.zeros(F.shape, bool)       # the bar's static white (its title): white in 9 tenths of OFF's
+            vo, vt = [int((m & ~stw).sum()) for m in wo], [int((m & ~stw).sum()) for m in wt]
+            mt, mo = (float(np.median(vt)) if vt else 0.0), (float(np.median(vo)) if vo else 0.0)
+            minw = max(20, int(200.0 * w * h / (1920 * 1350)))
+            judged = len(vt) >= 3 and len(vo) >= 3 and mo >= minw
+            tg = judged and mt >= 0.8 * mo; ok = ok and tg
+            lines.append('  %-16s (c) its text: white pixels (not its static white) per dump where it is drawn, median TALL %.0f (%d dumps) against OFF %.0f '
+                         '(%d dumps): %s%s' % (name, mt, len(vt), mo, len(vo), ('%.3f of OFF\'s (at least 0.8) ' % (mt / mo)) if mo else '',
+                                               'PASS' if tg else ('FAIL [TEXT CUT]' if judged else 'FAIL (not judged: OFF shows fewer than %d white pixels or fewer than 3 dumps)' % minw)))
+    for name, box in cens:                                                              # (r): the centred elements (review finding 3)
+        x0, x1, y0, y1 = px(box)
+        y0, y1 = max(0, y0), min(h, y1)
+        bo = [b[y0:y1, x0:x1] for b in OA]
+        best = None
+        for R in bo:
+            soff = np.mean([(b == R).all(axis=2) for b in bo], axis=0)
+            Fc = (soff >= 0.25) & (R.max(axis=2) > 40)
+            nfc = int(Fc.sum())
+            if best is None or nfc > best[0]:
+                best = (nfc, R, Fc)
+        nfc, R, Fc = best
+        if nfc < minf:
+            ok = False
+            lines.append('  %-16s (centre): footprint %d pixels (at least %d): FAIL (not judged: not drawn in a quarter of OFF\'s dumps)' % (name, nfc, minf)); continue
+        so = int(round(o))
+        sc = {}
+        for t in (0, -so, so, -1, 1, -2, 2, -8, 8):
+            if y0 + t < 0 or y1 + t > h:
+                continue
+            sc[t] = float(np.mean([((a[y0 + t:y1 + t, x0:x1] == R).all(axis=2) & Fc).sum() / float(nfc) for a in TA]))
+        edge = max(sc.get(-so, 0.0), sc.get(so, 0.0))
+        good = sc.get(0, 0.0) >= 0.2 and sc.get(0, 0.0) - edge >= 0.1; ok = ok and good
+        lines.append('  %-16s (centre): footprint %d pixels; %.3f at 0, %.3f at -%d, %.3f at +%d (+-1 %.3f / %.3f): %s' % (
+            name, nfc, sc.get(0, -1), sc.get(-so, -1), so, sc.get(so, -1), so, sc.get(-1, -1), sc.get(1, -1), 'PASS' if good else 'FAIL [MOVED]'))
+    return (0 if ok else 1), lines
+
+
+def h3_synth(seed=42):
+    """synthetic TALL / OFF pictures at 384x270 (o = 27): a textured scene, the four elements as opaque patterned blocks with a
+    translucent lower half (the face), drawn centred in OFF and moved by -o / +o in TALL"""
+    rng = np.random.default_rng(seed)
+    w, h = 384, 270
+    o, px = h3_geom(w, h)
+    yy, xx = np.mgrid[0:h, 0:w]
+    scene = np.zeros((h, w, 3), np.uint8)
+    scene[..., 0] = (80 + 60 * np.sin(xx / 9.0) + 30 * np.cos(yy / 5.0)).clip(0, 255)
+    scene[..., 1] = (100 + 50 * np.cos((xx + 2 * yy) / 7.0)).clip(0, 255)
+    scene[..., 2] = rng.integers(40, 200, size=(h, w))
+    def draw(img, box, shift, seed_, cut_text=0, phase=None):
+        """cut_text = the element's first rows whose TEXT a scissor removes (the opaque bar itself stays, as with the real scissor);
+        phase = the moment of a SCROLLING text (the INFORMATION message, task 42 review): its white pixels are the columns where
+        (column + 3 phase) % 10 < 7, so no pixel is white at every moment; None: static white rows"""
+        x0, x1, y0, y1 = px(box, shift)
+        r = np.random.default_rng(seed_)
+        pat = (r.integers(0, 180, size=(y1 - y0, x1 - x0, 3))).astype(np.uint8)       # the opaque bar: never white
+        half = 2 * (y1 - y0) // 3
+        for row in range(0, half, 3):
+            if row >= cut_text:
+                if phase is None:
+                    pat[row] = 255                                                     # white "text" rows in the opaque part
+                else:
+                    pat[row, (np.arange(x1 - x0) + 3 * phase) % 10 < 7] = 255
+        under = img[y0:y1, x0:x1].copy()
+        img[y0:y0 + half, x0:x1] = pat[:half]
+        lo = img[y0 + half:y1, x0:x1].astype(np.uint16)
+        img[y0 + half:y1, x0:x1] = ((lo + (pat[half:] & 0x7f)) // 2).astype(np.uint8)  # translucent lower third
+        img[y0:y1, x0:x1][:, 1::3] = under[:, 1::3]                                     # see-through columns (the face ring's box has holes)
+    return w, h, o, px, scene, draw
 
 
 def pick(ref_index, tall_index):
@@ -836,6 +1258,184 @@ def selftest():
         okc, _ = hashcontent(read_hashlog(wr2('xa_c.tsv', ref_h[1:], ref_h[0])), read_hashlog(wr2('xb_c.tsv', hx_cases[2][2][1:], hl)))
         n += 1; fails += 0 if not okc else 1
         print('fill_compare selftest: %-58s %s (expected FAIL: why it is no longer a condition)' % ('hashcontent on the run that parts at 960', 'PASS' if okc else 'FAIL'))
+    # task 42: runcheck h3 / h3off / h3169 and h3pictures
+    def h3l(passes, ident, bars, mism, off, anch, ft, fb, fc_, nt, nb, nc, nested=0, nopass=0):
+        return ('kh: aspect report: H3 (HUD anchoring, dk loop 0x166640: f_126500 at 0x140166677 = H3a, f_4ad270 at 0x140166693 = H3b): passes %d: o = 0 (16:9 or wider), nothing written %d; '
+                'the exe\'s bars on (no 3D view), left centred %d; band mismatch (h3-band-mismatch), left %d; test aid off %d; anchored %d (empty list 0); begun inside another pass %d; '
+                'objects: first (H3a) top %d bottom %d centre %d, next (H3b) top %d bottom %d centre %d; ends of the list (rax = 0) %d; next object outside a pass %d'
+                % (passes, ident, bars, mism, off, anch, nested, ft, fb, fc_, nt, nb, nc, anch, nopass))
+    def h3w(dis, ul=0, uc=0, gu=0):
+        return ('kh: aspect report: H3 objects by the reason of their anchor: by its class 9; by its owner\'s group (+0x14) 9; class not in the table, centred (its group is in the table) %d; '
+                'class not in the table, centred (its group is not in the table either) %d; generic child of a group not in the table %d; class and group disagree %d' % (ul, uc, gu, dis))
+    def h3i(ni=0, back=0, anch=0, re_=0, oth=0):                                         # task 42 review finding 2
+        return ('kh: aspect report: H3 setScreenMode (f_126500) inside an object of an anchored pass (any return address but 0x140166677 / 0x1401666bf; f_126500 recomputes MagicScale): %d: '
+                'the loop\'s MagicScale back after it %d; in anchored objects %d (the loop\'s MagicScale back: the anchored MS.w written again %d; another mode, left as the exe made it %d)' % (ni, back, anch, re_, oth))
+    h3_cases = [('runcheck h3: anchored at both edges', 'h3', [h3l(1000, 0, 400, 0, 0, 600, 0, 0, 600, 900, 1200, 300), h3w(0), h3i()], True),
+                ('runcheck h3: a band mismatch', 'h3', [h3l(1000, 0, 400, 5, 0, 595, 0, 0, 595, 900, 1200, 300), h3w(0), h3i(), 'kh: aspect: WARNING: h3-band-mismatch: x'], False),
+                ('runcheck h3: nothing at the top', 'h3', [h3l(1000, 0, 400, 0, 0, 600, 0, 0, 600, 0, 1200, 300), h3w(0), h3i()], False),
+                ('runcheck h3: class and group disagree', 'h3', [h3l(1000, 0, 400, 0, 0, 600, 0, 0, 600, 900, 1200, 300), h3w(4), h3i()], False),
+                ('runcheck h3: the test aid on', 'h3', [h3l(1000, 0, 0, 0, 1000, 0, 0, 0, 0, 0, 0, 0), h3w(0), h3i()], False),
+                ('runcheck h3off: every pass passed through', 'h3off', [h3l(1000, 0, 0, 0, 1000, 0, 0, 0, 0, 0, 0, 0), h3w(0), h3i()], True),
+                ('runcheck h3off: the test aid did not take effect', 'h3off', [h3l(1000, 0, 400, 0, 0, 600, 0, 0, 600, 900, 1200, 300), h3w(0), h3i()], False),
+                ('runcheck h3169: o = 0 at every pass', 'h3169', [h3l(1000, 1000, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), h3w(0), h3i()], True),
+                ('runcheck h3169: anchored at 16:9', 'h3169', [h3l(1000, 990, 0, 0, 0, 10, 0, 0, 10, 5, 5, 0), h3w(0), h3i()], False),
+                ('runcheck h3: no H3 line (an older build)', 'h3', ['kh: aspect report: KHNMC_ASPECT=fill'], False),
+                # task 42 review finding 2: setScreenMode inside objects of an anchored pass: in centre objects (the talk window's zoom) allowed,
+                # in an anchored object a failure; the line itself required (a build before the fix has none)
+                ('runcheck h3: setScreenMode inside centre objects (camp)', 'h3', [h3l(1000, 0, 400, 0, 0, 600, 0, 0, 600, 900, 1200, 300), h3w(0), h3i(346, 173)], True),
+                ('runcheck h3: setScreenMode inside an anchored object', 'h3', [h3l(1000, 0, 400, 0, 0, 600, 0, 0, 600, 900, 1200, 300), h3w(0), h3i(348, 174, 2, 1, 1)], False),
+                ('runcheck h3: an h3-inner-mode-anchored WARNING line', 'h3', [h3l(1000, 0, 400, 0, 0, 600, 0, 0, 600, 900, 1200, 300), h3w(0), h3i(),
+                                                                                'kh: aspect: WARNING: h3-inner-mode-anchored: x'], False),
+                ('runcheck h3: no inner setScreenMode line (before the fix)', 'h3', [h3l(1000, 0, 400, 0, 0, 600, 0, 0, 600, 900, 1200, 300), h3w(0)], False),
+                ('runcheck h3off: inner setScreenMode counted', 'h3off', [h3l(1000, 0, 0, 0, 1000, 0, 0, 0, 0, 0, 0, 0), h3w(0), h3i(2, 1)], False)]
+    # task 42 review finding 4: objects centred for want of a classification are listed as a NOTE (with their pairs), not a failure
+    h3_note = ('runcheck h3: unlisted classes printed, still PASS', [h3l(1000, 0, 400, 0, 0, 600, 0, 0, 600, 900, 1200, 300), h3w(0, 3, 1, 2), h3i(),
+                                                                       'kh: aspect report: H3 centred: class not in the table, centred (its group is in the table) vtable 0x1405b1234 .?AVX@dk@@, group (+0x14) 7: 3 objects'])
+    with tempfile.TemporaryDirectory() as td:
+        for k, (name, role, lines_, want) in enumerate(h3_cases):
+            pth = os.path.join(td, 'h3_%02d.out' % k); open(pth, 'w').write('\n'.join(lines_) + '\n')
+            ok, out = h3check(pth, role)
+            good_ = ok == want; n += 1; fails += 0 if good_ else 1
+            print('fill_compare selftest: %-58s %s (expected %s)' % (name, 'PASS' if ok else 'FAIL', 'PASS' if want else 'FAIL') + ('' if good_ else '   <-- WRONG\n' + '\n'.join(out)))
+        pth = os.path.join(td, 'h3_note.out'); open(pth, 'w').write('\n'.join(h3_note[1]) + '\n')
+        ok, out = h3check(pth, 'h3')
+        good_ = ok and any('NOTE' in l and 'of a class not in the table 4 (its group in the table 3, not 1), generic children of a group not in the table 2: '
+                           'class not in the table, centred (its group is in the table) vtable 0x1405b1234 .?AVX@dk@@, group (+0x14) 7: 3 objects' in l for l in out)
+        n += 1; fails += 0 if good_ else 1
+        print('fill_compare selftest: %-58s %s (expected PASS with the NOTE)' % (h3_note[0], 'PASS' if ok else 'FAIL') + ('' if good_ else '   <-- WRONG\n' + '\n'.join(out)))
+        w3, h3_, o3, px3, scene0, draw = h3_synth()
+        rank0 = lambda i: 0.0 if i % 2 == 0 else None                                            # the style rank: centred, in every other moment
+        def frames(name, variant, nfr=4, roll=7, rank=rank0, extra=()):
+            """variant(element, s, moment) -> (shift or None, text rows cut); rank(moment) -> the style rank's shift or None (review
+            finding 3: h3static's centred element); extra: more (name, s, box) elements drawn by variant (the camp route's)"""
+            d = os.path.join(td, name); os.makedirs(d)
+            with open(os.path.join(d, 'index.tsv'), 'w') as f:
+                f.write('present\tfile\twidth\theight\tdraws_total\tgame_frame\n')
+                for i in range(nfr):
+                    img = np.roll(scene0, roll * i, axis=1).copy()                                      # the moments (roll 0: a static scene)
+                    for j, (en, s_, box) in enumerate(list(H3_ELEMENTS) + list(extra)):
+                        sh, cut = variant(en, s_, i)
+                        if sh is not None:
+                            draw(img, box, sh, 100 + j, cut, i if en in H3_SCISSORED else None)    # the INFORMATION text scrolls
+                    if rank(i) is not None:
+                        draw(img, H3_CENTRED[0][1], rank(i), 200, 0)
+                    fn = 'frame-%06d.ppm' % (100 + i)
+                    with open(os.path.join(d, fn), 'wb') as g:
+                        g.write(b'P6\n%d %d\n255\n' % (w3, h3_)); g.write(img.tobytes())
+                    f.write('%d\t%s\t%d\t%d\t%d\t%d\n' % (100 + i, fn, w3, h3_, 1000 * i, 100 + i))
+            return d
+        off_d = frames('off', lambda en, s_, i: (0.0, 0))
+        hp3 = [('h3pictures: the four elements at their edges', frames('t_ok', lambda en, s_, i: (s_ * o3, 0)), 0),
+               ('h3pictures: H3 off in both runs (nothing moved)', frames('t_same', lambda en, s_, i: (0.0, 0)), 1),
+               ('h3pictures: the top elements one row off', frames('t_off1', lambda en, s_, i: (s_ * o3 + (1 if s_ < 0 else 0), 0)), 1),
+               ('h3pictures: the INFORMATION text cut by the band scissor', frames('t_cut', lambda en, s_, i: (s_ * o3, 8 if en == 'INFORMATION bar' else 0)), 1),
+               ('h3pictures: the command menu moved to the top', frames('t_flip', lambda en, s_, i: ((-o3 if en == 'command menu' else s_ * o3), 0)), 1),
+               ('h3pictures: an element moved by half the offset', frames('t_half', lambda en, s_, i: (s_ * o3 / 2 if en == 'player gauges' else s_ * o3, 0)), 1)]
+        # an element never drawn in either run (here the enemy gauge) is a failure, unless --elements leaves it out
+        off_ne = frames('off_ne', lambda en, s_, i: (None if en == 'enemy gauge' else 0.0, 0))
+        t_ne = frames('t_ne', lambda en, s_, i: (None if en == 'enemy gauge' else s_ * o3, 0))
+        code, out = h3pictures(t_ne, off_ne, (w3, h3_), min_pairs=3)
+        good_ = code == 1 and any(l.startswith('  enemy gauge') and 'present in 0 pairs' in l and l.endswith('FAIL') for l in out); n += 1; fails += 0 if good_ else 1
+        print('fill_compare selftest: %-58s %d (expected 1)' % ('h3pictures: the enemy gauge never drawn', code) + ('' if good_ else '   <-- WRONG\n' + '\n'.join(out)))
+        code, out = h3pictures(t_ne, off_ne, (w3, h3_), min_pairs=3, only=['INFORMATION bar', 'command menu', 'player gauges'])
+        good_ = code == 0; n += 1; fails += 0 if good_ else 1
+        print('fill_compare selftest: %-58s %d (expected 0)' % ('h3pictures: the same, --elements without it', code) + ('' if good_ else '   <-- WRONG\n' + '\n'.join(out)))
+        for name, d, want in hp3:
+            code, out = h3pictures(d, off_d, (w3, h3_), min_pairs=3)
+            good_ = code == want; n += 1; fails += 0 if good_ else 1
+            print('fill_compare selftest: %-58s %d (expected %d)' % (name, code, want) + ('' if good_ else '   <-- WRONG\n' + '\n'.join(out)))
+        # (r): a centred element (the style rank's box) drawn moved in TALL; and no common moment at all
+        drest = frames('t_rest', lambda en, s_, i: (s_ * o3, 0))
+        for i in range(4):
+            fp = os.path.join(drest, 'frame-%06d.ppm' % (100 + i)); a = read_ppm(fp).copy()
+            x0, x1, y0, y1 = px3((384, 597, 130, 280)); a[y0 + 10:y1 + 10, x0:x1] = a[y0:y1, x0:x1].copy()      # the style rank 10 rows lower
+            with open(fp, 'wb') as g:
+                g.write(b'P6\n%d %d\n255\n' % (w3, h3_)); g.write(a.tobytes())
+        code, out = h3pictures(drest, off_d, (w3, h3_), min_pairs=3)
+        good_ = code == 1 and any('(r) the rest unchanged' in l and l.endswith('FAIL') for l in out); n += 1; fails += 0 if good_ else 1
+        print('fill_compare selftest: %-58s %d (expected 1, on (r))' % ('h3pictures: a centred element moved', code) + ('' if good_ else '   <-- WRONG\n' + '\n'.join(out)))
+        dnone = frames('t_none', lambda en, s_, i: (s_ * o3, 0))
+        for i in range(4):
+            fp = os.path.join(dnone, 'frame-%06d.ppm' % (100 + i)); a = read_ppm(fp).copy(); a[..., 2] ^= 1
+            with open(fp, 'wb') as g:
+                g.write(b'P6\n%d %d\n255\n' % (w3, h3_)); g.write(a.tobytes())
+        code, out = h3pictures(dnone, off_d, (w3, h3_), min_pairs=3)
+        good_ = code == 3; n += 1; fails += 0 if good_ else 1
+        print('fill_compare selftest: %-58s %d (expected 3 UNDECIDED)' % ('h3pictures: no common moment', code) + ('' if good_ else '   <-- WRONG\n' + '\n'.join(out)))
+        # too few shared moments but an element failing in them: FAIL, not UNDECIDED
+        code, out = h3pictures(frames('t_off1b', lambda en, s_, i: (s_ * o3 + (1 if s_ < 0 else 0), 0)), off_d, (w3, h3_), min_pairs=10)
+        good_ = code == 1; n += 1; fails += 0 if good_ else 1
+        print('fill_compare selftest: %-58s %d (expected 1)' % ('h3pictures: one row off, too few moments', code) + ('' if good_ else '   <-- WRONG\n' + '\n'.join(out)))
+        # a white flash over the scene region at different moments of two drifted runs: not a shared moment (UNDECIDED, not a pair)
+        def flash(name, variant, shift):
+            d = frames(name, variant)
+            for r in read_dumps(d).values():
+                fp = os.path.join(d, r['file']); a = np.roll(read_ppm(fp), shift, axis=1).copy()
+                sx0_, sx1_, sy0_, sy1_ = px3(H3_SCENE); a[sy0_ - 3:sy1_ + 3, sx0_ - 3:sx1_ + 3] = 255
+                with open(fp, 'wb') as g:
+                    g.write(b'P6\n%d %d\n255\n' % (w3, h3_)); g.write(a.tobytes())
+            return d
+        code, out = h3pictures(flash('t_flash', lambda en, s_, i: (s_ * o3, 0), 5), flash('o_flash', lambda en, s_, i: (0.0, 0), 0), (w3, h3_), min_pairs=3)
+        good_ = code == 3; n += 1; fails += 0 if good_ else 1
+        print('fill_compare selftest: %-58s %d (expected 3)' % ('h3pictures: a white flash at different moments', code) + ('' if good_ else '   <-- WRONG\n' + '\n'.join(out)))
+        # h3static: the same synthetic runs, judged without shared moments (TALL's dumps rolled by 3 frames: no moment is shared)
+        off10 = frames('off10', lambda en, s_, i: (0.0, 0), 10)
+        def rolled(name, variant, **kw):
+            d = frames(name, variant, 10, **kw); rs = sorted(read_dumps(d).values(), key=lambda r: r['present'])
+            arrs = [read_ppm(os.path.join(d, r['file'])).copy() for r in rs]
+            for k, r in enumerate(rs):
+                with open(os.path.join(d, r['file']), 'wb') as g:
+                    g.write(b'P6\n%d %d\n255\n' % (w3, h3_)); g.write(arrs[(k + 3) % len(arrs)].tobytes())
+            return d
+        hs = [('h3static: the four elements at their edges', rolled('s_ok', lambda en, s_, i: (s_ * o3, 0)), 0),
+              ('h3static: H3 off in both runs (nothing moved)', rolled('s_same', lambda en, s_, i: (0.0, 0)), 1),
+              ('h3static: the top elements one row off', rolled('s_off1', lambda en, s_, i: (s_ * o3 + (1 if s_ < 0 else 0), 0)), 1),
+              ('h3static: the command menu moved to the top', rolled('s_flip', lambda en, s_, i: ((-o3 if en == 'command menu' else s_ * o3), 0)), 1),
+              ('h3static: an element moved by half the offset', rolled('s_half', lambda en, s_, i: (s_ * o3 / 2 if en == 'player gauges' else s_ * o3, 0)), 1)]
+        # an element drawn at BOTH places (moved, and a ghost left in the band): its old place is no footprint -> FAIL
+        dboth = frames('s_both', lambda en, s_, i: (s_ * o3, 0), 10)
+        for k, r in enumerate(sorted(read_dumps(dboth).values(), key=lambda r: r['present'])):
+            fp = os.path.join(dboth, r['file']); a = read_ppm(fp).copy()
+            for j, (en, s_, box) in enumerate(H3_ELEMENTS):
+                draw(a, box, 0.0, 100 + j, 0)
+            with open(fp, 'wb') as g:
+                g.write(b'P6\n%d %d\n255\n' % (w3, h3_)); g.write(a.tobytes())
+        hs.append(('h3static: every element drawn at both places', dboth, 1))
+        off_st = frames('off_static', lambda en, s_, i: (0.0, 0), 10, 0)                      # a camera standing still: the scene behind
+        hs_static = ('h3static: correct, over a static scene', frames('s_static', lambda en, s_, i: (s_ * o3, 0), 10, 0), 0)   # is no footprint
+        for name, d, want in hs + [hs_static]:
+            code, out = h3static(d, off_st if d == hs_static[1] else off10, (w3, h3_))
+            good_ = code == want; n += 1; fails += 0 if good_ else 1
+            print('fill_compare selftest: %-58s %d (expected %d)' % (name, code, want) + ('' if good_ else '   <-- WRONG\n' + '\n'.join(out)))
+        # task 42 review finding 3: h3static's (c) and (r) without shared moments; each must fail on ITS line, every other line passing
+        def only_fail(out, mark):
+            fl = [l for l in out if 'FAIL' in l]
+            return len(fl) == 1 and mark in fl[0]
+        hs3 = [('h3static: the INFORMATION text cut by the band scissor', rolled('s_cut', lambda en, s_, i: (s_ * o3, 8 if en == 'INFORMATION bar' else 0)), None, '[TEXT CUT]'),
+               ('h3static: the style rank moved to the top (-o)', rolled('s_rank', lambda en, s_, i: (s_ * o3, 0), rank=lambda i: -o3 if i % 2 == 0 else None), None, '[MOVED]'),
+               ('h3static: the style rank moved down by 10 rows', rolled('s_rank10', lambda en, s_, i: (s_ * o3, 0), rank=lambda i: 10.0 if i % 2 == 0 else None), None, '[MOVED]'),
+               ('h3static: the style rank missing in TALL', rolled('s_norank', lambda en, s_, i: (s_ * o3, 0), rank=lambda i: None), None, '[MOVED]'),
+               ('h3static: the style rank in neither run (not judged)', rolled('s_norank2', lambda en, s_, i: (s_ * o3, 0), rank=lambda i: None), None, 'not judged')]
+        off10n = frames('off10n', lambda en, s_, i: (0.0, 0), 10, rank=lambda i: None)
+        for name, d, only_, mark in hs3:
+            code, out = h3static(d, off10n if 'in neither' in name else off10, (w3, h3_), only_)
+            good_ = code == 1 and only_fail(out, mark); n += 1; fails += 0 if good_ else 1
+            print('fill_compare selftest: %-58s %d (expected 1, on %s only)' % (name, code, mark) + ('' if good_ else '   <-- WRONG\n' + '\n'.join(out)))
+        code, out = h3static(hs3[4][1], off10n, (w3, h3_), [e[0] for e in H3_ELEMENTS])
+        good_ = code == 0; n += 1; fails += 0 if good_ else 1
+        print('fill_compare selftest: %-58s %d (expected 0)' % ('h3static: the same, --elements the four anchored ones', code) + ('' if good_ else '   <-- WRONG\n' + '\n'.join(out)))
+        # task 42 review finding 1: a camp-route element (the radar, top) drawn in moments 0..7 of 20 only: judged over its window
+        # (--presents), not over the whole run (there it is no footprint); drawn unmoved in TALL it fails
+        radar = [e for e in H3_CAMP if e[0] == 'radar']
+        cv = lambda sh: (lambda en, s_, i: ((sh(s_) if i < 8 else None) if en == 'radar' else None, 0))
+        c_off = frames('c_off', cv(lambda s_: 0.0), 20, rank=lambda i: None, extra=radar)
+        c_ok = frames('c_ok', cv(lambda s_: s_ * o3), 20, 11, rank=lambda i: None, extra=radar)
+        c_same = frames('c_same', cv(lambda s_: 0.0), 20, 11, rank=lambda i: None, extra=radar)
+        for name, d, pw, want in (('h3static: the radar (camp) over its window', c_ok, (100, 107), 0), ('h3static: the radar over the whole run (no footprint)', c_ok, None, 1),
+                                  ('h3static: the radar unmoved, over its window', c_same, (100, 107), 1)):
+            code, out = h3static(d, c_off, (w3, h3_), ['radar'], presents=pw)
+            good_ = code == want; n += 1; fails += 0 if good_ else 1
+            print('fill_compare selftest: %-58s %d (expected %d)' % (name, code, want) + ('' if good_ else '   <-- WRONG\n' + '\n'.join(out)))
     print('fill_compare selftest: %d cases, %d wrong' % (n, fails))
     return 1 if fails else 0
 
@@ -856,7 +1456,7 @@ def main():
         v = opt('--' + k.replace('_', '-'), float)
         if v is not None:
             th[k] = v
-    out = opt('--out'); png = opt('--png'); mp = opt('--min-pairs'); ms = opt('--min-share')
+    out = opt('--out'); png = opt('--png'); mp = opt('--min-pairs'); ms = opt('--min-share'); opt_els = opt('--elements'); opt_pres = opt('--presents')
     fs = opt('--fade-strip', float)
     if fs is not None:
         th['fade_strip'] = fs
@@ -916,11 +1516,45 @@ def main():
         if av[2] == 'off':
             offl = av[4].split(',') if len(av) == 5 else []
             if not offl or any(k not in OFF_NAMES for k in offl):
-                print('fill_compare: runcheck RUN.OUT off WxH LIST: LIST is the KHNMC_ASPECT_TEST_OFF value (h2, h2b, h2c, h4, h5, comma-separated)', file=sys.stderr); return 2
+                print('fill_compare: runcheck RUN.OUT off WxH LIST: LIST is the KHNMC_ASPECT_TEST_OFF value (h2, h2b, h2c, h3, h4, h5, comma-separated)', file=sys.stderr); return 2
         elif len(av) == 5:
             print(__doc__); return 2
         ok, out = fillcheck(av[1], av[2], sc, offl)
         print('fill_compare: runcheck %s (%s%s): %s' % (av[1], av[2], ' ' + ','.join(offl) if offl else '', 'PASS' if ok else 'FAIL')); print('\n'.join(out)); return 0 if ok else 1
+    if av[0] == 'runcheck' and len(av) in (3, 4) and av[2] in ('h3', 'h3off', 'h3169'):
+        ok, out = h3check(av[1], av[2])
+        print('fill_compare: runcheck %s (%s): %s' % (av[1], av[2], 'PASS' if ok else 'FAIL')); print('\n'.join(out)); return 0 if ok else 1
+    if av[0] == 'h3static' and len(av) == 4:
+        m = re.fullmatch(r'(\d+)x(\d+)', av[3])
+        if not m:
+            print('fill_compare: h3static: the screen must be WxH, not %s' % av[3], file=sys.stderr); return 2
+        els = opt_els.split(',') if opt_els else None
+        known = [x[0] for x in H3_ELEMENTS + H3_CAMP + H3_CENTRED + H3_CAMP_CENTRED]
+        if els and any(e not in known for e in els):
+            print('fill_compare: h3static: --elements takes names of %s' % ', '.join(known), file=sys.stderr); return 2
+        pw = None
+        if opt_pres:
+            mp_ = re.fullmatch(r'(\d+)-(\d+)', opt_pres)
+            if not mp_ or int(mp_.group(1)) > int(mp_.group(2)):
+                print('fill_compare: h3static: --presents takes FROM-TO (present numbers, FROM <= TO), not %s' % opt_pres, file=sys.stderr); return 2
+            pw = (int(mp_.group(1)), int(mp_.group(2)))
+        for d in av[1:3]:
+            if not os.path.isfile(os.path.join(d, 'index.tsv')):
+                print('fill_compare: %s/index.tsv is missing' % d, file=sys.stderr); return 2
+        code, out = h3static(av[1], av[2], (int(m.group(1)), int(m.group(2))), els, presents=pw)
+        print('fill_compare: h3static %s %s %s: %s' % (av[1], av[2], av[3], 'PASS' if code == 0 else 'FAIL')); print('\n'.join(out)); return code
+    if av[0] == 'h3pictures' and len(av) == 4:
+        m = re.fullmatch(r'(\d+)x(\d+)', av[3])
+        if not m:
+            print('fill_compare: h3pictures: the screen must be WxH, not %s' % av[3], file=sys.stderr); return 2
+        els = opt_els.split(',') if opt_els else None
+        if els and any(e not in [x[0] for x in H3_ELEMENTS] for e in els):
+            print('fill_compare: h3pictures: --elements takes names of %s' % ', '.join(x[0] for x in H3_ELEMENTS), file=sys.stderr); return 2
+        for d in av[1:3]:
+            if not os.path.isfile(os.path.join(d, 'index.tsv')):
+                print('fill_compare: %s/index.tsv is missing' % d, file=sys.stderr); return 2
+        code, out = h3pictures(av[1], av[2], (int(m.group(1)), int(m.group(2))), int(mp) if mp else 20, png, els)
+        print('fill_compare: h3pictures %s %s %s: %s' % (av[1], av[2], av[3], {0: 'PASS', 1: 'FAIL', 3: 'UNDECIDED'}[code])); print('\n'.join(out)); return code
     if av[0] == 'selftest' and len(av) == 1:
         return selftest()
     print(__doc__); return 2

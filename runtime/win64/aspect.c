@@ -64,7 +64,9 @@ double kh_aspect_o(double W,double H){ return narrow_d(W,H)?(H-9.0*W/16.0)/2.0:0
 double kh_aspect_b(double W,double H){ return narrow_d(W,H)?208.0*(kh_aspect_r(W,H)-1.0):0.0; }
 
 /* ---- configuration ---------------------------------------------------------------------------------------------------------- */
-int kh_aspect_m;                           /* task 40: KHNMC_ASPECT_LOG=2, the measurement M (also read by runtime/null_d3d12.c, bgload.c) */
+int kh_aspect_m;                           /* task 40: KHNMC_ASPECT_LOG=2, the measurement M (also read by runtime/null_d3d12.c) */
+int kh_aspect_dk;                          /* task 42: KHNMC_ASPECT=fill or the measurement M: runtime/bgload.c's f_4ad270 hook reports the
+                                              dk loop's next object (H3b, M); 0 with nothing set or pc without the log (one flag test) */
 void kh_aspect_config(const char *mode,const char *log,const char *test_h1){
     if(mode&&*mode){ if(!strcmp(mode,"pc")) asp_mode=0; else if(!strcmp(mode,"fill")) asp_mode=1;
         else kh_fatal(NULL,"aspect-mode-unknown: KHNMC_ASPECT=%s (known: pc, fill)",mode); }
@@ -74,32 +76,34 @@ void kh_aspect_config(const char *mode,const char *log,const char *test_h1){
         if(strcmp(test_h1,"unconditional")) kh_fatal(NULL,"aspect-test-h1-value: KHNMC_ASPECT_TEST_H1=%s (the only value is unconditional, a test aid)",test_h1);
         if(asp_mode!=1) kh_fatal(NULL,"aspect-test-h1-needs-fill: KHNMC_ASPECT_TEST_H1=unconditional changes H1, which runs only with KHNMC_ASPECT=fill");
         asp_h1_uncond=1; }
+    kh_aspect_dk=asp_mode||kh_aspect_m;
     if(asp_mode||kh_aspect_log)
         fprintf(stderr,"kh: aspect: KHNMC_ASPECT=%s%s%s\n",asp_mode?"fill (H1: no 16:9 bars on a screen narrower than 16:9":"pc",
                 asp_mode?(asp_h1_uncond?", UNCONDITIONAL: every frame, KHNMC_ASPECT_TEST_H1 test aid)":", on frames with the 3D view)"):"",
                 kh_aspect_m?"; KHNMC_ASPECT_LOG=2: size records and the measurement M on":kh_aspect_log?"; KHNMC_ASPECT_LOG=1: size records on":"");
 }
 /* task 40 test aids (plan step 5 / 7 tests; both need KHNMC_ASPECT=fill, any other value is a named fatal):
- *   KHNMC_ASPECT_TEST_OFF=list   comma-separated h2 (= h2b,h2c), h2b, h2c, h4, h5: those fill hooks pass straight through (the picture
- *                                "without its change"); the others stay on.
+ *   KHNMC_ASPECT_TEST_OFF=list   comma-separated h2 (= h2b,h2c), h2b, h2c, h3 (task 42), h4, h5: those fill hooks pass straight
+ *                                through (the picture "without its change"); the others stay on.
  *   KHNMC_ASPECT_TEST_NOCULL=1   H2b / H2c divide m11 by 2047/208 (the exe's guard band) instead of r: the "no-cull reference" of
  *                                plan step 5 (nothing is culled vertically inside the guard band; the tall picture must equal it). */
-static int asp_off_h2b, asp_off_h2c, asp_off_h4, asp_off_h5, asp_nocull;
+static int asp_off_h2b, asp_off_h2c, asp_off_h3, asp_off_h4, asp_off_h5, asp_nocull;
 void kh_aspect_test_config(const char *off,const char *nocull){
     if(off&&*off){
         if(asp_mode!=1) kh_fatal(NULL,"aspect-test-needs-fill: KHNMC_ASPECT_TEST_OFF=%s turns fill hooks off, which run only with KHNMC_ASPECT=fill",off);
         const char *p=off;
         while(*p){ size_t n=strcspn(p,",");
             if(n==2&&!strncmp(p,"h2",2)) asp_off_h2b=asp_off_h2c=1; else if(n==3&&!strncmp(p,"h2b",3)) asp_off_h2b=1; else if(n==3&&!strncmp(p,"h2c",3)) asp_off_h2c=1;
+            else if(n==2&&!strncmp(p,"h3",2)) asp_off_h3=1;
             else if(n==2&&!strncmp(p,"h4",2)) asp_off_h4=1; else if(n==2&&!strncmp(p,"h5",2)) asp_off_h5=1;
-            else kh_fatal(NULL,"aspect-test-off-value: KHNMC_ASPECT_TEST_OFF=%s: '%.*s' is not one of h2, h2b, h2c, h4, h5 (comma-separated)",off,(int)n,p);
+            else kh_fatal(NULL,"aspect-test-off-value: KHNMC_ASPECT_TEST_OFF=%s: '%.*s' is not one of h2, h2b, h2c, h3, h4, h5 (comma-separated)",off,(int)n,p);
             p+=n; if(*p==','){ p++; if(!*p) kh_fatal(NULL,"aspect-test-off-value: KHNMC_ASPECT_TEST_OFF=%s ends with a comma",off); } } }
     if(nocull&&*nocull){
         if(strcmp(nocull,"1")) kh_fatal(NULL,"aspect-test-nocull-value: KHNMC_ASPECT_TEST_NOCULL=%s (the only value is 1, a test aid)",nocull);
         if(asp_mode!=1) kh_fatal(NULL,"aspect-test-needs-fill: KHNMC_ASPECT_TEST_NOCULL=1 changes H2, which runs only with KHNMC_ASPECT=fill");
         asp_nocull=1; }
-    if(asp_off_h2b||asp_off_h2c||asp_off_h4||asp_off_h5||asp_nocull)
-        fprintf(stderr,"kh: aspect: TEST AID: %s%s%s%s%s(not for play)\n",asp_off_h2b?"H2b off; ":"",asp_off_h2c?"H2c off; ":"",asp_off_h4?"H4 off; ":"",asp_off_h5?"H5 off; ":"",
+    if(asp_off_h2b||asp_off_h2c||asp_off_h3||asp_off_h4||asp_off_h5||asp_nocull)
+        fprintf(stderr,"kh: aspect: TEST AID: %s%s%s%s%s%s(not for play)\n",asp_off_h2b?"H2b off; ":"",asp_off_h2c?"H2c off; ":"",asp_off_h3?"H3 off; ":"",asp_off_h4?"H4 off; ":"",asp_off_h5?"H5 off; ":"",
                 asp_nocull?"H2 divides m11 by 2047/208 instead of r (the no-cull reference); ":"");
 }
 void kh_aspect_drawlog_config(const char *v);
@@ -464,13 +468,252 @@ void kh_aspect_m_rs_scissor(KCtx *g,u32 n,u64 rects){             /* runtime/nul
     if(i<48){ rs[i].n++; iv_add(&rs[i].fr,fr); } pthread_mutex_unlock(&mm);
 }
 
+/* ==== task 42: H3, the HUD anchored to the edges of the tall frame (NATIVE-FILL-PLAN.md section 5 "H3 hook points (corrected)",
+ * section 8 step 6) ===================================================================================================================
+ *
+ * The HUD is drawn by the dk draw loop f_166640 (shard_0028.c:28068): setScreenMode f_126500({1,0,0,0}) (return address 0x140166677),
+ * which makes f_1433a0 compute MagicScale MS = GX+0xa0..0xac for the loop's mode (on a narrow screen: the 16:9 layout fitted to the
+ * full width and CENTRED vertically, MS.w = the band offset o in pixels); then for each object: the first is [rdi+0x18] (L166685,
+ * no call), the next ones come from f_4ad270(id [rbx+0xc]) (return address 0x140166693; 0 = end of the list); an object without
+ * flag 0x42 at +0x10 draws through its vtable slot 2; at the end f_126500 (return address 0x1401666bf) restores the previous mode.
+ * Every HUD draw M saw uses vertex shader 586160 (screen row = GS y * MS.y + MS.w), and f_1121d0 compares GX+0xa0's 16 bytes with its
+ * copy and re-stages them at every draw (0x140112321..), so a write to GX+0xac between two objects moves the next object's draws.
+ * The D3D12 scissor of a scissored object is mapped at the draw by f_142c00 with the same MS (f_1121d0 0x140112e80: r8 = GX+0x90,
+ * [r8+0x14] = MS.y, [r8+0x1c] = MS.w), so it moves with the object (the INFORMATION bar's rect: TASK42 item 3; checked by M).
+ *   H3a: post-call hook on f_126500 at return address 0x140166677 only: MS.w_centre = GX+0xac (just computed for the loop's mode);
+ *        the first object = [guest rdi + 0x18] (f_126500 saves and restores rdi: 0x140126505 / 0x140126530); GX+0xac = MS.w_centre +
+ *        s(first) * o.
+ *   H3b: runtime/bgload.c's f_4ad270 hook at return address 0x140166693: rax != 0: GX+0xac = MS.w_centre + s(rax) * o; rax = 0 (the end
+ *        of the list): nothing.
+ *   s = -1 top (GS y 0 at frame row 0), +1 bottom (GS y 416 at the frame's last row), 0 centre (MS.w_centre written explicitly, so
+ *        an object after an anchored one is centred again).  The loop's own restore at 0x1401666bf recomputes MS: nothing to undo.
+ *   o = (H - 9W/16) / 2 from GX+0x18 / +0x1c (kh_aspect_o, the band offset of tasks 37 / 40), in pixels as MS.w is (GX+0x28 = 1 and
+ *        MS.w = 135 = o at 1920x1350: M).  At 16:9 or wider o = 0 and H3 writes NOTHING (an exact identity), and with nothing set or
+ *        KHNMC_ASPECT=pc the hooks are one flag test and the lifted body.
+ *   A pass is anchored only when (a) the frame is tall: H1 removes the exe's 16:9 bars in this frame (the 3D view was drawn in this
+ *        game frame or the previous one, H1's gate; or KHNMC_ASPECT_TEST_H1=unconditional), otherwise the bars cover the strips and
+ *        the HUD stays in the band (counted: "bars on"); and (b) MS.w_centre equals o within 1/2 pixel, i.e. the exe centred the band
+ *        as H3 assumes (otherwise the pass is left as the exe made it: the named, counted condition h3-band-mismatch, a WARNING line).
+ *   KHNMC_ASPECT_TEST_OFF=h3: every pass is left as the exe made it (counted).
+ *
+ * The anchor table (TASK42 item 1).  An object's anchor comes from its class (vtable); the generic children (dk::Sprite,
+ * dk::SpriteImage, dk::SpriteMessage) take the anchor of their OWNER, named by the dk group at +0x14:
+ *   f_166950(obj, prio, group) registers every dk object with the dk manager [0x140abcd20] and stores the group:
+ *   `mov [rcx+0x14],r8d` at 0x14016695a; its task callback 0x1401667d0 appends the object to the draw list that f_166640 walks.  The
+ *   widget code passes ONE group for a widget and all its children: f_16a900 (the sprite init: group = its 6th argument,
+ *   0x14016a920), f_16aa10 (r9d, 0x14016aa20), f_16aa50 (7th argument, 0x14016aa6f); the command menu f_15aff0 / f_15b270 / f_15d4a0
+ *   / f_15dc80 / f_15e410 pass 1 (e.g. 0x14015b08f), COMMAND_ONE's f_15d670 passes 2 (0x14015d9ee), the enemy gauge's f_182dd0
+ *   passes 6 (0x140182e57), the INFORMATION bar's f_18d830 / f_18e520 pass 7 (0x14018db06), the lock-on's f_17bc60 0x11
+ *   (0x14017bd4a).  The engine itself treats +0x14 as the widget: f_166bd0(group) sets flag 0x2 (hidden: the 0x42 test of the draw
+ *   loop at 0x14016669f) on EVERY object of the manager whose +0x14 equals group (0x140166bff), and f_166f30 / f_167020 / f_167200 ...
+ *   compare +0x14 the same way.  M (task 40, M40/*-M-review.txt "first drawn object" bytes; task 42 per-class group counts) shows +0x14
+ *   = 1 on dk::COMMAND_DRAW and the dk::Sprite after the SpriteImage (GS y 290..637), 2 on COMMAND_ONE (and dk::ReactionDecideSprite),
+ *   8 on dk::COUNTER and its children (GS y -13.7..96.4, camp route), 3 on GAUGE_PLAYER / GAUGE_ONE /
+ *   CIRCLE_MASK / FACE / SECTOR_MASK, 6 on GAUGE_ENEMY and its dk::Sprite (GS y 26..44), 7 on INFORMATION_WINDOW, ScisSpriteMessage
+ *   and its dk::Sprite (GS y 15..58), 0x11 on LockOn, 0 on SpriteImage (first in the pass), dk::Layout, Radar, the menus' Tz:: objects
+ *   and the dk::Sprite / SpriteMessage after them.  A pointer field naming the owner does not exist (task 40: none in +0x08..+0x78).
+ * The group also guards a fixed class: a top (bottom) class whose group is in the group table as bottom (top) stays centred (counted,
+ * the class and group listed in the exit report: "class and group disagree"); a centre group (0 = no widget, 0x11) does not veto.  A
+ * class NOT in the table stays centred whatever its group (TASK42 item 1 "Anything unclassified stays centred", plan section 5 "Anything
+ * not in the table is drawn at the centre"; task 42 review finding 4: a group rule for unlisted classes would move classes nobody
+ * measured, e.g. a 3D-attached marker or a message window registered under a HUD group); a generic child of a group not in the table
+ * stays centred too.  Every such object is counted and its (class, group) pair listed in the exit report ("H3 centred: ..."), so a
+ * class M has not seen shows up there with its group (the camp route's NEXT_EXP / GET_MUNNY / ReactionDecideSprite were found that
+ * way and are now in the table). */
+enum { H3_CENTRE=0, H3_TOP=1, H3_BOTTOM=2, H3_GENERIC=3 };
+static const char *h3_aname[4]={"centre","top","bottom","owner"};
+typedef struct { u64 vt; const char *name; int anchor; const char *ev; } H3Cls;
+/* GS y = POSITION - xyOffset of the class's draws (0..416 = the 16:9 band; M40, story / default route, null backend) */
+static const H3Cls h3cls[]={
+    {GS_BASE+0x5b2078ull,"dk::GAUGE_ONE",H3_BOTTOM,"HP / MP / Drive bars, GS y 265.9..445.1 (story) / 310..400.5 (default), group 3"},
+    {GS_BASE+0x5b2018ull,"dk::CIRCLE_MASK",H3_BOTTOM,"the face ring, GS y 260..425.7 / 305..405, group 3"},
+    {GS_BASE+0x5b2048ull,"dk::FACE",H3_BOTTOM,"GS y 296..407 / 305..400, group 3"},
+    {GS_BASE+0x5b1fe8ull,"dk::SECTOR_MASK",H3_BOTTOM,"a mask quad of the face gauge (GS y -1837..6351), drawn with FACE, group 3"},
+    {GS_BASE+0x5b2100ull,"dk::GAUGE_PLAYER",H3_BOTTOM,"container of the player gauges (no draws), group 3"},
+    {GS_BASE+0x5b2158ull,"dk::GAUGE_FRIEND",H3_BOTTOM,"party gauges (plan section 5 table; never drawn in M: flag 0x42 on every visit), groups 4 / 5 (statically: f_181d20 -> f_17ed50, the group table)"},
+    {GS_BASE+0x5b1c28ull,"dk::COMMAND_DRAW",H3_BOTTOM,"container of the command menu (no draws), group 1"},
+    {GS_BASE+0x5b1bf8ull,"dk::COMMAND_ONE",H3_BOTTOM,"command slots, GS y 282..637 (the panel continues below the band), group 2"},
+    {GS_BASE+0x5b21e0ull,"dk::GAUGE_ENEMY",H3_TOP,"container of the enemy gauge (its dk::Sprite: GS y 26..44), group 6"},
+    {GS_BASE+0x5b2430ull,"dk::INFORMATION_WINDOW",H3_TOP,"container of the INFORMATION bar (no draws), group 7"},
+    {GS_BASE+0x5b2400ull,"dk::ScisSpriteMessage",H3_TOP,"INFORMATION text, GS y 14..58, scissored, group 7"},
+    {GS_BASE+0x5b1df0ull,"dk::Layout",H3_CENTRE,"the mod's style rank (battle), group 0: measured, it rests at the band's vertical centre (its draws' GS y mid-points 192..224 in both routes, 2,935 of 3,602 in 192..208; band centre 208; GS y 61.7..361.7 is its zoom-in): no edge is nearer, so centred"},
+    {GS_BASE+0x5b2370ull,"dk::COUNTER",H3_TOP,"the mission counter's container (no draws), group 8; its dk::Sprite children: GS y -13.7..96.4 (camp route M)"},
+    {GS_BASE+0x5b2460ull,"dk::NEXT_EXP",H3_TOP,"camp route M: GS y 37..54 at the left edge (x -61..-27), group 7 (the INFORMATION widget's EXP line)"},
+    {GS_BASE+0x5b2490ull,"dk::GET_MUNNY",H3_TOP,"camp route M: GS y 37..92 at the left edge (x -57..-10), group 7 (the munny line)"},
+    {GS_BASE+0x5b1bc8ull,"dk::ReactionDecideSprite",H3_BOTTOM,"camp route M: the reaction command over the command menu, GS y 204.5..336.25, x -122..26, group 2"},
+    {GS_BASE+0x5b24f8ull,"dk::LockOn",H3_CENTRE,"attached to 3D (follows the target, GS y 17..814), group 0x11"},
+    {GS_BASE+0x5b2540ull,"dk::Exp",H3_CENTRE,"attached to 3D (plan section 5); camp route M: GS y 108..233 mid-screen, group 15"},
+    {GS_BASE+0x5b1b60ull,"dk::TREASURE_EVENT_INFO",H3_CENTRE,"camp route M: a full-band event window (GS y -63..416), group 0"},
+    {GS_BASE+0x5b24c0ull,"dk::Sprite3D",H3_CENTRE,"attached to 3D (skipped by flag 0x42 in M)"},
+    {GS_BASE+0x5b2340ull,"dk::Radar",H3_TOP,"the minimap, top right: no draws in the loop in the default and story routes; in the camp route (frames 20846+) its draws' GS y mid-points lie in 16..112 at x 273..789, inside the scissor (1604,177)-(1874,426) = GS x 485..581, y 16..112 at 1920x1350; group 0"},
+    {GS_BASE+0x5b2638ull,"dk::LEVELUP_INFO",H3_CENTRE,"container, no draws in either route, group 0"},
+    {GS_BASE+0x5b1b90ull,"dk::TREASURE_INFO",H3_CENTRE,"container, no draws in either route, group 0"},
+    {GS_BASE+0x5b1ee0ull,"dk::BILLBOARD_PLACE",H3_CENTRE,"no draws in either route, group 0"},
+    {GS_BASE+0x5b1e80ull,"dk::BILLBOARD_GUIDE",H3_CENTRE,"32 draws at GS y 360..388 in story frames 3475-3506 only, group 0: not classified by M, centred"},
+    {GS_BASE+0x5b1dc0ull,"Tz::Layout",H3_CENTRE,"full-screen menus (title, New Game, camp menu): the 16:9 safe area"},
+    {GS_BASE+0x5bab18ull,"Tz::MenuItem",H3_CENTRE,"menus"},
+    {GS_BASE+0x5baba8ull,"Tz::LightCur",H3_CENTRE,"menus"},
+    {GS_BASE+0x5b8478ull,"Tz::LayMsg",H3_CENTRE,"the camp menu (camp route, frames 20518-21813)"},{GS_BASE+0x5bbc20ull,"Tz::MultiSeq",H3_CENTRE,"the camp menu"},
+    {GS_BASE+0x5bab58ull,"Tz::LaySeqMess",H3_CENTRE,"the camp menu"},{GS_BASE+0x5bac58ull,"Tz::MenuObj",H3_CENTRE,"the camp menu (a full-frame quad)"},
+    {GS_BASE+0x5c5180ull,"YS::WINDOW_OBJ2D",H3_CENTRE,"message (talk) windows: the centred band"},
+    {GS_BASE+0x5b1a70ull,"dk::Sprite",H3_GENERIC,"generic child: its owner's anchor by the group +0x14"},
+    {GS_BASE+0x5b1a40ull,"dk::SpriteImage",H3_GENERIC,"generic (first in the HUD pass, group 0: centre)"},
+    {GS_BASE+0x5b1aa0ull,"dk::SpriteMessage",H3_GENERIC,"generic text (menus: group 0)"}};
+#define H3_NCLS ((int)(sizeof h3cls/sizeof *h3cls))
+typedef struct { u32 grp; int anchor; const char *owner; } H3Grp;
+static const H3Grp h3grp[]={
+    {1,H3_BOTTOM,"the command menu (dk::COMMAND_DRAW and its children)"},{2,H3_BOTTOM,"dk::COMMAND_ONE"},
+    {3,H3_BOTTOM,"the player gauges (dk::GAUGE_PLAYER, GAUGE_ONE, CIRCLE_MASK, FACE, SECTOR_MASK)"},
+    /* task 42 review finding 5: the party gauges' groups, read statically (never drawn in the routes: dk::GAUGE_FRIEND has flag 0x42 at
+     * every visit).  f_17ed50 (the gauge init) stores r9d / r8d at +0x34 / +0x38 and registers with group r8d + r9d + 3 (0x14017ed82
+     * `lea ecx,[r9+0x3]`, 0x14017ed86 `add r8d,ecx`, 0x14017ed8c `jmp 0x140166950`); f_17edf0 returns the same sum for the children.
+     * The player gauge f_17f270 passes 0 / 0 (0x14017f284 / 0x14017f287): group 3, as M measured.  The GAUGE_FRIEND builder f_181d20
+     * sets r9d = 1 (0x140181d41) and is called twice: r8d = 1 (0x14016c5ca, call 0x14016c5d3) -> group 5, r8d = 0 (0x14016c5e9, call
+     * 0x14016c5ef) -> group 4.  Its children (constructor 0x14016b5a0: dk::FACE at +0x50, 4 dk::GAUGE_ONE at +0x370, 5 dk::CIRCLE_MASK at
+     * +0xb70) register with that group (r15d = f_17edf0's result: f_17e4b0 r9d at 0x140181dcd, f_17ed10 -> f_16a900's 6th argument at
+     * 0x140181da8), so a generic child of the party gauges takes the bottom with them */
+    {4,H3_BOTTOM,"the party gauges (dk::GAUGE_FRIEND built by f_181d20 with r8d = 0: f_17ed50 group r8d + r9d + 3 = 4) and their children"},
+    {5,H3_BOTTOM,"the party gauges (dk::GAUGE_FRIEND built by f_181d20 with r8d = 1: group 5) and their children"},
+    {6,H3_TOP,"the enemy gauge (dk::GAUGE_ENEMY)"},
+    {8,H3_TOP,"the mission counter (dk::COUNTER and its children: f_18be20 registers them with group 8, 0x14018be6c / 0x14018bf2b; camp route M: GS y -13.7..96.4)"},{7,H3_TOP,"the INFORMATION bar (dk::INFORMATION_WINDOW, ScisSpriteMessage)"},
+    {0x11,H3_CENTRE,"the lock-on (dk::LockOn)"},
+    {0,H3_CENTRE,"no widget: the HUD pass's head dk::SpriteImage, dk::Layout, Radar, the menus' Tz:: objects and their children"}};
+#define H3_NGRP ((int)(sizeof h3grp/sizeof *h3grp))
+/* why an object got its anchor */
+enum { H3W_CLASS=0, H3W_GROUP, H3W_UNLISTED, H3W_UNCLASSIFIED, H3W_GROUP_UNKNOWN, H3W_DISAGREE, H3W_N };
+static const char *h3_wname[H3W_N]={"by its class","by its owner's group (+0x14)","class not in the table, centred (its group is in the table)","class not in the table, centred (its group is not in the table either)",
+                                     "generic child of a group not in the table","class and group disagree"};
+static int h3_cls_index(u64 vt){ for(int i=0;i<H3_NCLS;i++) if(h3cls[i].vt==vt) return i; return -1; }
+static int h3_grp_index(u32 grp){ for(int i=0;i<H3_NGRP;i++) if(h3grp[i].grp==grp) return i; return -1; }
+/* the anchor of an object of class vtable vt and dk group grp: H3_CENTRE / H3_TOP / H3_BOTTOM, *why = H3W_* */
+int kh_aspect_h3_anchor(u64 vt,u32 grp,int *why){
+    int c=h3_cls_index(vt), k=h3_grp_index(grp), w, a;
+    if(c<0){ w=k<0?H3W_UNCLASSIFIED:H3W_UNLISTED; a=H3_CENTRE; }                         /* not in the table: centred (TASK42 item 1), listed */
+    else if(h3cls[c].anchor==H3_GENERIC){ if(k<0){ w=H3W_GROUP_UNKNOWN; a=H3_CENTRE; } else { w=H3W_GROUP; a=h3grp[k].anchor; } }
+    else if(h3cls[c].anchor!=H3_CENTRE&&k>=0&&h3grp[k].anchor!=H3_CENTRE&&h3grp[k].anchor!=h3cls[c].anchor){ w=H3W_DISAGREE; a=H3_CENTRE; }   /* top against bottom */
+    else { w=H3W_CLASS; a=h3cls[c].anchor; }
+    if(why) *why=w; return a;
+}
+/* the MS.w H3 writes for an anchor: centre wc, top wc - o, bottom wc + o (single precision, as MS is stored) */
+static float h3_value(float wc,float o,int anchor){ return anchor==H3_TOP?wc-o:anchor==H3_BOTTOM?wc+o:wc; }
+typedef struct { _Atomic u64 passes, off, identity, bars, mismatch, anchored, empty, first[3], next[3], ends, nopass, nested, why[H3W_N], cls[H3_NCLS+1][3];
+                 _Atomic u64 inner, inner_back, inner_anch, inner_reapplied, inner_other; _Atomic int warned, warned_inner; float mm_wc, mm_o; } H3Stat;
+static H3Stat h3; static _Atomic int h3_logged;
+/* setScreenMode (f_126500) inside an object of an anchored pass, by (class of the current object, return address) (task 42 review finding 2) */
+typedef struct { u64 vt, ra, n, back; int a; char name[72]; } H3Inner;
+static H3Inner h3in[16]; static int n_h3in; static u64 h3in_cut;
+/* (class, group) pairs that were centred for want of a classification or because the class and the group disagree (exit report) */
+typedef struct { u64 vt; u32 grp; int why; u64 n; char name[72]; } H3Odd;
+static H3Odd h3odd[32]; static int n_h3odd; static u64 h3odd_cut;
+static void rtti_name(KCtx *g,u64 vt,char *out,size_t n);    /* M, below */
+#define H3_DEPTH 4
+static __thread int h3_depth;              /* dk passes begun (H3a) and not yet restored (0x1401666bf) on this thread */
+static __thread int h3_on[H3_DEPTH]; static __thread float h3_wc[H3_DEPTH], h3_o[H3_DEPTH];
+/* per anchored pass: the loop's MagicScale as H3a found it (GX+0xa0..0xac bits, before H3 wrote) and the current object (its class, its
+ * anchor, the MS.w H3 wrote for it; anchor -1 = none yet) */
+static __thread u32 h3_ms[H3_DEPTH][4]; static __thread u64 h3_cur_vt[H3_DEPTH]; static __thread int h3_cur_a[H3_DEPTH]; static __thread float h3_cur_v[H3_DEPTH];
+/* one object: its anchor, GX+0xac written; `first` = H3a (the list head), else H3b */
+static void h3_apply(KCtx *g,u64 obj,int first){
+    int d=h3_depth-1; u64 vt=(GA_OK(obj)&&GA_OK(obj+0x17))?rd64(g,obj):0; u32 grp=vt?rd32(g,obj+0x14):0; int why, a=kh_aspect_h3_anchor(vt,grp,&why);
+    float v=h3_value(h3_wc[d],h3_o[d],a); wrf(g,GX+0xac,v); h3_cur_vt[d]=vt; h3_cur_a[d]=a; h3_cur_v[d]=v;
+    h3.anchored++; (first?h3.first:h3.next)[a]++; h3.why[why]++; { int c=h3_cls_index(vt); h3.cls[c<0?H3_NCLS:c][a]++; }
+    if(why>=H3W_UNLISTED&&vt){ pthread_mutex_lock(&mm); int i; for(i=0;i<n_h3odd;i++) if(h3odd[i].vt==vt&&h3odd[i].grp==grp&&h3odd[i].why==why) break;
+        if(i==n_h3odd){ if(n_h3odd<32){ h3odd[i].vt=vt; h3odd[i].grp=grp; h3odd[i].why=why; rtti_name(g,vt,h3odd[i].name,sizeof h3odd[i].name); n_h3odd++; } else h3odd_cut++; }
+        if(i<32) h3odd[i].n++; pthread_mutex_unlock(&mm); }
+}
+/* H3a: after the lifted f_126500 returned to 0x140166677 (list = guest rdi) */
+static void h3a_post(KCtx *g){
+    h3.passes++;
+    if(h3_depth>0) h3.nested++;
+    int d=h3_depth<H3_DEPTH?h3_depth:H3_DEPTH-1; h3_depth=d+1; h3_on[d]=0;
+    if(asp_off_h3){ h3.off++; return; }
+    float W=rdf(g,GX+0x18), H=rdf(g,GX+0x1c); double o=(W>0&&H>0)?kh_aspect_o(W,H):0.0;
+    if(o==0.0){ h3.identity++; return; }                                             /* 16:9 or wider: nothing is written */
+    if(!asp_h1_uncond&&!gate_open_at(kh_game_frames())){ h3.bars++; return; }         /* the exe's bars are on this frame: the HUD stays in the band */
+    float wc=rdf(g,GX+0xac);
+    double dw=(double)wc-o; if(!(dw<=0.5&&dw>=-0.5)){ h3.mismatch++; h3.mm_wc=wc; h3.mm_o=(float)o;
+        if(!atomic_exchange(&h3.warned,1)) fprintf(stderr,"kh: aspect: WARNING: h3-band-mismatch: the dk loop's MagicScale.w is %g where the band offset o of the %gx%g screen is %g: the pass is left as the exe made it (counted)\n",wc,W,H,o);
+        return; }
+    h3_on[d]=1; h3_wc[d]=wc; h3_o[d]=(float)o; h3_cur_vt[d]=0; h3_cur_a[d]=-1;
+    for(int i=0;i<4;i++) h3_ms[d][i]=rd32(g,GX+0xa0+4ull*(u64)i);
+    if(kh_aspect_log&&!atomic_exchange(&h3_logged,1))
+        fprintf(stderr,"kh: aspect: H3: first anchored dk pass: screen %gx%g, o %g; MagicScale (GX+0xa0..0xac) %g %g %g %g; GS frame GX+0x38/0x3c %g/%g, GX+0x48/0x4c %g/%g; GX+0x28 %g; game frame %llu, present %llu, guest thread %u\n",
+                W,H,o,rdf(g,GX+0xa0),rdf(g,GX+0xa4),rdf(g,GX+0xa8),wc,rdf(g,GX+0x38),rdf(g,GX+0x3c),rdf(g,GX+0x48),rdf(g,GX+0x4c),rdf(g,GX+0x28),P(kh_game_frames()),P(gfx_presents),cur_tid());
+    u64 list=KH_RDI(g), first=GA_OK(list+0x18)&&GA_OK(list+0x1f)?rd64(g,list+0x18):0;
+    if(first) h3_apply(g,first,1); else h3.empty++;
+}
+/* H3b: f_4ad270 returned obj to 0x140166693 */
+static void h3b_post(KCtx *g,u64 obj){
+    if(!h3_depth){ h3.nopass++; return; }
+    if(!h3_on[h3_depth-1]) return;
+    if(!obj){ h3.ends++; return; }
+    h3_apply(g,obj,0);
+}
+static void h3_end(void){ if(h3_depth>0) h3_depth--; }                                 /* the loop's restore (0x1401666bf) */
+/* task 42 review finding 2: f_126500 returned to an address other than 0x140166677 / 0x1401666bf while an anchored pass is open on this
+ * thread, i.e. from inside the current object's draw (the dk loop calls nothing else between H3a and its restore but slot 2, f_4ad270
+ * and f_126500).  f_126500 always calls f_1433a0 (shard_0023.c L126515), which recomputes MagicScale for the mode it sets, so the
+ * object's anchored MS.w is gone after the call.  YS::WINDOW_OBJ2D does this (0x1403bc4c7: its zoom mode {0.8, 0, 0, w}, 0x1403bc4f0:
+ * the saved mode back; camp route M: 173 + 173), a centre class.  When the call leaves the loop's own MagicScale (all of GX+0xa0..0xac
+ * as H3a found it: the loop's mode is back) and the object is anchored, its anchored MS.w is written again, so the rest of its draws
+ * stay at its edge; another MagicScale (a mode of the object's own) is left as the exe made it.  Every call is counted by (class,
+ * return address); one in an ANCHORED object is the named condition h3-inner-mode-anchored (a WARNING line once and in the report;
+ * runcheck h3 requires 0): its draws in its own mode are not anchored, and no anchored class has been measured doing it. */
+static void h3_inner_post(KCtx *g,u64 ra){
+    int d=h3_depth-1, a=h3_cur_a[d]; u64 vt=h3_cur_vt[d]; int anch=a==H3_TOP||a==H3_BOTTOM, back=1;
+    for(int i=0;i<4;i++) if(rd32(g,GX+0xa0+4ull*(u64)i)!=h3_ms[d][i]) back=0;
+    h3.inner++; if(back) h3.inner_back++;
+    if(anch){ h3.inner_anch++; if(back){ wrf(g,GX+0xac,h3_cur_v[d]); h3.inner_reapplied++; } else h3.inner_other++; }
+    pthread_mutex_lock(&mm); int i; for(i=0;i<n_h3in;i++) if(h3in[i].vt==vt&&h3in[i].ra==ra) break;
+    if(i==n_h3in){ if(n_h3in<16){ memset(&h3in[i],0,sizeof h3in[i]); h3in[i].vt=vt; h3in[i].ra=ra; h3in[i].a=a; if(vt) rtti_name(g,vt,h3in[i].name,sizeof h3in[i].name); else snprintf(h3in[i].name,sizeof h3in[i].name,"(no object yet)"); n_h3in++; } else h3in_cut++; }
+    if(i<16){ h3in[i].n++; if(back) h3in[i].back++; }
+    if(anch&&!atomic_exchange(&h3.warned_inner,1))
+        fprintf(stderr,"kh: aspect: WARNING: h3-inner-mode-anchored: setScreenMode (f_126500) from return address 0x%llx inside an anchored object (%s, vtable 0x%llx, %s): "
+                       "%s; its draws in a mode of its own are not anchored (counted; see the exit report)\n",P(ra),i<16?h3in[i].name:"?",P(vt),h3_aname[a],
+                       back?"the loop's MagicScale is back, its anchored MS.w written again":"another mode, left as the exe made it");
+    pthread_mutex_unlock(&mm);
+}
+static void h3_report(FILE *f){
+    fprintf(f,"kh: aspect report: H3 (HUD anchoring, dk loop 0x166640: f_126500 at 0x140166677 = H3a, f_4ad270 at 0x140166693 = H3b): passes %llu: "
+              "o = 0 (16:9 or wider), nothing written %llu; the exe's bars on (no 3D view), left centred %llu; band mismatch (h3-band-mismatch), left %llu; test aid off %llu; anchored %llu (empty list %llu); "
+              "begun inside another pass %llu; objects: first (H3a) top %llu bottom %llu centre %llu, next (H3b) top %llu bottom %llu centre %llu; ends of the list (rax = 0) %llu; next object outside a pass %llu\n",
+            P(h3.passes),P(h3.identity),P(h3.bars),P(h3.mismatch),P(h3.off),P(h3.passes-h3.identity-h3.bars-h3.mismatch-h3.off),P(h3.empty),P(h3.nested),
+            P(h3.first[H3_TOP]),P(h3.first[H3_BOTTOM]),P(h3.first[H3_CENTRE]),P(h3.next[H3_TOP]),P(h3.next[H3_BOTTOM]),P(h3.next[H3_CENTRE]),P(h3.ends),P(h3.nopass));
+    fprintf(f,"kh: aspect report: H3 objects by the reason of their anchor:"); for(int w=0;w<H3W_N;w++) fprintf(f,"%s %s %llu",w?";":"",h3_wname[w],P(h3.why[w])); fputc('\n',f);
+    fprintf(f,"kh: aspect report: H3 objects by class (top / bottom / centre):");
+    for(int c=0;c<=H3_NCLS;c++){ u64 t=h3.cls[c][H3_TOP], b=h3.cls[c][H3_BOTTOM], m=h3.cls[c][H3_CENTRE]; if(t||b||m) fprintf(f," %s %llu/%llu/%llu;",c<H3_NCLS?h3cls[c].name:"(not in the table)",P(t),P(b),P(m)); }
+    fputc('\n',f);
+    pthread_mutex_lock(&mm);
+    for(int i=0;i<n_h3odd;i++)
+        fprintf(f,"kh: aspect report: H3 centred: %s vtable 0x%llx %s, group (+0x14) %u: %llu objects\n",h3_wname[h3odd[i].why],P(h3odd[i].vt),h3odd[i].name,h3odd[i].grp,P(h3odd[i].n));
+    if(h3odd_cut) fprintf(f,"kh: aspect report: H3 centred: %llu objects of further (class, group) pairs (table full)\n",P(h3odd_cut));
+    pthread_mutex_unlock(&mm);
+    fprintf(f,"kh: aspect report: H3 setScreenMode (f_126500) inside an object of an anchored pass (any return address but 0x140166677 / 0x1401666bf; f_126500 recomputes MagicScale): %llu: "
+              "the loop's MagicScale back after it %llu; in anchored objects %llu (the loop's MagicScale back: the anchored MS.w written again %llu; another mode, left as the exe made it %llu)\n",
+            P(h3.inner),P(h3.inner_back),P(h3.inner_anch),P(h3.inner_reapplied),P(h3.inner_other));
+    pthread_mutex_lock(&mm);
+    for(int i=0;i<n_h3in;i++) fprintf(f,"kh: aspect report: H3 setScreenMode inside an object: %s vtable 0x%llx (%s) from return address 0x%llx: %llu (the loop's MagicScale back after it %llu)\n",
+                                      h3in[i].name,P(h3in[i].vt),h3in[i].a>=0?h3_aname[h3in[i].a]:"no object",P(h3in[i].ra),P(h3in[i].n),P(h3in[i].back));
+    if(h3in_cut) fprintf(f,"kh: aspect report: H3 setScreenMode inside an object: %llu calls of further (class, return address) pairs (table full)\n",P(h3in_cut));
+    pthread_mutex_unlock(&mm);
+    if(h3.inner_anch) fprintf(f,"kh: aspect: WARNING: h3-inner-mode-anchored: %llu setScreenMode calls inside anchored objects (anchored MS.w written again after %llu, another mode left %llu): not measured, see the lines above\n",
+                              P(h3.inner_anch),P(h3.inner_reapplied),P(h3.inner_other));
+    if(h3.mismatch) fprintf(f,"kh: aspect: WARNING: h3-band-mismatch: %llu dk passes left as the exe made them (MagicScale.w %g against o %g at the last)\n",P(h3.mismatch),h3.mm_wc,h3.mm_o);
+    if(h3.nested||h3.nopass) fprintf(f,"kh: aspect: NOTE: H3: %llu dk passes begun inside another pass, %llu next objects outside a pass (both 0 in task 40's M)\n",P(h3.nested),P(h3.nopass));
+}
+
 /* ---- M: the dk draw loop and the draws ----------------------------------------------------------------------------------------- */
 enum { VK_NONE, VK_586160, VK_586710, VK_586c80, VK_5871b0, VK_593b10, VK_59ac40, VK_3D, VK_UNKNOWN, VK_N };
 static const char *vk_name[VK_N]={"no-pso","586160","586710","586c80","5871b0","593b10","59ac40","3d","unknown-vs"};
 static int vk_ms(int k){ return k==VK_586160||k==VK_586710||k==VK_586c80; }      /* the VS that read MagicScale.zw (plan section 5) */
 /* yreach / yout: MagicScale draws whose GS y range reaches beyond the 16:9 frame 0..416 / lies wholly beyond it, and when (task 40
  * review finding 4: dk::COMMAND_ONE's range 290..637 runs past the screen; these say how many draws and in which frames) */
-typedef struct { u64 vt; char name[72]; u64 seen, skipped, first, nested, draws[VK_N], ydraws, ycb, ystg, yreach, yout; int pmin,pmax; float ymin,ymax,xmin,xmax,pymin,pymax; Ivs fr, fryr; u8 snap[0x40]; int have_snap; } DkCls;
+/* task 42 (the anchor table's evidence): per class the dk groups (+0x14) of its drawn objects, where its MagicScale draws' staged
+ * MagicScale came from (GX+0xa0 = what H3 writes, GX+0x90 = a row H3 does not move, neither), and a histogram of its draws' GS y
+ * mid-points (8-row bins from GS y -16: the resting place of an animated element such as the style rank) */
+#define YH_N 56
+typedef struct { u64 vt; char name[72]; u64 seen, skipped, first, nested, draws[VK_N], ydraws, ycb, ystg, yreach, yout; int pmin,pmax; float ymin,ymax,xmin,xmax,pymin,pymax; Ivs fr, fryr; u8 snap[0x40]; int have_snap;
+                 u32 grpv[6]; u64 grpn[6], grpcut, mss[4], yh[YH_N], grpd[6]; float grpy0[6], grpy1[6]; } DkCls;
 static DkCls dkc[192]; static int n_dkc; static u64 dkc_cut, dk_passes, dk_passes_nested, dk_objects, dk_out_draws[VK_N], dk_gap_draws[VK_N];
 static u32 dk_tid, draw_tid; static u64 draws_other_thread;
 static float xyo[8][2]; static u64 xyo_n[8]; static int n_xyo; static u64 ms_novb, ms_nocb;
@@ -550,7 +793,10 @@ static void dk_set(KCtx *g,u64 obj){
     pthread_mutex_lock(&mm); int i=dk_class(g,obj); dk_objects++;
     if(i>=0){ DkCls *c=&dkc[i]; c->seen++; if(dk_pos==0) c->first++; if(dk_pos<c->pmin) c->pmin=dk_pos; if(dk_pos>c->pmax) c->pmax=dk_pos;
         if(rd8(g,obj+0x10)&0x42) c->skipped++; iv_add(&c->fr,(u32)kh_game_frames());
-        if(!c->have_snap&&GA_OK(obj)&&GA_OK(obj+0x3f)&&!(rd8(g,obj+0x10)&0x42)){ memcpy(c->snap,hp(g,obj),0x40); c->have_snap=1; } }   /* the first drawn object's bytes (owner field: plan section 5) */
+        if(!c->have_snap&&GA_OK(obj)&&GA_OK(obj+0x3f)&&!(rd8(g,obj+0x10)&0x42)){ memcpy(c->snap,hp(g,obj),0x40); c->have_snap=1; }   /* the first drawn object's bytes (owner field: plan section 5) */
+        if(GA_OK(obj+0x17)&&!(rd8(g,obj+0x10)&0x42)){ u32 gr=rd32(g,obj+0x14); int k;                                                     /* task 42: its dk group */
+            for(k=0;k<6;k++) if(c->grpn[k]&&c->grpv[k]==gr) break; if(k==6) for(k=0;k<6;k++) if(!c->grpn[k]) break;
+            if(k<6){ c->grpv[k]=gr; c->grpn[k]++; } else c->grpcut++; } }
     pthread_mutex_unlock(&mm);
     if(i!=dk_last_cls) dk_prev_other=dk_last_cls; dk_last_cls=i;                       /* the class of the nearest preceding object of another class */
     dk_cur=i; dk_obj=obj; dk_pos++;
@@ -591,17 +837,25 @@ static int m_chain(KCtx *g,u64 *ra,int max){
     for(u64 a=sp;a<sp+0x2000&&n<max;a+=8){ if(!GA_OK(a+7)) break; u64 v=rd64(g,a); if(v>=text_lo&&v<text_hi&&call_before(g,v)) ra[n++]=v; }
     return n;
 }
-void kh_aspect_dk_next(KCtx *g,u64 ra,u64 obj){    /* runtime/bgload.c f_4ad270, KHNMC_ASPECT_LOG=2: obj = its result */
-    if(ra!=DK_RA_NEXT||!dk_in) return; dk_set(g,obj); }
+/* runtime/bgload.c f_4ad270 when kh_aspect_dk (fill, or KHNMC_ASPECT_LOG=2): obj = its result.  H3b first (it sets the object's MS.w
+ * before M notes the object current; M records only) */
+void kh_aspect_dk_next(KCtx *g,u64 ra,u64 obj){
+    if(ra!=DK_RA_NEXT) return;
+    if(asp_mode) h3b_post(g,obj);
+    if(kh_aspect_m&&dk_in) dk_set(g,obj); }
 void orig_f_126500(KCtx *);
 void f_126500(KCtx *g){
-    if(__builtin_expect(!kh_aspect_m,1)){ orig_f_126500(g); return; }
+    if(__builtin_expect(!kh_aspect_m&&!asp_mode,1)){ orig_f_126500(g); return; }
     u64 ra=rd64(g,KH_RSP(g));
-    if(ra==DK_RA_END){ if(dk_in){ dk_in=0; dk_cur=-1; dk_obj=0; } orig_f_126500(g); return; }
-    if(ra!=DK_RA_MODE&&dk_in&&dk_cur>=0){ pthread_mutex_lock(&mm); dkc[dk_cur].nested++; int i; for(i=0;i<n_nra;i++) if(nra[i].ra==ra) break;
+    if(ra==DK_RA_END){ if(asp_mode) h3_end(); if(kh_aspect_m&&dk_in){ dk_in=0; dk_cur=-1; dk_obj=0; } orig_f_126500(g); return; }
+    if(kh_aspect_m&&ra!=DK_RA_MODE&&dk_in&&dk_cur>=0){ pthread_mutex_lock(&mm); dkc[dk_cur].nested++; int i; for(i=0;i<n_nra;i++) if(nra[i].ra==ra) break;
         if(i==n_nra&&n_nra<32){ nra[i].ra=ra; n_nra++; } if(i<32) nra[i].n++; pthread_mutex_unlock(&mm); }
+    int inner=asp_mode&&ra!=DK_RA_MODE&&h3_depth>0&&h3_on[h3_depth-1];               /* task 42 review: inside an object of an anchored pass */
     orig_f_126500(g);
+    if(inner) h3_inner_post(g,ra);
     if(ra==DK_RA_MODE){                                                              /* the plan's H3a point: list = guest rdi */
+        if(asp_mode) h3a_post(g);                                                    /* task 42: H3a (before M notes the first object) */
+        if(!kh_aspect_m) return;
         u64 list=KH_RDI(g); pthread_mutex_lock(&mm); dk_passes++; if(dk_in) dk_passes_nested++; if(!dk_tid) dk_tid=cur_tid(); pthread_mutex_unlock(&mm);
         dk_in=1; dk_pos=0; dk_cur=-1; dk_obj=0; dk_last_cls=dk_prev_other=-1;
         if(GA_OK(list+0x18)) dk_set(g,rd64(g,list+0x18)); }
@@ -626,6 +880,9 @@ void kh_aspect_m_draw(KCtx *g,const KhMDraw *d){
     else if(dk_cur<0) dk_gap_draws[kind]++;
     else { DkCls *c=&dkc[dk_cur]; c->draws[kind]++;
         if(yv){ c->ydraws++; if(d->src==3) c->ystg++; else c->ycb++; float xa=d->xmin-ox, xb=d->xmax-ox;
+            if(dk_obj&&GA_OK(dk_obj+0x17)){ u32 gr=rd32(g,dk_obj+0x14);                                         /* task 42: GS y per (class, group) */
+                for(int k=0;k<6;k++) if(c->grpn[k]&&c->grpv[k]==gr){ if(!c->grpd[k]++){ c->grpy0[k]=a; c->grpy1[k]=b; } else { if(a<c->grpy0[k]) c->grpy0[k]=a; if(b>c->grpy1[k]) c->grpy1[k]=b; } break; } }
+            c->mss[d->mssrc&3]++; { float ym=(a+b)*0.5f; int bi=ym<-16.0f?0:ym>=-16.0f+8.0f*YH_N?YH_N-1:(int)((ym+16.0f)/8.0f); if(bi<0) bi=0; if(bi>=YH_N) bi=YH_N-1; c->yh[bi]++; }   /* task 42 */
             if(a<c->ymin) c->ymin=a; if(b>c->ymax) c->ymax=b; if(xa<c->xmin) c->xmin=xa; if(xb>c->xmax) c->xmax=xb;
             if(pa<c->pymin) c->pymin=pa; if(pb>c->pymax) c->pymax=pb;
             if(a<0||b>416){ c->yreach++; if(b<0||a>416) c->yout++; iv_add(&c->fryr,(u32)kh_game_frames()); } }
@@ -682,6 +939,11 @@ static void m_report(FILE *f){
         if(c->ydraws){ fprintf(f,"; its %llu MagicScale draws with vertices (rows from a bound CB %llu, from the staged rows only %llu): GS frame (POSITION - xyOffset) y %g..%g, x %g..%g; screen rows (y MagicScale.y + MagicScale.w) %.1f..%.1f",P(c->ydraws),P(c->ycb),P(c->ystg),c->ymin,c->ymax,c->xmin,c->xmax,c->pymin,c->pymax);
             fprintf(f,"; of them reaching beyond the 16:9 frame (GS y < 0 or > 416) %llu, wholly beyond it %llu",P(c->yreach),P(c->yout)); if(c->yreach){ fprintf(f," (in"); iv_print(f,&c->fryr); fputc(')',f); } }
         if(c->draws[VK_5871b0]||c->draws[VK_593b10]||c->draws[VK_3D]||c->draws[VK_59ac40]) fprintf(f,"; FLAG: draws that ignore MagicScale.zw");
+        { int any=0; for(int k=0;k<6;k++) if(c->grpn[k]){ fprintf(f,"%s%u x%llu",any?", ":"; dk groups (+0x14) of its drawn objects: ",c->grpv[k],P(c->grpn[k]));      /* task 42 */
+              if(c->grpd[k]) fprintf(f," (%llu MagicScale draws, GS y %g..%g)",P(c->grpd[k]),c->grpy0[k],c->grpy1[k]); any=1; }
+          if(c->grpcut) fprintf(f,", other groups x%llu",P(c->grpcut));
+          if(c->ydraws){ fprintf(f,"; staged MagicScale of its draws: GX+0xa0 %llu, GX+0x90 %llu, neither %llu; GS y mid-points (8-row bins from -16):",P(c->mss[1]),P(c->mss[2]),P(c->mss[3]));
+              for(int k=0;k<YH_N;k++) if(c->yh[k]) fprintf(f," [%d..%d)=%llu",-16+8*k,-8+8*k,P(c->yh[k])); } }
         fputc(';',f); iv_print(f,&c->fr);
         if(c->have_snap){ fprintf(f,"; first drawn object +0x00..0x3f:"); for(int k=0;k<0x40;k+=4){ u32 v; memcpy(&v,c->snap+k,4); fprintf(f,"%s%08x",k%16?" ":" | ",v); } }
         fputc('\n',f); }
@@ -761,6 +1023,7 @@ void kh_aspect_report(FILE *f){
         fprintf(f,"; totals: rewritten %llu + %llu, already %llu, other rect %llu + %llu\n",P(tr),P(sr),P(ta),P(to),P(so));
         if(to||so) fprintf(f,"kh: aspect: NOTE: H4 left %llu fade / bar draws and %llu bar settings with a rect that is neither the exe's nor the extended one (see the M lines for the rects)\n",P(to),P(so));
         fprintf(f,"kh: aspect report: H5 (full-height scissors, 0x126fd0): calls %llu: extended %llu, other rects (left) %llu, r = 1 %llu, test aid off %llu\n",P(h5_calls),P(h5_ext),P(h5_other),P(h5_identity),P(h5_off));
+        h3_report(f);                                                               /* task 42 */
     }
     if(kh_aspect_m) m_report(f);
     if(!kh_aspect_log) return;
@@ -788,6 +1051,15 @@ static u64 st_call(KCtx *g,void (*fn)(KCtx*),const u64 *a,int n,int *rsp_ok){
     fn(g); u64 r=KH_RAX(g); if(rsp_ok) *rsp_ok=KH_RSP(g)==sp+8;
     KH_RSP(g)=sv[0]; KH_RCX(g)=sv[1]; KH_RDX(g)=sv[2]; KH_R8(g)=sv[3]; KH_R9(g)=sv[4]; return r;
 }
+/* task 42: the same with a chosen return address (the hooks H3a / H3b act only at the dk loop's call sites) and guest rdi (f_166640's
+ * list; f_126500 saves and restores it) */
+static u64 st_call_ra(KCtx *g,void (*fn)(KCtx*),u64 ra,u64 rdi,const u64 *a,int n,int *rsp_ok){
+    u64 sv[6]={KH_RSP(g),KH_RCX(g),KH_RDX(g),KH_R8(g),KH_R9(g),KH_RDI(g)}, sp=(sv[0]-0x400)&~15ull; memset(hp(g,sp),0,0x80);
+    for(int i=4;i<n;i++) wr64(g,sp+0x20+8ull*(u64)(i-4),a[i]);
+    sp-=8; wr64(g,sp,ra); KH_RSP(g)=sp; KH_RCX(g)=n>0?a[0]:0; KH_RDX(g)=n>1?a[1]:0; KH_R8(g)=n>2?a[2]:0; KH_R9(g)=n>3?a[3]:0; KH_RDI(g)=rdi;
+    fn(g); u64 r=KH_RAX(g); if(rsp_ok) *rsp_ok=KH_RSP(g)==sp+8&&KH_RDI(g)==rdi;
+    KH_RSP(g)=sv[0]; KH_RCX(g)=sv[1]; KH_RDX(g)=sv[2]; KH_R8(g)=sv[3]; KH_R9(g)=sv[4]; KH_RDI(g)=sv[5]; return r;
+}
 static u64 st_vcall(KCtx *g,u64 obj,int slot,u64 a1){      /* a COM method through the object's guest vtable */
     u64 sv[3]={KH_RSP(g),KH_RCX(g),KH_RDX(g)}, sp=((sv[0]-0x400)&~15ull)-8; wr64(g,sp,0x7ff7ffff0000ull); KH_RSP(g)=sp; KH_RCX(g)=obj; KH_RDX(g)=a1;
     kh_dispatch(g,rd64(g,rd64(g,obj)+8ull*(u64)slot)); u64 r=KH_RAX(g); KH_RSP(g)=sv[0]; KH_RCX(g)=sv[1]; KH_RDX(g)=sv[2]; return r;
@@ -809,7 +1081,7 @@ static int fatal_case(int which,const char *expect){
         case 5: kh_aspect_config(NULL,"yes",NULL); break;
         case 6: kh_aspect_config("fill",NULL,"always"); break;
         case 7: kh_aspect_config("pc",NULL,"unconditional"); break;
-        case 8: asp_mode=1; kh_aspect_test_config("h2,h3",NULL); break;              /* task 40 test aids */
+        case 8: asp_mode=1; kh_aspect_test_config("h2,h6",NULL); break;              /* task 40 test aids */
         case 9: asp_mode=0; kh_aspect_test_config("h2",NULL); break;
         case 10: asp_mode=1; kh_aspect_test_config(NULL,"yes"); break;
         case 11: asp_mode=0; kh_aspect_test_config(NULL,"1"); break;
@@ -901,6 +1173,187 @@ static void h2t_fn(KCtx *g){ h2t_seen=rd32(g,h2t_cam+CAM_M11); if(h2t_put) wr32(
 static u64 h2w_cam[3]; static u32 h2w_seen[3]; static int h2w_calls;
 static void h2w_fn(KCtx *g){ h2w_calls++; for(int i=0;i<3;i++) h2w_seen[i]=rd32(g,h2w_cam[i]+CAM_M11); }
 void f_19cfc0(KCtx *);
+/* ---- task 42: H3 through the real hooks and the lifted bodies -----------------------------------------------------------------------
+ * One dk pass as f_166640 makes it: setScreenMode = the hook f_126500 (lifted f_126500 -> f_11c150, f_1433a0) with return address
+ * 0x140166677 and guest rdi = the list ([list+0x18] = the first object); the next objects = the hook f_4ad270 (runtime/bgload.c; lifted
+ * f_4ad270 decodes the id the lifted f_4ad240 made) with return address 0x140166693; the end of the list = id 0 (rax = 0); the
+ * restore = f_126500 with return address 0x1401666bf.  ws[i] = GX+0xac after object i's hook; before every H3b call GX+0xac holds a
+ * signalling NaN, so ws[i] is that NaN exactly when H3b wrote nothing; ws[n] = after the end of the list. */
+void f_4ad270(KCtx *);
+#define H3T_SNAN 0x7f80dead
+#define ID_TAB (GS_BASE+0x2b0d720ull)       /* the id table (runtime/idtable.c PTAB) and its guard: saved and restored around the test */
+static int h3t_pass(KCtx *g,const u64 *objs,int n,float *ws,float *wsend){
+    u64 list=ga_calloc(1,0x80), out=ga_calloc(1,0x20), mode=ga_calloc(1,0x10), back=ga_calloc(1,0x20); int ok=h3_depth==0, k;
+    wr64(g,list+0x18,objs[0]); wrf(g,mode,1.0f);                                                 /* f_166640's mode {1,0,0,0} */
+    st_call_ra(g,f_126500,DK_RA_MODE,list,(u64[]){out,mode},2,&k); ok&=k; ws[0]=rdf(g,GX+0xac);
+    for(int i=1;i<n;i++){ u32 id=(u32)kh_call(g,GS_BASE+0x4ad240ull,objs[i],0,0,0); wr32(g,GX+0xac,H3T_SNAN);
+        u64 r=st_call_ra(g,f_4ad270,DK_RA_NEXT,list,(u64[]){id},1,&k); ok&=k&&r==objs[i]; ws[i]=rdf(g,GX+0xac); }
+    wr32(g,GX+0xac,H3T_SNAN); u64 r=st_call_ra(g,f_4ad270,DK_RA_NEXT,list,(u64[]){0},1,&k); ok&=k&&r==0; *wsend=rdf(g,GX+0xac);
+    st_call_ra(g,f_126500,DK_RA_END,list,(u64[]){back,out},2,&k); ok&=k&&h3_depth==0;         /* the loop's restore: the pass is over */
+    ga_free(list); ga_free(out); ga_free(mode); ga_free(back); return ok;
+}
+static u64 h3t_obj(KCtx *g,u64 vt,u32 grp){ u64 o=ga_calloc(1,0x40); wr64(g,o,vt); wr32(g,o+0x14,grp); return o; }
+static void h3_selftest(KCtx *g){
+    /* the anchor lookup: every class of the table, the generic children by their owner group, the guards */
+    { int w;
+      for(int c=0;c<H3_NCLS;c++) if(h3cls[c].anchor!=H3_GENERIC){ ACHECK(kh_aspect_h3_anchor(h3cls[c].vt,0,&w)==h3cls[c].anchor&&w==H3W_CLASS); }   /* group 0: no veto */
+      static const u64 gen[3]={GS_BASE+0x5b1a70ull,GS_BASE+0x5b1a40ull,GS_BASE+0x5b1aa0ull};                 /* dk::Sprite, SpriteImage, SpriteMessage */
+      for(int i=0;i<3;i++){
+          ACHECK(kh_aspect_h3_anchor(gen[i],1,&w)==H3_BOTTOM&&w==H3W_GROUP&&kh_aspect_h3_anchor(gen[i],2,NULL)==H3_BOTTOM&&kh_aspect_h3_anchor(gen[i],3,NULL)==H3_BOTTOM);
+          ACHECK(kh_aspect_h3_anchor(gen[i],6,NULL)==H3_TOP&&kh_aspect_h3_anchor(gen[i],7,&w)==H3_TOP&&w==H3W_GROUP);
+          ACHECK(kh_aspect_h3_anchor(gen[i],0x11,&w)==H3_CENTRE&&w==H3W_GROUP);
+          ACHECK(kh_aspect_h3_anchor(gen[i],0,&w)==H3_CENTRE&&w==H3W_GROUP&&kh_aspect_h3_anchor(gen[i],99,&w)==H3_CENTRE&&w==H3W_GROUP_UNKNOWN); }
+      /* "a child takes its owner's anchor": the (owner class, group) pairs M measured (+0x14 of the drawn objects) give the child the
+       * owner's anchor */
+      static const struct { u64 vt; u32 grp; } own[]={{GS_BASE+0x5b1c28ull,1},{GS_BASE+0x5b1bf8ull,2},{GS_BASE+0x5b2100ull,3},{GS_BASE+0x5b2078ull,3},{GS_BASE+0x5b2018ull,3},
+          {GS_BASE+0x5b2048ull,3},{GS_BASE+0x5b1fe8ull,3},{GS_BASE+0x5b21e0ull,6},{GS_BASE+0x5b2430ull,7},{GS_BASE+0x5b2400ull,7},{GS_BASE+0x5b24f8ull,0x11},
+          {GS_BASE+0x5b2158ull,4},{GS_BASE+0x5b2158ull,5}};                                     /* the party gauges (statically: review finding 5) */
+      for(size_t i=0;i<sizeof own/sizeof *own;i++){ int wo, wc; ACHECK(kh_aspect_h3_anchor(own[i].vt,own[i].grp,&wo)==kh_aspect_h3_anchor(gen[0],own[i].grp,&wc)&&wo==H3W_CLASS&&wc==H3W_GROUP); }
+      /* the decisions of section 1 of implementation notes (measured: M40, run-B42/M), pinned: (vtable, its measured group, anchor) */
+      static const struct { u32 vt, grp; int a; } dec[]={{0x5b2078,3,H3_BOTTOM},{0x5b2018,3,H3_BOTTOM},{0x5b2048,3,H3_BOTTOM},{0x5b1fe8,3,H3_BOTTOM},{0x5b2100,3,H3_BOTTOM},
+          {0x5b1c28,1,H3_BOTTOM},{0x5b1bf8,2,H3_BOTTOM},{0x5b1bc8,2,H3_BOTTOM},{0x5b21e0,6,H3_TOP},{0x5b2430,7,H3_TOP},{0x5b2400,7,H3_TOP},{0x5b2460,7,H3_TOP},
+          {0x5b2490,7,H3_TOP},{0x5b2370,8,H3_TOP},{0x5b2340,0,H3_TOP},{0x5b1df0,0,H3_CENTRE},{0x5b24f8,0x11,H3_CENTRE},{0x5b2540,15,H3_CENTRE},{0x5b1dc0,0,H3_CENTRE},
+          {0x5c5180,0,H3_CENTRE},{0x5b1a70,7,H3_TOP},{0x5b1a70,6,H3_TOP},{0x5b1a70,8,H3_TOP},{0x5b1a70,1,H3_BOTTOM},{0x5b1a40,1,H3_BOTTOM},{0x5b1a40,0,H3_CENTRE},
+          /* task 42 review finding 5: the party gauges' groups 4 / 5 (f_181d20 -> f_17ed50, statically) and their children */
+          {0x5b2158,4,H3_BOTTOM},{0x5b2158,5,H3_BOTTOM},{0x5b2048,4,H3_BOTTOM},{0x5b2078,5,H3_BOTTOM},{0x5b2018,4,H3_BOTTOM},
+          {0x5b1a70,4,H3_BOTTOM},{0x5b1a70,5,H3_BOTTOM},{0x5b1a40,4,H3_BOTTOM},{0x5b1a40,5,H3_BOTTOM}};
+      for(size_t i=0;i<sizeof dec/sizeof *dec;i++) ACHECK(kh_aspect_h3_anchor(GS_BASE+dec[i].vt,dec[i].grp,NULL)==dec[i].a);
+      ACHECK(kh_aspect_h3_anchor(GS_BASE+0x5b1a70ull,4,&w)==H3_BOTTOM&&w==H3W_GROUP&&kh_aspect_h3_anchor(GS_BASE+0x5b1a70ull,5,&w)==H3_BOTTOM&&w==H3W_GROUP);   /* not "group unknown" */
+      ACHECK(kh_aspect_h3_anchor(GS_BASE+0x5b2400ull,4,&w)==H3_CENTRE&&w==H3W_DISAGREE&&kh_aspect_h3_anchor(GS_BASE+0x5b2158ull,5,&w)==H3_BOTTOM&&w==H3W_CLASS);
+      ACHECK(kh_aspect_h3_anchor(GS_BASE+0x5b2078ull,7,&w)==H3_CENTRE&&w==H3W_DISAGREE);                 /* a bottom class in the top group: centred */
+      ACHECK(kh_aspect_h3_anchor(GS_BASE+0x5b2430ull,3,&w)==H3_CENTRE&&w==H3W_DISAGREE);
+      ACHECK(kh_aspect_h3_anchor(GS_BASE+0x5b24f8ull,7,&w)==H3_CENTRE&&w==H3W_CLASS);                     /* attached to 3D: centre whatever its group */
+      ACHECK(kh_aspect_h3_anchor(GS_BASE+0x5b2078ull,99,&w)==H3_BOTTOM&&w==H3W_CLASS);                    /* a group not in the table: the class holds */
+      ACHECK(kh_aspect_h3_anchor(GS_BASE+0x5b2078ull,0x11,&w)==H3_BOTTOM&&w==H3W_CLASS&&kh_aspect_h3_anchor(GS_BASE+0x5b2430ull,0,&w)==H3_TOP&&w==H3W_CLASS);   /* a centre group does not veto */
+      /* a class not in the table stays centred whatever its group (TASK42 item 1; review finding 4), the reason says whether the group is known */
+      ACHECK(kh_aspect_h3_anchor(GS_BASE+0x5b1234ull,7,&w)==H3_CENTRE&&w==H3W_UNLISTED&&kh_aspect_h3_anchor(GS_BASE+0x5b1234ull,2,&w)==H3_CENTRE&&w==H3W_UNLISTED);
+      ACHECK(kh_aspect_h3_anchor(GS_BASE+0x5b1234ull,3,&w)==H3_CENTRE&&w==H3W_UNLISTED&&kh_aspect_h3_anchor(GS_BASE+0x5b1234ull,6,&w)==H3_CENTRE&&w==H3W_UNLISTED);
+      ACHECK(kh_aspect_h3_anchor(GS_BASE+0x5b1234ull,0x11,&w)==H3_CENTRE&&w==H3W_UNLISTED&&kh_aspect_h3_anchor(GS_BASE+0x5b1234ull,9,&w)==H3_CENTRE&&w==H3W_UNCLASSIFIED);
+      ACHECK(kh_aspect_h3_anchor(GS_BASE+0x5b1a70ull,8,&w)==H3_TOP&&w==H3W_GROUP&&kh_aspect_h3_anchor(GS_BASE+0x5b2370ull,8,&w)==H3_TOP&&w==H3W_CLASS);   /* the counter */
+      ACHECK(kh_aspect_h3_anchor(0,99,&w)==H3_CENTRE&&w==H3W_UNCLASSIFIED);
+      ACHECK(h3_value(135.0f,135.0f,H3_TOP)==0.0f&&h3_value(135.0f,135.0f,H3_BOTTOM)==270.0f&&h3_value(135.0f,135.0f,H3_CENTRE)==135.0f);
+      ACHECK(h3_value(188.0625f,188.0625f,H3_TOP)==0.0f&&h3_value(188.0625f,188.0625f,H3_BOTTOM)==376.125f); }
+    /* the passes through the real hooks */
+    u8 gxsave[0x100]; memcpy(gxsave,hp(g,GX),0x100); u32 guard=rd32(g,GX_GUARD);                  /* GX's first 0x100 bytes: sizes, mode, MS, scissor */ wr32(g,GX_GUARD,0x80000000u);
+    u8 tsave[0x204]; memcpy(tsave,hp(g,ID_TAB),0x204); int tlive=rd32(g,ID_TAB+0x200)!=0;
+    if(!tlive){ for(int i=0;i<64;i++) wr64(g,ID_TAB+8ull*i,~0ull); wr32(g,ID_TAB+0x200,0x80000000u); }   /* as 0x4ad2c0 leaves it */
+    int sm=asp_mode, su=asp_h1_uncond, so=asp_off_h3, sdk=kh_aspect_dk, sml=kh_aspect_m; u64 s3=atomic_load(&last3d_plus1); H3Stat sh; memcpy(&sh,&h3,sizeof sh);
+    kh_aspect_m=0; kh_aspect_dk=1; asp_h1_uncond=0; asp_off_h3=0; h3.warned=1; h3.warned_inner=1;   /* no WARNING lines from the test cases */
+    /* f_1433a0 (0x1433a0..0x14355f, this = GX+8) reads the screen GX+0x18 / +0x1c, GX+0x10 / +0x14, the scales GX+0x20 / +0x24 / +0x28 and
+     * the GS frame 512 x 416 at GX+0x38 / +0x3c and GX+0x48 / +0x4c (the values a run has: task 42's first-pass line); it writes MS at
+     * GX+0xa0..0xac (MS.w = mode.w * h + (GX+0x14 - h) / 2, h = 9W/16 on a narrow screen), SafeScale GX+0xb0, the flag GX+0xb4 = 1 */
+    #define H3SCREEN(W_,H_) do{ wrf(g,GX+0x18,(float)(W_)); wrf(g,GX+0x1c,(float)(H_)); wrf(g,GX+0x10,(float)(W_)); wrf(g,GX+0x14,(float)(H_)); wrf(g,GX+0x20,1); wrf(g,GX+0x24,1); wrf(g,GX+0x28,1); \
+                                wrf(g,GX+0x38,512); wrf(g,GX+0x3c,416); wrf(g,GX+0x48,512); wrf(g,GX+0x4c,416); }while(0)
+    /* the objects: a top class FIRST in its pass (the H3a case), then bottom, a generic child of the INFORMATION group (top), one of
+     * the command group (bottom), the lock-on (centre), a generic child of group 0 (centre), an unclassified class of a group not in the
+     * table (centre), a bottom
+     * class again (after the centre ones: the centre ones must have restored MS.w_centre in between) */
+    const u64 o[8]={h3t_obj(g,GS_BASE+0x5b2400ull,7),h3t_obj(g,GS_BASE+0x5b2078ull,3),h3t_obj(g,GS_BASE+0x5b1a70ull,7),h3t_obj(g,GS_BASE+0x5b1a70ull,1),
+                    h3t_obj(g,GS_BASE+0x5b24f8ull,0x11),h3t_obj(g,GS_BASE+0x5b1a70ull,0),h3t_obj(g,GS_BASE+0x5b9990ull,9),h3t_obj(g,GS_BASE+0x5b2048ull,3)};
+    static const int exp[8]={-1,+1,-1,+1,0,0,0,+1};
+    static const int scr[6][2]={{1920,1350},{2670,1878},{1920,1080},{2560,1440},{3840,2160},{2560,1080}};
+    for(int s=0;s<6;s++){ H3SCREEN(scr[s][0],scr[s][1]); double o_=kh_aspect_o(scr[s][0],scr[s][1]); float ws[8], we, pc[8], pce;
+        note_3d(kh_game_frames());
+        asp_mode=0; u64 np0=h3.nopass, ps0=h3.passes; ACHECK(h3t_pass(g,o,8,pc,&pce));                  /* pc: the exe's MS.w_centre */
+        ACHECK(fbits(pc[0])!=H3T_SNAN&&fbits(pce)==H3T_SNAN); for(int i=1;i<8;i++) ACHECK(fbits(pc[i])==H3T_SNAN);   /* pc: H3b writes nothing */
+        { float pm[8], pme; kh_aspect_m=1; ACHECK(h3t_pass(g,o,8,pm,&pme)); kh_aspect_m=0;              /* pc with the measurement M: the hooks run, H3 does not */
+          ACHECK(fbits(pm[0])==fbits(pc[0])&&fbits(pme)==H3T_SNAN); for(int i=1;i<8;i++) ACHECK(fbits(pm[i])==H3T_SNAN);
+          ACHECK(h3.nopass==np0&&h3.passes==ps0&&h3_depth==0); }
+        if(s<2) ACHECK(pc[0]==(float)o_);                                                               /* the exe's MS.w is the band offset o */
+        else ACHECK(pc[0]==0.0f);
+        asp_mode=1; u64 a0=h3.anchored, id0=h3.identity; ACHECK(h3t_pass(g,o,8,ws,&we));                /* fill */
+        ACHECK(fbits(we)==H3T_SNAN);                                                                     /* the end of the list: nothing */
+        if(s<2){ for(int i=0;i<8;i++) ACHECK(ws[i]==pc[0]+(float)exp[i]*(float)o_);
+                 ACHECK(ws[0]==0.0f&&ws[1]==2.0f*pc[0]&&h3.anchored==a0+8); }                          /* top: GS y 0 at row 0; bottom: 416 at the last row */
+        else { ACHECK(fbits(ws[0])==fbits(pc[0])&&h3.identity==id0+1&&h3.anchored==a0); for(int i=1;i<8;i++) ACHECK(fbits(ws[i])==H3T_SNAN); } }   /* 16:9 or wider: nothing written */
+    /* the bars on (no 3D view in this frame or the previous one): the pass stays centred, nothing written; with
+     * KHNMC_ASPECT_TEST_H1=unconditional it is anchored */
+    { H3SCREEN(1920,1350); float ws[8], we; atomic_store(&last3d_plus1,0); asp_mode=1; u64 b0=h3.bars;
+      ACHECK(h3t_pass(g,o,8,ws,&we)&&ws[0]==135.0f&&h3.bars==b0+1); for(int i=1;i<8;i++) ACHECK(fbits(ws[i])==H3T_SNAN);
+      asp_h1_uncond=1; ACHECK(h3t_pass(g,o,8,ws,&we)&&ws[0]==0.0f&&ws[1]==270.0f&&ws[4]==135.0f); asp_h1_uncond=0; note_3d(kh_game_frames()); }
+    /* the test aid off: nothing written, counted */
+    { float ws[8], we; asp_off_h3=1; u64 f0=h3.off; ACHECK(h3t_pass(g,o,8,ws,&we)&&ws[0]==135.0f&&h3.off==f0+1); for(int i=1;i<8;i++) ACHECK(fbits(ws[i])==H3T_SNAN); asp_off_h3=0; }
+    /* a first object of each anchor (H3a anchors the head of the list, not only the objects from f_4ad270) and an empty list */
+    { const u64 one[3]={o[1],o[4],o[2]}; float ws[1], we;
+      for(int i=0;i<3;i++){ ACHECK(h3t_pass(g,&one[i],1,ws,&we)&&ws[0]==(i==0?270.0f:i==1?135.0f:0.0f)&&fbits(we)==H3T_SNAN); }
+      u64 z=0; u64 e0=h3.empty; ACHECK(h3t_pass(g,&z,1,ws,&we)&&ws[0]==135.0f&&h3.empty==e0+1); }
+    /* the owner field is +0x14 (a u32): the same generic child moves with the group written there, and nothing else in the object
+     * counts (+0x10 flags and +0x18 hold group-like values here) */
+    { u64 c=h3t_obj(g,GS_BASE+0x5b1a70ull,7); wr32(g,c+0x10,3); wr32(g,c+0x18,3); const u64 two[2]={o[4],c}; float ws[2], we;
+      ACHECK(h3t_pass(g,two,2,ws,&we)&&ws[1]==0.0f);
+      wr32(g,c+0x14,3); wr32(g,c+0x10,7); wr32(g,c+0x18,7); ACHECK(h3t_pass(g,two,2,ws,&we)&&ws[1]==270.0f);
+      wr32(g,c+0x14,0x00000103u); ACHECK(h3t_pass(g,two,2,ws,&we)&&ws[1]==135.0f);   /* group 0x103: not in the table */
+      ga_free(c);
+      u64 u=h3t_obj(g,GS_BASE+0x5b9990ull,7); const u64 two2[2]={o[4],u};                             /* a class not in the table stays centred */
+      u64 ul0=h3.why[H3W_UNLISTED], uc0=h3.why[H3W_UNCLASSIFIED];                                      /* whatever its group (review finding 4), counted */
+      ACHECK(h3t_pass(g,two2,2,ws,&we)&&ws[1]==135.0f); wr32(g,u+0x14,2); ACHECK(h3t_pass(g,two2,2,ws,&we)&&ws[1]==135.0f);
+      wr32(g,u+0x14,9); ACHECK(h3t_pass(g,two2,2,ws,&we)&&ws[1]==135.0f); ACHECK(h3.why[H3W_UNLISTED]==ul0+2&&h3.why[H3W_UNCLASSIFIED]==uc0+1); ga_free(u); }
+    /* only the dk loop's call sites: f_126500 from elsewhere (here 0x1401704a1) and f_4ad270 from elsewhere (0x1401668ff, f_1668d0's
+     * walk of the manager list) inside a pass change nothing */
+    { u64 list=ga_calloc(1,0x40), out=ga_calloc(1,0x20), mode=ga_calloc(1,0x10); wr64(g,list+0x18,o[1]); wrf(g,mode,1.0f); int k; u64 ps=h3.passes;
+      st_call_ra(g,f_126500,GS_BASE+0x1704a1ull,list,(u64[]){out,mode},2,&k); ACHECK(k&&rdf(g,GX+0xac)==135.0f&&h3_depth==0&&h3.passes==ps);
+      st_call_ra(g,f_126500,DK_RA_MODE,list,(u64[]){out,mode},2,&k); ACHECK(k&&rdf(g,GX+0xac)==270.0f&&h3_depth==1);
+      u32 id=(u32)kh_call(g,GS_BASE+0x4ad240ull,o[0],0,0,0); wr32(g,GX+0xac,H3T_SNAN);
+      ACHECK(st_call_ra(g,f_4ad270,GS_BASE+0x1668ffull,list,(u64[]){id},1,&k)==o[0]&&k&&rd32(g,GX+0xac)==H3T_SNAN);
+      ACHECK(st_call_ra(g,f_4ad270,DK_RA_NEXT,list,(u64[]){id},1,&k)==o[0]&&k&&rdf(g,GX+0xac)==0.0f);
+      st_call_ra(g,f_126500,DK_RA_END,list,(u64[]){mode,out},2,&k); ACHECK(k&&h3_depth==0); ga_free(list); ga_free(out); ga_free(mode); }
+    /* the band mismatch: MagicScale.w not the band offset (here written by hand after the exe's f_126500): the pass is left, counted */
+    { u64 mm0=h3.mismatch; int d0=h3_depth; wrf(g,GX+0xac,100.0f); u64 sv=KH_RDI(g); u64 list=ga_calloc(1,0x40); wr64(g,list+0x18,o[0]); KH_RDI(g)=list;
+      h3a_post(g); ACHECK(h3.mismatch==mm0+1&&rdf(g,GX+0xac)==100.0f&&h3_depth==d0+1&&!h3_on[h3_depth-1]);
+      wr32(g,GX+0xac,H3T_SNAN); h3b_post(g,o[1]); ACHECK(rd32(g,GX+0xac)==H3T_SNAN); h3_end(); ACHECK(h3_depth==d0); KH_RDI(g)=sv; ga_free(list); }
+    /* review finding 2: setScreenMode INSIDE an object (YS::WINDOW_OBJ2D's pair: f_126500 from 0x1403bc4c7 with its zoom mode {0.8, 0,
+     * 0, 0.1} and the saved mode out in rcx, then from 0x1403bc4f0 with the saved mode back), through the hook and the lifted body.
+     * f_126500 recomputes MagicScale: after the pair MS.w is the band centre's again (the exe: 135).  An anchored object gets its
+     * anchored MS.w again after the call that brings the loop's MagicScale back; the call that sets another mode is left as the exe
+     * made it; a centre object is left (the value is the centre's); all counted by (class, return address); nothing is counted or
+     * written outside a pass, with the test aid, in pc or with the bars on */
+    { H3SCREEN(1920,1350); note_3d(kh_game_frames()); asp_mode=1;
+      const u64 RA_WSET=GS_BASE+0x3bc4ccull, RA_WBACK=GS_BASE+0x3bc4f5ull;
+      H3Inner hin[16]; memcpy(hin,h3in,sizeof hin); int nhin=n_h3in; u64 hcut=h3in_cut; n_h3in=0; h3in_cut=0;
+      u64 list=ga_calloc(1,0x40), out=ga_calloc(1,0x20), mode=ga_calloc(1,0x10), wm=ga_calloc(1,0x10), sv=ga_calloc(1,0x20), tmp=ga_calloc(1,0x20);
+      u64 win=h3t_obj(g,GS_BASE+0x5c5180ull,0); int k, kk=1; u32 id;
+      wrf(g,mode,1.0f); wrf(g,wm,0.8f); wrf(g,wm+12,0.1f);
+      u64 i0=h3.inner, b0=h3.inner_back, a0=h3.inner_anch, r0=h3.inner_reapplied, x0=h3.inner_other;
+      st_call_ra(g,f_126500,RA_WSET,list,(u64[]){sv,wm},2,&k); kk&=k; float wexe=rdf(g,GX+0xac);           /* outside a pass: the exe's value */
+      st_call_ra(g,f_126500,RA_WBACK,list,(u64[]){tmp,sv},2,&k); kk&=k;
+      ACHECK(kk&&wexe!=135.0f&&wexe!=0.0f&&wexe!=270.0f&&h3.inner==i0&&h3_depth==0);
+      wr64(g,list+0x18,o[0]);                                                                           /* the list head: a top class */
+      st_call_ra(g,f_126500,DK_RA_MODE,list,(u64[]){out,mode},2,&k); ACHECK(k&&h3_depth==1&&rdf(g,GX+0xac)==0.0f);
+      st_call_ra(g,f_126500,RA_WSET,list,(u64[]){sv,wm},2,&k); ACHECK(k&&rdf(g,GX+0xac)==wexe);            /* its own mode: as the exe made it */
+      st_call_ra(g,f_126500,RA_WBACK,list,(u64[]){tmp,sv},2,&k); ACHECK(k&&rdf(g,GX+0xac)==0.0f);           /* the loop's mode back: top again */
+      ACHECK(h3.inner==i0+2&&h3.inner_back==b0+1&&h3.inner_anch==a0+2&&h3.inner_reapplied==r0+1&&h3.inner_other==x0+1);
+      /* a mode of its own whose MS.w equals the band centre's: mode {scale, kind, x, y} = {0.5, 0, 0, -0.5} (f_1433a0: MS.w = y * s9W/16
+       * + (H - s9W/16) / 2 = -270 + 405 = 135, MS.x / MS.y halved): not the loop's MagicScale, so left as the exe made it (only all
+       * of GX+0xa0..0xac equal to H3a's counts as the loop's mode back) */
+      { u64 wm0=ga_calloc(1,0x10); wrf(g,wm0,0.5f); wrf(g,wm0+12,-0.5f); st_call_ra(g,f_126500,RA_WSET,list,(u64[]){sv,wm0},2,&k); float w0=rdf(g,GX+0xac);
+        ACHECK(k&&w0==135.0f&&rd32(g,GX+0xa0)!=h3_ms[0][0]); st_call_ra(g,f_126500,RA_WBACK,list,(u64[]){tmp,sv},2,&k); ACHECK(k&&rdf(g,GX+0xac)==0.0f);
+        ACHECK(h3.inner==i0+4&&h3.inner_back==b0+2&&h3.inner_anch==a0+4&&h3.inner_reapplied==r0+2&&h3.inner_other==x0+2); ga_free(wm0); i0+=2; b0+=1; a0+=2; r0+=1; x0+=1; }
+      id=(u32)kh_call(g,GS_BASE+0x4ad240ull,o[1],0,0,0); ACHECK(st_call_ra(g,f_4ad270,DK_RA_NEXT,list,(u64[]){id},1,&k)==o[1]&&k&&rdf(g,GX+0xac)==270.0f);
+      st_call_ra(g,f_126500,RA_WSET,list,(u64[]){sv,wm},2,&k); ACHECK(k&&rdf(g,GX+0xac)==wexe);
+      st_call_ra(g,f_126500,RA_WBACK,list,(u64[]){tmp,sv},2,&k); ACHECK(k&&rdf(g,GX+0xac)==270.0f);         /* bottom again */
+      id=(u32)kh_call(g,GS_BASE+0x4ad240ull,win,0,0,0); ACHECK(st_call_ra(g,f_4ad270,DK_RA_NEXT,list,(u64[]){id},1,&k)==win&&k&&rdf(g,GX+0xac)==135.0f);
+      u64 a1=h3.inner_anch, r1=h3.inner_reapplied;                                                       /* the window itself: centre */
+      st_call_ra(g,f_126500,RA_WSET,list,(u64[]){sv,wm},2,&k); ACHECK(k&&rdf(g,GX+0xac)==wexe);
+      st_call_ra(g,f_126500,RA_WBACK,list,(u64[]){tmp,sv},2,&k); ACHECK(k&&rdf(g,GX+0xac)==135.0f);
+      ACHECK(h3.inner==i0+6&&h3.inner_back==b0+3&&h3.inner_anch==a1&&h3.inner_reapplied==r1&&a1==a0+4&&r1==r0+2&&h3.inner_other==x0+2);
+      ACHECK(st_call_ra(g,f_4ad270,DK_RA_NEXT,list,(u64[]){0},1,&k)==0&&k);
+      st_call_ra(g,f_126500,DK_RA_END,list,(u64[]){tmp,out},2,&k); ACHECK(k&&h3_depth==0);
+      { int nw=0; for(int i=0;i<n_h3in;i++) if(h3in[i].vt==GS_BASE+0x5c5180ull&&h3in[i].a==H3_CENTRE&&h3in[i].n==1&&h3in[i].back==(h3in[i].ra==RA_WBACK)) nw++;
+        ACHECK(n_h3in==6&&nw==2); }                                                                      /* 3 classes x 2 return addresses */
+      /* outside an anchored pass nothing: the test aid, pc, the bars on */
+      for(int c=0;c<3;c++){ u64 ic=h3.inner; if(c==0) asp_off_h3=1; else if(c==1) asp_mode=0; else atomic_store(&last3d_plus1,0);
+          st_call_ra(g,f_126500,DK_RA_MODE,list,(u64[]){out,mode},2,&k); ACHECK(k&&rdf(g,GX+0xac)==135.0f);
+          st_call_ra(g,f_126500,RA_WSET,list,(u64[]){sv,wm},2,&k); ACHECK(k&&rdf(g,GX+0xac)==wexe);
+          st_call_ra(g,f_126500,RA_WBACK,list,(u64[]){tmp,sv},2,&k); ACHECK(k&&rdf(g,GX+0xac)==135.0f&&h3.inner==ic);
+          st_call_ra(g,f_4ad270,DK_RA_NEXT,list,(u64[]){0},1,&k); st_call_ra(g,f_126500,DK_RA_END,list,(u64[]){tmp,out},2,&k); ACHECK(k&&h3_depth==0);
+          asp_off_h3=0; asp_mode=1; note_3d(kh_game_frames()); }
+      ga_free(list); ga_free(out); ga_free(mode); ga_free(wm); ga_free(sv); ga_free(tmp); ga_free(win);
+      memcpy(h3in,hin,sizeof hin); n_h3in=nhin; h3in_cut=hcut; }
+    #undef H3SCREEN
+    for(int i=0;i<8;i++) ga_free(o[i]);
+    memcpy(&h3,&sh,sizeof sh); asp_mode=sm; asp_h1_uncond=su; asp_off_h3=so; kh_aspect_dk=sdk; kh_aspect_m=sml; atomic_store(&last3d_plus1,s3);
+    memcpy(hp(g,ID_TAB),tsave,0x204); wr32(g,GX_GUARD,guard); memcpy(hp(g,GX),gxsave,0x100);
+}
 int kh_aspect_selftest(KCtx *g){
     sfails=schecks=0;
     /* -- r, o, b (plan section 3) -- */
@@ -1075,6 +1528,8 @@ int kh_aspect_selftest(KCtx *g){
       #undef SCREEN
       asp_mode=sm; asp_nocull=snc; asp_off_h4=so4; asp_off_h5=so5; h2b.calls=h2b.identity=h2b.edited=0; h2c.calls=h2c.identity=h2c.edited=0;
       wr32(g,GX_GUARD,guard); memcpy(hp(g,GX+0x10),gxsave,32); }
+    /* -- task 42: H3 -- */
+    h3_selftest(g);
     /* -- M: the RTTI names, the frame intervals, the null backend's vertex-shader kinds -- */
     { char nm[72]; rtti_name(g,GS_BASE+0x5b24f8ull,nm,sizeof nm); ACHECK(!strcmp(nm,".?AVLockOn@dk@@"));
       rtti_name(g,GS_BASE+0x5b1c28ull,nm,sizeof nm); ACHECK(!strcmp(nm,".?AVCOMMAND_DRAW@dk@@"));
@@ -1129,7 +1584,7 @@ int kh_aspect_selftest(KCtx *g){
         ACHECK(fatal_case(2,"screen-value-range: KHNMC_SCREEN=8x8")); ACHECK(fatal_case(3,"screen-and-kh-win:"));
         ACHECK(fatal_case(4,"aspect-mode-unknown: KHNMC_ASPECT=wide")); ACHECK(fatal_case(5,"aspect-log-value: KHNMC_ASPECT_LOG=yes"));
         ACHECK(fatal_case(6,"aspect-test-h1-value: KHNMC_ASPECT_TEST_H1=always")); ACHECK(fatal_case(7,"aspect-test-h1-needs-fill:"));
-        ACHECK(fatal_case(8,"aspect-test-off-value: KHNMC_ASPECT_TEST_OFF=h2,h3: 'h3' is not one of")); ACHECK(fatal_case(9,"aspect-test-needs-fill: KHNMC_ASPECT_TEST_OFF=h2"));
+        ACHECK(fatal_case(8,"aspect-test-off-value: KHNMC_ASPECT_TEST_OFF=h2,h6: 'h6' is not one of h2, h2b, h2c, h3, h4, h5")); ACHECK(fatal_case(9,"aspect-test-needs-fill: KHNMC_ASPECT_TEST_OFF=h2"));
         ACHECK(fatal_case(10,"aspect-test-nocull-value: KHNMC_ASPECT_TEST_NOCULL=yes")); ACHECK(fatal_case(11,"aspect-test-needs-fill: KHNMC_ASPECT_TEST_NOCULL=1"));
         ACHECK(fatal_case(12,"aspect-test-off-value: KHNMC_ASPECT_TEST_OFF=h4, ends with a comma")); ACHECK(fatal_case(13,"aspect-log-value: KHNMC_ASPECT_LOG=3"));
         ACHECK(fatal_case(14,"aspect-m-drawlog-needs-m: KHNMC_ASPECT_M_DRAWLOG=x.tsv@1-2")); ACHECK(fatal_case(15,"aspect-m-drawlog-value: KHNMC_ASPECT_M_DRAWLOG=x.tsv@5-3"));

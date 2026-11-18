@@ -132,9 +132,9 @@ static void chaos_step(KCtx *g,u64 node){
     u64 n=atomic_fetch_add(&c_scan_steps,1)+1;
     if(chaos_n && n%chaos_n==0){ atomic_fetch_add(&c_chaos,1); struct timespec ts={chaos_us/1000000u,(long)(chaos_us%1000000u)*1000L}; nanosleep(&ts,0); }
 }
-extern int kh_aspect_m; void kh_aspect_dk_next(KCtx *g,u64 ra,u64 obj);
+extern int kh_aspect_dk; void kh_aspect_dk_next(KCtx *g,u64 ra,u64 obj);
 void f_4ad270(KCtx *g){
-    if(__builtin_expect(kh_aspect_m,0)){                                    /* task 40, KHNMC_ASPECT_LOG=2: the dk draw loop's next object (runtime/aspect.c, M) */
+    if(__builtin_expect(kh_aspect_dk,0)){                                   /* task 40 / 42, KHNMC_ASPECT=fill or KHNMC_ASPECT_LOG=2: the dk draw loop's next object (runtime/aspect.c: H3b, M) */
         u64 ra=rd64(g,KH_RSP(g));
         if(__builtin_expect(scan_hook_on,0)){ orig_f_4ad270(g); if(ra==RA_SCAN_STEP && scan_step_fn) scan_step_fn(g,KH_RAX(g)); }
         else orig_f_4ad270(g);
