@@ -109,8 +109,9 @@ int  kh_present_frame(KCtx *g,KhPresenter *p,u32 idx,u64 present_no);           
                                                                                        * back buffer, queued after it, to kh_present_check */
 void kh_present_check(KhPresenter *p,u64 present_no,const u8 *ref,u32 ref_row_pitch); /* check mode against that independent reference (review V36 n=1) */
 void kh_present_resize(KhPresenter *p,const KhPresentBuffers *bb);                   /* new back buffers (ResizeBuffers) */
-void kh_present_quiesce(KhPresenter *p);                                             /* every submission of the presenter is complete */
-void kh_present_resume(KhPresenter *p);                                              /* the swapchain is rebuilt at the next present */
+void kh_present_quiesce(KhPresenter *p);                                             /* every submission of the presenter made so far is complete; any
+                                                                                       * thread, also while a Present waits in its marker (d) (review Y39 n=1) */
+void kh_present_resume(KhPresenter *p);                                              /* the swapchain is rebuilt at the next present; any thread, any time */
 void kh_present_teardown(KhPresenter *p);
 void kh_present_report(FILE *f);
 u64  kh_gfx_gate_last_clear_ns(void);
@@ -128,6 +129,11 @@ int  kh_vkd3d_swap_test_info(KCtx *g,u64 sc,KhSwapInfo *out);                   
 void kh_vkd3d_swap_test_release(KCtx *g,u64 sc);                                     /* presenter teardown, back buffers released and destroyed */
 void kh_vkd3d_test_bbmode(int mode);                                                 /* -1 = KHNMC_GFX_BACKBUFFERS; 0 own, 1 general, 2 committed */
 int  kh_present_selftest(KCtx *g,u64 m,u64 dev,u64 q,u64 fct);                      /* gfx_present.c, called by the vkd3d selftest */
+/* task 39 selftest helper (gfx_present.c): a thread that (when after_change is set) first waits until *after_change differs from
+ * `from`, then sets the gate after set_ms, holds it hold_ms, clears it, waits 10 ms and then signals `fence` to 1 from the CPU (a queue
+ * that Waits on it is blocked until then: the bounded waits must not count the held time) */
+typedef struct { ID3D12Fence *fence; unsigned set_ms, hold_ms; const volatile u64 *after_change; u64 from; u64 set_ns, cleared_ns; int changed; } KhGateHoldSig;
+void *kh_gfx_test_hold_then_signal(void *arg);
 
 /* ---- selftest helpers: call a guest-visible function pointer like a lifted `call` (n arguments, 4 in registers) ----------------- */
 extern int kh_gfxc_st_fails;

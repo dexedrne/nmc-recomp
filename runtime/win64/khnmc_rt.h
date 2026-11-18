@@ -64,6 +64,18 @@ const char *ga_src_name(int src);
 
 /* host-side access to guest memory. g may be NULL in identity mode only; always pass it. */
 static inline void *hp(KCtx *g, u64 a){ return (void*)XL(g,a); }
+#if defined(KH_ORDERED_MEM) && KH_ORDERED_MEM      /* task 39: the lifted code's model (khrt.h): aligned 1/2/4/8-byte accesses acquire / release */
+static inline u8  rd8 (KCtx *g,u64 a){ return kh_om_ld8 (XL(g,a),a); }
+static inline u16 rd16(KCtx *g,u64 a){ return kh_om_ld16(XL(g,a),a); }
+static inline u32 rd32(KCtx *g,u64 a){ return kh_om_ld32(XL(g,a),a); }
+static inline u64 rd64(KCtx *g,u64 a){ return kh_om_ld64(XL(g,a),a); }
+static inline void wr8 (KCtx *g,u64 a,u8 v){ kh_om_st8 (XL(g,a),a,v); }
+static inline void wr16(KCtx *g,u64 a,u16 v){ kh_om_st16(XL(g,a),a,v); }
+static inline void wr32(KCtx *g,u64 a,u32 v){ kh_om_st32(XL(g,a),a,v); }
+static inline void wr64(KCtx *g,u64 a,u64 v){ kh_om_st64(XL(g,a),a,v); }
+#else
+/* (the #line directives keep the line numbers of a build without KH_ORDERED_MEM as they were: its objects stay byte-identical) */
+#line 67
 static inline u8  rd8 (KCtx *g,u64 a){ return *(u8*)XL(g,a); }
 static inline u16 rd16(KCtx *g,u64 a){ u16 v; memcpy(&v,(void*)XL(g,a),2); return v; }
 static inline u32 rd32(KCtx *g,u64 a){ u32 v; memcpy(&v,(void*)XL(g,a),4); return v; }
@@ -72,6 +84,8 @@ static inline void wr8 (KCtx *g,u64 a,u8 v){ *(u8*)XL(g,a)=v; }
 static inline void wr16(KCtx *g,u64 a,u16 v){ memcpy((void*)XL(g,a),&v,2); }
 static inline void wr32(KCtx *g,u64 a,u32 v){ memcpy((void*)XL(g,a),&v,4); }
 static inline void wr64(KCtx *g,u64 a,u64 v){ memcpy((void*)XL(g,a),&v,8); }
+#endif
+#line 75
 const char *gstr(KCtx *g,u64 a);                   /* NUL-terminated guest C string as host pointer (identity: same bytes) */
 size_t gw_len(KCtx *g,u64 a);                      /* UTF-16 length */
 void gw_to_utf8(KCtx *g,u64 a,char *out,size_t outsz);

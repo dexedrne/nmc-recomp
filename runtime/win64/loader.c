@@ -213,6 +213,7 @@ static void *guest_main(void *arg){
 static int kh_main_body(int argc,char **argv){
     setvbuf(stderr,NULL,_IOLBF,0);
     kh_host_env_init(&argc,&argv);                  /* host_env.c: nothing unless KH_IOS_PATHS (app container directories, Documents/khnmc.conf) */
+    { extern void kh_ordered_mem_startup(void); kh_ordered_mem_startup(); }   /* every build: which memory-ordering variant this is, in the log too (review Y39 n=3) */
     const char *e;
     if((e=getenv("KH_EXE"))) snprintf(exe_path,sizeof exe_path,"%s",e);
     if((e=getenv("KH_ROOT"))) snprintf(kh_root,sizeof kh_root,"%s",e);

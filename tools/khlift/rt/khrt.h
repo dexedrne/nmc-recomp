@@ -161,3 +161,72 @@ static inline u64 calc_cond(u64 cond,u64 op,u64 d1,u64 d2,u64 nd){
   return (cond&1)? !r : r;
 }
 #include "khrt_simd.h"
+
+/* ---- KH_ORDERED_MEM (task 39; Makefile ORDERED_MEM=1): x86 memory order for guest accesses on a weakly ordered host --------------
+ * LD / ST above are plain memcpy.  x86 keeps the order of a thread's loads among themselves and of its stores among themselves (TSO):
+ * a guest thread may publish data with plain stores (payload, then flag) and another may read flag, then payload, with no fence.
+ * On arm64 plain loads and stores can be reordered (by the compiler too), so the reader can see the new flag and the old payload.
+ * With -DKH_ORDERED_MEM=1 every naturally aligned 1/2/4/8-byte guest access is an acquire load / release store:
+ *     arm64: LDAPR (the rcpc feature; macOS arm64 targets have it, the iOS SDK build adds +rcpc: Makefile OM_RCPC) else LDAR; STLR
+ *     x86-64: the same MOVs as before plus compiler ordering (TSO already gives acquire/release), so this checks correctness and
+ *             compile cost on Linux, not the arm64 cost
+ * Unaligned accesses, 16- and 32-byte vector accesses and every other size keep memcpy.  The alignment is tested on the GUEST
+ * address: the bias is a multiple of the page size (the guest space is an mmap; runtime/ordered_mem.c checks it), so the host
+ * address has the same alignment and a constant guest address needs no run-time test.  KH_CAS and KH_FENCE are unchanged.
+ * Every unit compiled this way carries a tag in the section kh_om (runtime/ordered_mem.c counts them: the selftest shows the lifted
+ * shards really are ordered) and references kh_ordered_mem_runtime_v1, which only a runtime built the same way defines: an ordered
+ * object linked with a plain runtime does not link.  With KH_ORDERED_MEM unset nothing below exists and LD / ST are unchanged. */
+#if defined(KH_ORDERED_MEM) && KH_ORDERED_MEM
+#if KH_XLATE_MODE==1
+_Static_assert((((uintptr_t)(KH_BIAS))&4095u)==0,"KH_ORDERED_MEM tests alignment on the guest address: KH_BIAS must be a multiple of 4096");
+#endif
+#define KH_OM_INL static inline __attribute__((always_inline))
+KH_OM_INL u8  kh_om_ld8 (uintptr_t h,u64 ga){ (void)ga; return __atomic_load_n((const u8*)h,__ATOMIC_ACQUIRE); }
+KH_OM_INL u16 kh_om_ld16(uintptr_t h,u64 ga){ u16 v; if(!(ga&1)) return __atomic_load_n((const u16*)h,__ATOMIC_ACQUIRE); memcpy(&v,(const void*)h,2); return v; }
+KH_OM_INL u32 kh_om_ld32(uintptr_t h,u64 ga){ u32 v; if(!(ga&3)) return __atomic_load_n((const u32*)h,__ATOMIC_ACQUIRE); memcpy(&v,(const void*)h,4); return v; }
+KH_OM_INL u64 kh_om_ld64(uintptr_t h,u64 ga){ u64 v; if(!(ga&7)) return __atomic_load_n((const u64*)h,__ATOMIC_ACQUIRE); memcpy(&v,(const void*)h,8); return v; }
+KH_OM_INL void kh_om_st8 (uintptr_t h,u64 ga,u8 v){ (void)ga; __atomic_store_n((u8*)h,v,__ATOMIC_RELEASE); }
+KH_OM_INL void kh_om_st16(uintptr_t h,u64 ga,u16 v){ if(!(ga&1)){ __atomic_store_n((u16*)h,v,__ATOMIC_RELEASE); return; } memcpy((void*)h,&v,2); }
+KH_OM_INL void kh_om_st32(uintptr_t h,u64 ga,u32 v){ if(!(ga&3)){ __atomic_store_n((u32*)h,v,__ATOMIC_RELEASE); return; } memcpy((void*)h,&v,4); }
+KH_OM_INL void kh_om_st64(uintptr_t h,u64 ga,u64 v){ if(!(ga&7)){ __atomic_store_n((u64*)h,v,__ATOMIC_RELEASE); return; } memcpy((void*)h,&v,8); }
+/* the size branches are compile-time constants (sizeof); the byte count of the copies is clamped so that the dead branches of a
+ * type of another size stay well-formed */
+#define KH_OM_N(T,I) (sizeof(T)<sizeof(I)?sizeof(T):sizeof(I))
+#undef LD
+#undef ST
+#define LD(T,a) ({ T _v; u64 _ga=(u64)(a); uintptr_t _h=XL(g,_ga); \
+    if(sizeof(T)==1){ u8 _x=kh_om_ld8(_h,_ga); memcpy(&_v,&_x,KH_OM_N(T,u8)); } \
+    else if(sizeof(T)==2){ u16 _x=kh_om_ld16(_h,_ga); memcpy(&_v,&_x,KH_OM_N(T,u16)); } \
+    else if(sizeof(T)==4){ u32 _x=kh_om_ld32(_h,_ga); memcpy(&_v,&_x,KH_OM_N(T,u32)); } \
+    else if(sizeof(T)==8){ u64 _x=kh_om_ld64(_h,_ga); memcpy(&_v,&_x,KH_OM_N(T,u64)); } \
+    else memcpy(&_v,(const void*)_h,sizeof(T)); _v; })
+#define ST(T,a,v) do{ T _v=(v); u64 _ga=(u64)(a); uintptr_t _h=XL(g,_ga); \
+    if(sizeof(T)==1){ u8 _x=0; memcpy(&_x,&_v,KH_OM_N(T,u8)); kh_om_st8(_h,_ga,_x); } \
+    else if(sizeof(T)==2){ u16 _x=0; memcpy(&_x,&_v,KH_OM_N(T,u16)); kh_om_st16(_h,_ga,_x); } \
+    else if(sizeof(T)==4){ u32 _x=0; memcpy(&_x,&_v,KH_OM_N(T,u32)); kh_om_st32(_h,_ga,_x); } \
+    else if(sizeof(T)==8){ u64 _x=0; memcpy(&_x,&_v,KH_OM_N(T,u64)); kh_om_st64(_h,_ga,_x); } \
+    else memcpy((void*)_h,&_v,sizeof(T)); }while(0)
+/* which instructions this unit's accesses compile to (the report line of runtime/ordered_mem.c) */
+#if defined(__aarch64__) && defined(__ARM_FEATURE_RCPC)
+#define KH_OM_INSNS "arm64: LDAPR (rcpc) / STLR"
+#elif defined(__aarch64__)
+#define KH_OM_INSNS "arm64: LDAR / STLR (this target has no rcpc)"
+#elif defined(__x86_64__)
+#define KH_OM_INSNS "x86-64: MOV (TSO) + compiler ordering"
+#else
+#define KH_OM_INSNS "__atomic acquire / release"
+#endif
+#if defined(__APPLE__)
+#define KH_OM_SECTION "__DATA,__kh_om"
+#else
+#define KH_OM_SECTION "kh_om"
+#endif
+#ifdef __BASE_FILE__
+#define KH_OM_FILE __BASE_FILE__                   /* the translation unit (not this header); the counter takes its last path component */
+#else
+#define KH_OM_FILE __FILE__
+#endif
+static const char kh_om_tu_tag[] __attribute__((used,section(KH_OM_SECTION))) = "kh-om1:" KH_OM_FILE;
+extern const char kh_ordered_mem_runtime_v1;
+static const char *const kh_om_tu_need __attribute__((used)) = &kh_ordered_mem_runtime_v1;
+#endif

@@ -255,7 +255,15 @@ static int selftest_all(KCtx *g){
               fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=gfx): only the graphics suites ran, %d failures\n",f); return f; }
           if(!strcmp(only,"aspect")){ extern int kh_aspect_selftest(KCtx *); int f=kh_aspect_selftest(g);      /* task 37: for its mutation checks */
               fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=aspect): only the suite `aspect` ran, %d failures\n",f); return f; }
-          if(strcmp(only,"route31")) kh_fatal(g,"KHNMC_SELFTEST_ONLY=%s: the suites that can run alone are route31, vsync, gfx and aspect",only);
+          /* task 39: `gate` (the admission-counted suspend gate), `ordered` (memory ordering: the option really on in this binary) and
+           * `membench` (the cost of guest loads / stores plain against acquire/release, for the Mac mini and the phone) */
+          if(!strcmp(only,"gate")){ extern int kh_gfx_gate_selftest(void); int f=kh_gfx_gate_selftest();
+              fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=gate): only the suite `gfx gate` ran, %d failures\n",f); return f; }
+          if(!strcmp(only,"ordered")){ extern int kh_ordered_mem_selftest(KCtx *); int f=kh_ordered_mem_selftest(g);
+              fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=ordered): only the suite `memory ordering` ran, %d failures\n",f); return f; }
+          if(!strcmp(only,"membench")){ extern int kh_membench(KCtx *); int f=kh_membench(g);
+              fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=membench): the memory-ordering microbenchmark only, %d failures\n",f); return f; }
+          if(strcmp(only,"route31")) kh_fatal(g,"KHNMC_SELFTEST_ONLY=%s: the suites that can run alone are route31, vsync, gfx, aspect, gate, ordered and membench",only);
           extern int kh_input_route31_selftest(KCtx *); int f=kh_input_route31_selftest(g);
           fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=route31): only the suite `input route Q31` ran, %d failures\n",f); return f?f:0; } }
     CHECK(rd64(g,GS_BASE+0x7534a8)!=0); /* Task 6: table 3 must exist before scripts run. */
@@ -284,6 +292,8 @@ static int selftest_all(KCtx *g){
     { extern int kh_sync_vclock_selftest(KCtx *); fails+=kh_sync_vclock_selftest(g); }   /* review of task 28: virtual time-outs of KHNMC_CLOCK_SYNC=all without lock-order deadlocks */
     { extern int kh_compat_selftest(void); fails+=kh_compat_selftest(); }      /* task 20: the host primitives that differ between Linux and Darwin */
     { extern int kh_vsync_selftest(void); fails+=kh_vsync_selftest(); }        /* TASK36: WaitForVBlank paced by display ticks (gfx_present.c) */
+    { extern int kh_gfx_gate_selftest(void); fails+=kh_gfx_gate_selftest(); }  /* task 39: the admission-counted suspend gate (gfx_present.c) */
+    { extern int kh_ordered_mem_selftest(KCtx *); fails+=kh_ordered_mem_selftest(g); }   /* task 39: KH_ORDERED_MEM (runtime/ordered_mem.c) */
     { extern int kh_loader_selftest(void); fails+=kh_loader_selftest(); }      /* review U35 n=24: the bias-mode reservation keeps its low guard or is a named fatal */
     input_selftest(g);
     { extern int kh_input_hold_selftest(KCtx *); fails+=kh_input_hold_selftest(g); }

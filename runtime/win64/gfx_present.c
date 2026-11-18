@@ -18,6 +18,8 @@
  *       counted unless the gate is set or was cleared less than one slice ago; 5 counted time-outs in a row are gfx-present-acquire.
  *   (d) vkd3d_queue_signal_on_cpu on the presenter's fence, waited for in slices (5 expired slices = gfx-present-queue-blocked; a
  *       stopped process costs only the slice it interrupts): everything the game queued for this frame has left vkd3d's op queue.
+ *       Done WITHOUT the presenter's lock (review Y39 n=1): under a set gate the wait has no bound, and the main thread's
+ *       kh_present_resume / kh_present_quiesce must not wait for it.
  *   (e) gate check again: if set now, the acquired image stays "acquired, not presented", the thread parks, and on the way back the
  *       slot's acquire semaphore is consumed (an empty batch that waits on it) and then destroyed and made anew, and the swapchain is
  *       rebuilt.  Otherwise our command buffer is recorded: back-buffer barrier (COLOR_ATTACHMENT_OUTPUT|TRANSFER -> TRANSFER, writes ->
@@ -58,6 +60,7 @@
 #include <string.h>
 #include <math.h>
 #include <unistd.h>
+#include <sys/wait.h>
 
 #define P_(x) ((unsigned long long)(x))
 static void ns_to_ts(u64 ns,struct timespec *ts){ ts->tv_sec=(time_t)(ns/1000000000ull); ts->tv_nsec=(long)(ns%1000000000ull); }
@@ -65,12 +68,22 @@ static void ns_to_ts(u64 ns,struct timespec *ts){ ts->tv_sec=(time_t)(ns/1000000
 extern int kh_gfx_vkd3d_on;
 static _Atomic u64 sh_layer_calls, sh_size_calls, sh_size_zero; static _Atomic int sh_presenter_layer; static const char *sh_env_mode="off (unset)";
 
-/* ==== 1. the suspend gate ======================================================================================================= */
+/* ==== 1. the suspend gate (admission-counted since task 39: IOS-GRAPHICS-PLAN.md "Review c1/c2" item 1) ==========================
+ * A flag alone did not stop a thread that had passed its check just before the flag was set: it could still submit after the app
+ * went to the background.  Every submit-capable region of the runtime is now an ADMISSION: kh_gfx_gate_enter (or _try_enter) counts
+ * the thread in under gate_m while the gate is clear, kh_gfx_gate_leave counts it out after its submission call returned, and
+ * kh_gfx_gate_quiesce waits (bounded, in expired slices) until nothing is admitted.  A thread admitted before the gate was set
+ * finishes its submission and holds quiesce until it leaves; a thread that arrives while the gate is set waits outside (parked,
+ * counted, holding no runtime lock) and is not counted. */
 static pthread_mutex_t gate_m=PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t gate_cv=PTHREAD_COND_INITIALIZER;
+static pthread_cond_t gate_idle_cv; static pthread_once_t gate_once=PTHREAD_ONCE_INIT;   /* monotonic (kh_cond_init): quiesce waits on it */
+static void gate_once_init(void){ kh_cond_init(&gate_idle_cv); }
 static _Atomic int gate_on, gate_hold_fences; static _Atomic u64 gate_queue_waits, gate_last_clear_ns;
 static u64 gate_sets, gate_parks, gate_parked_ns, gate_fence_parks;
-#define GATE_PLACES 12
-static struct { const char *where; u64 n; } gate_place[GATE_PLACES]; static int gate_nplace; static u64 gate_place_more;
+static int gate_admitted; static u64 gate_admissions, gate_refused_try, gate_q_calls, gate_q_ok, gate_q_timeout, gate_q_unset, gate_slices_free;
+#define GATE_PLACES 16
+static struct { const char *where; u64 n, admits; int inside; } gate_place[GATE_PLACES]; static int gate_nplace; static u64 gate_place_more;
+static __thread int gate_tl_depth, gate_tl_place=-1, gate_tl_armed;    /* this thread's admission (never nested), its place, the test hook */
 void kh_gfx_gate_set(void){ pthread_mutex_lock(&gate_m); if(!gate_on){ atomic_store(&gate_on,1); gate_sets++; } pthread_mutex_unlock(&gate_m); }
 void kh_gfx_gate_clear(void){ pthread_mutex_lock(&gate_m); atomic_store(&gate_on,0); atomic_store(&gate_last_clear_ns,kh_host_ns()); pthread_cond_broadcast(&gate_cv); pthread_mutex_unlock(&gate_m); }
 int  kh_gfx_gate_is_set(void){ return atomic_load(&gate_on); }
@@ -78,11 +91,16 @@ void kh_gfx_gate_hold_fence_signals(int on){ atomic_store(&gate_hold_fences,on?1
 void kh_gfx_gate_note_queue_wait(void){ atomic_fetch_add(&gate_queue_waits,1); }
 u64  kh_gfx_gate_last_clear_ns(void){ return atomic_load(&gate_last_clear_ns); }
 uint64_t kh_gfx_gate_parks(void){ pthread_mutex_lock(&gate_m); u64 n=gate_parks; pthread_mutex_unlock(&gate_m); return n; }
+int  kh_gfx_gate_admitted(void){ pthread_mutex_lock(&gate_m); int n=gate_admitted; pthread_mutex_unlock(&gate_m); return n; }
+/* caller holds gate_m: the index of a place (-1 when the table is full: counted as "more places") */
+static int gate_place_of(const char *where){
+    int i; for(i=0;i<gate_nplace;i++) if(gate_place[i].where==where||!strcmp(gate_place[i].where,where)) return i;
+    if(gate_nplace<GATE_PLACES){ gate_place[i].where=where; gate_place[i].n=gate_place[i].admits=0; gate_place[i].inside=0; gate_nplace++; return i; }
+    return -1;
+}
 /* caller holds gate_m and saw the gate set */
 static void gate_wait_locked(const char *where){
-    int i; for(i=0;i<gate_nplace;i++) if(gate_place[i].where==where||!strcmp(gate_place[i].where,where)) break;
-    if(i==gate_nplace){ if(gate_nplace<GATE_PLACES){ gate_place[i].where=where; gate_place[i].n=0; gate_nplace++; } else i=-1; }
-    if(i>=0) gate_place[i].n++; else gate_place_more++;
+    int i=gate_place_of(where); if(i>=0) gate_place[i].n++; else gate_place_more++;
     gate_parks++; u64 t0=kh_host_ns();
     while(atomic_load(&gate_on)) pthread_cond_wait(&gate_cv,&gate_m);     /* parked: no runtime lock is held by the caller */
     gate_parked_ns+=kh_host_ns()-t0;
@@ -90,6 +108,70 @@ static void gate_wait_locked(const char *where){
 void kh_gfx_gate_park(const char *where){
     if(!atomic_load(&gate_on)) return;
     pthread_mutex_lock(&gate_m); if(atomic_load(&gate_on)) gate_wait_locked(where); pthread_mutex_unlock(&gate_m);
+}
+/* ---- admissions ---- */
+static void gate_test_on_admit(const char *where);                      /* the selftest hook (below); caller holds gate_m */
+static const char *gate_test_armed_place;
+static void gate_admit_locked(const char *where){
+    if(gate_tl_depth){ const char *outer=gate_tl_place>=0?gate_place[gate_tl_place].where:"(a place past the table)"; pthread_mutex_unlock(&gate_m);
+        kh_fatal(NULL,"gfx-gate-nested: kh_gfx_gate_enter(\"%s\") on a thread that is already admitted (at \"%s\"): a nested admission waits at the set gate while its outer one holds quiesce",
+                 where,outer); }
+    int i=gate_place_of(where); if(i>=0){ gate_place[i].admits++; gate_place[i].inside++; } else gate_place_more++;
+    gate_admitted++; gate_admissions++; gate_tl_depth=1; gate_tl_place=i;
+    if(gate_test_armed_place&&strstr(where,gate_test_armed_place)) gate_test_on_admit(where);
+}
+void kh_gfx_gate_enter(const char *where){
+    pthread_mutex_lock(&gate_m);
+    if(atomic_load(&gate_on)) gate_wait_locked(where);      /* clear when it returns, and gate_m held all the way to the admission */
+    gate_admit_locked(where); pthread_mutex_unlock(&gate_m);
+}
+int kh_gfx_gate_try_enter(const char *where){
+    pthread_mutex_lock(&gate_m);
+    if(atomic_load(&gate_on)){ gate_refused_try++; pthread_mutex_unlock(&gate_m); return 0; }
+    gate_admit_locked(where); pthread_mutex_unlock(&gate_m); return 1;
+}
+static u64 gate_test_left_ns; static int gate_test_left;
+void kh_gfx_gate_leave(void){
+    pthread_mutex_lock(&gate_m);
+    if(!gate_tl_depth||gate_admitted<=0){ int a=gate_admitted; pthread_mutex_unlock(&gate_m);
+        kh_fatal(NULL,"gfx-gate-unbalanced: kh_gfx_gate_leave on a thread that is not admitted (%d admitted in all)",a); }
+    if(gate_tl_place>=0) gate_place[gate_tl_place].inside--;
+    gate_tl_depth=0; gate_tl_place=-1;
+    if(gate_tl_armed){ gate_tl_armed=0; gate_test_left=1; gate_test_left_ns=kh_host_ns(); }
+    if(--gate_admitted==0){ pthread_once(&gate_once,gate_once_init); pthread_cond_broadcast(&gate_idle_cv); }
+    pthread_mutex_unlock(&gate_m);
+}
+/* immediately before every submission call of an admitted region (review Y39 n=2): the calling thread must be admitted there.  A
+ * leave moved in front of its submission, or an admission dropped, is the named fatal gfx-gate-not-admitted the first time that path
+ * runs (the per-site quiesce tests see only where the region is LEFT, not where the submission is) */
+void kh_gfx_gate_assert_admitted(const char *what){
+    if(!gate_tl_depth) kh_fatal(NULL,"gfx-gate-not-admitted: %s on a thread that is not admitted at the suspend gate (the submission must lie between kh_gfx_gate_enter / _try_enter and kh_gfx_gate_leave)",what);
+}
+const char *kh_gfx_gate_result_name(int r){ return r==KH_GATE_QUIESCED?"quiesced":r==KH_GATE_NOT_QUIESCED?"suspend-not-quiesced":r==KH_GATE_QUIESCE_NOT_SET?"gate-not-set":"?"; }
+int kh_gfx_gate_quiesce(unsigned slices){
+    pthread_once(&gate_once,gate_once_init);
+    pthread_mutex_lock(&gate_m); gate_q_calls++;
+    if(!atomic_load(&gate_on)){ gate_q_unset++; pthread_mutex_unlock(&gate_m);
+        fprintf(stderr,"kh: gfx gate: quiesce called while the gate is clear: gate-not-set (nothing waited for; set the gate first)\n"); return KH_GATE_QUIESCE_NOT_SET; }
+    unsigned expired=0; int r=KH_GATE_QUIESCED;
+    while(gate_admitted>0){ if(kh_cond_wait_stuck(&gate_idle_cv,&gate_m,&expired,slices?slices:1)==ETIMEDOUT&&gate_admitted>0){ r=KH_GATE_NOT_QUIESCED; break; } }
+    if(r==KH_GATE_QUIESCED){ gate_q_ok++; pthread_mutex_unlock(&gate_m); return r; }
+    gate_q_timeout++; char who[512]; int k=0; who[0]=0;
+    for(int i=0;i<gate_nplace&&k<(int)sizeof who-80;i++) if(gate_place[i].inside>0) k+=snprintf(who+k,sizeof who-(size_t)k,"%s%s x%d",k?"; ":"",gate_place[i].where,gate_place[i].inside);
+    int n=gate_admitted; pthread_mutex_unlock(&gate_m);
+    fprintf(stderr,"kh: gfx gate: suspend-not-quiesced: %d thread(s) still admitted after %u expired slice(s) of %u ms (%s); the gate stays set\n",n,slices?slices:1,kh_stuck_slice_ms,k?who:"places past the table");
+    return r;
+}
+/* a bounded wait in expired slices (5 = a named fatal at the call site) must not count time while the gate is set: GPU work and the
+ * CPU fence signals a queue waits for are held then (review c1/c2, both families).  An expired slice counts only when the gate is
+ * clear now and was not cleared during the slice (a slice that overlapped a set gate, or the one in which it cleared, is free). */
+int kh_gfx_gate_slice_counts(uint64_t slice_start_ns){ return !atomic_load(&gate_on)&&atomic_load(&gate_last_clear_ns)<slice_start_ns; }
+void kh_gfx_gate_slices_begin(KhGateSlices *s){ u64 now=kh_host_ns(); s->start_ns=now; s->deadline_ns=now+(u64)kh_stuck_slice_ms*1000000ull; s->counted=s->free_=0; }
+int kh_gfx_gate_slices_expired(KhGateSlices *s,unsigned slices){
+    u64 now=kh_host_ns(); if(now<s->deadline_ns) return 0;
+    if(kh_gfx_gate_slice_counts(s->start_ns)) s->counted++; else { s->free_++; pthread_mutex_lock(&gate_m); gate_slices_free++; pthread_mutex_unlock(&gate_m); }
+    s->start_ns=now; s->deadline_ns=now+(u64)kh_stuck_slice_ms*1000000ull;
+    return s->counted>=slices;
 }
 /* ID3D12Fence::Signal from the CPU: held only while a queue may be blocked (fact 11 of the plan): fence signals were put on hold
  * (step 11, a drain that did not complete) or a queue Wait was ever seen */
@@ -103,12 +185,113 @@ int kh_gfx_gate_park_fence_signal(void){
 void kh_gfx_gate_test_reset_queue_waits(void){ atomic_store(&gate_queue_waits,0); }      /* selftest only */
 void kh_gfx_gate_report(FILE *f){
     pthread_mutex_lock(&gate_m);
-    fprintf(f,"kh: gfx gate: set %llu time(s), %llu park(s) (%.1f ms parked in all), fence-signal parks %llu, queue Waits seen %llu, fence signals held: %s",
+    fprintf(f,"kh: gfx gate: set %llu time(s), %llu park(s) (%.1f ms parked in all), fence-signal parks %llu, queue Waits seen %llu, fence signals held: %s; "
+              "admissions %llu (admitted now %d, try_enter refused %llu), quiesce %llu (quiesced %llu, suspend-not-quiesced %llu, gate-not-set %llu), "
+              "bounded-wait slices not counted under the gate %llu",
             P_(gate_sets),P_(gate_parks),gate_parked_ns/1e6,P_(gate_fence_parks),P_(atomic_load(&gate_queue_waits)),
-            atomic_load(&gate_hold_fences)?"yes":atomic_load(&gate_queue_waits)?"yes (a queue Wait was seen)":"no");
-    for(int i=0;i<gate_nplace;i++) fprintf(f,"%s %s=%llu",i?";":"; by place:",gate_place[i].where,P_(gate_place[i].n));
+            atomic_load(&gate_hold_fences)?"yes":atomic_load(&gate_queue_waits)?"yes (a queue Wait was seen)":"no",
+            P_(gate_admissions),gate_admitted,P_(gate_refused_try),P_(gate_q_calls),P_(gate_q_ok),P_(gate_q_timeout),P_(gate_q_unset),P_(gate_slices_free));
+    for(int i=0;i<gate_nplace;i++) fprintf(f,"%s %s=%llu park(s)/%llu admission(s)",i?";":"; by place:",gate_place[i].where,P_(gate_place[i].n),P_(gate_place[i].admits));
     if(gate_place_more) fprintf(f," +%llu at more places",P_(gate_place_more));
     fputc('\n',f); pthread_mutex_unlock(&gate_m);
+}
+/* ---- selftest hook for the real sites (gfx_vkd3d.c, the presenter): kh_gfx_gate_test_arm(place, slices) makes the NEXT admission at a
+ * place whose name contains `place` set the gate from inside its admitted region (the race of review c1/c2: a thread already past its
+ * check when the app goes to the background) and start a thread that runs kh_gfx_gate_quiesce(slices).  That thread records the
+ * result and whether the admitted thread had left when quiesce returned, then clears the gate.  kh_gfx_gate_test_result joins it. */
+static pthread_t gate_test_th; static int gate_test_started, gate_test_fired, gate_test_q_result, gate_test_left_at_return; static unsigned gate_test_slices;
+static u64 gate_test_admit_ns, gate_test_return_ns;
+static void *gate_test_quiescer(void *a){ (void)a; int r=kh_gfx_gate_quiesce(gate_test_slices);
+    pthread_mutex_lock(&gate_m); gate_test_q_result=r; gate_test_left_at_return=gate_test_left; gate_test_return_ns=kh_host_ns(); pthread_mutex_unlock(&gate_m);
+    kh_gfx_gate_clear(); return NULL; }
+static void gate_test_on_admit(const char *where){                      /* caller holds gate_m, the thread was just admitted */
+    (void)where; gate_test_armed_place=NULL; gate_test_fired=1; gate_tl_armed=1; gate_test_left=0; gate_test_admit_ns=kh_host_ns();
+    if(!gate_on){ atomic_store(&gate_on,1); gate_sets++; }
+    gate_test_started=pthread_create(&gate_test_th,NULL,gate_test_quiescer,NULL)==0;
+}
+void kh_gfx_gate_test_arm(const char *place,unsigned slices){ pthread_mutex_lock(&gate_m); gate_test_armed_place=place; gate_test_slices=slices; gate_test_fired=0; gate_test_started=0;
+    gate_test_q_result=-1; gate_test_left_at_return=0; gate_test_left=0; pthread_mutex_unlock(&gate_m); }
+/* 1 = the armed admission happened, quiesce returned `quiesced`, only after that thread left, and the gate is clear again */
+int kh_gfx_gate_test_result(const char *what){
+    pthread_mutex_lock(&gate_m); int fired=gate_test_fired, started=gate_test_started; const char *still=gate_test_armed_place; gate_test_armed_place=NULL; pthread_mutex_unlock(&gate_m);
+    if(started) pthread_join(gate_test_th,NULL);
+    pthread_mutex_lock(&gate_m); int ok=fired&&started&&gate_test_q_result==KH_GATE_QUIESCED&&gate_test_left_at_return&&gate_test_return_ns>=gate_test_left_ns&&gate_test_left_ns>=gate_test_admit_ns;
+    int qr=gate_test_q_result, left=gate_test_left_at_return; gate_test_fired=gate_test_started=0; pthread_mutex_unlock(&gate_m);
+    if(!ok) fprintf(stderr,"gfx gate selftest: %s: %s (quiesce result %s, the admitted thread had %s when quiesce returned)\n",what,
+                    !fired?(still?"NO admission at this place (the region is not admission-counted)":"the hook was disarmed"):!started?"the quiesce thread could not start":"quiesce did not wait for the admitted thread",
+                    qr<0?"none":kh_gfx_gate_result_name(qr),left?"left":"NOT left");
+    if(kh_gfx_gate_is_set()){ kh_gfx_gate_clear(); ok=0; fprintf(stderr,"gfx gate selftest: %s: the gate was still set after the test\n",what); }
+    return ok;
+}
+/* ---- the core selftest (every build: the gate is host code) ---- */
+typedef struct { const char *where; _Atomic int state; _Atomic int go; u64 admit_ns, leave_ns; } GateT;   /* state: 1 asking, 2 admitted, 3 left */
+static void *gate_t_main(void *a){ GateT *t=(GateT*)a; atomic_store(&t->state,1); kh_gfx_gate_enter(t->where); t->admit_ns=kh_host_ns(); atomic_store(&t->state,2);
+    while(!atomic_load(&t->go)){ struct timespec ts={0,1000000}; nanosleep(&ts,0); }
+    t->leave_ns=kh_host_ns(); kh_gfx_gate_leave(); atomic_store(&t->state,3); return NULL; }
+static void *gate_t_release(void *a){ GateT *t=(GateT*)a; struct timespec ts={0,100000000}; nanosleep(&ts,0); atomic_store(&t->go,1); return NULL; }
+static int gate_t_wait_state(GateT *t,int s){ for(int i=0;i<5000;i++){ if(atomic_load(&t->state)>=s) return 1; struct timespec ts={0,1000000}; nanosleep(&ts,0); } return 0; }
+static void *gate_t_bounded(void *a){ (void)a; struct timespec ts={0,(long)(8u*kh_stuck_slice_ms)*1000000L}; nanosleep(&ts,0); kh_gfx_gate_clear(); return NULL; }
+static int gate_fatal_child(int which,char *out,size_t n){       /* 1 = the child ended with the named fatal (exit 3) */
+    FILE *f=kh_tmpfile(); if(!f) return 0; pid_t c=kh_fork(); if(c<0){ fclose(f); return 0; }
+    if(c==0){ dup2(fileno(f),2); if(which==0){ kh_gfx_gate_enter("child: outer"); kh_gfx_gate_enter("child: nested"); }
+        else if(which==1) kh_gfx_gate_leave();
+        else { kh_gfx_gate_enter("child: admitted"); kh_gfx_gate_assert_admitted("child: a submission inside its admission"); kh_gfx_gate_leave();
+               kh_gfx_gate_assert_admitted("child: a submission after its leave"); }
+        _exit(99); }
+    int st=0; waitpid(c,&st,0); rewind(f); size_t k=fread(out,1,n-1,f); out[k]=0; fclose(f); return WIFEXITED(st)&&WEXITSTATUS(st)==3; }
+int kh_gfx_gate_selftest(void){
+    int n=0,f=0;
+#define TG(c) do{ n++; if(!(c)){ f++; fprintf(stderr,"gfx gate selftest FAIL: %s (line %d)\n",#c,__LINE__); } }while(0)
+    unsigned sl0=kh_stuck_slice_ms; kh_stuck_slice_ms=20;
+    TG(!kh_gfx_gate_is_set() && kh_gfx_gate_admitted()==0);
+    /* 1. quiesce with the gate clear: a named result, nothing waited for */
+    TG(kh_gfx_gate_quiesce(3)==KH_GATE_QUIESCE_NOT_SET && !strcmp(kh_gfx_gate_result_name(KH_GATE_QUIESCE_NOT_SET),"gate-not-set"));
+    /* 2. a thread admitted BEFORE the gate is set holds quiesce until it leaves (released 100 ms later by another thread) */
+    { GateT a; memset(&a,0,sizeof a); a.where="selftest: admitted before the gate"; pthread_t ta,tr; TG(pthread_create(&ta,NULL,gate_t_main,&a)==0); TG(gate_t_wait_state(&a,2));
+      TG(kh_gfx_gate_admitted()==1); kh_gfx_gate_set(); TG(pthread_create(&tr,NULL,gate_t_release,&a)==0);
+      u64 t0=kh_host_ns(); int r=kh_gfx_gate_quiesce(50); u64 t1=kh_host_ns();
+      TG(r==KH_GATE_QUIESCED && atomic_load(&a.state)==3 && t1>=a.leave_ns && t1-t0>=80000000ull && kh_gfx_gate_admitted()==0);
+      pthread_join(tr,NULL); pthread_join(ta,NULL); kh_gfx_gate_clear(); }
+    /* 3. a thread that ARRIVES while the gate is set waits outside: not admitted, one park counted, quiesce does not wait for it; it is
+     *    admitted only after the gate is cleared */
+    { GateT b; memset(&b,0,sizeof b); b.where="selftest: arrives while the gate is set"; atomic_store(&b.go,1); u64 p0=kh_gfx_gate_parks();
+      kh_gfx_gate_set(); pthread_t tb; TG(pthread_create(&tb,NULL,gate_t_main,&b)==0); TG(gate_t_wait_state(&b,1));
+      for(int i=0;i<500&&kh_gfx_gate_parks()==p0;i++){ struct timespec ts={0,1000000}; nanosleep(&ts,0); }
+      struct timespec ts={0,60000000}; nanosleep(&ts,0);
+      TG(atomic_load(&b.state)==1 && kh_gfx_gate_parks()==p0+1 && kh_gfx_gate_admitted()==0);
+      u64 t0=kh_host_ns(); TG(kh_gfx_gate_quiesce(5)==KH_GATE_QUIESCED && kh_host_ns()-t0<15000000ull);   /* at once: nobody is admitted */
+      TG(!kh_gfx_gate_try_enter("selftest: try_enter while set"));                                       /* try_enter: refused, no park */
+      TG(kh_gfx_gate_parks()==p0+1);
+      u64 tc=kh_host_ns(); kh_gfx_gate_clear(); pthread_join(tb,NULL); TG(atomic_load(&b.state)==3 && b.admit_ns>=tc); }
+    /* 4. quiesce returns the named result suspend-not-quiesced when its slices run out (3 slices of 20 ms); the gate stays set; once
+     *    the thread leaves, quiesce succeeds */
+    { GateT c; memset(&c,0,sizeof c); c.where="selftest: holds past the bound"; pthread_t tc; TG(pthread_create(&tc,NULL,gate_t_main,&c)==0); TG(gate_t_wait_state(&c,2));
+      kh_gfx_gate_set(); u64 t0=kh_host_ns(); int r=kh_gfx_gate_quiesce(3); u64 dt=kh_host_ns()-t0;
+      TG(r==KH_GATE_NOT_QUIESCED && !strcmp(kh_gfx_gate_result_name(r),"suspend-not-quiesced") && dt>=55000000ull && kh_gfx_gate_is_set() && kh_gfx_gate_admitted()==1);
+      atomic_store(&c.go,1); pthread_join(tc,NULL); TG(kh_gfx_gate_quiesce(3)==KH_GATE_QUIESCED); kh_gfx_gate_clear(); }
+    /* 5. try_enter with the gate clear admits; leave counts out */
+    TG(kh_gfx_gate_try_enter("selftest: try_enter while clear") && kh_gfx_gate_admitted()==1); kh_gfx_gate_leave(); TG(kh_gfx_gate_admitted()==0);
+    /* 6. a bounded wait (5 slices) does not count the slices that overlap a set gate: the gate is held 8 slices, then cleared; the
+     *    budget runs out only after 5 counted slices after the clear (the slice in which it cleared is free too) */
+    { KhGateSlices s; kh_gfx_gate_set(); pthread_t th; TG(pthread_create(&th,NULL,gate_t_bounded,NULL)==0); u64 t0=kh_host_ns();
+      kh_gfx_gate_slices_begin(&s); while(!kh_gfx_gate_slices_expired(&s,5)){ struct timespec ts={0,1000000}; nanosleep(&ts,0); }
+      u64 dt=kh_host_ns()-t0; pthread_join(th,NULL);
+      TG(s.counted==5 && s.free_>=5 && dt>=(u64)(8+4)*kh_stuck_slice_ms*1000000ull && !kh_gfx_gate_is_set());   /* counting under the gate would end at ~5 slices */
+      KhGateSlices s2; t0=kh_host_ns(); kh_gfx_gate_slices_begin(&s2); while(!kh_gfx_gate_slices_expired(&s2,5)){ struct timespec ts={0,1000000}; nanosleep(&ts,0); }
+      dt=kh_host_ns()-t0; TG(s2.counted==5 && s2.free_==0 && dt<(u64)8*kh_stuck_slice_ms*1000000ull); }          /* gate clear: 5 slices, no more */
+    /* 7. the hook used by the per-site tests, on a plain admission */
+    { kh_gfx_gate_test_arm("selftest: hook",50); kh_gfx_gate_enter("selftest: hook site"); struct timespec ts={0,30000000}; nanosleep(&ts,0);
+      TG(kh_gfx_gate_is_set()); kh_gfx_gate_leave(); TG(kh_gfx_gate_test_result("hook on a plain admission")); }
+    /* 8. a nested admission and a leave without one are named fatals (child processes); so is a submission outside an admission
+     *    (review Y39 n=2: inside its admission the check passes, after the leave it is gfx-gate-not-admitted, naming the second call) */
+    if(kh_fork_ok()){ char out[4096]; TG(gate_fatal_child(0,out,sizeof out) && strstr(out,"gfx-gate-nested")!=NULL);
+        TG(gate_fatal_child(1,out,sizeof out) && strstr(out,"gfx-gate-unbalanced")!=NULL);
+        TG(gate_fatal_child(2,out,sizeof out) && strstr(out,"gfx-gate-not-admitted: child: a submission after its leave")!=NULL && !strstr(out,"inside its admission on a thread")); }
+    else kh_selftest_not_run("gfx gate","a nested admission, a leave without one and a submission outside an admission (named fatals in a child process)",3);
+    kh_stuck_slice_ms=sl0;
+    fprintf(stderr,"kh: gfx gate selftest: %d checks, %d failures (admitted before the set holds quiesce until it leaves; an arrival while set waits outside; quiesce: quiesced / suspend-not-quiesced / gate-not-set; try_enter; bounded waits do not count slices under the gate; nested and unbalanced admissions and a submission outside an admission are named fatals)\n",n,f);
+#undef TG
+    return f;
 }
 
 /* ==== 2. display pacing of WaitForVBlank (host clock) ============================================================================
@@ -376,11 +559,13 @@ struct KhPresenter { pthread_mutex_t m; const KhVk *vk; ID3D12Device *dev; ID3D1
     int stale, stale_reason, sc_src_ok, linear_ok; VkCommandPool pool; PSlot slot[PSLOTS]; u64 frames; KhPresentBuffers bb; VkFormat fmt;
     VkBuffer hb[2]; VkDeviceMemory hm[2]; u8 *hp[2]; u64 hsz[2]; int counted_timeouts; int busy;
     int made;                                       /* a swapchain was made once: later builds are counted as rebuilds by their reason */
+    int in_marker;                                  /* a Present is in its marker wait (d), WITHOUT p->m (review Y39 n=1) */
     int chk_pending, chk_slot; u64 chk_n; u32 chk[8];   /* a check present waiting for its reference (kh_present_check): sw sh dx dy dw dh bw bh */
     int lchk_valid; u32 lchk[8]; };                 /* the last checked present (selftest: its copy against a CPU-made picture) */
 /* counters, all presenters */
 static _Atomic u64 c_frames, c_submits, c_presents, c_rebuild[RC_N], c_to_counted, c_to_free, c_parked_acq, c_sem_remade, c_consumed, c_slot_waits,
-    c_cpu_spins, c_check_ok, c_check_fail, c_check_skipped, c_check_bars_bad, c_check_src_bad, c_sc_suboptimal, c_sc_outdated, c_sc_surface_lost;
+    c_cpu_spins, c_check_ok, c_check_fail, c_check_skipped, c_check_bars_bad, c_check_src_bad, c_sc_suboptimal, c_sc_outdated, c_sc_surface_lost,
+    c_marker_free;                                    /* task 39: marker-wait slices not counted because the gate was set */
 /* selftest injections (review V36 n=3: the headless surface never loses itself and never has a zero size) */
 static VkResult test_inject_present, test_inject_acquire; static int test_inject_zero;
 static u64 st_cost_n, st_cost_sum, st_cost_max, st_acq_sum, st_acq_max, st_hold_sum, st_hold_max; static double st_dmax, st_dmean_max;
@@ -503,16 +688,26 @@ KhPresenter *kh_present_attach(ID3D12Device *dev,ID3D12CommandQueue *q,const KhP
             bb->general?"own images, PRESENT = GENERAL":"own images, PRESENT = TRANSFER_SRC",p->family,p->linear_ok?"LINEAR":"NEAREST (no linear filtering for the format)",kh_gfxc_pres_ext.display_timing?"chained":"not enabled");
     return p;
 }
+/* the game's VkQueue for one of OUR gated submissions (review Y39 n=2): the thread must be admitted when it takes the queue and still
+ * when it gives it back, so the whole submission lies inside the admission; a leave in front of it is gfx-gate-not-admitted.  (queue_idle
+ * borrows the queue too, but only to wait: no admission) */
+static VkQueue gated_queue_acquire(KhPresenter *p,const char *what){ kh_gfx_gate_assert_admitted(what); return vkd3d_acquire_vk_queue(p->queue); }
+static void gated_queue_release(KhPresenter *p,const char *what){ kh_gfx_gate_assert_admitted(what); vkd3d_release_vk_queue(p->queue); }
 /* an acquired image that was never presented (the gate was set after the acquire): its semaphore has a pending signal.  An empty batch
- * that waits on it consumes the signal (the gate is clear here), then the semaphore is destroyed and made anew, as the plan asks */
-static void slot_consume(KhPresenter *p,PSlot *s){
-    if(!s->acquired) return; const KhVk *v=p->vk;
+ * that waits on it consumes the signal, then the semaphore is destroyed and made anew, as the plan asks.  The submit is an ADMISSION at
+ * the gate (task 39): 0 = the gate is set, nothing was done (the caller lets go of p->m and goes back to the gate); 1 = done or nothing
+ * to do.  Caller holds p->m. */
+static int slot_consume(KhPresenter *p,PSlot *s,const char *where){
+    if(!s->acquired) return 1; const KhVk *v=p->vk;
+    if(!kh_gfx_gate_try_enter(where)) return 0;
     VkPipelineStageFlags ws=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT; VkSubmitInfo si; memset(&si,0,sizeof si); si.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO; si.waitSemaphoreCount=1; si.pWaitSemaphores=&s->acq; si.pWaitDstStageMask=&ws;
     VKC(v->ResetFences(v->dev,1,&s->fence),"vkResetFences");
-    VkQueue q=vkd3d_acquire_vk_queue(p->queue); VkResult r=v->QueueSubmit(q,1,&si,s->fence); vkd3d_release_vk_queue(p->queue);
+    VkQueue q=gated_queue_acquire(p,"presenter: vkQueueSubmit consuming a parked acquire"); VkResult r=v->QueueSubmit(q,1,&si,s->fence); gated_queue_release(p,"presenter: the queue after consuming a parked acquire");
+    kh_gfx_gate_leave();
     if(r!=VK_SUCCESS) kh_fatal(NULL,"gfx-present-vk: vkQueueSubmit (consuming a parked acquire) failed: VkResult %d",(int)r);
     s->pending=1; slot_wait(p,s,"consuming a parked acquire"); atomic_fetch_add(&c_consumed,1);
     del_sem(v,&s->acq); s->acq=mk_sem(v); atomic_fetch_add(&c_sem_remade,1); s->acquired=0;
+    return 1;
 }
 /* the destination rectangle of the picture inside the swapchain image */
 static void fit_rect(const KhPresenter *p,u32 bw,u32 bh,u32 sw,u32 sh,u32 *dx,u32 *dy,u32 *dw,u32 *dh){
@@ -566,8 +761,10 @@ static int rect_is(u32 sw,u32 sh,u32 dx,u32 dy,u32 dw,u32 dh){ u32 r[6]; kh_pres
  * The caller starts the Present again from (a). */
 static void park_after_acquire(KhPresenter *p,PSlot *s,const char *where){
     atomic_fetch_add(&c_parked_acq,1); p->busy=0; pthread_mutex_unlock(&p->m);
-    kh_gfx_gate_park(where);
-    pthread_mutex_lock(&p->m); slot_consume(p,s); p->stale=1; p->stale_reason=RC_RESUME; pthread_mutex_unlock(&p->m);
+    /* task 39 (review c1/c2, verification): the consumption is admitted at the gate; a gate set AGAIN between the park and the admission
+     * (a quick resume and a second background) parks again instead of submitting */
+    for(;;){ kh_gfx_gate_park(where); pthread_mutex_lock(&p->m); if(slot_consume(p,s,"presenter: consume a parked acquire")) break; pthread_mutex_unlock(&p->m); }
+    p->stale=1; p->stale_reason=RC_RESUME; pthread_mutex_unlock(&p->m);
 }
 /* ---- one Present ----
  * Returns 1 when this present made check copies: the caller (kh_vkd3d_present) then queues an independent D3D12 readback of the same
@@ -589,7 +786,7 @@ int kh_present_frame(KCtx *g,KhPresenter *p,u32 idx,u64 n){
         if(!p->sc){ pthread_mutex_unlock(&p->m); atomic_fetch_add(&c_zero_size,1); return 0; }   /* zero-size drawable: nothing to present (counted) */
         s=&p->slot[p->frames%PSLOTS];
         slot_wait(p,s,"slot reuse");                                                          /* (c) the slot's semaphore and command buffer are free again */
-        if(s->acquired) slot_consume(p,s);
+        if(!slot_consume(p,s,"presenter: consume a parked acquire")){ pthread_mutex_unlock(&p->m); continue; }   /* gate set: back to (a) */
         u64 t0=kh_host_ns(); VkResult r;
         if(test_inject_acquire){ r=test_inject_acquire; test_inject_acquire=0; }             /* selftest: a result the headless surface never gives */
         else r=v->AcquireNextImageKHR(v->dev,p->sc,(u64)kh_stuck_slice_ms*1000000ull,s->acq,VK_NULL_HANDLE,&ii);
@@ -604,11 +801,24 @@ int kh_present_frame(KCtx *g,KhPresenter *p,u32 idx,u64 n){
         if(ii>=p->nimg) kh_fatal(NULL,"gfx-present-vk: vkAcquireNextImageKHR gave image %u of %u",ii,p->nimg);
         subopt=r==VK_SUBOPTIMAL_KHR; p->counted_timeouts=0; s->acquired=1; s->img=(int)ii;
         if(test_after_acquire) test_after_acquire(p);
-        /* (d) everything the game queued for this frame has left vkd3d's op queue */
+        /* (d) everything the game queued for this frame has left vkd3d's op queue.  WITHOUT the presenter's lock (review Y39 n=1): under
+         *     a set gate this wait has no bound (its slices are not counted), and step 11's main thread takes p->m before it clears the
+         *     gate (kh_present_resume, kh_present_quiesce): holding p->m here deadlocked them while a queue waited on a held CPU signal.
+         *     p->busy keeps another Present out (gfx-present-reentry); kh_present_resize / _teardown meanwhile are gfx-present-busy.
+         *     The marker op is flushed by this call only when it is alone in the game's queue, so it never pushes THAT queue's queued
+         *     work; but running it signals p->fence from the CPU, and vkd3d then flushes EVERY blocked queue of the device (command.c
+         *     891, 746-776): a queue whose Wait another thread's signal has just satisfied can have its work submitted from this thread.
+         *     That is the CPU-signal race of step 11 (implementation notes section 7; the step-11 test with the gipa submission counter guards it),
+         *     not one of our gated submissions. */
+        p->busy=1; p->in_marker=1; pthread_mutex_unlock(&p->m);
         u64 td=kh_host_ns(); HRESULT hr=vkd3d_queue_signal_on_cpu(p->queue,p->fence,++p->fence_val); if(FAILED(hr)) kh_fatal(NULL,"gfx-present: vkd3d_queue_signal_on_cpu failed hr=0x%08x",(unsigned)hr);
-        { unsigned expired=0; u64 dl=kh_host_ns()+(u64)kh_stuck_slice_ms*1000000ull;
+        /* the marker wait: 5 COUNTED slices; a slice that overlaps a set gate is not counted (task 39, review c1/c2: a queue may wait
+         * on a CPU fence signal that the gate holds; the wait goes on once the gate clears) */
+        { KhGateSlices sl; kh_gfx_gate_slices_begin(&sl);
           while(ID3D12Fence_GetCompletedValue(p->fence)<p->fence_val){ atomic_fetch_add(&c_cpu_spins,1); struct timespec ts={0,50000}; nanosleep(&ts,0);
-              u64 now=kh_host_ns(); if(now>=dl){ if(++expired>=5) kh_fatal(NULL,"gfx-present-queue-blocked: vkd3d did not hand the frame's work to Vulkan within 5 slices of %u ms (a queue waits on a fence nobody signals?)",kh_stuck_slice_ms); dl=now+(u64)kh_stuck_slice_ms*1000000ull; } } }
+              if(kh_gfx_gate_slices_expired(&sl,5)) kh_fatal(NULL,"gfx-present-queue-blocked: vkd3d did not hand the frame's work to Vulkan within 5 slices of %u ms with the gate clear (%u more under the gate; a queue waits on a fence nobody signals?)",kh_stuck_slice_ms,sl.free_); }
+          if(sl.free_) atomic_fetch_add(&c_marker_free,sl.free_); }
+        pthread_mutex_lock(&p->m); p->in_marker=0;
         /* (e) the gate again: if it is set now, this acquire stays "acquired, not presented" and the thread parks */
         if(kh_gfx_gate_is_set()){ park_after_acquire(p,s,"presenter: after acquire (e)"); continue; }
         p->busy=1;
@@ -650,10 +860,13 @@ int kh_present_frame(KCtx *g,KhPresenter *p,u32 idx,u64 n){
         VkPresentInfoKHR pi; memset(&pi,0,sizeof pi); pi.sType=VK_STRUCTURE_TYPE_PRESENT_INFO_KHR; pi.waitSemaphoreCount=1; pi.pWaitSemaphores=&p->rsem[ii]; pi.swapchainCount=1; pi.pSwapchains=&p->sc; pi.pImageIndices=&ii;
         VkPresentTimeGOOGLE pt={(u32)n,0}; VkPresentTimesInfoGOOGLE pti; memset(&pti,0,sizeof pti); pti.sType=VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE; pti.swapchainCount=1; pti.pTimes=&pt;
         if(kh_gfxc_pres_ext.display_timing) pi.pNext=&pti;
-        /* the last look before the queue: a gate set while the command buffer was recorded parks here too (the recording is dropped) */
-        if(kh_gfx_gate_is_set()){ park_after_acquire(p,s,"presenter: before submit and present"); continue; }
+        /* the last look before the queue is an ADMISSION (task 39): a gate set while the command buffer was recorded parks here too (the
+         * recording is dropped); once admitted, a gate set from now on waits in kh_gfx_gate_quiesce until this submit and present are
+         * done and the queue is released */
+        if(!kh_gfx_gate_try_enter("presenter: submit and present")){ park_after_acquire(p,s,"presenter: before submit and present"); continue; }
         VKC(v->ResetFences(v->dev,1,&s->fence),"vkResetFences");
-        u64 th=kh_host_ns(); VkQueue vq=vkd3d_acquire_vk_queue(p->queue); VkResult sr=v->QueueSubmit(vq,1,&sub,s->fence); VkResult pr=sr==VK_SUCCESS?v->QueuePresentKHR(vq,&pi):VK_ERROR_UNKNOWN; vkd3d_release_vk_queue(p->queue);
+        u64 th=kh_host_ns(); VkQueue vq=gated_queue_acquire(p,"presenter: vkQueueSubmit + vkQueuePresentKHR"); VkResult sr=v->QueueSubmit(vq,1,&sub,s->fence); VkResult pr=sr==VK_SUCCESS?v->QueuePresentKHR(vq,&pi):VK_ERROR_UNKNOWN; gated_queue_release(p,"presenter: the queue after submit and present");
+        kh_gfx_gate_leave();
         u64 te=kh_host_ns(), hold=te-th, cost=te-td;
         if(sr!=VK_SUCCESS) kh_fatal(NULL,"gfx-present-vk: vkQueueSubmit failed: VkResult %d",(int)sr);
         s->pending=1; s->acquired=0; atomic_fetch_add(&c_submits,1); atomic_fetch_add(&c_presents,1);
@@ -695,13 +908,22 @@ void kh_present_check(KhPresenter *p,u64 n,const u8 *ref,u32 rp){
     check_ppm(p->hp[0],sw,sh,n);
     p->chk_pending=0; p->busy=0; pthread_mutex_unlock(&p->m);
 }
-/* every submission of ours is complete (the back buffers may be destroyed afterwards) */
+/* every submission of ours MADE SO FAR is complete (the back buffers may be destroyed afterwards).  Any thread, also the main thread of
+ * step 11 while the gate is set: p->m is never held across an unbounded wait (review Y39 n=1), so this does not wait for a Present
+ * inside its marker wait (d); that one has not submitted yet, and at (e) it parks while the gate is set */
 void kh_present_quiesce(KhPresenter *p){ if(!p) return; pthread_mutex_lock(&p->m); for(int i=0;i<PSLOTS;i++) slot_wait(p,&p->slot[i],"quiesce"); pthread_mutex_unlock(&p->m); }
-void kh_present_resize(KhPresenter *p,const KhPresentBuffers *bb){ if(!p) return; pthread_mutex_lock(&p->m); p->bb=*bb; p->general=bb->general; pthread_mutex_unlock(&p->m); }
+/* resize and teardown change what a Present uses: never while one is in its marker wait (d) on another thread, which no longer holds
+ * p->m there (review Y39 n=1); that would be ResizeBuffers / release concurrent with Present: the named fatal gfx-present-busy */
+static void not_in_marker(KhPresenter *p,const char *what){
+    if(p->in_marker){ pthread_mutex_unlock(&p->m); kh_fatal(NULL,"gfx-present-busy: %s while a Present of the same swap chain waits in its marker (d) on another thread (ResizeBuffers / release concurrent with Present)",what); } }
+void kh_present_resize(KhPresenter *p,const KhPresentBuffers *bb){ if(!p) return; pthread_mutex_lock(&p->m); not_in_marker(p,"kh_present_resize"); p->bb=*bb; p->general=bb->general; pthread_mutex_unlock(&p->m); }
+/* any thread, at any time (the main thread of step 11 before it clears the gate): the swapchain is rebuilt at the next Present */
 void kh_present_resume(KhPresenter *p){ if(!p) return; pthread_mutex_lock(&p->m); p->stale=1; p->stale_reason=RC_RESUME; pthread_mutex_unlock(&p->m); }
+static int test_in_marker(KhPresenter *p){ pthread_mutex_lock(&p->m); int r=p->in_marker; pthread_mutex_unlock(&p->m); return r; }   /* selftest */
 void kh_present_teardown(KhPresenter *p){
-    if(!p) return; const KhVk *v=p->vk; pthread_mutex_lock(&p->m);
-    for(int i=0;i<PSLOTS;i++){ slot_wait(p,&p->slot[i],"teardown"); slot_consume(p,&p->slot[i]); }
+    if(!p) return; const KhVk *v=p->vk; pthread_mutex_lock(&p->m); not_in_marker(p,"kh_present_teardown");
+    for(int i=0;i<PSLOTS;i++){ slot_wait(p,&p->slot[i],"teardown");
+        while(!slot_consume(p,&p->slot[i],"presenter: consume a parked acquire (teardown)")){ pthread_mutex_unlock(&p->m); kh_gfx_gate_park("presenter teardown"); pthread_mutex_lock(&p->m); } }
     queue_idle(p); swapchain_destroy(p,p->sc,p->nimg,p->rsem); p->sc=VK_NULL_HANDLE;
     for(int i=0;i<PSLOTS;i++){ del_sem(v,&p->slot[i].acq); v->DestroyFence(v->dev,p->slot[i].fence,NULL); kh_vko_note(VKO_FENCE,0); }
     v->DestroyCommandPool(v->dev,p->pool,NULL); kh_vko_note(VKO_POOL,0);
@@ -720,12 +942,12 @@ void kh_present_report(FILE *f){
     pthread_mutex_lock(&pm_g); char p50[48], p99[48]; pct_fmt(p50,sizeof p50,hist_pct(0.5)); pct_fmt(p99,sizeof p99,hist_pct(0.99));
     fprintf(f,"kh: gfx present: mode=%s frames=%llu submits=%llu presents=%llu; swapchains made %llu, rebuilt %llu (size %llu, out-of-date %llu, suboptimal %llu, surface-lost %llu, after-park %llu); "
               "present cost (d)-(f) mean %.3f ms p50 %s p99 %s max %.3f ms; acquire mean %.3f ms max %.3f ms; queue mutex held mean %.3f ms max %.3f ms; "
-              "acquire time-outs counted %llu / not counted %llu; parked after acquire %llu (semaphores made anew %llu, consumed %llu); signal_on_cpu waits that spun %llu; "
+              "acquire time-outs counted %llu / not counted %llu; parked after acquire %llu (semaphores made anew %llu, consumed %llu); signal_on_cpu waits that spun %llu (slices not counted under the gate %llu); "
               "check (against the D3D12 readback): ok %llu failed %llu (bars %llu, source copy %llu) skipped %llu, largest difference %.2f, largest mean %.3f; surface lost %llu; zero-size drawable skips %llu; live Vulkan objects of the runtime %lld\n",
             mode_names[pr_mode<0?0:pr_mode],P_(c_frames),P_(c_submits),P_(c_presents),P_(c_rebuild[RC_FIRST]),P_(c_rebuild[RC_SIZE]+c_rebuild[RC_OUTDATED]+c_rebuild[RC_SUBOPTIMAL]+c_rebuild[RC_SURFACE]+c_rebuild[RC_RESUME]),
             P_(c_rebuild[RC_SIZE]),P_(c_rebuild[RC_OUTDATED]),P_(c_rebuild[RC_SUBOPTIMAL]),P_(c_rebuild[RC_SURFACE]),P_(c_rebuild[RC_RESUME]),
             st_cost_n?st_cost_sum/1e6/(double)st_cost_n:0.0,p50,p99,st_cost_max/1e6,st_cost_n?st_acq_sum/1e6/(double)st_cost_n:0.0,st_acq_max/1e6,
-            st_cost_n?st_hold_sum/1e6/(double)st_cost_n:0.0,st_hold_max/1e6,P_(c_to_counted),P_(c_to_free),P_(c_parked_acq),P_(c_sem_remade),P_(c_consumed),P_(c_cpu_spins),
+            st_cost_n?st_hold_sum/1e6/(double)st_cost_n:0.0,st_hold_max/1e6,P_(c_to_counted),P_(c_to_free),P_(c_parked_acq),P_(c_sem_remade),P_(c_consumed),P_(c_cpu_spins),P_(c_marker_free),
             P_(c_check_ok),P_(c_check_fail),P_(c_check_bars_bad),P_(c_check_src_bad),P_(c_check_skipped),st_dmax,st_dmean_max,P_(c_sc_surface_lost),P_(c_zero_size),kh_vko_live_total());
     pthread_mutex_unlock(&pm_g);
 }
@@ -831,10 +1053,39 @@ static int pt_frame(PT *t,KCtx *g,u64 sc,int draws,int clear,const float c[4]){
 static u64 mk_swap(KCtx *g,u64 gm,u64 fct,u64 q,u32 w,u32 h){
     u64 d=gm; memset(hp(g,d),0,48); wr32(g,d,w); wr32(g,d+4,h); wr32(g,d+8,0x57); wr32(g,d+16,1); wr32(g,d+24,0x30); wr32(g,d+28,3); wr32(g,d+36,3); wr32(g,d+44,0x42);
     wr64(g,gm+64,0); if((u32)GC(VT(fct,15),fct,q,0xAB0001,d,0,0,gm+64)) return 0; return rd64(g,gm+64); }
+void *kh_gfx_test_hold_then_signal(void *arg){ KhGateHoldSig *h=(KhGateHoldSig*)arg;
+    if(h->after_change){ for(int i=0;i<10000&&*h->after_change==h->from;i++){ struct timespec t1={0,1000000}; nanosleep(&t1,0); } h->changed=*h->after_change!=h->from; }
+    struct timespec ts={(time_t)(h->set_ms/1000),(long)(h->set_ms%1000)*1000000L}; nanosleep(&ts,0); h->set_ns=kh_host_ns(); kh_gfx_gate_set();
+    ts.tv_sec=(time_t)(h->hold_ms/1000); ts.tv_nsec=(long)(h->hold_ms%1000)*1000000L; nanosleep(&ts,0); h->cleared_ns=kh_host_ns(); kh_gfx_gate_clear();
+    ts.tv_sec=0; ts.tv_nsec=10000000L; nanosleep(&ts,0);
+    if(FAILED(ID3D12Fence_Signal(h->fence,1))) fprintf(stderr,"gfx gate selftest: ID3D12Fence::Signal from the CPU failed\n");
+    return NULL; }
 typedef struct { unsigned hold_ms; } GateHold;
 static void *gate_clearer(void *a){ GateHold *h=(GateHold*)a; struct timespec ts={(time_t)(h->hold_ms/1000),(long)(h->hold_ms%1000)*1000000L}; nanosleep(&ts,0); kh_gfx_gate_clear(); return NULL; }
 static pthread_t gate_thread; static GateHold gate_hold;
 static void hook_set_gate(KhPresenter *p){ (void)p; kh_present_test_after_acquire(NULL); kh_gfx_gate_set(); gate_hold.hold_ms=60; pthread_create(&gate_thread,NULL,gate_clearer,&gate_hold); }
+static KhGateHoldSig hold5f; static pthread_t hold5f_th; static int hold5f_started;          /* task 39, test 5f */
+static void hook_start_hold(KhPresenter *p){ (void)p; kh_present_test_after_acquire(NULL); hold5f_started=pthread_create(&hold5f_th,NULL,kh_gfx_test_hold_then_signal,&hold5f)==0; }
+/* test 5g (review Y39 n=1): step 11's main thread while the presenter waits in (d) under a set gate.  The helper waits until the marker
+ * spins, sets the gate, and runs kh_present_quiesce + kh_present_resume (+ a look at in_marker) on a third thread, as the main thread
+ * does before it clears the gate.  It clears the gate when they returned, or after 300 ms (the deadlock, which the test breaks), then
+ * signals the fence the game's queue waits on. */
+typedef struct { ID3D12Fence *fence; KhPresenter *p; u64 spins0, set_ns, ret_ns, cleared_ns; _Atomic int returned; int in_d, calls_started, marker_seen; } Main5g;
+static Main5g m5g; static pthread_t m5g_th; static int m5g_started;
+static void *m5g_calls(void *a){ Main5g *h=(Main5g*)a; kh_present_quiesce(h->p); kh_present_resume(h->p); h->marker_seen=test_in_marker(h->p);
+    h->ret_ns=kh_host_ns(); atomic_store(&h->returned,1); return NULL; }
+static void *m5g_main(void *a){ Main5g *h=(Main5g*)a; struct timespec ms1={0,1000000};
+    for(int i=0;i<5000&&atomic_load(&c_cpu_spins)==h->spins0;i++) nanosleep(&ms1,0);
+    h->in_d=atomic_load(&c_cpu_spins)!=h->spins0;
+    h->set_ns=kh_host_ns(); kh_gfx_gate_set();
+    pthread_t c; h->calls_started=pthread_create(&c,NULL,m5g_calls,h)==0;
+    for(int i=0;i<300&&h->calls_started&&!atomic_load(&h->returned);i++) nanosleep(&ms1,0);
+    h->cleared_ns=kh_host_ns(); kh_gfx_gate_clear();
+    struct timespec ms10={0,10000000}; nanosleep(&ms10,0);
+    if(FAILED(ID3D12Fence_Signal(h->fence,1))) fprintf(stderr,"gfx present selftest: 5g: ID3D12Fence::Signal from the CPU failed\n");
+    if(h->calls_started) pthread_join(c,NULL);
+    return NULL; }
+static void hook_start_5g(KhPresenter *p){ kh_present_test_after_acquire(NULL); m5g.p=p; m5g.spins0=atomic_load(&c_cpu_spins); m5g_started=pthread_create(&m5g_th,NULL,m5g_main,&m5g)==0; }
 /* review V36 n=1: pictures made on the CPU, independent of every GPU copy.  A flat colour (float -> UNORM, round to nearest) and the
  * selftest's pattern evaluated as the pixel shader does in float: R = frac(px/7), G = frac(py/5), B = frac((px+py)/23) at the pixel
  * centre (px = x + 0.5).  BGRA rows, 4*w bytes. */
@@ -907,6 +1158,47 @@ int kh_present_selftest(KCtx *g,u64 m,u64 dev,u64 q,u64 fct){
       TS(pt_cpu_check(t.si.pres,pat128,128,72,tm,tn,"after a park",0));
       kh_present_test_counters(&x,&x,&x,&r1,&ok1,&bad1,&pk1,&rm1);
       TS(pk1==pk0+1 && rm1==rm0+1 && r1==r0+1 && ok1==ok0+1 && bad1==bad0 && dt>=50000000ull && kh_gfx_gate_parks()==gp0+1 && !kh_gfx_gate_is_set()); }
+    /* 5e. (task 39) the admissions of the presenter's three submit-capable regions.  For each, the gate is set from INSIDE the admitted
+     *     region (the race of review c1/c2: a thread already past its check when the app is sent to the background) and another thread
+     *     runs kh_gfx_gate_quiesce: it must return `quiesced` only after the region was left, and the present must pass its checks.
+     *     (1) submit + present, from the last check to vkd3d_release_vk_queue; (2) the check-mode reference readback (gfx_vkd3d.c);
+     *     (3) the consumption of a parked acquire (the gate set after the acquire as in 5, then again inside the consumption) */
+    { u64 x,ok0,ok1,bad0,bad1; kh_present_test_counters(&x,&x,&x,&x,&ok0,&bad0,&x,&x);
+      kh_gfx_gate_test_arm("presenter: submit and present",50); TS(pt_frame(&t,g,sc,1,-1,NULL)); TS(kh_gfx_gate_test_result("presenter: submit and present"));
+      TS(pt_cpu_check(t.si.pres,pat128,128,72,tm,tn,"admitted submit and present",0));
+      kh_gfx_gate_test_arm("Present (check-mode reference readback)",50); TS(pt_frame(&t,g,sc,1,-1,NULL)); TS(kh_gfx_gate_test_result("Present (check-mode reference readback)"));
+      TS(pt_cpu_check(t.si.pres,pat128,128,72,tm,tn,"admitted reference readback",0));
+      kh_gfx_gate_test_arm("presenter: consume a parked acquire",50); kh_present_test_after_acquire(hook_set_gate); TS(pt_frame(&t,g,sc,1,-1,NULL)); pthread_join(gate_thread,NULL);
+      TS(kh_gfx_gate_test_result("presenter: consume a parked acquire")); TS(pt_cpu_check(t.si.pres,pat128,128,72,tm,tn,"admitted consumption",0));
+      kh_present_test_counters(&x,&x,&x,&x,&ok1,&bad1,&x,&x); TS(ok1==ok0+3 && bad1==bad0 && kh_gfx_gate_admitted()==0 && !kh_gfx_gate_is_set()); }
+    /* 5f. (task 39, review c1/c2) the marker wait (d) does not count slices while the gate is set.  The game's queue Waits on a fence
+     *     that another thread signals from the CPU 340 ms later; meanwhile that thread sets the gate at 30 ms and clears it at 330 ms (15
+     *     slices of 20 ms).  Counting them would end in gfx-present-queue-blocked after 5 slices (100 ms); now the present waits, passes
+     *     its checks, and at least 5 marker slices were not counted */
+    { unsigned sl0=kh_stuck_slice_ms; ID3D12Fence *fw=NULL; TS(SUCCEEDED(ID3D12Device_CreateFence(t.si.dev,0,D3D12_FENCE_FLAG_NONE,&IID_ID3D12Fence,(void**)&fw)));
+      if(fw){ kh_stuck_slice_ms=20; TS(SUCCEEDED(ID3D12CommandQueue_Wait(t.si.queue,fw,1)));
+          memset(&hold5f,0,sizeof hold5f); hold5f.fence=fw; hold5f.set_ms=10; hold5f.hold_ms=300; hold5f_started=0;
+          kh_present_test_after_acquire(hook_start_hold);                     /* the thread starts right after the acquire, before (d) */
+          u64 mf0=atomic_load(&c_marker_free), t0=kh_host_ns(); TS(pt_frame(&t,g,sc,1,-1,NULL)); u64 t1=kh_host_ns(); TS(hold5f_started); if(hold5f_started) pthread_join(hold5f_th,NULL);
+          TS(pt_cpu_check(t.si.pres,pat128,128,72,tm,tn,"after a marker wait under the gate",0));
+          TS(atomic_load(&c_marker_free)>=mf0+5 && t1-t0>=300000000ull && t1>=hold5f.cleared_ns && !kh_gfx_gate_is_set());
+          kh_stuck_slice_ms=sl0; ID3D12Fence_Release(fw); } }
+    /* 5g. (review Y39 n=1) step 11's main thread may call kh_present_quiesce and kh_present_resume while the gate is set and the
+     *     presenter waits in its marker (d) for a queue that waits on a CPU signal the gate holds: both must return BEFORE the gate is
+     *     cleared (with p->m held through (d) they waited for the presenter, which waited for the clear: a deadlock, broken here by the
+     *     helper's 300 ms limit).  The presenter is seen inside (d) by them, the present goes on after the clear, and the next present
+     *     rebuilds the swapchain as resumed (after-park) */
+    { ID3D12Fence *fw=NULL; TS(SUCCEEDED(ID3D12Device_CreateFence(t.si.dev,0,D3D12_FENCE_FLAG_NONE,&IID_ID3D12Fence,(void**)&fw)));
+      if(fw){ TS(SUCCEEDED(ID3D12CommandQueue_Wait(t.si.queue,fw,1)));
+          memset(&m5g,0,sizeof m5g); m5g.fence=fw; m5g_started=0; kh_present_test_after_acquire(hook_start_5g);
+          TS(pt_frame(&t,g,sc,1,-1,NULL)); TS(m5g_started); if(m5g_started) pthread_join(m5g_th,NULL);
+          TS(pt_cpu_check(t.si.pres,pat128,128,72,tm,tn,"after the main thread's calls during the marker wait",0));
+          int ok=m5g.in_d&&m5g.calls_started&&atomic_load(&m5g.returned)&&m5g.ret_ns<m5g.cleared_ns&&m5g.marker_seen==1; TS(ok);
+          if(!ok) fprintf(stderr,"gfx present selftest: 5g: marker spinning %d, calls %s %.1f ms after the gate was set (the gate cleared after %.1f ms), presenter seen in (d) %d\n",m5g.in_d,
+                          atomic_load(&m5g.returned)?(m5g.ret_ns<m5g.cleared_ns?"returned":"returned only AFTER the clear,"):"did not return",(m5g.ret_ns-m5g.set_ns)/1e6,(m5g.cleared_ns-m5g.set_ns)/1e6,m5g.marker_seen);
+          u64 rr0=atomic_load(&c_rebuild[RC_RESUME]); TS(pt_frame(&t,g,sc,1,-1,NULL)); TS(atomic_load(&c_rebuild[RC_RESUME])==rr0+1);
+          TS(pt_cpu_check(t.si.pres,pat128,128,72,tm,tn,"the present after the resume",0) && !kh_gfx_gate_is_set() && kh_gfx_gate_admitted()==0);
+          ID3D12Fence_Release(fw); } }
     /* 5b. (review V36 n=3) SURFACE_LOST from vkQueuePresentKHR (injected once after a real present: the headless surface never loses
      *     itself): the swapchain and the surface are dropped at once and made anew at the next present, counted as a surface-lost rebuild
      *     (before, the lost surface was kept and the next build asked it for its capabilities: the named fatal gfx-present-vk) */

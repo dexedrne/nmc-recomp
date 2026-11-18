@@ -56,7 +56,7 @@ int kh_mod_syscalls_selftest(KCtx *g){
     T(rd64(g,table+113*16+8)==0x40000001);
     if(kh_fork_ok()){
     T(fatal_case(g,2,args,"index=2 name=AddFormExp"));          /* Set_Action (0) is implemented since Task 23 */
-    T(fatal_case(g,50,args,"index=50 name=GetCurrentRC_MEM"));
+    T(fatal_case(g,49,args,"index=49 name=IsRCBlocked"));       /* task 39: 50 is an alias of 48 now (below); 49 is still unimplemented */
     } else kh_selftest_not_run("mod syscall","two unimplemented syscalls (named fatal with the call site)",2);   /* iOS: no fork (host_env.c) */
 
     /* Snapshot globals touched by the fixtures; restore them before other selftests. */
@@ -111,6 +111,10 @@ int kh_mod_syscalls_selftest(KCtx *g){
     u64 player=ga_calloc(1,0xdd8), command=ga_calloc(1,0xb50);
     wr64(g,GS_BASE+0x2a105d0,player); wr64(g,player+0xdd0,command); wr8(g,command+0xb42,0xa7);
     T(invoke(g,48,args,0,0)==0xa7);
+    /* task 39: index 50 is the same DLL handler (0x12920, same flags): the same answer as 48 for the same state, for two states */
+    T(rd64(g,table+50*16+8)==rd64(g,table+48*16+8));
+    T(invoke(g,50,args,0,0)==0xa7);
+    wr8(g,command+0xb42,0x3c); { u32 r48=invoke(g,48,args,0,0), r50=invoke(g,50,args,0,0); T(r48==0x3c && r50==r48); }
     u64 byte=ga_calloc(1,16); u32 byte_id=idof(g,byte); wr32(g,byte,0xaabbccdd);
     invoke(g,69,args,byte_id,0x12345678); T(rd32(g,byte)==0xaabbcc78);
 

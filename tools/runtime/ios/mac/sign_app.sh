@@ -14,15 +14,18 @@
 #   archive's backend must match GFX, either way); xcodebuild then gets KHNMC_GFX_LDFLAGS.  launchctl does not pass the caller's
 #   environment: put it into the job's command, `... && GFX=1 tools/ios/mac/sign_app.sh ent'`.  A failed check is written to sign.log
 #   ("sign_app: FAILED ...") and nothing is built or signed.
+# ORDERED_MEM=1 (environment; task 39): sign the variant whose libraries `ORDERED_MEM=1 mac/build.sh iphoneos` made (obj-iphoneos-om/).
 . "$(dirname "$0")/lib.sh"
 V=${1:-ent}; case "$V" in ent|plain) ;; *) sed -n '2,4p' "$0" >&2; exit 2;; esac
+OM=${ORDERED_MEM:-0}; case "$OM" in 0|1) ;; *) echo "ios/mac: sign_app: ORDERED_MEM must be 0 or 1" >&2; exit 2;; esac
+XLIBS=(); [ "$OM" = 1 ] && XLIBS=("KHNMC_LIBS=$PWD/obj-iphoneos-om")
 [ -f "$STATE/device.env" ] && . "$STATE/device.env"
 : "${TEAM:?ios/mac: sign_app: no TEAM in $STATE/device.env}"
 B="$KROOT/build/app-signed"; OUT="$RUNS/app-signed"; mkdir -p "$OUT" "$B"; rm -f "$OUT/sign.done"
 {
-  echo "sign_app: start $(date) ($V, GFX=$GFX)"
+  echo "sign_app: start $(date) ($V, GFX=$GFX, ORDERED_MEM=$OM)"
   ok=1; GX=()
-  gfx_lib_check obj-iphoneos/libkhnmc-rt.a || ok=0
+  gfx_lib_check "obj-iphoneos$([ "$OM" = 1 ] && echo -om)/libkhnmc-rt.a" || ok=0
   if [ $ok = 1 ] && [ "$GFX" = 1 ]; then GFXLD=$(gfx_ldflags) && GX=("KHNMC_GFX_LDFLAGS=$GFXLD") || ok=0; fi
   if [ $ok = 1 ]; then
   ENT=(); if [ "$V" = ent ]; then cp tools/ios/probe/probe.entitlements.example "$B/app.entitlements"; ENT=("CODE_SIGN_ENTITLEMENTS=$B/app.entitlements"); fi
@@ -32,7 +35,7 @@ B="$KROOT/build/app-signed"; OUT="$RUNS/app-signed"; mkdir -p "$OUT" "$B"; rm -f
      -configuration Release -derivedDataPath "$KROOT/build/app-signed/dd" -jobs $JOBS -allowProvisioningUpdates \
      SYMROOT="$B/sym" OBJROOT="$B/obj" MODULE_CACHE_DIR="$KROOT/build/app-signed/dd/ModuleCache.noindex" DEAD_CODE_STRIPPING=NO \
      DEVELOPMENT_TEAM="$TEAM" CODE_SIGN_STYLE=Automatic CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED=YES \
-     "CODE_SIGN_IDENTITY=Apple Development" ${ENT[@]+"${ENT[@]}"} ${GX[@]+"${GX[@]}"} build
+     "CODE_SIGN_IDENTITY=Apple Development" ${ENT[@]+"${ENT[@]}"} ${GX[@]+"${GX[@]}"} ${XLIBS[@]+"${XLIBS[@]}"} build
   echo "sign_app: xcodebuild exit=$?"
   APP="$B/sym/Release-iphoneos/KHNMC.app"
   codesign -dv "$APP" 2>&1 | grep -E "TeamIdentifier|not signed"

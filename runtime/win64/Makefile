@@ -56,6 +56,28 @@ ifneq ($(origin GFX_VKD3D),command line)
 GFX_VKD3D = 0
 endif
 endif
+# Task 39: ORDERED_MEM=1 (-DKH_ORDERED_MEM=1, lifter-rt/khrt.h and runtime/khnmc_rt.h): every naturally aligned 1/2/4/8-byte guest load
+# is an acquire load and every such store a release store (arm64: LDAPR / STLR; x86-64: the same MOVs plus compiler ordering), the
+# x86 TSO order that guest code may rely on.  Default 0 on every host until it is measured on the Mac mini and the phone and the owner
+# decides.  Every object depends on it, the lifted shards too (no re-lift, a recompile): the variant has its own object directories
+# and binary (suffix -om: obj-om/ + ./khnmc-om, obj-x2-objcopy-om/ + ./khnmc-x2-objcopy-om, obj-iphoneos-om/, on Darwin obj-om/ +
+# ./khnmc-om), and the identity build compiles the shards here instead of linking the prebuilt (plain) archive.  ORDERED_MEM=0 or unset
+# changes no command line and no object.  OM_RCPC=1 (default with ORDERED_MEM=1 on a Mac) adds the rcpc target feature: LDAPR instead
+# of LDAR (macOS arm64 targets have it already; the iOS 17 floor is the A12, which has it; OM_RCPC=0 measures LDAR).
+ORDERED_MEM ?= 0
+ifeq ($(filter $(ORDERED_MEM),0 1),)
+$(error ORDERED_MEM must be 0 or 1)
+endif
+ifeq ($(ORDERED_MEM),1)
+OMSFX = -om
+OMFLAGS = -DKH_ORDERED_MEM=1
+ifeq ($(UNAME_S),Darwin)
+OM_RCPC ?= 1
+ifeq ($(OM_RCPC),1)
+OMFLAGS += -Xclang -target-feature -Xclang +rcpc
+endif
+endif
+endif
 # PREPARED, NOT RUN: an iOS SDK as the target (needs Xcode; arm64 only)
 IOS_MIN ?= 17.0
 ifneq ($(IOS_SDK),)
@@ -70,14 +92,14 @@ ifneq ($(UNAME_S),Darwin)
 $(error IOS_SDK needs a Mac with Xcode)
 endif
 CC = xcrun --sdk $(IOS_SDK) clang -target $(IOS_TRIPLE)
-OL = obj-$(IOS_SDK)
+OL = obj-$(IOS_SDK)$(OMSFX)
 BIN = $(OL)/khnmc-not-an-app
 endif
 ifeq ($(UNAME_S),Darwin)
 XLATE ?= 2
 HOOKMODE ?= rename
-OL ?= obj
-BIN ?= khnmc$(IOSSFX)
+OL ?= obj$(OMSFX)
+BIN ?= khnmc$(OMSFX)$(IOSSFX)
 # the vkd3d backend is OFF on Darwin unless `make GFX_VKD3D=1` asks for it (Task 21b, block below); IOS_PATHS=1 keeps it off unless the
 # command line asks (TASK38)
 GFX_VKD3D ?= 0
@@ -90,13 +112,18 @@ GEN_PREBUILT ?= 0
 XLATE ?= 0
 HOOKMODE ?= objcopy
 # $(OL): objects of the lifted shards and their archive (they do not depend on IOS_PATHS); $(O): everything else of the variant
-ifeq ($(XLATE)-$(HOOKMODE),0-objcopy)
+ifeq ($(XLATE)-$(HOOKMODE)-$(ORDERED_MEM),0-objcopy-0)
 OL ?= obj
 BIN ?= khnmc$(IOSSFX)
 LIFTLIB ?= $(LIFTED)/lib/x86/libkh2lifted.a
+else ifeq ($(XLATE)-$(HOOKMODE),0-objcopy)
+# task 39: the identity build with ORDERED_MEM=1: the prebuilt archive is plain, so the shards are compiled here (identity addresses)
+OL ?= obj-om
+BIN ?= khnmc-om$(IOSSFX)
+LIFTLIB = $(OL)/libkh2lifted.a
 else
-OL ?= obj-x$(XLATE)-$(HOOKMODE)
-BIN ?= khnmc-x$(XLATE)-$(HOOKMODE)$(IOSSFX)
+OL ?= obj-x$(XLATE)-$(HOOKMODE)$(OMSFX)
+BIN ?= khnmc-x$(XLATE)-$(HOOKMODE)$(OMSFX)$(IOSSFX)
 LIFTLIB = $(OL)/libkh2lifted.a
 XFLAGS = -DKH_XLATE_MODE=$(XLATE)
 endif
@@ -108,7 +135,7 @@ ifeq ($(filter $(HOOKMODE),objcopy rename),)
 $(error HOOKMODE must be objcopy or rename)
 endif
 CFLAGS = -std=gnu11 $(OPT) -w -fno-strict-aliasing -fwrapv -fno-delete-null-pointer-checks -fno-math-errno -ffp-contract=off -pthread \
-         -I$(ROOT)/lifter-rt -I$(ROOT)/runtime -I$(LIFTED)/gen $(XFLAGS) $(IOSFLAGS) $(EXTRA)
+         -I$(ROOT)/lifter-rt -I$(ROOT)/runtime -I$(LIFTED)/gen $(XFLAGS) $(IOSFLAGS) $(OMFLAGS) $(EXTRA)
 RTSRC = $(wildcard $(ROOT)/runtime/*.c)
 # TASK28, PREPARED, NOT RUN: COREAUDIO=1 adds the Apple output-unit glue (runtime/ios/audio_coreaudio.c, an audio unit whose render
 # callback calls kh_audio_out_pull) and AudioToolbox.  Darwin / iOS SDK builds only; never built on the machines this was written on.
@@ -353,7 +380,14 @@ SHARDS_DIR ?= $(LIFTED)/shards
 SHARD_NAMES := $(patsubst %.c,%,$(notdir $(wildcard $(SHARDS_DIR)/shard_*.c)))
 SHARD_OBJ = $(patsubst %,$(OL)/lifted/%.o,$(SHARD_NAMES))
 # the lifter's flags (lifted/tools/buildgen.py, docs/LIFT-POLICY.md section 8) + the address mode
-LIFT_CFLAGS = -O1 -w -fno-strict-aliasing -fwrapv -fno-delete-null-pointer-checks -fno-math-errno -ffp-contract=off -I$(ROOT)/lifter-rt -I$(LIFTED)/gen $(XFLAGS) $(LIFT_EXTRA)
+LIFT_CFLAGS = -O1 -w -fno-strict-aliasing -fwrapv -fno-delete-null-pointer-checks -fno-math-errno -ffp-contract=off -I$(ROOT)/lifter-rt -I$(LIFTED)/gen $(XFLAGS) $(OMFLAGS) $(LIFT_EXTRA)
+# task 39: the selftest counts the shards compiled with ORDERED_MEM=1 in the binary against this number (runtime/ordered_mem.c)
+$(O)/ordered_mem.o: CFLAGS += -DKH_OM_SHARDS=$(words $(SHARD_NAMES))
+# task 39: no object of any variant lists lifter-rt/*.h as a prerequisite (an edit of khrt.h rebuilt nothing).  The ORDERED_MEM=1
+# variant does (its code is in khrt.h); the plain variants are left as they were, so this change rebuilds none of their objects.
+ifeq ($(ORDERED_MEM),1)
+$(SHARD_OBJ) $(RTOBJ) $(LIFTOBJ) $(O)/loader_app.o $(O)/hook_forwarders.o: $(wildcard $(ROOT)/lifter-rt/*.h)
+endif
 ifeq ($(HOOKMODE),objcopy)
 $(OL)/lifted/%.o: $(SHARDS_DIR)/%.c
 	@mkdir -p $(OL)/lifted && $(CC) $(LIFT_CFLAGS) -c $< -o $@
@@ -459,7 +493,7 @@ $(O)/ios_symbols.ok: $(BIN) tools/check_ios_symbols.py
 endif
 # arm64 compile check of the hand-written runtime only (no lifted shards): clang -arch arm64 on macOS
 arm64check:
-	@for f in $(RTSRC) $(ROOT)/lifter-rt/khrt_cpu.c $(ROOT)/lifter-rt/rt_libm.c; do echo CC $$f; clang -arch arm64 -std=gnu11 -O1 -w -fno-strict-aliasing -fwrapv -fno-math-errno -ffp-contract=off -I$(ROOT)/lifter-rt -I$(ROOT)/runtime -I$(LIFTED)/gen -DKH_XLATE_MODE=2 -c $$f -o /tmp/khnmc_arm_chk.o || exit 1; done
+	@for f in $(RTSRC) $(ROOT)/lifter-rt/khrt_cpu.c $(ROOT)/lifter-rt/rt_libm.c; do echo CC $$f; clang -arch arm64 -std=gnu11 -O1 -w -fno-strict-aliasing -fwrapv -fno-math-errno -ffp-contract=off -I$(ROOT)/lifter-rt -I$(ROOT)/runtime -I$(LIFTED)/gen -DKH_XLATE_MODE=2 $(OMFLAGS) -c $$f -o /tmp/khnmc_arm_chk.o || exit 1; done
 # ---- Task 12 rules: generated table (python3 stdlib), re-lift (needs the lifter environment: KHLIFT, KHLIFT_PY, KH_UNIVERSE), link check
 ifeq ($(GEN_PREBUILT),1)
 # the generated files are inputs here (tools/darwin_build.sh copies gen/ from the Linux dev host); a rule without prerequisites

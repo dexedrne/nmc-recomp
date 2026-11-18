@@ -15,15 +15,18 @@
 #   GFX=1 (TASK38; device SDK only): the libraries with the graphics backend (make GFX_VKD3D=1: vkd3d for iOS + MoltenVK, see lib.sh),
 #   checked in the archive, and xcodebuild gets KHNMC_GFX_LDFLAGS (the Makefile's GFX_APP_LDFLAGS); the link checks then allow exactly
 #   mktemp (MoltenVK imports it).  Without GFX=1 every step is as before.
+#   ORDERED_MEM=1 (environment; task 39): the variant with acquire/release guest accesses (Makefile ORDERED_MEM=1): its libraries are in
+#   obj-<sdk>-om/ and xcodebuild links those (KHNMC_LIBS); then sign it with `ORDERED_MEM=1 tools/ios/mac/sign_app.sh`.  Default 0.
 . "$(dirname "$0")/lib.sh"
 SDK=${1:-}; T=$(sdk_triple "$SDK") || exit 2
 [ "$GFX" = 1 ] && [ "$SDK" != iphoneos ] && { echo "ios/mac: build: GFX=1 is for the device SDK only (MoltenVK's iOS library has no simulator slice): the $SDK app keeps the null backend" >&2; exit 2; }
 LOG="$RUNS/build-$SDK.log"; : > "$LOG"
 # every memory gate: mem_gate ends with `exit 3`, which in a pipeline ends only its subshell, hence the PIPESTATUS check
 mem_gate "the $SDK build" | tee -a "$LOG"; [ "${PIPESTATUS[0]}" = 0 ] || exit 3
-OL="obj-$SDK"
+OM=${ORDERED_MEM:-0}; case "$OM" in 0|1) ;; *) echo "ios/mac: build: ORDERED_MEM must be 0 or 1" >&2; exit 2;; esac
+OL="obj-$SDK"; XLIBS=(); [ "$OM" = 1 ] && { OL="obj-$SDK-om"; XLIBS=("KHNMC_LIBS=$PWD/$OL"); }
 # no build-machine paths in the objects (debug info, __FILE__): the same two variables in EVERY make call of this script
-MK=(nice -n $NICE make IOS_SDK="$SDK" COREAUDIO=1 "EXTRA=-ffile-prefix-map=$SRC/=khnmc/" "LIFT_EXTRA=-ffile-prefix-map=$SRC/=khnmc/")
+MK=(nice -n $NICE make IOS_SDK="$SDK" COREAUDIO=1 ORDERED_MEM="$OM" "EXTRA=-ffile-prefix-map=$SRC/=khnmc/" "LIFT_EXTRA=-ffile-prefix-map=$SRC/=khnmc/")
 [ "$GFX" = 1 ] && MK+=(GFX_VKD3D=1)
 "${MK[@]}" "$OL/shards/.stamp" >> "$LOG" 2>&1 || { echo "ios/mac: build: the renamed shard copies could not be generated (see $LOG)" >&2; exit 1; }
 names=$(cd lifted/shards && ls shard_*.c | sed 's/\.c$//'); total=$(echo "$names" | wc -l | tr -d ' ')
@@ -55,7 +58,7 @@ mem_gate "xcodebuild of the app" | tee -a "$LOG"; [ "${PIPESTATUS[0]}" = 0 ] || 
 # orig_f_<rva>; a replaced original is never called, and dead stripping removed it from the first app (2026-11-17)
 DEST="generic/platform=iOS"; [ "$SDK" = iphonesimulator ] && DEST="generic/platform=iOS Simulator"
 nice -n $NICE xcodebuild -project tools/ios/KHNMC.xcodeproj -scheme KHNMC -sdk "$SDK" -destination "$DEST" -configuration Release \
-    -derivedDataPath "$KROOT/build/dd" -jobs $JOBS SYMROOT="$XC/sym" OBJROOT="$XC/obj" MODULE_CACHE_DIR="$KROOT/build/dd/ModuleCache.noindex" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= DEAD_CODE_STRIPPING=NO ${GX[@]+"${GX[@]}"} build >> "$LOG" 2>&1 \
+    -derivedDataPath "$KROOT/build/dd" -jobs $JOBS SYMROOT="$XC/sym" OBJROOT="$XC/obj" MODULE_CACHE_DIR="$KROOT/build/dd/ModuleCache.noindex" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= DEAD_CODE_STRIPPING=NO ${GX[@]+"${GX[@]}"} ${XLIBS[@]+"${XLIBS[@]}"} build >> "$LOG" 2>&1 \
     || { echo "ios/mac: build: xcodebuild failed for $SDK (see $LOG)" >&2; grep -B2 -A6 "error:" "$LOG" | tail -40 >&2; exit 1; }
 APP="$XC/sym/Release-$SDK/KHNMC.app"
 [ -x "$APP/KHNMC" ] || { echo "ios/mac: build: no app binary at $APP/KHNMC" >&2; exit 1; }

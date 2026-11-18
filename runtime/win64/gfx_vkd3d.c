@@ -1050,17 +1050,21 @@ static void bb_images_free(Swap *s){
     for(int i=0;i<NBUF;i++){ if(s->img[i]){ kh_vk_destroy_image(s->vk,s->img[i]); kh_vko_note(VKO_IMAGE,0); s->img[i]=VK_NULL_HANDLE; atomic_fetch_add(&n_bb_images_freed,1); }
         if(s->mem[i]){ kh_vk_free(s->vk,s->mem[i]); kh_vko_note(VKO_MEM,0); s->mem[i]=VK_NULL_HANDLE; } }
 }
-/* before own images are destroyed: the gate (this is a submission outside the game's queue calls), a fence signalled on the queue and
- * waited for in slices (5 expired = gfx-backbuffer-drain; a stopped process costs one slice), then the presenter's submissions */
+/* before own images are destroyed: the drain's Signal is an admission at the gate (task 39: this is a submission outside the game's
+ * queue calls; it waits while the gate is set), then the fence is waited for in COUNTED slices (5 = gfx-backbuffer-drain; a stopped
+ * process costs one slice; a slice that overlaps a set gate is not counted, review c1/c2), then the presenter's submissions */
+static _Atomic u64 n_bb_drain_free;                                  /* drain-wait slices not counted because the gate was set */
 static void bb_drain(KCtx *g,Swap *s,const char *why){
-    kh_gfx_gate_park("back-buffer drain (ResizeBuffers / release)");
-    u64 want=++s->fence_val; HRCHK(ID3D12CommandQueue_Signal(s->queue,s->fence,want),"ID3D12CommandQueue::Signal(back-buffer drain)");
-    unsigned expired=0; u64 dl=kh_host_ns()+(u64)kh_stuck_slice_ms*1000000ull;
+    kh_gfx_gate_enter("back-buffer drain (ResizeBuffers / release)");
+    u64 want=++s->fence_val; kh_gfx_gate_assert_admitted("back-buffer drain: ID3D12CommandQueue::Signal"); HRCHK(ID3D12CommandQueue_Signal(s->queue,s->fence,want),"ID3D12CommandQueue::Signal(back-buffer drain)");
+    kh_gfx_gate_leave();
+    KhGateSlices sl; kh_gfx_gate_slices_begin(&sl);
     for(;;){ UINT64 done=ID3D12Fence_GetCompletedValue(s->fence);
         if(done==~0ull) kh_fatal(g,"gfx-device-removed: the fence reports a removed device during the back-buffer drain (%s)",why);
         if(done>=want) break;
-        struct timespec ts={0,200000}; nanosleep(&ts,0); u64 now=kh_host_ns();
-        if(now>=dl){ if(++expired>=5) kh_fatal(g,"gfx-backbuffer-drain: the queue did not reach the drain fence within 5 slices of %u ms (%s; fence at %llu, want %llu)",kh_stuck_slice_ms,why,P(done),P(want)); dl=now+(u64)kh_stuck_slice_ms*1000000ull; } }
+        struct timespec ts={0,200000}; nanosleep(&ts,0);
+        if(kh_gfx_gate_slices_expired(&sl,5)) kh_fatal(g,"gfx-backbuffer-drain: the queue did not reach the drain fence within 5 slices of %u ms with the gate clear (%u more under the gate; %s; fence at %llu, want %llu)",kh_stuck_slice_ms,sl.free_,why,P(done),P(want)); }
+    if(sl.free_) atomic_fetch_add(&n_bb_drain_free,sl.free_);
     if(s->pres) kh_present_quiesce(s->pres);
     atomic_fetch_add(&n_bb_drains,1);
 }
@@ -1176,8 +1180,9 @@ static void barrier(ID3D12GraphicsCommandList *l,ID3D12Resource *r,D3D12_RESOURC
     D3D12_RESOURCE_BARRIER x; memset(&x,0,sizeof x); x.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; x.Transition.pResource=r; x.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     x.Transition.StateBefore=a; x.Transition.StateAfter=b; ID3D12GraphicsCommandList_ResourceBarrier(l,1,&x);
 }
-/* copy back buffer idx to the readback buffer and map it; the caller unmaps with readback_done */
-static const u8 *readback(KCtx *g,Swap *s,u32 idx,u64 n){
+/* copy back buffer idx to the readback buffer and map it; the caller unmaps with readback_done.  Its ExecuteCommandLists + Signal on the
+ * game's queue are an admission at the suspend gate (task 39): `where` names the place (waits while the gate is set) */
+static const u8 *readback(KCtx *g,Swap *s,u32 idx,u64 n,const char *where){
     HRCHK(ID3D12CommandAllocator_Reset(s->alloc),"ID3D12CommandAllocator::Reset(frame readback)");
     HRCHK(ID3D12GraphicsCommandList_Reset(s->list,s->alloc,NULL),"ID3D12GraphicsCommandList::Reset(frame readback)");
     barrier(s->list,s->buf[idx],D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1188,9 +1193,11 @@ static const u8 *readback(KCtx *g,Swap *s,u32 idx,u64 n){
     barrier(s->list,s->buf[idx],D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_PRESENT);
     HRCHK(ID3D12GraphicsCommandList_Close(s->list),"ID3D12GraphicsCommandList::Close(frame readback)");
     ID3D12CommandList *lists[1]={(ID3D12CommandList*)s->list};
-    ID3D12CommandQueue_ExecuteCommandLists(s->queue,1,lists);
+    kh_gfx_gate_enter(where);
+    kh_gfx_gate_assert_admitted("frame readback: ID3D12CommandQueue::ExecuteCommandLists"); ID3D12CommandQueue_ExecuteCommandLists(s->queue,1,lists);
     u64 want=++s->fence_val;
-    HRCHK(ID3D12CommandQueue_Signal(s->queue,s->fence,want),"ID3D12CommandQueue::Signal(frame readback)");
+    kh_gfx_gate_assert_admitted("frame readback: ID3D12CommandQueue::Signal"); HRCHK(ID3D12CommandQueue_Signal(s->queue,s->fence,want),"ID3D12CommandQueue::Signal(frame readback)");
+    kh_gfx_gate_leave();
     for(u64 waited=0;;waited++){                                               /* the copy runs after everything the game queued for this frame */
         UINT64 done=ID3D12Fence_GetCompletedValue(s->fence);
         if(done==~0ull) kh_fatal(g,"gfx-device-removed: the fence reports a removed device while reading back present %llu (GetDeviceRemovedReason hr=0x%08x)",P(n),(unsigned)ID3D12Device_GetDeviceRemovedReason(s->dev));
@@ -1307,7 +1314,7 @@ void kh_vkd3d_present(KCtx *g,u64 o,u64 n){
     u32 idx=rd32(g,o+40)%NBUF;
     int want_dump=dump_dir[0]&&n>=dump_from&&n<=dump_to&&n%dump_every==0, want_video=video_wanted(), want_hash=hash_f!=NULL;
     if(want_dump||want_video||want_hash){
-        u64 t0=kh_host_ns(); const u8 *base=readback(g,s,idx,n);
+        u64 t0=kh_host_ns(); const u8 *base=readback(g,s,idx,n,"Present (frame readback)");
         if(want_hash) hash_frame(g,s,base,n);
         if(want_video) video_capture(g,s,base,n);
         if(want_dump) dump_frame(g,s,base,idx,n,t0);
@@ -1315,9 +1322,8 @@ void kh_vkd3d_present(KCtx *g,u64 o,u64 n){
     /* the presenter: after the readback, before null_d3d12.c advances the index.  A check present (review V36 n=1) is then compared with an
      * INDEPENDENT reference: a D3D12 readback of the same back buffer, queued AFTER the presenter's submission (so it does not close the
      * window between the game's work and the blit), gated like every other readback */
-    if(s->pres&&kh_present_frame(g,s->pres,idx,n)){
-        kh_gfx_gate_park("Present (check-mode reference readback)");
-        const u8 *ref=readback(g,s,idx,n); kh_present_check(s->pres,n,ref,s->fp.Footprint.RowPitch); readback_done(s); }
+    if(s->pres&&kh_present_frame(g,s->pres,idx,n)){                       /* the readback's submission waits at the gate (an admission) */
+        const u8 *ref=readback(g,s,idx,n,"Present (check-mode reference readback)"); kh_present_check(s->pres,n,ref,s->fp.Footprint.RowPitch); readback_done(s); }
 }
 /* process exit (loader.c, before the reports): an open video stream is closed here and nowhere else; the report says if it was cut short */
 void kh_gfx_vkd3d_finish(void){
@@ -1335,8 +1341,8 @@ void kh_gfx_vkd3d_report(FILE *f){
     fprintf(f,"kh: gfx vkd3d: bridge=%s device=%s driver-mode=%s devices-created=%llu (+%llu probes) native-calls=%llu fence-events-signalled=%llu bundles: recorded=%llu executed=%llu (%llu replayed calls) live=%llu; default-descriptor-tables=%llu on %d tracked command lists; frame-dumps=%llu%s%s\n",kh_gfx_wrap_on?"wrapped":"trampoline",vk_dev_name,drv_system?"system":"lavapipe",
             P(n_devices),P(n_probe_devices),P(kh_native_calls),P(n_events_signalled),P(n_bundles_made),P(n_bundles_run),P(n_bundle_cmds),P(n_bundles_live),P(n_default_tables),nlst,P(dumps_written),dump_dir[0]?" in ":"",dump_dir);
     if(hash_path[0]) fprintf(f,"kh: gfx hash log: %llu presents hashed into %s\n",P(hashes_written),hash_path);
-    fprintf(f,"kh: gfx vkd3d: back buffers %s: own images made %llu, destroyed %llu, drains %llu; live Vulkan objects of the runtime %lld; gipa wrapper: %llu names, vkCreateInstance %llu, vkCreateDevice %llu\n",
-            bb_names[bb_mode_env],P(n_bb_images_made),P(n_bb_images_freed),P(n_bb_drains),kh_vko_live_total(),P(gw_names),P(gw_inst_calls),P(gw_dev_calls));
+    fprintf(f,"kh: gfx vkd3d: back buffers %s: own images made %llu, destroyed %llu, drains %llu (wait slices not counted under the gate %llu); live Vulkan objects of the runtime %lld; gipa wrapper: %llu names, vkCreateInstance %llu, vkCreateDevice %llu\n",
+            bb_names[bb_mode_env],P(n_bb_images_made),P(n_bb_images_freed),P(n_bb_drains),P(atomic_load(&n_bb_drain_free)),kh_vko_live_total(),P(gw_names),P(gw_inst_calls),P(gw_dev_calls));
     kh_present_report(f); kh_gfx_gate_report(f);
     census_line(f,"report");                                                     /* TASK38: the memory census, every 300 presents and at exit */
     census_report(f);
@@ -1682,7 +1688,20 @@ int kh_gfx_vkd3d_selftest(KCtx *g){
           pthread_t th; T(pthread_create(&th,NULL,gate_obs_clear,&ob)==0);
           u64 t0=kh_host_ns(); T((u32)GC(VT(sc,13),sc,3,128,72,0x57,0x42)==0); u64 dt=kh_host_ns()-t0; pthread_join(th,NULL);
           T(dt>=100000000ull && ob.p_at_clear==p0+1 && ob.dr_at_clear==dr0 && ob.fr_at_clear==if0 && !kh_gfx_gate_is_set());
-          T(n_bb_images_made==im0+3 && n_bb_images_freed==if0+3 && n_bb_drains==dr0+1 && atomic_load(&kh_vko_live[VKO_IMAGE])==live0); }   /* TASK36: the old images are destroyed after the drain */
+          T(n_bb_images_made==im0+3 && n_bb_images_freed==if0+3 && n_bb_drains==dr0+1 && atomic_load(&kh_vko_live[VKO_IMAGE])==live0);   /* TASK36: the old images are destroyed after the drain */
+          /* task 39: the drain's Signal is an ADMISSION: the gate set from inside it holds kh_gfx_gate_quiesce until the Signal returned */
+          kh_gfx_gate_test_arm("back-buffer drain",50); T((u32)GC(VT(sc,13),sc,3,128,72,0x57,0x42)==0); T(kh_gfx_gate_test_result("back-buffer drain"));
+          /* task 39 (review c1/c2): the drain's fence wait does not count slices while the gate is set.  The queue Waits on a fence that
+           * another thread signals from the CPU; once the drain's Signal is queued (its fence value moved) that thread sets the gate,
+           * holds it 300 ms (15 slices of 20 ms), clears it and signals.  Counting would be gfx-backbuffer-drain after 5 slices (100 ms) */
+          { Swap *ss=swap_of(g,sc,"selftest"); ID3D12Fence *fw=NULL; unsigned sl0=kh_stuck_slice_ms;
+            T(SUCCEEDED(ID3D12Device_CreateFence(ss->dev,0,D3D12_FENCE_FLAG_NONE,&IID_ID3D12Fence,(void**)&fw)));
+            if(fw){ kh_stuck_slice_ms=20; T(SUCCEEDED(ID3D12CommandQueue_Wait(ss->queue,fw,1)));
+                KhGateHoldSig hs; memset(&hs,0,sizeof hs); hs.fence=fw; hs.set_ms=5; hs.hold_ms=300; hs.after_change=(const volatile u64*)&ss->fence_val; hs.from=ss->fence_val;
+                pthread_t th; T(pthread_create(&th,NULL,kh_gfx_test_hold_then_signal,&hs)==0);
+                u64 fr0=atomic_load(&n_bb_drain_free), dr1=n_bb_drains, t0=kh_host_ns(); T((u32)GC(VT(sc,13),sc,3,128,72,0x57,0x42)==0); u64 t1=kh_host_ns(); pthread_join(th,NULL);
+                T(hs.changed && n_bb_drains==dr1+1 && atomic_load(&n_bb_drain_free)>=fr0+5 && t1-t0>=300000000ull && t1>=hs.cleared_ns && !kh_gfx_gate_is_set());
+                kh_stuck_slice_ms=sl0; ID3D12Fence_Release(fw); } } }
       else { T((u32)GC(VT(sc,13),sc,3,128,72,0x57,0x42)==0); T(n_bb_images_made==im0 && n_bb_images_freed==if0); } }
     T((u32)GC(VT(sc,9),sc,1,GP(&IID_ID3D12Resource),m+88)==0); rt=rd64(g,m+88);
     if(rt){ u64 d=m+256; GC(VT(rt,10),rt,d); T(rd64(g,d+16)==128&&rd32(g,d+24)==72); GC(VT(rt,2),rt); rt=0; }
@@ -1722,6 +1741,11 @@ int kh_gfx_vkd3d_selftest(KCtx *g){
         u64 t0=kh_host_ns(); T(st_clear_present(g,m,dev,q,sc,al,cl,handle2,0.5f,0.25f,0.125f)); u64 dt=kh_host_ns()-t0; pthread_join(th,NULL);
         T(dt>=100000000ull && ob.d_at_clear==d0 && ob.p_at_clear==p0+1 && dumps_written==d0+1 && !kh_gfx_gate_is_set());
         char path[1200]; snprintf(path,sizeof path,"%s/frame-3000001.ppm",tmp); T(ppm_is(path,128,72,128,64,32)); unlink(path); snprintf(path,sizeof path,"%s/index.tsv",tmp); unlink(path); dump_dir[0]=0; }
+      /* task 39: the frame readback's ExecuteCommandLists + Signal are an ADMISSION: the gate set from inside them holds quiesce until they
+       * returned; the dump is still written */
+      { snprintf(dump_dir,sizeof dump_dir,"%s",tmp); dump_every=1; gfx_presents=3500000; u64 d0=dumps_written;
+        kh_gfx_gate_test_arm("Present (frame readback)",50); T(st_clear_present(g,m,dev,q,sc,al,cl,handle2,0.5f,0.25f,0.125f)); T(kh_gfx_gate_test_result("Present (frame readback)") && dumps_written==d0+1);
+        char path[1200]; snprintf(path,sizeof path,"%s/frame-3500001.ppm",tmp); T(ppm_is(path,128,72,128,64,32)); unlink(path); snprintf(path,sizeof path,"%s/index.tsv",tmp); unlink(path); dump_dir[0]=0; }
       /* TASK36: ID3D12Fence::Signal from the CPU (wrapped bridge): not held while no queue may be blocked; held (parked until the gate is
        * cleared, the fence unchanged meanwhile) when fence signals are held, and by itself once a queue Wait was seen */
       if(kh_gfx_wrap_on&&fence){ ID3D12Fence *rf=(ID3D12Fence*)real_of(g,fence,WK_FENCE,"selftest fence"); u64 v0=ID3D12Fence_GetCompletedValue(rf), p0=kh_gfx_gate_parks();

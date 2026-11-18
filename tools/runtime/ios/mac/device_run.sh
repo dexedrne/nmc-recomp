@@ -37,6 +37,9 @@
 #   selftest`.  GFX=1 implies GFX_APP=1 (GFX=1 GFX_APP=0 is refused).  Unset: no check, as before.
 . "$(dirname "$0")/lib.sh"
 MODE=${1:-selftest}; INPUT=""; FRAMES=7000; DIFF=none
+# task 39: SELFTEST_ONLY=membench|ordered|gate (environment, selftest mode only): one suite alone (KHNMC_SELFTEST_ONLY), e.g. the
+# memory-ordering microbenchmark of an ORDERED_MEM=1 app against a plain one
+SONLY=${SELFTEST_ONLY:-}; case "$SONLY" in ''|membench|ordered|gate) ;; *) echo "ios/mac: device_run: SELFTEST_ONLY must be membench, ordered or gate" >&2; exit 2;; esac
 case "$MODE" in
   selftest) LIMIT=${2:-1500};;
   play) LIMIT=0;;
@@ -89,7 +92,7 @@ fi
 { echo "# written by tools/ios/mac/device_run.sh ($MODE ${INPUT})"; echo "log khnmc.log"; echo "status khnmc.status"
   # no sound in test runs unless SOUND=1 (route mode): a selftest must never reach the speaker (2026-11-18: a test signal did)
   if [ "$MODE" = selftest ] || [ "${SOUND:-0}" != 1 ]; then echo "env KHNMC_AUDIO=null"; fi
-  if [ "$MODE" = selftest ]; then echo "arg --selftest"
+  if [ "$MODE" = selftest ]; then echo "arg --selftest"; if [ -n "$SONLY" ]; then echo "env KHNMC_SELFTEST_ONLY=$SONLY"; fi
   else TAG=$(basename "$OUT"); echo "env KH_ROOT=@TMP@/$TAG/root"; echo "env KH_DOCS=@TMP@/$TAG/docs"   # fresh per run, as tools/route_batch.sh: a config the game saved in an earlier run changes how it boots
     echo "env KHNMC_INPUT_SCRIPT=@DOCS@/input.txt"; echo "env KH_RUN_GAME_FRAMES=$FRAMES"; echo "env KH_RUN_SECONDS=$((LIMIT-120))"
     echo "env KH_DUMP_THREADS=1"; echo "env KHNMC_PHASELOG=@DOCS@/phase.log"; echo "env KHNMC_FILELOG=@DOCS@/files.log"

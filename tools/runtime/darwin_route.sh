@@ -27,6 +27,8 @@
 #                                               (tools/ios/probe/probe_host.c + probe_core.c; TOUCH_MIB default 64, at most 256
 #                                               on this shared machine): a test of the PROGRAM on arm64 Darwin, not an answer
 #                                               about an iPhone.  Result: $RUN/probe/mac-probe.txt
+#   env: KHNMC_MAC_BIN (task 39): the binary `selftest` and `run` start there, ./khnmc (default) or ./khnmc-om (the build of
+#        tools/darwin_build.sh with MAKE_ARGS="ORDERED_MEM=1"; nothing else is accepted)
 #   env: KHNMC_MAC, KHNMC_MAC_DIR (default khnmc-work/build-j26) as in tools/darwin_build.sh; KHNMC_RUN_DIR = where results go
 #        here (default run-J26); KHNMC_MAC_NICE (default 10) and KHNMC_MAC_MIN_FREE (default 30: `memory_pressure` free
 #        percentage below which nothing is started; the reading is printed before every run)
@@ -46,7 +48,8 @@ case "$RDIR" in *..*|*" "*) echo "darwin_route: bad KHNMC_MAC_DIR" >&2; exit 2;;
 for v in "$NICE" "$MINFREE"; do case "$v" in ''|*[!0-9]*) echo "darwin_route: KHNMC_MAC_NICE / KHNMC_MAC_MIN_FREE must be numbers" >&2; exit 2;; esac; done
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ServerAliveCountMax=10)
 cmd=${1:-}; [ $# -gt 0 ] && shift
-busy(){ "${SSH[@]}" "$MAC" 'pgrep -u "$(id -u)" -x khnmc.bin >/dev/null || pgrep -u "$(id -u)" -x khnmc >/dev/null || pgrep -u "$(id -u)" -x khnmc-iospaths >/dev/null' && { echo "darwin_route: a khnmc process is already running on the Mac mini: one run at a time" >&2; return 0; }; return 1; }
+MBIN=${KHNMC_MAC_BIN:-./khnmc}; case "$MBIN" in ./khnmc|./khnmc-om) ;; *) echo "darwin_route: KHNMC_MAC_BIN must be ./khnmc or ./khnmc-om (got $MBIN)" >&2; exit 2;; esac
+busy(){ "${SSH[@]}" "$MAC" 'pgrep -u "$(id -u)" -x khnmc.bin >/dev/null || pgrep -u "$(id -u)" -x khnmc >/dev/null || pgrep -u "$(id -u)" -x khnmc-om >/dev/null || pgrep -u "$(id -u)" -x khnmc-iospaths >/dev/null' && { echo "darwin_route: a khnmc process is already running on the Mac mini: one run at a time" >&2; return 0; }; return 1; }
 # the scripts that run there (route_one.py, ios_paths_selftest.sh, wav_compare.py) are this worktree's: same rsync as darwin_build.sh
 # task 27: and input/ (route_one.py's default route, input/route-field-battle.txt, is read there)
 push_tools(){ rsync -a --delete --exclude '__pycache__' -e "ssh -o BatchMode=yes -o ConnectTimeout=20" "$HERE/tools/" "$MAC:$RDIR/tools/" || { echo "darwin_route: cannot copy tools/ to the Mac mini" >&2; exit 1; }
@@ -90,7 +93,7 @@ selftest)
     case "$kv" in *[!A-Za-z0-9_=./:@%+,-]*) echo "darwin_route: '$kv': only letters, digits and _ = . / : @ % + , - can be passed" >&2; exit 2;; esac; XENV="$XENV $kv"; done
   busy && exit 3
   mkdir -p "$RUN"; push_tools
-  "${SSH[@]}" "$MAC" "cd ~/$RDIR && mkdir -p run/tmp && $GATE && rm -rf run/docs-selftest && find run/tmp -maxdepth 1 -name 'khnmc-route-*' -exec rm -rf {} + && (KH_EXE=\$PWD/pc/kh2fm.exe KH_DOCS=\$PWD/run/docs-selftest KH_TMPDIR=\$PWD/run/tmp TMPDIR=\$PWD/run/tmp$XENV nice -n $NICE ./khnmc --selftest > run/selftest-$TAG.out 2>&1; echo \"selftest exit=\$?\" | tee -a run/selftest-$TAG.out; echo \"darwin_route: left in run/tmp: \$(ls -A run/tmp | tr '\\n' ' ')\")" || exit 1
+  "${SSH[@]}" "$MAC" "cd ~/$RDIR && mkdir -p run/tmp && $GATE && rm -rf run/docs-selftest && find run/tmp -maxdepth 1 -name 'khnmc-route-*' -exec rm -rf {} + && (KH_EXE=\$PWD/pc/kh2fm.exe KH_DOCS=\$PWD/run/docs-selftest KH_TMPDIR=\$PWD/run/tmp TMPDIR=\$PWD/run/tmp$XENV nice -n $NICE $MBIN --selftest > run/selftest-$TAG.out 2>&1; echo \"selftest exit=\$?\" | tee -a run/selftest-$TAG.out; echo \"darwin_route: left in run/tmp: \$(ls -A run/tmp | tr '\\n' ' ')\")" || exit 1
   scp -q -o BatchMode=yes "$MAC:$RDIR/run/selftest-$TAG.out" "$RUN/mac-selftest-$TAG.out" || exit 1
   grep -a "SKIPPED\|FAIL\|transcript\|guest space\|selftest exit" "$RUN/mac-selftest-$TAG.out" | cut -c1-220
   grep -aq "^selftest exit=0" "$RUN/mac-selftest-$TAG.out"
@@ -107,7 +110,7 @@ ios-selftest)
   ;;
 run)
   TAG=${1:-}; tagok "$TAG"; shift
-  route "$TAG" ./khnmc "" "$@"; exit $?
+  route "$TAG" "$MBIN" "" "$@"; exit $?
   ;;
 ios-run)
   TAG=${1:-}; tagok "$TAG"; shift

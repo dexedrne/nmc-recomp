@@ -2,13 +2,45 @@
  *
  * Three pieces, all in runtime/gfx_present.c:
  *
- *  1. THE SUSPEND GATE.  One process-wide flag.  While it is set, no thread of the runtime submits GPU work: the checks are at the top
- *     of kh_vkd3d_present (before the frame readback for dumps, hash log and video, which submits on the game's queue), before the
- *     ResizeBuffers / back-buffer drain, in the presenter (before acquire, after every acquire time-out, and again before submit and
- *     present), and on ID3D12Fence::Signal from the CPU while a queue may be blocked (a CPU signal can make vkd3d submit queued work:
- *     command.c 1197-1205; the hold is switched on by kh_gfx_gate_hold_fence_signals, or by itself once a queue Wait was seen).  A
- *     thread that meets the set gate parks on a condition, holds no runtime lock, and is counted.  The iOS scene delegate (step 11)
- *     sets and clears it (step 11, with the queue drain and the stuck-budget exemption); today only the selftest does.
+ *  1. THE SUSPEND GATE, admission-counted (task 39; IOS-GRAPHICS-PLAN.md "Review c1/c2" item 1).  A process-wide flag plus a count of
+ *     the threads that are inside a submit-capable region.  kh_gfx_gate_enter(where) waits while the gate is set, then counts the
+ *     caller in under the gate's mutex; kh_gfx_gate_try_enter(where) does the same without waiting (0 = the gate is set, nothing was
+ *     done: the caller takes its own way back to the gate); kh_gfx_gate_leave() counts it out after the submission call returned.
+ *     kh_gfx_gate_quiesce(slices), called after kh_gfx_gate_set, waits until nothing is admitted, at most `slices` expired slices of
+ *     kh_stuck_slice_ms, and returns a named result (kh_gfx_gate_result_name).  A thread admitted before the gate was set finishes
+ *     its submission and holds quiesce until it leaves; a thread that arrives while it is set parks outside, holds no runtime lock,
+ *     is counted per place and is not admitted.  Admissions never nest (gfx-gate-nested); a leave without one is gfx-gate-unbalanced.
+ *     What is gated TODAY:
+ *       ADMISSIONS (the submission happens only while admitted):
+ *         - the presenter from its last check to vkd3d_release_vk_queue (submit + vkQueuePresentKHR; gfx_present.c "presenter:
+ *           submit and present");
+ *         - the presenter's consumption of a parked acquire (slot_consume's vkQueueSubmit), also in park_after_acquire, which
+ *           parks again when the gate was set once more between its park and its admission;
+ *         - the frame readback of kh_vkd3d_present (dumps, hash log, video) and the check-mode reference readback: their
+ *           ExecuteCommandLists + Signal on the game's queue (gfx_vkd3d.c readback());
+ *         - the back-buffer drain's ID3D12CommandQueue::Signal (ResizeBuffers / release).
+ *       PARKS (wait while set, not admission-counted):
+ *         - the top of kh_vkd3d_present (the game's Present waits while the gate is set, also when nothing is read back);
+ *         - the presenter before vkAcquireNextImageKHR and after every acquire time-out; its check after the marker (e) parks
+ *           after the acquire (park_after_acquire);
+ *         - ID3D12Fence::Signal from the CPU (wrapped bridge, gfx_wrap.c w_fence slot 10), only while a queue may be blocked (fence
+ *           signals held by kh_gfx_gate_hold_fence_signals, or a queue Wait was seen): a CPU signal can make vkd3d submit queued
+ *           work (command.c 1197-1205).
+ *       NOT HELD YET (plan step 11): the game's own queue calls through gfx_wrap.c w_queue (ExecuteCommandLists, Signal, Wait) and,
+ *       outside the conditions above, its CPU fence signals.  So today the gate stops the RUNTIME's submissions, not the game's.
+ *       Every submission call of an admission is preceded by kh_gfx_gate_assert_admitted (the presenter's also when it gives the
+ *       VkQueue back): a submission outside its admission is the named fatal gfx-gate-not-admitted (review Y39 n=2).
+ *       The presenter's marker (d) is outside every admission: vkd3d flushes it only when it is alone in the game's queue (so never
+ *       that queue's own queued work), but running it signals a fence from the CPU, which makes vkd3d flush EVERY blocked queue of
+ *       the device (vkd3d 2.1 command.c 891, 746-776).  A queue whose Wait another thread's signal has just satisfied (a CPU signal that
+ *       passed its check before the set, the race step 11 lists) can thus have its work submitted from the presenter thread; the
+ *       step-11 test (no vkQueueSubmit through the gipa counter while the gate is set) is the guard (review Y39 n=5).
+ *     The presenter does not hold its lock in (d) (review Y39 n=1): kh_present_resume and kh_present_quiesce may be called from the
+ *     main thread while the gate is set and a Present waits there.
+ *     The bounded waits after a submission (the presenter's marker wait (d), the drain's fence wait) count an expired slice only when
+ *     the gate was clear for the whole slice (kh_gfx_gate_slices_*): time under a set gate never fires their named fatals.
+ *     The iOS scene delegate (step 11) sets and clears it, with the queue drain and the stuck-budget exemption; today only the
+ *     selftests do.
  *
  *  2. DISPLAY PACING (host clock only).  IDXGIOutput::WaitForVBlank (null_d3d12.c) waits for the next display refresh when a tick
  *     source is registered: the iOS shell's CADisplayLink calls kh_vsync_tick on every refresh; on Linux KHNMC_DISPLAY=timer60 is a
@@ -36,6 +68,26 @@ void kh_gfx_gate_set(void);                     /* from now on every gated threa
 void kh_gfx_gate_clear(void);                   /* wakes every parked thread */
 int  kh_gfx_gate_is_set(void);
 void kh_gfx_gate_hold_fence_signals(int on);    /* step 11: hold ID3D12Fence::Signal from the CPU while the gate is set */
+/* admissions (task 39): every submit-capable region of the runtime */
+void kh_gfx_gate_enter(const char *where);      /* wait while set (parked, counted), then admitted; `where` names the place (a string literal) */
+int  kh_gfx_gate_try_enter(const char *where);  /* 1 = admitted; 0 = the gate is set: not admitted, not parked (counted as refused) */
+void kh_gfx_gate_leave(void);                   /* after the submission call returned; the last one out wakes kh_gfx_gate_quiesce */
+void kh_gfx_gate_assert_admitted(const char *what);   /* right before a submission call: not admitted = the named fatal gfx-gate-not-admitted */
+enum { KH_GATE_QUIESCED=0, KH_GATE_NOT_QUIESCED=1, KH_GATE_QUIESCE_NOT_SET=2 };
+int  kh_gfx_gate_quiesce(unsigned slices);      /* the gate set: wait until nothing is admitted, at most `slices` expired slices; KH_GATE_* */
+const char *kh_gfx_gate_result_name(int r);     /* "quiesced", "suspend-not-quiesced" (logged with the places still admitted), "gate-not-set" */
+int  kh_gfx_gate_admitted(void);                /* threads admitted now */
+/* a bounded wait in expired slices that does not count time under a set gate: begin, then after every poll `expired(s, N)` = 1 once N
+ * slices COUNTED (the gate clear for the whole slice); s.free_ = slices not counted */
+typedef struct { uint64_t start_ns, deadline_ns; unsigned counted, free_; } KhGateSlices;
+void kh_gfx_gate_slices_begin(KhGateSlices *s);
+int  kh_gfx_gate_slices_expired(KhGateSlices *s,unsigned slices);
+int  kh_gfx_gate_slice_counts(uint64_t slice_start_ns);
+int  kh_gfx_gate_selftest(void);                /* every --selftest (and KHNMC_SELFTEST_ONLY=gate) */
+/* selftest: the next admission at a place containing `place` sets the gate inside its region and runs kh_gfx_gate_quiesce(slices) on
+ * another thread; kh_gfx_gate_test_result(what) = 1 when quiesce returned `quiesced` only after that thread left (and joins it) */
+void kh_gfx_gate_test_arm(const char *place,unsigned slices);
+int  kh_gfx_gate_test_result(const char *what);
 /* runtime-internal */
 void kh_gfx_gate_park(const char *where);       /* returns at once when the gate is clear; otherwise parks (counted per place) */
 int  kh_gfx_gate_park_fence_signal(void);       /* ID3D12Fence::Signal: parks only while the gate is set AND fence signals are held; 1 = parked */

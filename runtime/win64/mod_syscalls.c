@@ -228,7 +228,8 @@ static void syscall_handler(KCtx *g){
         if(p) require_mem(g,p,16);
         wr32(g,args,p && (rd64(g,p+(idx==34?8:0))&q)!=0); break;
     case 46: ability_count(g,args); break;
-    case 48:
+    case 48: case 50:   /* task 39 (review c1/c2, both families): descriptor 50 is the DLL's second entry for the SAME handler 0x12920
+                         * (GetCurrentRC_MEM, flags 0x40000000 as 48): on the PC both run that code, so 50 is an alias, not a fatal */
         p=call(g,0x3b3e80,0,0); require_mem(g,p,0xdd8);
         p=rd64(g,p+0xdd0); require_mem(g,p,0xb43);
         wr32(g,args,rd8(g,p+0xb42)); break;
@@ -267,7 +268,7 @@ void kh_mod_syscalls_init(KCtx *g){
     }
     /* The two four-byte static edits are halves of this one pointer. No count field exists. */
     wr64(g,GS_BASE+0x7534a8,table);
-    fprintf(stderr,"kh: mod syscall table 3 installed: 114 descriptors at 0x%llx (18 implemented, 96 named fatals)\n",(unsigned long long)table);
+    fprintf(stderr,"kh: mod syscall table 3 installed: 114 descriptors at 0x%llx (19 implemented, 95 named fatals)\n",(unsigned long long)table);
 }
 
 /* DLL 0x2d110 -> exe 0x1f9a80.  FULL REPLACEMENT (Task 23 audit: the handler never reaches its trampoline slot 0x81d90): it stores the
