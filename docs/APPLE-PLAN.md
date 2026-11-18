@@ -265,3 +265,12 @@ owner decides and the phone's own numbers exist (implementation notes section 6,
   yet" (vkd3d ignores D3D12 aliasing barriers; nothing visible in the frames), the feature-level notes, 108 x the emulated-timestamp
   MoltenVK message. The fetched frames (a battle with the style rank, the Twilight Town gang at the accessory shop with a talk box, the
   mission pause screen) look right. Pictures: ~/Documents/khnmc/phone-frames/story-gpu-20261118/ (not committed).
+- **First picture on the phone's screen** (2026-11-18 12:36 ET, a PREVIEW build of task 41 before its fix pass, ORDERED_MEM=1, installed
+  from the Mac mini): `GFX=1 PRESENT=1 device_run.sh route input/title-i21-hold1.txt 2700 none 1500` exit 0; then `GFX=1 PRESENT=1
+  play` left running for the owner. Display-link pacing: 60.00 waits per second, 0 late, 0 missed ticks; the game at 60.00 frames per
+  second after the opening loads (52.4 and 58.2 during them); present cost 0.11-0.16 ms; one swapchain, never rebuilt; surface caps:
+  usage 0x1f (TRANSFER_DST and TRANSFER_SRC yes), FIFO only, 2-3 images, B8G8R8A8_UNORM; 0 vkd3d err lines.
+- **The drawable is 2853x2007, not the panel's 2670x1878, and that is right:** UIKit's nativeScale on the inner screen is 3.0 (MoltenVK:
+  "contents scale 3.0"), i.e. iOS composites a 3x frame buffer (951x669 points x 3) and the display hardware scales it to the panel
+  (the iPhone 12 mini scheme; no UIKit API gives the panel size there). Rendering at 2670x1878 would make iOS upscale it to 2853x2007
+  and the hardware downscale it again: about 12 % less GPU work for a softer picture. A possible battery option (plan step 13), not a fix.
