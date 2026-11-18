@@ -274,3 +274,12 @@ owner decides and the phone's own numbers exist (implementation notes section 6,
   "contents scale 3.0"), i.e. iOS composites a 3x frame buffer (951x669 points x 3) and the display hardware scales it to the panel
   (the iPhone 12 mini scheme; no UIKit API gives the panel size there). Rendering at 2670x1878 would make iOS upscale it to 2853x2007
   and the hardware downscale it again: about 12 % less GPU work for a softer picture. A possible battery option (plan step 13), not a fix.
+- **Frame counter** (owner 2026-11-18, after playing: "need a frame counter"): `KHNMC_HUD=1` in khnmc.conf turns on Apple's Metal
+  performance HUD on the game's layer after the first present (CAMetalLayer.developerHUDProperties, iOS 16+: frame rate, frame time,
+  GPU time, memory). device_run.sh writes it for every run with the picture (`HUD=0` turns it off) and has `NOLAUNCH=1` for play mode
+  (the configuration goes to the phone, the game is not started; the icon starts it). Installed 16:37 with the selftest passing.
+- **Owner's first play session (2026-11-18 afternoon), his reports and their tasks:** the HUD in the 16:9 band (task 42); black bars in
+  the main menu, the pause screen and letterboxed scenes (task 46); pre-rendered movies hang on black until the pause menu's Skip
+  (task 44); Xbox prompts with a DualSense (task 45: the game's own HID driver knows only the DualShock 4: 054C:05C4 / 09CC / 0BA0);
+  about 22 fps in Twilight Town's Station Plaza and Tram Common when characters move (task 48, from his save); portrait with live
+  rotation wanted (task 47). Elsewhere a steady 59.5-60 fps. Owner rule: the game never runs on the Mac mini.

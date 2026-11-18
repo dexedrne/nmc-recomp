@@ -166,7 +166,16 @@ static _Atomic int display_link_stopped;
         fprintf(stderr,"kh: ios: display link stopped: this run does not present to the layer (WaitForVBlank keeps its pacing)\n"); return; }
     if(!_registered){ kh_vsync_register(); _registered=1; fprintf(stderr,"kh: ios: display link: ticks pace WaitForVBlank (60/60/60, its own thread)\n"); }
     kh_vsync_tick(kh_app_host_ns());
-    if(!_label_done && kh_present_presented()>0){ _label_done=1; dispatch_async(dispatch_get_main_queue(),^{ test_label.hidden=YES; }); }
+    if(!_label_done && kh_present_presented()>0){ _label_done=1; dispatch_async(dispatch_get_main_queue(),^{ test_label.hidden=YES;
+        /* owner 2026-11-18 ("need a frame counter"): KHNMC_HUD=1 (khnmc.conf: env KHNMC_HUD=1; read here, after the runtime applied the
+         * conf) turns on Apple's Metal performance HUD on the game's layer: frame rate, frame time, GPU time, memory.  iOS 16+. */
+        const char *hud=getenv("KHNMC_HUD");
+        if(hud && hud[0]=='1' && hud[1]==0){
+            if(@available(iOS 16.0,*)){ CAMetalLayer *ml=(CAMetalLayer *)test_label.superview.layer;
+                if([ml isKindOfClass:[CAMetalLayer class]]){ ml.developerHUDProperties=@{@"mode":@"default"}; fprintf(stderr,"kh: ios: Metal performance HUD on (KHNMC_HUD=1)\n"); }
+                else fprintf(stderr,"kh: ios: KHNMC_HUD=1 but the game view's layer is not a CAMetalLayer: no HUD\n"); }
+        } else if(hud && hud[0]) fprintf(stderr,"kh: ios: KHNMC_HUD must be 1 (got '%s'): no HUD\n",hud);
+    }); }
 }
 @end
 static void start_display_link(void){

@@ -97,10 +97,13 @@ play_conf(){ { echo "# the game (tools/ios/mac/device_run.sh play): the controll
 play_conf
 # TASK41: the conf lines of a run with the picture on the screen (GFX=1 PRESENT=1)
 gfx_lines(){ :; }; if [ "$GFX" = 1 ]; then gfx_lines(){ echo "env KHNMC_GFX=vkd3dw"; echo "env VKD3D_DEBUG=warn"; echo "env VKD3D_SHADER_DEBUG=warn"; echo "env MVK_CONFIG_PERFORMANCE_TRACKING=1"; }; fi
-present_lines(){ echo "env KHNMC_GFX_PRESENT=layer"; echo "env KHNMC_SCREEN=layer"; echo "env KHNMC_ASPECT=fill"; [ -z "$PRESENT_CHECK" ] || echo "env KHNMC_GFX_PRESENT_CHECK=$PRESENT_CHECK"; }
+# HUD=1 (owner 2026-11-18, default 1 for runs with the picture; HUD=0 turns it off): Apple's Metal performance HUD (fps, frame and GPU time)
+present_lines(){ echo "env KHNMC_GFX_PRESENT=layer"; echo "env KHNMC_SCREEN=layer"; echo "env KHNMC_ASPECT=fill"; [ "${HUD:-1}" = 1 ] && echo "env KHNMC_HUD=1"; [ -z "$PRESENT_CHECK" ] || echo "env KHNMC_GFX_PRESENT_CHECK=$PRESENT_CHECK"; }
 if [ "$MODE" = play ] && [ "$PRESENT" = 1 ]; then
   { echo "# the game with its picture (tools/ios/mac/device_run.sh GFX=1 PRESENT=1 play): the controller is pad 0, sound on, no script"; echo "log khnmc.log"; echo "status khnmc.status"; gfx_lines; present_lines; } > "$OUT/gfx-play.conf"
   cp_to "$OUT/gfx-play.conf" khnmc.conf || { say "copy of the GFX play configuration FAILED"; tail -5 "$OUT/devicectl.log"; exit 1; }
+  # NOLAUNCH=1 (owner not playing right now): leave the configuration on the phone and do not start the game; the icon starts it
+  if [ "${NOLAUNCH:-0}" = 1 ]; then say "the play configuration with the picture is on the phone; NOT launched (NOLAUNCH=1): the icon starts it"; echo "$OUT"; exit 0; fi
   xcrun devicectl device process launch --device "$DEVICE" --timeout 60 --terminate-existing "$BUNDLE_ID" >> "$OUT/devicectl.log" 2>&1 || { say "launch FAILED (phone locked?)"; tail -5 "$OUT/devicectl.log"; exit 1; }
   say "the game is running on the phone with its picture (GFX=1 PRESENT=1 play); its log: Documents/khnmc.log (fetch it with SKIP_INSTALL=1 ... or devicectl copy from)"; echo "$OUT"; exit 0
 fi
