@@ -40,8 +40,11 @@ ls -l "$OL/libkhnmc-rt.a" "$OL/libkh2loose.a" | tee -a "$LOG"
 python3 tools/ios/make_project.py >> "$LOG" 2>&1 || { echo "ios/mac: build: make_project.py failed" >&2; exit 1; }
 XC="$KROOT/build/xc"; mkdir -p "$XC" "$KROOT/build/dd"
 mem_gate "xcodebuild of the app" | tee -a "$LOG"; [ "${PIPESTATUS[0]}" = 0 ] || exit 3
-nice -n $NICE xcodebuild -project tools/ios/KHNMC.xcodeproj -target KHNMC -sdk "$SDK" -configuration Release \
-    -derivedDataPath "$KROOT/build/dd" -jobs $JOBS SYMROOT="$XC/sym" OBJROOT="$XC/obj" MODULE_CACHE_DIR="$KROOT/build/dd/ModuleCache.noindex" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= build >> "$LOG" 2>&1 \
+# DEAD_CODE_STRIPPING=NO: the link check (tools/check_hook_link.py) proves every hooked function was renamed by finding its
+# orig_f_<rva>; a replaced original is never called, and dead stripping removed it from the first app (2026-11-17)
+DEST="generic/platform=iOS"; [ "$SDK" = iphonesimulator ] && DEST="generic/platform=iOS Simulator"
+nice -n $NICE xcodebuild -project tools/ios/KHNMC.xcodeproj -scheme KHNMC -sdk "$SDK" -destination "$DEST" -configuration Release \
+    -derivedDataPath "$KROOT/build/dd" -jobs $JOBS SYMROOT="$XC/sym" OBJROOT="$XC/obj" MODULE_CACHE_DIR="$KROOT/build/dd/ModuleCache.noindex" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= DEAD_CODE_STRIPPING=NO build >> "$LOG" 2>&1 \
     || { echo "ios/mac: build: xcodebuild failed for $SDK (see $LOG)" >&2; grep -B2 -A6 "error:" "$LOG" | tail -40 >&2; exit 1; }
 APP="$XC/sym/Release-$SDK/KHNMC.app"
 [ -x "$APP/KHNMC" ] || { echo "ios/mac: build: no app binary at $APP/KHNMC" >&2; exit 1; }

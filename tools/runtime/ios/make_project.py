@@ -201,7 +201,34 @@ def projects():
                       'PRODUCT_BUNDLE_IDENTIFIER': 'beer.vyvanse.khnmc.probe',
                       'OTHER_CFLAGS': PREFIX_MAP,
                       'OTHER_LDFLAGS': [x for f in FRAMEWORKS for x in ('-framework', f)]})
-    return [(HERE / 'KHNMC.xcodeproj' / 'project.pbxproj', app), (HERE / 'KHNMCProbe.xcodeproj' / 'project.pbxproj', probe)]
+    out = [(HERE / 'KHNMC.xcodeproj' / 'project.pbxproj', app), (HERE / 'KHNMCProbe.xcodeproj' / 'project.pbxproj', probe)]
+    # a shared scheme per project: xcodebuild accepts -derivedDataPath (which keeps Xcode's derived data inside our folder) only
+    # together with -scheme, not with -target (found on the first real run, 2026-11-17)
+    for name in ('KHNMC', 'KHNMCProbe'):
+        out.append((HERE / f'{name}.xcodeproj' / 'xcshareddata' / 'xcschemes' / f'{name}.xcscheme', scheme(name)))
+    return out
+
+
+def scheme(name):
+    tgt = hashlib.md5('/'.join((name.lower(), 'target', name)).encode()).hexdigest()[:24].upper()   # = generate()'s oid('target', name)
+    ref = f'''<BuildableReference BuildableIdentifier = "primary" BlueprintIdentifier = "{tgt}" BuildableName = "{name}.app" BlueprintName = "{name}" ReferencedContainer = "container:{name}.xcodeproj"></BuildableReference>'''
+    return f'''<?xml version="1.0" encoding="UTF-8"?>
+<Scheme LastUpgradeVersion = "2720" version = "1.7">
+   <BuildAction parallelizeBuildables = "YES" buildImplicitDependencies = "YES">
+      <BuildActionEntries>
+         <BuildActionEntry buildForTesting = "NO" buildForRunning = "YES" buildForProfiling = "NO" buildForArchiving = "YES" buildForAnalyzing = "NO">
+            {ref}
+         </BuildActionEntry>
+      </BuildActionEntries>
+   </BuildAction>
+   <LaunchAction buildConfiguration = "Release" launchStyle = "0" useCustomWorkingDirectory = "NO" ignoresPersistentStateOnLaunch = "NO" debugDocumentVersioning = "YES" allowLocationSimulation = "NO">
+      <BuildableProductRunnable runnableDebuggingMode = "0">
+         {ref}
+      </BuildableProductRunnable>
+   </LaunchAction>
+   <ArchiveAction buildConfiguration = "Release" revealArchiveInOrganizer = "NO"></ArchiveAction>
+</Scheme>
+'''
 
 
 def sane(text):
@@ -233,7 +260,7 @@ def main():
     p.add_argument('--check', action='store_true')
     a = p.parse_args()
     for path, text in projects():
-        bad = sane(text)
+        bad = sane(text) if path.suffix == '.pbxproj' else (None if '<Scheme' in text and 'BlueprintIdentifier' in text else 'bad scheme text')
         if bad:
             sys.exit('%s: generator error: %s' % (path.relative_to(ROOT), bad))
         if a.check:
