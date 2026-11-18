@@ -253,7 +253,9 @@ static int selftest_all(KCtx *g){
               fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=vsync): only the suite `vsync` ran, %d failures\n",f); return f; }
           if(!strcmp(only,"gfx")){ extern int kh_gfx_selftest(KCtx *); int f=kh_gfx_selftest(g);
               fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=gfx): only the graphics suites ran, %d failures\n",f); return f; }
-          if(strcmp(only,"route31")) kh_fatal(g,"KHNMC_SELFTEST_ONLY=%s: the suites that can run alone are route31, vsync and gfx",only);
+          if(!strcmp(only,"aspect")){ extern int kh_aspect_selftest(KCtx *); int f=kh_aspect_selftest(g);      /* task 37: for its mutation checks */
+              fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=aspect): only the suite `aspect` ran, %d failures\n",f); return f; }
+          if(strcmp(only,"route31")) kh_fatal(g,"KHNMC_SELFTEST_ONLY=%s: the suites that can run alone are route31, vsync, gfx and aspect",only);
           extern int kh_input_route31_selftest(KCtx *); int f=kh_input_route31_selftest(g);
           fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=route31): only the suite `input route Q31` ran, %d failures\n",f); return f?f:0; } }
     CHECK(rd64(g,GS_BASE+0x7534a8)!=0); /* Task 6: table 3 must exist before scripts run. */
@@ -293,6 +295,7 @@ static int selftest_all(KCtx *g){
     { extern int kh_input_route31_selftest(KCtx *); fails+=kh_input_route31_selftest(g); }   /* task 31: objective / message / reaction / menu readers, @react, @goto object */
     { extern int kh_warp_selftest(KCtx *); fails+=kh_warp_selftest(g); }                     /* task 33: the debug warp (runtime/warp.c) */
     { extern int kh_input_route33_selftest(KCtx *); fails+=kh_input_route33_selftest(g); }   /* task 33: the @warp / @warp list steps */
+    { extern int kh_aspect_selftest(KCtx *); fails+=kh_aspect_selftest(g); }                 /* task 37: KHNMC_SCREEN (S1, S2), r / o / b, H1 (runtime/aspect.c) */
     /* allocator */
     u64 p[64]; for(int i=0;i<64;i++){ p[i]=ga_alloc((u64)(i*37+1),(i%5==0)?64:16); CHECK(p[i]&&!(p[i]&15)); if(i%5==0) CHECK(!(p[i]&63)); memset(hp(g,p[i]),0xA5,(size_t)(i*37+1)); }
     for(int i=0;i<64;i+=2) ga_free(p[i]); u64 q=ga_calloc(10,10); CHECK(q&&rd64(g,q)==0&&rd64(g,q+88)==0); q=ga_realloc(q,5000); CHECK(q&&ga_usable(q)>=5000);

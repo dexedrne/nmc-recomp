@@ -31,6 +31,11 @@ void kh_vkd3d_swap_getbuffer(KCtx *g,u64 o); void kh_vkd3d_swap_resize(KCtx *g,u
 /* texture recorder: sampled textures (no RT/DS flag) by DXGI format and by size class, and the footprint uploads that fill them (CopyTextureRegion) */
 static _Atomic u64 tx_res[128], tx_res_bytes[128], tx_up[128], tx_up_bytes[128], tx_distinct_up, tx_rtds, tx_sized[8], tx_up_sized[8], tx_up_total_bytes, tx_up_calls, tx_other_up;
 static const char *size_names[8]={"<=64","128","256","512","1024","2048",">2048","1D/3D"};
+/* task 37 (runtime/aspect.c): the screen seam's size for the DXGI output (S2) and, with KHNMC_ASPECT_LOG=1, the size records (swap
+ * chain, render-target / depth-stencil / multisampled textures, the GX sizes at each present) */
+int kh_screen_size(int *w,int *h); extern int kh_aspect_log;
+void kh_aspect_note_swapchain(KCtx *g,const char *what,u64 desc,u32 w,u32 h); void kh_aspect_note_texture(KCtx *g,u64 desc); void kh_aspect_note_present(KCtx *g,u64 present);
+int kh_screen_check_present(KCtx *g,u32 scw,u32 sch,u64 present);      /* KHNMC_SCREEN set: the presented size is the screen's (else screen-not-applied) */
 static const char *fmt_name(u32 f){ static __thread char b[16]; switch(f){ case 71: return "BC1_UNORM"; case 72: return "BC1_SRGB"; case 74: return "BC2_UNORM"; case 75: return "BC2_SRGB"; case 77: return "BC3_UNORM"; case 78: return "BC3_SRGB";
     case 87: return "B8G8R8A8_UNORM"; case 91: return "B8G8R8A8_SRGB"; case 28: return "R8G8B8A8_UNORM"; case 49: return "R8G8_UNORM"; case 61: return "R8_UNORM"; case 103: return "NV12"; case 98: return "BC7_UNORM"; default: snprintf(b,sizeof b,"fmt%u",f); return b; } }
 static int size_class(u64 w,u32 h){ u64 m=w>h?w:h; return m<=64?0:m<=128?1:m<=256?2:m<=512?3:m<=1024?4:m<=2048?5:6; }
@@ -60,6 +65,7 @@ static u64 new_resource(KCtx *g,u64 desc,int placed_dim_hint){
     wr64(g,r+R_VA,(atomic_fetch_add(&res_ids,1))<<32); gfx_resources++;
     if(desc&&dim>=2&&dim<=4){
         u32 h=rd32(g,desc+24); u32 mips=rd16(g,desc+30),arr=rd16(g,desc+28),flags=rd32(g,desc+48); if(!mips) mips=1; if(!arr) arr=1;
+        if(__builtin_expect(kh_aspect_log,0)) kh_aspect_note_texture(g,desc);   /* task 37: render-target / depth-stencil / multisampled sizes */
         if(flags&3) tx_rtds++;
         else { u32 bw,bpb; fmt_info(fmt,&bw,&bpb); u64 sz=0; for(u32 m=0;m<mips;m++){ u64 W=w>>m; if(!W) W=1; u32 H=h>>m; if(!H) H=1; sz+=((W+bw-1)/bw)*bpb*((H+bw-1)/bw); }
                sz*=(dim==2||dim==3)?arr:1; if(fmt<128){ tx_res[fmt]++; tx_res_bytes[fmt]+=sz; } tx_sized[dim==3?size_class(w,h):7]++; }
@@ -85,6 +91,7 @@ static int h_factory(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) retur
         u64 sc=new_obj(C_swap,96); u64 d=ARG(g,3); wr32(g,sc+32,d?rd32(g,d):1280); wr32(g,sc+36,d?rd32(g,d+4):720); wr32(g,sc+40,0);
         KWaitObj *w=NULL; (void)w; extern u64 kh_mk_event_h(int manual,int initial); wr64(g,sc+48,kh_mk_event_h(1,1));
         if(kh_gfx_vkd3d_on) kh_vkd3d_swap_attach(g,sc,A1(g),d);
+        if(__builtin_expect(kh_aspect_log,0)) kh_aspect_note_swapchain(g,"CreateSwapChainForHwnd",d,rd32(g,sc+32),rd32(g,sc+36));
         out_obj(g,ARG(g,6),sc); SET_RAX(g,0); return 1; }
     default: return 0; } }
 static int h_adapter(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)o;(void)c;
@@ -101,8 +108,8 @@ static int h_output(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return
         if(kh_vsync_wait()){ SET_RAX(g,0); return 1; }                       /* TASK36: a display tick source (iOS display link, KHNMC_DISPLAY=timer60) paces it (gfx_present.c) */
         kh_vsync_note_sleep();
         struct timespec ts={0,vblank_ns}; nanosleep(&ts,0); SET_RAX(g,0); return 1; }                                 /* host clock: pace at 60 Hz (KHNMC_NULL_VBLANK_NS: another frame time, for timing experiments) */
-    if(s==7){ u64 d=A1(g); memset(hp(g,d),0,0x60); utf8_to_gw(g,d,32,"\\\\.\\DISPLAY1");
-        /* DesktopCoordinates RECT at +0x40, AttachedToDesktop +0x50 */ wr32(g,d+0x48,1920); wr32(g,d+0x4c,1080); wr32(g,d+0x50,1); wr64(g,d+0x58,0xAB0100); SET_RAX(g,0); return 1; }
+    if(s==7){ u64 d=A1(g); memset(hp(g,d),0,0x60); utf8_to_gw(g,d,32,"\\\\.\\DISPLAY1"); int sw,sh; kh_screen_size(&sw,&sh);     /* task 37 (S2): 1920x1080 unless KHNMC_SCREEN */
+        /* DesktopCoordinates RECT at +0x40, AttachedToDesktop +0x50 */ wr32(g,d+0x48,(u32)sw); wr32(g,d+0x4c,(u32)sh); wr32(g,d+0x50,1); wr64(g,d+0x58,0xAB0100); SET_RAX(g,0); return 1; }
     return 0; }
 static int h_swap(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)c;
     switch(s){
@@ -112,6 +119,8 @@ static int h_swap(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1
         kh_gfx_report(stderr);
         if(gfx_presents%300==0) kh_gfx_tex_report(stderr);
         if(kh_gfx_vkd3d_on) kh_vkd3d_present(g,o,gfx_presents);            /* optional image dump of the buffer being presented */
+        kh_screen_check_present(g,rd32(g,o+32),rd32(g,o+36),gfx_presents);  /* task 37 review: returns at once unless KHNMC_SCREEN is set */
+        if(__builtin_expect(kh_aspect_log,0)) kh_aspect_note_present(g,gfx_presents);     /* task 37: GX size fields when they change */
         wr32(g,o+40,rd32(g,o+40)+1); SET_RAX(g,0); return 1;                 /* Present / Present1 */
     case 9: if(kh_gfx_vkd3d_on){ kh_vkd3d_swap_getbuffer(g,o); return 1; }
             { u32 i=(u32)A1(g)%3; u64 b=rd64(g,o+56+8*i); if(!b){ u64 desc=ga_alloc(56,16); memset(hp(g,desc),0,56); wr32(g,desc,3); wr64(g,desc+16,rd32(g,o+32)); wr32(g,desc+24,rd32(g,o+36)); wr16(g,desc+28,1); wr16(g,desc+30,1); wr32(g,desc+32,0x57); wr32(g,desc+36,1);
@@ -119,7 +128,8 @@ static int h_swap(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1
             kh_com_ref_add(g,b); out_obj(g,A3(g),b); SET_RAX(g,0); return 1; }        /* GetBuffer(idx, riid, **pp): the caller gets a new reference (AddRef, as DXGI does) and releases it */
     case 10: SET_RAX(g,0); return 1;                                                                        /* SetFullscreenState */
     case 12: { u64 d=A1(g); memset(hp(g,d),0,0x48); wr32(g,d,rd32(g,o+32)); wr32(g,d+4,rd32(g,o+36)); wr32(g,d+0x10,0x57); wr32(g,d+0x1c,1); wr32(g,d+0x24,0x30); wr32(g,d+0x28,3); wr32(g,d+0x38,1); wr32(g,d+0x3c,3); wr32(g,d+0x40,0x42); SET_RAX(g,0); return 1; } /* GetDesc */
-    case 13: if(kh_gfx_vkd3d_on){ u32 nw=(u32)A2(g)?(u32)A2(g):rd32(g,o+32), nh=(u32)A3(g)?(u32)A3(g):rd32(g,o+36); kh_vkd3d_swap_resize(g,o,nw,nh);
+    case 13: if(__builtin_expect(kh_aspect_log,0)) kh_aspect_note_swapchain(g,"ResizeBuffers (asked)",0,(u32)A2(g),(u32)A3(g));   /* task 37: 0 = keep that side */
+             if(kh_gfx_vkd3d_on){ u32 nw=(u32)A2(g)?(u32)A2(g):rd32(g,o+32), nh=(u32)A3(g)?(u32)A3(g):rd32(g,o+36); kh_vkd3d_swap_resize(g,o,nw,nh);
                  if(!(u32)KH_RAX(g)){ wr32(g,o+32,nw); wr32(g,o+36,nh); wr32(g,o+40,0); } return 1; }       /* real buffers: new size, back-buffer index restarts at 0 */
              wr32(g,o+32,(u32)A2(g)?(u32)A2(g):rd32(g,o+32)); wr32(g,o+36,(u32)A3(g)?(u32)A3(g):rd32(g,o+36)); SET_RAX(g,0); return 1;     /* ResizeBuffers(count,w,h,fmt,flags) */
     case 15: out_obj(g,A1(g),o_output); SET_RAX(g,0); return 1;                                             /* GetContainingOutput */
@@ -259,6 +269,7 @@ static int h_blob(KCtx *g,u64 o,int s,const char *c){ (void)c; if(s==3){ SET_RAX
 static int h_misc(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)g;(void)o;(void)s;(void)c; return 0; }
 
 u64 kh_mk_event_h(int manual,int initial);
+u64 kh_null_output_obj(void){ return o_output; }                           /* task 37 selftest (runtime/aspect.c): the DXGI output (S2) */
 static u64 mk_blob(KCtx *g,u64 src,u64 size){ u64 b=new_obj(C_blob,16); u64 d=ga_alloc(size?size:16,16); if(src&&size) memcpy(hp(g,d),hp(g,src),size); wr64(g,b+32,d); wr64(g,b+40,size); return b; }
 
 void kh_seam_gfx_init(void){

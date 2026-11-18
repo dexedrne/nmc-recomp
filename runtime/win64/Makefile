@@ -146,6 +146,15 @@ FILE_HOOKS += $(MOOSE_HOOKS)
 # Task 32 (runtime/events_stub.c, KHNMC_EVENTS=stub): 3a1f70 = find an event entry (BAR type 22) of the loaded area file by name; its only caller is the event starter 3ac350
 EVENT_HOOKS = 3a1f70
 FILE_HOOKS += $(EVENT_HOOKS)
+# Task 37 (runtime/aspect.c, NATIVE-FILL-PLAN.md section 7): KHNMC_ASPECT=fill.  11c1e0 = H1, post-call: on a screen narrower than 16:9
+# the largest-16:9 fit keeps the full height, so 0x14e050 / 0x4ed940 draw no bars; 186920 = the map pass, a pass-through that records
+# the frame of the 3D view for H1's condition (H2b's m11 edit joins it in plan step 5).  Later plan steps add 2bd190 126500 156940
+# 1569b0 156a70 156e20 126fd0 4b7530.  With KHNMC_ASPECT unset both are exact pass-throughs.
+ASPECT_HOOKS = 11c1e0 186920
+ifneq ($(shell grep -l '^void f_1948c0' $(ROOT)/runtime/aspect.c),)
+ASPECT_HOOKS += 1948c0
+endif
+FILE_HOOKS += $(ASPECT_HOOKS)
 # ---- Task 12: mod static edits ---------------------------------------------------------------------------------------------------
 # The mod DLL patches code bytes in 28 exe functions and attaches two INLINE detours (inside 3c3fe0 and 360920).  Those 30 functions
 # are re-lifted from the patched image into $(GEN)/mod_static_lifted.c and replace the vanilla lifted bodies through the alias list
