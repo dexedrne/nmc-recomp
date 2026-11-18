@@ -43,6 +43,9 @@ int  kh_route_cursor(KCtx *g,int kind);
 int  kh_route_cursor_target(KCtx *g,int kind,int arg);
 void kh_route_state_tick(KCtx *g,u64 n);                           /* once per game frame, before any condition: per-frame probes, trace */
 void kh_route_state_summary(KCtx *g,u64 n,char *out,size_t cap);   /* every state at once (time-out fatal, report) */
+/* task 33 (the debug warp's result line): what `field` is made of: FIELD_COMMAND.execute calls in the last game frame, field message
+ * windows in the list and how many of them wait for a button (`field` = calls > 0, a world set, no window waiting) */
+void kh_route_field_parts(KCtx *g,u64 *field_cmds,int *windows,int *waiting);
 #define KR_BATTLE_RECENT 300                                       /* `battle`: a hit computed within this many game frames */
 
 /* ---- task 29 readers (all read-only; every pointer is checked before it is followed) ---------------------------------------- */

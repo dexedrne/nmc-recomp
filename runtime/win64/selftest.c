@@ -254,6 +254,8 @@ int kh_selftest(KCtx *g){
     { extern int kh_data_deny_selftest(KCtx *); extern int kh_events_stub_selftest(KCtx *); extern int kh_music_log_selftest(KCtx *);   /* task 32 */
       fails+=kh_data_deny_selftest(g)+kh_events_stub_selftest(g)+kh_music_log_selftest(g); }
     { extern int kh_input_route31_selftest(KCtx *); fails+=kh_input_route31_selftest(g); }   /* task 31: objective / message / reaction / menu readers, @react, @goto object */
+    { extern int kh_warp_selftest(KCtx *); fails+=kh_warp_selftest(g); }                     /* task 33: the debug warp (runtime/warp.c) */
+    { extern int kh_input_route33_selftest(KCtx *); fails+=kh_input_route33_selftest(g); }   /* task 33: the @warp / @warp list steps */
     /* allocator */
     u64 p[64]; for(int i=0;i<64;i++){ p[i]=ga_alloc((u64)(i*37+1),(i%5==0)?64:16); CHECK(p[i]&&!(p[i]&15)); if(i%5==0) CHECK(!(p[i]&63)); memset(hp(g,p[i]),0xA5,(size_t)(i*37+1)); }
     for(int i=0;i<64;i+=2) ga_free(p[i]); u64 q=ga_calloc(10,10); CHECK(q&&rd64(g,q)==0&&rd64(g,q+88)==0); q=ga_realloc(q,5000); CHECK(q&&ga_usable(q)>=5000);

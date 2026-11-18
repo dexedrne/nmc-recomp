@@ -38,6 +38,7 @@ static int package_fallback(const char *path){
 }
 static void file_log(KCtx *g,const char *path,const char *source,int size){
     kh_phase_file(g,path); kh_music_note_file(g,path,source!=NULL,size);
+    { extern void kh_warp_file_event(KCtx *,const char *,const char *); kh_warp_file_event(g,path,source); }   /* task 33: attributed to a debug warp while one is watched */
     const char *log=getenv("KHNMC_FILELOG"); FILE *lf=fopen(log?log:"filelog.txt","a");
     if(!lf) kh_fatal(g,"cannot append file log %s",log?log:"filelog.txt");
     int failed=fprintf(lf,"%s %s %d %s\n",source?"HIT":"MISS",source?source:"NONE",size,path)<0;

@@ -289,3 +289,53 @@ alone (said to be a PARTIAL RUN; not a pass of the selftest).
 Station Heights): 164 steps; START opens the camp menu at game frame 22,378 on difficulty 3 and 24,363 on difficulty 1, the route
 ends at 22,624 / 24,609 (run-Q31/last-camp-d3, last-camp-d1; the frames vary by a few hundred from run to run).  Its main list has no Items and no Customize row there (menu flags
 0x70 / 0x72 clear: the route checks them), so a Potion can neither go into an item slot nor be used from the menu yet.
+
+## Route scripts, task 33: the DEBUG WARP (a test tool, not play)
+
+**A result after a warp says "this room loads from this state", not "the game reaches it".** The warp puts the game in a room
+the story may never send it to with these programs, and everything the room expects (story flags, party, items, the room
+before it) is whatever the run had when it warped. No story route and not the default route use it; a route that does prints
+`kh: warp:` lines for every warp and its route report counts `debug warps`.
+
+```
+@warp WORLD ROOM [door N] [map N] [btl N] [evt N] [settle S] [timeout T]
+                                               ask the GAME for a map jump to WORLD ROOM through its own function, the way the
+                                               mod's script call MapJump and the camp menu's place jump do: the 10-byte place
+                                               record {world, room, door, 0, map program, btl program, evt program} handed to exe
+                                               0x152990(record, 1, 0, 0, 0) on the game thread at the end of a game frame, only
+                                               when the field has been up S game frames in a row (default 60) with no system menu,
+                                               no message window and no jump pending.  WORLD is a name of the exe's table
+                                               0x140717210 (zz es tt di hb bb he al mu po lk lm dc wi nm wm ca tr eh) or 0..18;
+                                               ROOM 0..63; door default 0; a program left out is 0xffff = the save's program for
+                                               that room (0x152be0).  The step is met when the jump has run and the field has
+                                               stayed up S game frames in the new room (or in the room its own program jumped on
+                                               to); not within T game frames of the request (default: the @timeout) is the named
+                                               fatal `route-warp-failed` with the outcome below.  Nothing else is written to the
+                                               game: the record is copied by 0x152990 at once.
+@warp list FILE [settle S] [timeout T]
+                                               the same for every line of FILE (relative to the route file): `WORLD ROOM [door N]
+                                               [map N] [btl N] [evt N]`, `#` comments.  A place that does not come back to the
+                                               field ends the run (exit 6, `kh: warp: list stopped at entry K of N ...`, then the
+                                               route report); tools/room_sweep.sh starts the next process with the next entry.
+```
+
+Every warp prints `kh: warp: #K DEBUG WARP (a test tool, not play) to ...` when it is asked for and one
+`kh: warp: #K result ROOM OUTCOME: ...` line (requested / jump done / field at game frame, the place and programs now, the
+player's position, what `field` is made of at the end: `at the end: field commands this frame N, message windows W (waiting X),
+menu-open M, jump pending J`, the mission file, scene files, the map files opened with their source (the first 12 names), every
+file MISS that looks like game data with the return sites on the loading thread's stack, files opened), then a map report (id
+table slots, id-zone and far-zone marks, RSS: the PROCESS's marks, which a list of rooms in one process carries from room to room). A fault or a named fatal during a warp also prints `kh: warp: FAULT OR FATAL DURING DEBUG WARP #K ...`.
+
+| outcome | means |
+|---|---|
+| `FIELD`, `FIELD+MISSION` | the field is up in the room and stayed up S frames (a mission file was opened: the btl program started a mission) |
+| `JUMPED-ON` | the room loaded and its own program (an event, a door, a jump of its programs) moved the game on to another room, where the field came up; the result names that room |
+| `MAP-MISSING` | no field within T frames, and the room's map file `map/<world><room>.map` (the exe names it after the room, 0x152ed0 + "map/%s.map" at 0x161c50) was asked for and is in neither the loose tree nor the packages |
+| `SCENE` | no field within T frames; event data was read (a scene ran or runs) |
+| `JUMP-PENDING`, `MESSAGE-WAITING`, `MENU-OPEN`, `LOADING` | no field within T frames, and at the time-out: a jump the room's program asked for is pending / a field message window waits for a button (the warp presses nothing) / a system menu runs / none of these (still loading, or no player control). Logs before the review of task 33 say `STILL-LOADING` for all four |
+| `JUMPED-ON-NO-FIELD` | the room's own program moved on to another room and no field came there within T frames |
+| `JUMP-NOT-DONE`, `JUMP-NOT-STARTED`, `NO-SAFE-MOMENT` | the jump task did not finish / never appeared / no safe moment came within T frames |
+
+`tools/room_sweep.sh` (task 33) runs the sweep over every area file with these lists (see its header); `tools/room_sweep.py
+--selftest` checks its log parsing, its table and the runner's bookkeeping. Its table adds `NO-PROGRAM` from the data: a `LOADING`
+whose place names no map, btl or evt program of its room's area file (nothing of the room runs).

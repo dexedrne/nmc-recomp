@@ -194,6 +194,7 @@ static int message(KCtx *g){ int t,wt; windows(g,&t,&wt); return wt>0; }
 /* task 30, for the trace line: state and mode of the first window of the list (mode 1 = confirm, 2 = a choice) */
 static void first_window(KCtx *g,int *st,int *mode){ u64 w=rd64(g,WIN_HEAD); *st=*mode=-1; if(readable(w,0x5c8)){ *st=(s32)rd32(g,w+0xa0); *mode=(s32)rd32(g,w+0x260); } }
 static int field(KCtx *g){ return fc_frame>0 && rd8(g,NOW_WORLD)!=0xff && !message(g); }
+void kh_route_field_parts(KCtx *g,u64 *field_cmds,int *nwin,int *nwait){ *field_cmds=fc_frame; windows(g,nwin,nwait); }
 static int battle(u64 n){ u64 h=kh_phase_damage_hits(), last=kh_phase_damage_last_frame(); return h>0 && n>=last && n-last<=KR_BATTLE_RECENT; }
 
 /* ---- task 29 ------------------------------------------------------------------------------------------------------------------ */

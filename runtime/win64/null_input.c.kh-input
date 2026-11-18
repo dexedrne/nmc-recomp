@@ -19,6 +19,7 @@
 #include <math.h>
 #include "route_state.h"
 #include "mod_config.h"
+#include "warp.h"
 typedef struct { u16 buttons; u8 lt,rt; s16 lx,ly,rx,ry; } ScriptPad;
 _Static_assert(sizeof(ScriptPad)==12,"XINPUT_GAMEPAD layout");
 typedef struct { u64 start,end; ScriptPad pad; } InputRange;
@@ -101,15 +102,16 @@ static void hold_check(KCtx *g,u64 present){
  * frame after the last relative press, a frame with nothing pressed: two steps' presses are always separated by at least one
  * released frame, so the game sees every press as a new one.  A step without relative lines hands over in the same tick. */
 typedef struct { int kind, arg, neg; } Cond;
-enum { ST_WAIT, ST_PRESS, ST_SELECT, ST_EXPECT, ST_GOTO, ST_FIGHT, ST_SKIP, ST_TALK, ST_REACT };
-static const char *st_name[]={"@wait","@press","@select","@expect","@goto","@fight","@skip","@talk","@react"};
+enum { ST_WAIT, ST_PRESS, ST_SELECT, ST_EXPECT, ST_GOTO, ST_FIGHT, ST_SKIP, ST_TALK, ST_REACT, ST_WARP, ST_WARPLIST };   /* task 33: the debug warp (runtime/warp.c) */
+static const char *st_name[]={"@wait","@press","@select","@expect","@goto","@fight","@skip","@talk","@react","@warp","@warp list"};
 typedef struct { u64 a,b; ScriptPad pad; } RelRange;
 typedef struct { int type; Cond c; ScriptPad pad, held; u64 every, hold, timeout; unsigned line; char text[160]; RelRange *rel; size_t nrel; u64 maxb;
                  u64 started, met, waited;
                  float gx, gz, radius; u64 stall; int has_until, to_enemy; u64 stable;
                  int to_object; char obj_name[40];       /* task 31: @goto object NAME (the nearest object with that objentry model name) */
                  int only;                               /* task 31: @if-difficulty N: -1 = always */
-                 int react_id; } Step;                   /* task 31: @react [id N]: only this reaction command is answered (-1 = any) */   /* @talk: frames `until` must hold in a row */   /* @goto: target (or the nearest enemy), radius, frames without progress, `until` in c */
+                 int react_id;                           /* task 31: @react [id N]: only this reaction command is answered (-1 = any) */
+                 KhWarpTarget *warp; size_t nwarp, warp_i; u64 settle; } Step;   /* @warp / @warp list (task 33): the places, the next one, frames the field must stay up */   /* @talk: frames `until` must hold in a row */   /* @goto: target (or the nearest enemy), radius, frames without progress, `until` in c */
 static Step *steps; static size_t nsteps;
 #define ARG_DIFFICULTY (-2)                /* a condition argument `difficulty`: the route's difficulty (@difficulty N or KHNMC_ROUTE_DIFFICULTY) */
 static int route_difficulty=-1; static const char *route_difficulty_from="";
@@ -145,6 +147,8 @@ static int goto_noobj; static u64 react_presses; static int react_seen; static f
  * and why the one seen last could not be answered */
 static int react_landing; static u64 react_open, react_shut; static const char *react_why;
 #define REACT_BUTTON 0x8000                                   /* Y on an XInput pad: the reaction button (triangle on the PS2) */
+static int warp_watching; static int warp_seq;            /* task 33: a warp of the current step is being watched; warps begun in this run */
+#define WARP_LIST_STOPPED_EXIT 6                          /* `@warp list`: a place did not come back to the field, the run ends here (tools/room_sweep.sh goes on) */
 static int route_exit_at_end;                             /* KHNMC_ROUTE_END=exit: the run ends (exit 0, with the reports) when the route is done */
 u64 kh_phase_damage_hits(void);
 /* a condition's value after its `not`: 1 holds, 0 does not, -1 its reader cannot read the state now (KR_UNREADABLE): then neither the
@@ -181,7 +185,7 @@ static void route_tick(KCtx *g,u64 n){
                            goto_best=1e30f; goto_best_at=n; goto_seen=0; goto_lx=goto_ly=0; fight_a=0; fight_enemies=0; fight_presses=0; fight_pages=0; skip_btn=0; skip_hold=skip_gap=0; skip_starts=skip_skips=skip_moves=skip_pages=0; talk_run=talk_presses=0; talk_msg=0; goto_noobj=0; react_presses=0; react_seen=-1; goto_ox=goto_oz=1e30f;
                            react_landing=0; react_open=react_shut=0; react_why=NULL; }
         if(step_phase==1){
-            int cv=s->type==ST_GOTO||s->type==ST_FIGHT||s->type==ST_SKIP||s->type==ST_TALK||s->type==ST_REACT?0:cond_val(g,&s->c,n), ok=cv>0;   /* @goto / @fight / @skip / @talk / @react read their `until` themselves */
+            int cv=s->type==ST_GOTO||s->type==ST_FIGHT||s->type==ST_SKIP||s->type==ST_TALK||s->type==ST_REACT||s->type==ST_WARP||s->type==ST_WARPLIST?0:cond_val(g,&s->c,n), ok=cv>0;   /* @goto / @fight / @skip / @talk / @react read their `until` themselves; @warp has none */
             if(s->type==ST_EXPECT){
                 if(cv<0) route_fatal_state(g,n,"route-condition-unreadable",s,"the state this condition reads cannot be read now (no field player or status sheet, no command menu, no item slots): neither it nor its negation can be checked");
                 if(!ok) route_fatal_state(g,n,"route-expect-failed",s,"the game is not in this state");
@@ -289,6 +293,17 @@ static void route_tick(KCtx *g,u64 n){
                                              goto_tx,goto_tz,(unsigned long long)s->stall,goto_x,goto_z,goto_d,goto_best,(unsigned long long)goto_best_at,fight_enemies,goto_have_cam?"":"(unreadable) ",goto_cam);
                     route_fatal_state(g,n,"route-goto-stalled",s,what);
                 }
+            } else if(s->type==ST_WARP||s->type==ST_WARPLIST){   /* task 33: the debug warp, one place after the other (runtime/warp.c) */
+                if(!warp_watching){ KhWarpTarget t=s->warp[s->warp_i]; if(s->type==ST_WARP) t.line=s->line; kh_warp_begin(g,++warp_seq,&t,n); warp_watching=1; }
+                char what[600]; int r=kh_warp_tick(g,n,s->settle,s->timeout,what,sizeof what);
+                if(r>0){ warp_watching=0; if(++s->warp_i>=s->nwarp) step_met(s,n,n-1); }
+                else if(r<0){
+                    warp_watching=0;
+                    if(s->type==ST_WARP) route_fatal_state(g,n,"route-warp-failed",s,what);
+                    fprintf(stderr,"kh: warp: list stopped at entry %zu of %zu (list line %u `%s`): %s; the %zu entries after it are not warped in this run\n",
+                            s->warp_i+1,s->nwarp,s->warp[s->warp_i].line,s->warp[s->warp_i].text,what,s->nwarp-s->warp_i-1);
+                    extern void kh_exit_process(int); kh_exit_process(WARP_LIST_STOPPED_EXIT);       /* prints the route report (debug warps) */
+                }
             } else {                                           /* ST_SELECT: move the cursor one row at a time until it is on the row */
                 int pressing=sel_from>=0 && (long long)n-1<sel_until;
                 int v=cursor_fn(g,s->c.kind), want=target_fn(g,s->c.kind,s->c.arg);
@@ -300,7 +315,7 @@ static void route_tick(KCtx *g,u64 n){
                 }
             }
             if(step_phase==1){
-                if(n-s->started>=s->timeout){
+                if(s->type!=ST_WARP && s->type!=ST_WARPLIST && n-s->started>=s->timeout){      /* @warp: a time-out per place, kept by runtime/warp.c */
                     char what[800];
                     if(s->type==ST_SELECT && s->c.kind==KR_PAUSE_ID) snprintf(what,sizeof what,"the pause screen's cursor did not reach the row with id %d within %llu game frames; "
                                                      "that row is %d (-1 = no such row or the screen is not up), the cursor is on row %d",s->c.arg,(unsigned long long)s->timeout,target_fn(g,s->c.kind,s->c.arg),cursor_fn(g,s->c.kind));
@@ -352,8 +367,13 @@ static void route_tick(KCtx *g,u64 n){
 static void route_report(FILE *f){
     size_t done=0; for(size_t i=0;i<nsteps;i++) if(steps[i].met) done++;
     fprintf(f,"kh: route report: %zu of %zu steps done%s; difficulty %d%s; met at game frame:",done,nsteps,route_done?"":" -- ROUTE INCOMPLETE",route_difficulty,route_difficulty_from);
-    for(size_t i=0;i<nsteps;i++) if(steps[i].met) fprintf(f," L%u:%s=%llu",steps[i].line,steps[i].type==ST_SELECT?"select":steps[i].type==ST_GOTO?"goto":steps[i].type==ST_FIGHT?"fight":steps[i].type==ST_SKIP?"skip":steps[i].type==ST_TALK?"talk":steps[i].type==ST_REACT?"react":kh_route_cond_info[steps[i].c.kind].name,(unsigned long long)steps[i].met);
+    int warps=0; for(size_t i=0;i<nsteps;i++) if(steps[i].type==ST_WARP||steps[i].type==ST_WARPLIST) warps=1;
+    for(size_t i=0;i<nsteps;i++) if(steps[i].met) fprintf(f," L%u:%s=%llu",steps[i].line,steps[i].type==ST_SELECT?"select":steps[i].type==ST_GOTO?"goto":steps[i].type==ST_FIGHT?"fight":steps[i].type==ST_SKIP?"skip":steps[i].type==ST_TALK?"talk":steps[i].type==ST_REACT?"react":
+                                                         steps[i].type==ST_WARP?"warp":steps[i].type==ST_WARPLIST?"warp-list":kh_route_cond_info[steps[i].c.kind].name,(unsigned long long)steps[i].met);
     if(!route_done && cur_step<nsteps) fprintf(f,"; waiting at line %u `%s` since game frame %llu",steps[cur_step].line,steps[cur_step].text,(unsigned long long)steps[cur_step].started);
+    if(warps){ u64 rq=0,fd=0,jo=0,fl=0; kh_warp_counts(&rq,&fd,&jo,&fl);
+        fprintf(f,"; debug warps %llu (field reached %llu, jumped on by the room's own program %llu, failed %llu; a TEST TOOL: a result after a warp says this room loads from this state, "
+                  "not that the game reaches it)",(unsigned long long)rq,(unsigned long long)fd,(unsigned long long)jo,(unsigned long long)fl); }
     fputc('\n',f);
 }
 void kh_input_report(FILE *f){
@@ -427,11 +447,11 @@ static int parse_cond(char **words,int n,int *i,Cond *c,const char **why){
     }
     return 1;
 }
-static void route_free(void){ for(size_t i=0;i<nsteps;i++) free(steps[i].rel); free(steps); steps=NULL; nsteps=0; }
+static void route_free(void){ for(size_t i=0;i<nsteps;i++){ free(steps[i].rel); free(steps[i].warp); } free(steps); steps=NULL; nsteps=0; }
 void kh_input_load(KCtx *g,const char *path){
     free(ranges); ranges=NULL; nranges=0; scripted=path!=NULL; packet=0; memset(&last_pad,0,sizeof last_pad);
     hold_frame=-1; hold_state=-1; atomic_store(&hold_shift,0); atomic_store(&hold_released,0); clock_game=0;
-    route_free(); cur_step=0; step_phase=0; route_done=0; memset(&route_pad,0,sizeof route_pad); route_difficulty=-1; route_difficulty_from=""; sel_from=sel_until=-1;
+    route_free(); cur_step=0; step_phase=0; route_done=0; warp_watching=0; warp_seq=0; kh_warp_reset_counts(); memset(&route_pad,0,sizeof route_pad); route_difficulty=-1; route_difficulty_from=""; sel_from=sel_until=-1;
     memset(&step_base,0,sizeof step_base); hold_timeout=HOLD_TIMEOUT_DEFAULT; hold_line=0;
     if(!path) return;
     snprintf(route_path,sizeof route_path,"%s",path);
@@ -465,7 +485,7 @@ void kh_input_load(KCtx *g,const char *path){
         if(!strcmp(words[0],"@clock")){ if(n!=2||strcmp(words[1],"game-frames")||clock_game) goto invalid; clock_game=1; if(!first_frame_line) first_frame_line=lineno; continue; }
         if(!strcmp(words[0],"@timeout")){ long long v; if(n!=2||!number(words[1],1,100000000,&v)){ why="@timeout takes a number of game frames"; goto invalid; } timeout_default=(u64)v; continue; }
         if(!strcmp(words[0],"@difficulty")){ long long v; if(n!=2||!number(words[1],0,3,&v)||route_difficulty>=0){ why="@difficulty takes 0..3, once"; goto invalid; } route_difficulty=(int)v; route_difficulty_from=" (@difficulty)"; continue; }
-        if(!strcmp(words[0],"@wait")||!strcmp(words[0],"@expect")||!strcmp(words[0],"@press")||!strcmp(words[0],"@select")||!strcmp(words[0],"@goto")||!strcmp(words[0],"@fight")||!strcmp(words[0],"@skip")||!strcmp(words[0],"@talk")||!strcmp(words[0],"@react")){
+        if(!strcmp(words[0],"@wait")||!strcmp(words[0],"@expect")||!strcmp(words[0],"@press")||!strcmp(words[0],"@select")||!strcmp(words[0],"@goto")||!strcmp(words[0],"@fight")||!strcmp(words[0],"@skip")||!strcmp(words[0],"@talk")||!strcmp(words[0],"@react")||!strcmp(words[0],"@warp")){
             Step st; memset(&st,0,sizeof st); st.line=lineno; st.timeout=timeout_default; st.every=8; st.hold=2; st.radius=100.0f; st.stall=240; st.c.kind=-1; st.react_id=-1; st.only=only;
             snprintf(st.text,sizeof st.text,"%s",t0);
             int i=1;
@@ -501,6 +521,27 @@ void kh_input_load(KCtx *g,const char *path){
                     if(!strcmp(words[i],"radius")) st.radius=(float)w; else if(!strcmp(words[i],"stall")) st.stall=(u64)w; else if(!strcmp(words[i],"timeout")) st.timeout=(u64)w;
                     else { why="unknown option for @goto (radius, until, stall, timeout)"; goto invalid; }
                     i+=2;
+                }
+            } else if(!strcmp(words[0],"@warp")){                 /* task 33: the debug warp, a TEST TOOL (runtime/warp.c; input/README.md) */
+                st.settle=KH_WARP_SETTLE_DEFAULT;
+                if(n>=2 && !strcmp(words[1],"list")){             /* @warp list FILE [settle S] [timeout T] */
+                    st.type=ST_WARPLIST;
+                    if(n<3){ why="@warp list FILE [settle S] [timeout T]"; goto invalid; }
+                    char lp[1024]; const char *slash=strrchr(path,'/');
+                    if(words[2][0]=='/' || !slash) snprintf(lp,sizeof lp,"%s",words[2]);     /* relative: next to the route file */
+                    else snprintf(lp,sizeof lp,"%.*s/%s",(int)(slash-path),path,words[2]);
+                    i=3;
+                    while(i<n){ long long w; if(i+1>=n || !number(words[i+1],1,100000000,&w)){ why="@warp list: settle and timeout take a number of game frames"; goto invalid; }
+                        if(!strcmp(words[i],"settle")) st.settle=(u64)w; else if(!strcmp(words[i],"timeout")) st.timeout=(u64)w;
+                        else { why="unknown option for @warp list (settle, timeout)"; goto invalid; }
+                        i+=2; }
+                    static char lwhy[700];
+                    if(!kh_warp_list_load(lp,&st.warp,&st.nwarp,lwhy,sizeof lwhy)){ why=lwhy; goto invalid; }
+                } else {                                          /* @warp WORLD ROOM [door N] [map N] [btl N] [evt N] [settle S] [timeout T] */
+                    st.type=ST_WARP; KhWarpTarget t;
+                    if(!kh_warp_parse(words,n,&i,&t,1,&st.settle,&st.timeout,&why)) goto invalid;
+                    t.line=lineno; snprintf(t.text,sizeof t.text,"%s",t0);
+                    st.warp=malloc(sizeof t); if(!st.warp) kh_fatal(g,"scripted XInput: allocation failed"); st.warp[0]=t; st.nwarp=1;
                 }
             } else if(!strcmp(words[0],"@talk")){                 /* @talk until COND [every P] [hold H] [stable S] [timeout N] (task 30) */
                 st.type=ST_TALK; st.every=20; st.hold=2; st.stable=30;
@@ -552,7 +593,7 @@ void kh_input_load(KCtx *g,const char *path){
                 if(st.c.neg || (st.c.kind!=KR_TITLE_CHOICE && st.c.kind!=KR_NEWGAME_CHOICE && st.c.kind!=KR_COMMAND_ROW && st.c.kind!=KR_COMMAND_ID && st.c.kind!=KR_PAUSE_ID && st.c.kind!=KR_MESSAGE_CHOICE)){
                     why="@select moves title-choice or newgame-choice (or the field command menu: command-row, command-id; the pause screen: pause-id; a choice window: message-choice)"; goto invalid; }
             }
-            while(st.type!=ST_GOTO && st.type!=ST_FIGHT && st.type!=ST_SKIP && st.type!=ST_TALK && st.type!=ST_REACT && i<n){                /* options: every P, hold H (@press), timeout T (every step but @expect) */
+            while(st.type!=ST_GOTO && st.type!=ST_FIGHT && st.type!=ST_SKIP && st.type!=ST_TALK && st.type!=ST_REACT && st.type!=ST_WARP && st.type!=ST_WARPLIST && i<n){                /* options: every P, hold H (@press), timeout T (every step but @expect) */
                 long long v; if(i+1>=n || !number(words[i+1],1,100000000,&v)){ why="an option takes a number"; goto invalid; }
                 if(!strcmp(words[i],"timeout") && st.type!=ST_EXPECT) st.timeout=(u64)v;
                 else if(!strcmp(words[i],"every") && st.type==ST_PRESS) st.every=(u64)v;
@@ -1757,5 +1798,79 @@ int kh_input_route31_selftest(KCtx *g){
     kh_input_load(g,getenv("KHNMC_INPUT_SCRIPT"));
     fprintf(stderr,"kh: input route Q31 selftest: %d checks, %d failures\n",checks,fails);
 #undef QCHECK
+    return fails;
+}
+
+/* ---- task 33: the debug warp steps (`@warp`, `@warp list`; the warp itself is runtime/warp.c, tested there) ---------------------
+ * Here: the route lines, the step's hand-over (met when the warp reached the field, one list entry after the other), the route report's
+ * `debug warps`, the named fatal of a single warp that fails, the end of a list that stops (exit 6) and the load errors. */
+static int w33_field, w33_busy, w33_place_w=0x12, w33_place_r=2, w33_req, w33_stuck_from=1000000;
+static int w33_cond(KCtx *g,int kind,u64 n){ (void)g; (void)n; return kind==KR_FIELD?w33_field:0; }
+static int w33_jbusy(KCtx *g){ (void)g; return w33_busy; }
+static int w33_place(KCtx *g,int *w,int *r){ (void)g; *w=w33_place_w; *r=w33_place_r; return 1; }
+static void w33_request(KCtx *g,const u8 rec[10]){ (void)g; w33_req++; w33_busy=1; if(w33_req<w33_stuck_from){ w33_place_w=rec[0]; w33_place_r=rec[1]; } }
+/* a game that carries out every jump at once: the jump task appears with the request and is gone at the next frame; the field is
+ * always up, except after the w33_stuck_from-th request (that room never comes back) */
+static void w33_tick(KCtx *g,u64 n){ route_tick(g,n); if(w33_busy) w33_busy=0; w33_field=w33_req<w33_stuck_from; }
+static void w33_run(KCtx *g,u64 n0,u64 n1){ for(u64 n=n0;n<=n1;n++) w33_tick(g,n); }
+static void w33_body(void){ kh_input_load(t_g,t_child_path); w33_run(t_g,1,t_fatal_ticks); _exit(0); }
+int kh_input_route33_selftest(KCtx *g){
+    int checks=0,fails=0; t_g=g;
+#define WCHECK(c) do{ checks++; if(!(c)){ fails++; fprintf(stderr,"input route S33 selftest FAIL: %s (line %d)\n",#c,__LINE__); } }while(0)
+    char *sv_env=getenv("KHNMC_ROUTE_DIFFICULTY"); char sv_envv[16]=""; if(sv_env) snprintf(sv_envv,sizeof sv_envv,"%s",sv_env); unsetenv("KHNMC_ROUTE_DIFFICULTY");
+    KhWarpProbe fp={w33_cond,w33_jbusy,w33_place,w33_request}; kh_warp_set_probe(&fp);
+    /* 1. a single warp: parsed, met when the field has stayed up `settle` frames in the new room, counted in the report */
+    WCHECK(t_load(g,"@timeout 500\n@warp mu 13 door 1 map 0x4f settle 5\n+1 +1 A\n") && nsteps==1 && steps[0].type==ST_WARP && steps[0].nwarp==1 &&
+           steps[0].warp[0].world==8 && steps[0].warp[0].room==13 && steps[0].warp[0].door==1 && steps[0].warp[0].prog[0]==0x4f && steps[0].warp[0].prog[1]==0xffff &&
+           steps[0].settle==5 && steps[0].timeout==500 && steps[0].nrel==1);
+    WCHECK(t_load(g,"@warp lk 3\n") && steps[0].settle==KH_WARP_SETTLE_DEFAULT && steps[0].timeout==3600);
+    w33_req=0; w33_busy=0; w33_field=1; w33_place_w=0x12; w33_place_r=2; w33_stuck_from=1000000;
+    t_load(g,"@warp mu 13 settle 5\n+1 +1 A\n"); u64 rq0=kh_warp_count();
+    w33_run(g,1,4); WCHECK(w33_req==0 && !steps[0].met);                       /* 5 safe frames before the request */
+    w33_run(g,5,5); WCHECK(w33_req==1 && w33_place_w==8 && w33_place_r==13);
+    w33_run(g,6,40); WCHECK(steps[0].met>0 && route_done && kh_warp_count()==rq0+1);
+    { FILE *f=kh_tmpfile(); if(f){ route_report(f); rewind(f); char l[2048]=""; size_t nr=fread(l,1,sizeof l-1,f); l[nr]=0; fclose(f);
+        WCHECK(strstr(l,"L1:warp=") && strstr(l,"debug warps ") && strstr(l,"this room loads from this state, not that the game reaches it")); }
+      else kh_selftest_not_run("input route S33","route report into a temp file",1); }
+    /* a route without a warp says nothing about warps */
+    WCHECK(t_load(g,"@wait field\n")); { FILE *f=kh_tmpfile(); if(f){ route_report(f); rewind(f); char l[2048]=""; size_t nr=fread(l,1,sizeof l-1,f); l[nr]=0; fclose(f); WCHECK(!strstr(l,"debug warps")); } }
+    /* 2. the list: relative to the route file, every entry in turn, the step met after the last */
+    char lp[KH_TMP_MAX]; kh_tmp_path(lp,sizeof lp,"khnmc-r33list-XXXXXX"); int fd=mkstemp(lp); WCHECK(fd>=0);
+    if(fd>=0){ const char *txt="mu 12\nmu 13 map 0x4f btl 0x4f evt 0x4f\n# a comment\nlm 3\n"; WCHECK(write(fd,txt,strlen(txt))==(ssize_t)strlen(txt)); close(fd); }
+    const char *base=strrchr(lp,'/'); base=base?base+1:lp;
+    char rt[600]; snprintf(rt,sizeof rt,"@warp list %s settle 4 timeout 200\n@warp eh 2 settle 2\n",base);
+    w33_req=0; w33_busy=0; w33_field=1; w33_place_w=0x12; w33_place_r=2; w33_stuck_from=1000000;
+    WCHECK(t_load(g,rt) && nsteps==2 && steps[0].type==ST_WARPLIST && steps[0].nwarp==3 && steps[0].settle==4 && steps[0].timeout==200 &&
+           steps[0].warp[1].prog[2]==0x4f && steps[0].warp[2].world==11 && steps[0].warp[2].line==4);
+    w33_run(g,1,200); WCHECK(w33_req==4 && steps[0].warp_i==3 && steps[0].met>0 && steps[1].met>steps[0].met && w33_place_w==0x12 && w33_place_r==2 && route_done);
+    /* 3. named fatals and the stop of a list, in a child */
+    if(kh_fork_ok()){
+        char o[32768];
+        w33_req=0; w33_busy=0; w33_field=1; w33_place_w=0x12; w33_place_r=2; w33_stuck_from=1;
+        t_fatal_txt="@warp mu 13 settle 3 timeout 40\n"; t_fatal_ticks=300;
+        WCHECK(t_child(w33_body,o,sizeof o)==3 && strstr(o,"route-warp-failed:") && strstr(o,"line 1 `@warp mu 13 settle 3 timeout 40`") && strstr(o,"JUMP-NOT-DONE"));
+        w33_req=0; w33_busy=0; w33_field=1; w33_place_w=0x12; w33_place_r=2; w33_stuck_from=2;   /* the second entry never comes back */
+        snprintf(rt,sizeof rt,"@warp list %s settle 3 timeout 40\n",lp); t_fatal_txt=rt; t_fatal_ticks=400;
+        int st=t_child(w33_body,o,sizeof o);
+        WCHECK(st==6 && strstr(o,"kh: warp: #1 result mu12 FIELD") && strstr(o,"kh: warp: #2 result mu13 JUMP-NOT-DONE") &&
+               strstr(o,"kh: warp: list stopped at entry 2 of 3 (list line 2 `mu 13 map 0x4f btl 0x4f evt 0x4f`)") && strstr(o,"the 1 entries after it are not warped in this run") &&
+               strstr(o,"ROUTE INCOMPLETE") && strstr(o,"debug warps 2 (field reached 1, jumped on by the room's own program 0, failed 1;"));
+        if(st!=6 || !strstr(o,"kh: warp: #2 result mu13")){ const char *k=strstr(o,"kh: warp:"); fprintf(stderr,"  list stop: status %d: %.1500s\n",st,k?k:o); }
+        static const struct { const char *txt, *msg; } bad[]={
+            {"@warp\n","line 1: @warp WORLD ROOM"}, {"@warp qq 1\n","line 1: @warp: unknown world"}, {"@warp mu 99\n","line 1: @warp: the room is a number 0..63"},
+            {"@warp mu 1 speed 2\n","line 1: unknown option for @warp"}, {"@warp list\n","line 1: @warp list FILE"}, {"@warp list khnmc-no-such-list.txt\n","cannot open the warp list"},
+            {"@warp list x settle\n","line 1: @warp list: settle and timeout take a number"}, {"@warp list x color 2\n","line 1: unknown option for @warp list"},
+            {"@warp mu 1\n+0 +1 A\n","line 2: +A +B BUTTONS"},
+        };
+        for(size_t i=0;i<sizeof bad/sizeof *bad;i++){ t_fatal_txt=bad[i].txt; t_fatal_ticks=1;
+            int s2=t_child(w33_body,o,sizeof o); WCHECK(s2==3 && strstr(o,"scripted XInput: ") && strstr(o,bad[i].msg)); if(s2!=3||!strstr(o,bad[i].msg)) fprintf(stderr,"  case %zu: status %d: %.300s\n",i,s2,o); }
+    } else kh_selftest_not_run("input route S33","@warp fatals and the stop of a list (in a child)",11);
+    if(fd>=0) unlink(lp);
+    kh_warp_set_probe(NULL);
+    kh_input_load(g,NULL);
+    if(sv_env) setenv("KHNMC_ROUTE_DIFFICULTY",sv_envv,1);
+    kh_input_load(g,getenv("KHNMC_INPUT_SCRIPT"));
+    fprintf(stderr,"kh: input route S33 selftest: %d checks, %d failures\n",checks,fails);
+#undef WCHECK
     return fails;
 }
