@@ -186,3 +186,28 @@ direction's first full deflection once.
 - Seen on the way: the game creates about two command allocators and lists per frame (CreateCommandAllocator 5,540 by frame 2,700);
   worth a look for the phone's CPU time (a pool in the wrapper), not a correctness question.
 
+
+## ORDERED_MEM on Apple silicon (Mac mini, M4 Pro; 2026-11-18, task 39 merged)
+
+`ORDERED_MEM=1` makes naturally aligned guest loads acquire loads and stores release stores (runtime/win64/implementation notes). Measured on
+the Mac mini from `~/work/khnmc-build` (`run-Y39-mac/`, Mac build dir `~/khnmc-work/build-y39`, both builds `GFX_VKD3D=1`):
+
+- **The plain build really reorders on Apple silicon.** The membench litmus test (one thread writes data then a flag, another reads the
+  flag then the data; 4,000,000 rounds): plain accesses saw the flag ahead of the data 1,736,980 times (the plain build's own LD/ST
+  175,820 times); acquire/release 0 times, and the ordered build's own LD/ST 0 times. On x86 all three are 0. Guest code written for
+  x86 may rely on that order (flags and queues between the game's threads), so the plain build carries a real, if unobserved, risk on
+  the phone.
+- **Code:** the plain binary has 15 LDAPR / 1,964 LDAR / 728 STLR (the runtime's own atomics); the ordered one 297,211 LDAPR /
+  1,964 LDAR / 307,346 STLR; 117 of 117 lifted shards, the re-lifted mod and 66 runtime units built with it (the report line).
+- **Selftests:** plain 170,153 / 0, ordered 170,158 / 0; with graphics on the GPU (vkd3d + MoltenVK) plain 170,773 / 0, ordered
+  170,778 / 0.
+- **Cost, microbenchmark** (ns per step, best of 5): load64 0.910 -> 0.959 (+5.4 %), load32 +4.3 %, store64 +2.8 %, load+store
+  0.949 -> 1.070 (+12.7 %).
+- **Cost, the game** (null backend, frames clock, unpaced, default route to 7,000 frames, alternated plain/ordered/ordered/plain;
+  identical route results): wall 27 s -> 28 s, CPU 31 s -> 32 s (about +3 %), RSS 512 -> 517 MB.
+- **GPU story route** (host clock, MoltenVK, 12,000 frames, one run each; both 58 of 58): plain wall 281 s / CPU 127 s, ordered
+  275 s / 125 s: no visible cost. (The second pair was refused by the Mac mini's 30 % memory floor: its owner's work was using the
+  memory. Not rerun.)
+
+Recommendation for the owner: build the Apple targets (Mac and iPhone) with `ORDERED_MEM=1` by default. The default stays 0 until the
+owner decides and the phone's own numbers exist (implementation notes section 6, "The phone"; needs the MacBook on power).
