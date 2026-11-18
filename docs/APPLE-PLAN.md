@@ -258,3 +258,10 @@ owner decides and the phone's own numbers exist (implementation notes section 6,
   Checked: Mac mini default `make` = ORDERED_MEM 1 / khnmc-om, its selftest 170,158 / 0 with "acquire/release ... 117 lifted shards";
   MacBook default build = obj-iphoneos-om, 48 MB, signed with ORDERED_MEM=1. The phone's selftest of the default app waits for the
   phone (it was unavailable to the MacBook at 09:35).
+- **The story route on the A20's GPU** (2026-11-18, installed and run from the Mac mini over Wi-Fi; the ORDERED_MEM=1 graphics app,
+  offscreen, host clock, `GFX=1 DUMP_EVERY=1500 FETCH="3000 6000 9000 10500" HASHLOG=1 device_run.sh route input/route-story.txt 12000
+  3 2400`): exit 0, **58 of 58 steps**, 11,999 presents in 267 s with readbacks; memory peak phys_footprint 1,690 MiB with 4,454 MiB
+  still available (gpuMemoryAllocated 943 MiB); 0 vkd3d err lines. Warnings: 15,951 x "ResourceBarrier: Aliasing barriers not implemented
+  yet" (vkd3d ignores D3D12 aliasing barriers; nothing visible in the frames), the feature-level notes, 108 x the emulated-timestamp
+  MoltenVK message. The fetched frames (a battle with the style rank, the Twilight Town gang at the accessory shop with a talk box, the
+  mission pause screen) look right. Pictures: ~/Documents/khnmc/phone-frames/story-gpu-20261118/ (not committed).
