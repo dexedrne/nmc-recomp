@@ -238,6 +238,11 @@ void kh_host_env_init(int *argc,char ***argv){
     fprintf(stderr,"kh: host dirs: temporary files in %s\n",kh_tmpdir());
     const char *wd=getenv("KH_ROOT"); he_mkdirs(wd);
     if(chdir(wd)) kh_fatal(NULL,"app-home-not-writable: cannot enter the working directory %s",wd);
+    /* the game's Documents folder: the game creates only its own sub-folders in it, so it must exist (a test run gives a fresh
+     * one under @TMP@ through khnmc.conf: tools/ios/mac/device_run.sh route; the game's config there changes how it boots) */
+    const char *gd=getenv("KH_DOCS"); struct stat gst; he_mkdirs(gd);
+    if(stat(gd,&gst)||!S_ISDIR(gst.st_mode)) kh_fatal(NULL,"app-docs-not-writable: cannot create the game's Documents folder %s",gd);
+    fprintf(stderr,"kh: host dirs: working directory %s, game Documents %s\n",wd,gd);
 }
 
 /* selftest of this section (exists only in a KH_IOS_PATHS build): expansion, the conf syntax, the status hook */

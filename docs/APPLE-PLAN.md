@@ -122,3 +122,17 @@ from iCloud backup at every start (written to Documents/khnmc-backup.txt) and ke
 **Never use `devicectl device copy to --remove-existing-content`:** aimed at one sub-folder, it emptied the whole app container
 (the first full copy was lost that way and sent again). devicectl has no delete; stray files are left or removed by the app.
 
+## The game plays on the iPhone, 2026-11-18 (null graphics backend, full data, scripted controller)
+`tools/runtime/ios/mac/device_run.sh route INPUT FRAMES DIFFICULTY` on the iPhone Duo with the profile-A data:
+- **Field route** (input/route-field-battle.txt, difficulty 0, 7,000 game frames): all 14 steps (boot, title, new game, difficulty,
+  the first field, a battle, 8 hits) in 141 s including the app's start: the game's own 60 fps pace.
+- **Story route** (input/route-story.txt, difficulty 3, 9,300 game frames): all 58 steps, done at game frame 8,980 (Linux 9,193):
+  both opening maps with their missions and objective texts read from the game's messages, on into Twilight Town (02:07) and the Accessory Shop's Talk command. Every scripted walk took the same number of
+  game frames as on Linux (e.g. +267, +36, +289, +123); the two fights differ by a few hundred frames, as fights do.
+- Memory: the bias layout with the full 12 GiB arena and the low guard reserved as on the Mac; the guest heap's high-water about
+  1.1 GB, about 255 MB of it resident at the end of the field route.
+- Sound goes to the null device for now (no output yet); the picture is not presented yet (next: docs on the iPhone graphics path).
+- Test runs get fresh game folders under the app's tmp/ (KH_ROOT, KH_DOCS in khnmc.conf): the game's own config from an earlier run
+  (Documents/Saves/.../config1525.dat) makes it boot past the first-time screens, which a route that waits for them never sees
+  (the first story run on the phone ended so: 0 of 58 steps). The runtime now creates the game's Documents folder itself.
+
