@@ -3,7 +3,8 @@
 set -u
 export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
 export LC_ALL=C
-KROOT="$HOME/Developer/KHNMC"                 # the only directory of this project on this Mac
+KROOT="${KHNMC_KROOT:-$HOME/Developer/KHNMC}"  # the only directory of this project on this Mac; KHNMC_KROOT (owner 2026-11-18):
+                                              # another Mac that only installs and runs a signed app (the Mac mini: ~/khnmc-work/phone)
 SRC="$KROOT/src"; RUNS="$KROOT/run"; STATE="$KROOT/state"
 JOBS=2; NICE=10; MINFREE=25                   # 8 GB RAM: 2 compile jobs, niced, no compile below 25 % free memory
 SIM_NAME="KHNMC Test"                         # OUR simulator; found again only through the UDID we wrote down
