@@ -679,9 +679,15 @@ int kh_sync_selftest(KCtx *g){
     }
     /* 5. a thread handle is signalled when the thread ends (infinite and finite waits return then) */
     u64 sl=kh_host_fn("sync_selftest_sleeper",st_sleeper);
-    u64 th=thread_create(g,0,sl,120,0,NULL); u64 t0=kh_now_ns(); u32 r=kh_wait(g,th,0xFFFFFFFFu); u64 dt=(kh_now_ns()-t0)/1000000;
+    /* the stopwatch starts BEFORE the thread exists: the thread's 120 ms sleep begins after t0, so dt>=120 holds even when this thread
+     * is descheduled right after the create (first run on the iPhone, 2026-11-18: the app started while the phone was unlocking and
+     * one of these two checks failed; the values are printed now when they do) */
+    u64 t0=kh_now_ns(); u64 th=thread_create(g,0,sl,120,0,NULL); u32 r=kh_wait(g,th,0xFFFFFFFFu); u64 dt=(kh_now_ns()-t0)/1000000;
+    if(!(th && r==0 && dt>=100 && dt<3000)) fprintf(stderr,"kh: sync selftest: thread-handle wait (infinite): handle %llx result %#x after %llu ms (expected 0 after 100..3000 ms)\n",(unsigned long long)th,r,(unsigned long long)dt);
     SCHECK(th && r==0 && dt>=100 && dt<3000); { KWaitObj *w=h_get(th,HK_THREAD); SCHECK(w && w->thread->done && w->thread->exit_code==7); } SCHECK(kh_wait(g,th,0)==0); h_close(th);
-    th=thread_create(g,0,sl,120,0,NULL); t0=kh_now_ns(); r=kh_wait(g,th,8000); dt=(kh_now_ns()-t0)/1000000; SCHECK(r==0 && dt>=100 && dt<3000);
+    t0=kh_now_ns(); th=thread_create(g,0,sl,120,0,NULL); r=kh_wait(g,th,8000); dt=(kh_now_ns()-t0)/1000000;
+    if(!(r==0 && dt>=100 && dt<3000)) fprintf(stderr,"kh: sync selftest: thread-handle wait (8000 ms): handle %llx result %#x after %llu ms (expected 0 after 100..3000 ms)\n",(unsigned long long)th,r,(unsigned long long)dt);
+    SCHECK(r==0 && dt>=100 && dt<3000);
     SCHECK(kh_wait(g,th,0)==0); h_close(th); SCHECK(kh_wait(g,th,0)==0xFFFFFFFFu);
     th=thread_create(g,0,sl,300,0,NULL); SCHECK(kh_wait(g,th,20)==0x102);                     /* still running */
     /* 6. suspending another thread is refused loudly; a self-suspend blocks until ResumeThread, counts as on Windows */

@@ -99,3 +99,16 @@ in the main work tree. How it was done: the probe project built with `CODE_SIGNI
 <TEAM> and `-allowProvisioningUpdates` in a windowless `launchctl submit` job on the MacBook (the signing keychain is in the
 GUI session), then `xcrun devicectl device install app / process launch / copy from` over the network to the paired phone.
 
+## The game app on the iPhone itself, 2026-11-18
+The KHNMC app (lifted game, runtime, the mod), signed with the owner's team and both memory entitlements, installed over the
+network, runs its whole selftest on the iPhone Duo: **169,479 checks, 0 failures**, in about 16 s, three runs in a row. The 381
+checks that need a child process (`fork`, refused on iOS) are reported NOT RUN, as designed. The first attempt, which started while
+the phone was still unlocking, failed one timing check of the thread tests (a stopwatch started after the thread it timed); the
+check now starts the stopwatch before the thread and prints what it measured if it ever fails again.
+How: `tools/runtime/ios/mac/sign_app.sh ent` in a windowless `launchctl submit` job (signing needs the GUI session's keychain), then
+`tools/runtime/ios/mac/device_run.sh selftest` over ssh (install, khnmc.conf + kh2fm.exe into the app's Documents, launch with
+retries while the phone is locked, poll the status file, fetch the log). Team and device ids live only in
+`~/Developer/KHNMC/state/device.env` on the Mac. The phone must stay unlocked with the app in front while it runs.
+Next on the phone: the null-backend field route (needs the route data subset in the app's Documents), then the graphics stack
+(vkd3d + MoltenVK built for iOS) for a real picture.
+
