@@ -283,3 +283,9 @@ owner decides and the phone's own numbers exist (implementation notes section 6,
   (task 44); Xbox prompts with a DualSense (task 45: the game's own HID driver knows only the DualShock 4: 054C:05C4 / 09CC / 0BA0);
   about 22 fps in Twilight Town's Station Plaza and Tram Common when characters move (task 48, from his save); portrait with live
   rotation wanted (task 47). Elsewhere a steady 59.5-60 fps. Owner rule: the game never runs on the Mac mini.
+- **Portrait at launch** (owner 2026-11-18: "i want to do duo portrait mode also", "Fill the whole tall screen"; "protrait mode shouldnt
+  be that hard"): the app now supports portrait (supportedInterfaceOrientations all but upside down; Info.plist). The game takes the
+  drawable's size at start-up, so started in portrait it builds its screen at 2007x2853 and the fill code (tasks 37 / 40 / 42) works
+  from that size: the default route passes at KHNMC_SCREEN=2007x2853 KHNMC_ASPECT=fill on the null backend (7,006 presents, built size
+  right at every present, no fatal). Installed 18:13 (no selftest: the phone was locked). A rotation while the game runs only refits
+  the picture (the presenter's swapchain follows; the game's size does not): live resize is task 47, now much smaller.

@@ -215,7 +215,10 @@ static void start_display_link(void){
 }
 - (BOOL)prefersStatusBarHidden { return YES; }
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
+/* owner 2026-11-18: portrait too ("Fill the whole tall screen").  The game takes the drawable's size at start-up (KHNMC_SCREEN=layer), so
+ * it fills the screen in the orientation it was STARTED in; a rotation while it runs only changes the presenter's swapchain (the
+ * picture is fitted into the new shape) until live resize exists (task 47). */
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAllButUpsideDown; }
 /* the drawable's size in pixels (bounds x nativeScale), 0 x 0 before the view has a screen */
 - (BOOL)pixelsW:(uint32_t *)w h:(uint32_t *)h {
     UIScreen *scr=self.view.window.windowScene.screen; if(!scr) return NO;
