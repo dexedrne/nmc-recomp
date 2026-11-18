@@ -114,6 +114,11 @@ extern KhFn kh_lookup(u64 target);
 #define LVP_ICD "/usr/share/vulkan/icd.d/lvp_icd.json"
 #define DXGI_INVALID_CALL 0x887A0001u
 static int drv_system;
+/* TASK36 (plan step 6): KHNMC_GFX_BACKBUFFERS, see the swap-chain section */
+enum { BB_OWN, BB_GENERAL, BB_COMMITTED };
+static const char *const bb_names[]={"own","general","committed"};
+static int bb_mode_env, bb_mode_test=-1;
+static _Atomic u64 n_bb_images_made, n_bb_images_freed, n_bb_drains;
 static char dump_dir[1024]; static u64 dump_every=300; static _Atomic u64 dumps_written; static u64 dump_from, dump_to=~0ull;
 static FILE *hash_f; static char hash_path[1024]; static _Atomic u64 hashes_written;
 static char vk_dev_name[300]="(no Vulkan device created yet)";
@@ -128,6 +133,12 @@ static void bundle_classes(void){ C_balloc=kh_com_class("vkd3d:BundleAllocator",
 /* ---- start-up: driver selection, native ranges, dump configuration --------------------------------------------------------- */
 static void driver_setup(void){
     const char *d=getenv("KHNMC_GFX_DRIVER");
+#if KH_IOS_PATHS && !defined(__linux__)
+    /* TASK36 (plan step 1): an Apple app build (KH_IOS_PATHS on Darwin) has exactly one Vulkan implementation, MoltenVK, linked into the
+     * program; it is the default there.  On LINUX the CPU-only policy below stays exactly as it is, KH_IOS_PATHS or not (the plan
+     * said "under KH_IOS_PATHS"; that would have made a Linux IOS_PATHS build pick the system driver = the real GPU). */
+    if(!d||!*d){ drv_system=1; fprintf(stderr,"kh: gfx vkd3d: Apple app build: the system's Vulkan implementation (MoltenVK) is the default driver\n"); return; }
+#endif
     if(d&&!strcmp(d,"system")){
         drv_system=1;
         fprintf(stderr,"kh: gfx vkd3d: KHNMC_GFX_DRIVER=system: the SYSTEM Vulkan drivers (GPU) are used; the Vulkan environment is left as it is\n");
@@ -213,6 +224,9 @@ void kh_gfxc_init_common(const char *label){
     if(e&&*e){ char *end; unsigned long long v=strtoull(e,&end,10); if(*end||!v) kh_fatal(NULL,"gfx-dump-every: KHNMC_GFX_DUMP_EVERY=%s is not a positive integer",e); dump_every=v; }
     e=getenv("KHNMC_GFX_DUMP_FROM"); if(e&&*e){ char *end; dump_from=strtoull(e,&end,10); if(*end) kh_fatal(NULL,"gfx-dump-window: KHNMC_GFX_DUMP_FROM=%s is not a present number",e); }
     e=getenv("KHNMC_GFX_DUMP_TO"); if(e&&*e){ char *end; dump_to=strtoull(e,&end,10); if(*end||dump_to<dump_from) kh_fatal(NULL,"gfx-dump-window: KHNMC_GFX_DUMP_TO=%s is not a present number at or after KHNMC_GFX_DUMP_FROM=%llu",e,P(dump_from)); }
+    e=getenv("KHNMC_GFX_BACKBUFFERS"); bb_mode_env=BB_OWN;                  /* TASK36: own VkImages (default), general, committed */
+    if(e&&*e){ if(!strcmp(e,"own")) bb_mode_env=BB_OWN; else if(!strcmp(e,"general")) bb_mode_env=BB_GENERAL; else if(!strcmp(e,"committed")) bb_mode_env=BB_COMMITTED;
+        else kh_fatal(NULL,"gfx-backbuffers-mode: KHNMC_GFX_BACKBUFFERS=%s (own = our VkImages, PRESENT = TRANSFER_SRC; general = our VkImages, PRESENT = GENERAL; committed = vkd3d's resources, the old path)",e); }
     e=getenv("KHNMC_GFX_HASHLOG");
     if(e&&*e){ if(snprintf(hash_path,sizeof hash_path,"%s",e)>=(int)sizeof hash_path) kh_fatal(NULL,"gfx-hashlog: KHNMC_GFX_HASHLOG is too long");
         hash_f=fopen(hash_path,"w"); if(!hash_f) kh_fatal(NULL,"gfx-hashlog: cannot create %s (%s)",hash_path,strerror(errno));
@@ -225,6 +239,7 @@ void kh_gfxc_init_common(const char *label){
     fprintf(stderr,"kh: gfx backend: %s; address model: %s; frame dump: %s%s every %llu presents",label,KH_XLATE_MODE==0?"identity":"bias",dump_dir[0]?"to ":"off",dump_dir,P(dump_every));
     if(dump_from||dump_to!=~0ull) fprintf(stderr,", presents %llu..%llu only",P(dump_from),P(dump_to));
     if(hash_f) fprintf(stderr,"; picture hash of every present: %s",hash_path);
+    fprintf(stderr,"; back buffers: %s",bb_names[bb_mode_env]);
     if(video_path[0]) fprintf(stderr,"; video stream: %s, %llu pictures from %s%s%llu, scale 1/%d%s",video_path,P(video_max),video_from_field?"the field":"virtual vblank ",video_from_field?" + ":"",P(video_from_field?video_lead:video_from),video_scale,video_exit?", then exit":"");
     fputc('\n',stderr);
 }
@@ -247,9 +262,71 @@ static const char *const vk_lib_names[]={"libvulkan.1.dylib","libMoltenVK.dylib"
 static const char *const vk_lib_names[]={"libvulkan.so.1"};
 #endif
 static PFN_vkGetInstanceProcAddr vk_gipa; static const char *vk_lib_name, *vk_lib_from="";
+PFN_vkGetInstanceProcAddr kh_gfxc_vk_gipa_real(void){ return vk_gipa; }
+const char *kh_gfxc_dump_dir(void){ return dump_dir; }
+
+/* ---- TASK36, plan step 1: the gipa wrapper seam and the presentation extensions ----------------------------------------------------
+ * vkd3d gets kh_vk_gipa_wrap as its vkGetInstanceProcAddr.  vkd3d loads its global and instance functions through it, and every device
+ * function through the vkGetDeviceProcAddr it gets there (vkd3d utils.c 814-864), so this is the one place where later steps can
+ * intercept (step 9: VkLayerSettingsCreateInfoEXT chained on a COPY of vkd3d's VkInstanceCreateInfo, whose pNext vkd3d leaves NULL;
+ * step 12: vkGetDeviceProcAddr for the pipeline cache; step 11: a vkQueueSubmit counter).  Today it passes everything through: the
+ * two observers below call the real vkCreateInstance / vkCreateDevice with the caller's arguments unchanged and only record which
+ * extensions vkd3d enabled, for the report line and the selftest.  A name it resolves for itself (vkGetInstanceProcAddr) is answered
+ * with the wrapper, so nothing reaches the real one around it. */
+KhPresExt kh_gfxc_pres_ext;
+static _Atomic u64 gw_names, gw_inst_calls, gw_dev_calls;
+static PFN_vkCreateInstance gw_real_ci; static PFN_vkCreateDevice gw_real_cd;
+static int has_name(const char *const *v,u32 n,const char *s){ for(u32 i=0;i<n;i++) if(v[i]&&!strcmp(v[i],s)) return 1; return 0; }
+static VkResult VKAPI_PTR gw_create_instance(const VkInstanceCreateInfo *ci,const VkAllocationCallbacks *a,VkInstance *out){
+    atomic_fetch_add(&gw_inst_calls,1);
+    VkResult r=gw_real_ci(ci,a,out);
+    if(r==VK_SUCCESS&&ci){ const char *const *e=ci->ppEnabledExtensionNames; u32 n=ci->enabledExtensionCount;
+        kh_gfxc_pres_ext.surface=has_name(e,n,"VK_KHR_surface"); kh_gfxc_pres_ext.headless=has_name(e,n,"VK_EXT_headless_surface");
+        kh_gfxc_pres_ext.metal=has_name(e,n,"VK_EXT_metal_surface"); kh_gfxc_pres_ext.layer_settings=has_name(e,n,"VK_EXT_layer_settings"); kh_gfxc_pres_ext.seen_instance=1; }
+    return r;
+}
+static VkResult VKAPI_PTR gw_create_device(VkPhysicalDevice pd,const VkDeviceCreateInfo *ci,const VkAllocationCallbacks *a,VkDevice *out){
+    atomic_fetch_add(&gw_dev_calls,1);
+    VkResult r=gw_real_cd(pd,ci,a,out);
+    if(r==VK_SUCCESS&&ci){ const char *const *e=ci->ppEnabledExtensionNames; u32 n=ci->enabledExtensionCount;
+        kh_gfxc_pres_ext.swapchain=has_name(e,n,"VK_KHR_swapchain"); kh_gfxc_pres_ext.display_timing=has_name(e,n,"VK_GOOGLE_display_timing");
+        kh_gfxc_pres_ext.metal_objects=has_name(e,n,"VK_EXT_metal_objects"); kh_gfxc_pres_ext.seen_device=1; }
+    return r;
+}
+static PFN_vkVoidFunction VKAPI_PTR kh_vk_gipa_wrap(VkInstance inst,const char *name){
+    atomic_fetch_add(&gw_names,1);
+    if(name&&!strcmp(name,"vkGetInstanceProcAddr")) return (PFN_vkVoidFunction)kh_vk_gipa_wrap;
+    PFN_vkVoidFunction f=vk_gipa(inst,name);
+    if(!f||!name) return f;
+    if(!strcmp(name,"vkCreateInstance")){ gw_real_ci=(PFN_vkCreateInstance)f; return (PFN_vkVoidFunction)gw_create_instance; }
+    if(!strcmp(name,"vkCreateDevice")){ gw_real_cd=(PFN_vkCreateDevice)f; return (PFN_vkVoidFunction)gw_create_device; }
+    return f;
+}
+/* requested as OPTIONAL: a missing one is skipped by vkd3d (device.c 355-367, 415-420); a missing REQUIRED one would only be warned
+ * about and still be passed on, and instance or device creation would fail (device.c 347-351, 411-414) */
+static const char *const opt_inst_ext[]={"VK_KHR_surface","VK_EXT_headless_surface","VK_EXT_metal_surface","VK_EXT_layer_settings"};
+#if defined(__APPLE__)
+static const char *const opt_dev_ext[]={"VK_KHR_swapchain","VK_GOOGLE_display_timing","VK_EXT_metal_objects"};
+#else
+static const char *const opt_dev_ext[]={"VK_KHR_swapchain","VK_GOOGLE_display_timing"};
+#endif
+static int pres_ext_printed;
+static void pres_ext_report(void){
+    if(pres_ext_printed) return; pres_ext_printed=1; const KhPresExt *x=&kh_gfxc_pres_ext;
+    fprintf(stderr,"kh: gfx vkd3d: presentation extensions: surface=%d headless=%d metal=%d swapchain=%d display_timing=%d metal_objects=%d layer_settings=%d "
+                   "(requested as optional; 1 = enabled, as seen at vkCreateInstance / vkCreateDevice through the gipa wrapper; %llu names resolved through it)\n",
+            x->surface,x->headless,x->metal,x->swapchain,x->display_timing,x->metal_objects,x->layer_settings,P(gw_names));
+}
 /* caller holds vm */
 static HRESULT instance_get(void){
     if(vk_inst) return S_OK;
+#ifdef KH_GFX_VULKAN_STATIC
+    /* TASK36 (plan step 1): the Vulkan implementation is LINKED into the program (Apple: MoltenVK's static library, no loader; a Linux
+     * test build links the loader with -lvulkan).  Nothing is loaded at run time, so a named library is an error, not a silent no-op. */
+    if(!vk_gipa){ const char *named=getenv("KHNMC_GFX_VULKAN_LIB");
+        if(named&&*named) kh_fatal(NULL,"gfx-vulkan-lib-static: KHNMC_GFX_VULKAN_LIB=%s, but this build links its Vulkan implementation (KH_GFX_VULKAN_STATIC): there is no library to load",named);
+        vk_gipa=vkGetInstanceProcAddr; vk_lib_name="the program's own vkGetInstanceProcAddr (KH_GFX_VULKAN_STATIC: linked, not loaded)"; vk_lib_from=""; }
+#else
     if(!vk_gipa){ char why[512]; why[0]=0; void *lib=NULL;
         /* a library named outright (KHNMC_GFX_VULKAN_LIB, else the build's KH_GFX_VULKAN_LIB) is THE library: an absolute path, and no
          * search by name when it cannot be loaded */
@@ -268,9 +345,12 @@ static HRESULT instance_get(void){
         if(!lib) kh_fatal(NULL,"gfx-vulkan-loader: no Vulkan library of this OS can be loaded (%s). KHNMC_GFX_VULKAN_LIB=<absolute path> names one outright",why);
         vk_gipa=(PFN_vkGetInstanceProcAddr)dlsym(lib,"vkGetInstanceProcAddr");
         if(!vk_gipa) kh_fatal(NULL,"gfx-vulkan-loader: %s has no vkGetInstanceProcAddr",vk_lib_name); }
+#endif
     struct vkd3d_application_info app; memset(&app,0,sizeof app); app.type=VKD3D_STRUCTURE_TYPE_APPLICATION_INFO; app.application_name="khnmc"; app.api_version=VKD3D_API_VERSION_2_1;
-    struct vkd3d_instance_create_info ici; memset(&ici,0,sizeof ici); ici.type=VKD3D_STRUCTURE_TYPE_INSTANCE_CREATE_INFO; ici.next=&app; ici.pfn_signal_event=sig_event; ici.wchar_size=2;
-    ici.pfn_vkGetInstanceProcAddr=vk_gipa;
+    struct vkd3d_optional_instance_extensions_info oie; memset(&oie,0,sizeof oie); oie.type=VKD3D_STRUCTURE_TYPE_OPTIONAL_INSTANCE_EXTENSIONS_INFO; oie.next=&app;
+    oie.extensions=opt_inst_ext; oie.extension_count=(uint32_t)(sizeof opt_inst_ext/sizeof*opt_inst_ext);
+    struct vkd3d_instance_create_info ici; memset(&ici,0,sizeof ici); ici.type=VKD3D_STRUCTURE_TYPE_INSTANCE_CREATE_INFO; ici.next=&oie; ici.pfn_signal_event=sig_event; ici.wchar_size=2;
+    ici.pfn_vkGetInstanceProcAddr=kh_vk_gipa_wrap;
     HRESULT hr=vkd3d_create_instance(&ici,&vk_inst);
     if(FAILED(hr)){ vk_inst=NULL; fprintf(stderr,"kh: gfx vkd3d: vkd3d_create_instance FAILED hr=0x%08x (Vulkan library %s, VK_DRIVER_FILES=%s)\n",(unsigned)hr,vk_lib_name,getenv("VK_DRIVER_FILES")?getenv("VK_DRIVER_FILES"):"(unset)"); return hr; }
     /* every physical device the instance can see must be a CPU implementation unless the system driver was asked for; the two functions
@@ -279,7 +359,7 @@ static HRESULT instance_get(void){
     PFN_vkEnumeratePhysicalDevices enum_pd=(PFN_vkEnumeratePhysicalDevices)vk_gipa(vi,"vkEnumeratePhysicalDevices");
     PFN_vkGetPhysicalDeviceProperties props=(PFN_vkGetPhysicalDeviceProperties)vk_gipa(vi,"vkGetPhysicalDeviceProperties");
     if(!enum_pd||!props) kh_fatal(NULL,"gfx-vulkan-loader: %s gives no vkEnumeratePhysicalDevices / vkGetPhysicalDeviceProperties for the instance",vk_lib_name);
-    fprintf(stderr,"kh: gfx vkd3d: Vulkan library %s (%shanded to vkd3d as its vkGetInstanceProcAddr)\n",vk_lib_name,vk_lib_from);
+    fprintf(stderr,"kh: gfx vkd3d: Vulkan library %s (%sits vkGetInstanceProcAddr is handed to vkd3d behind the gipa wrapper)\n",vk_lib_name,vk_lib_from);
     VkPhysicalDevice pd[16]; uint32_t n=16; VkResult vr=enum_pd(vi,&n,pd);
     if((vr!=VK_SUCCESS&&vr!=VK_INCOMPLETE)||!n) kh_fatal(NULL,"gfx-vulkan-devices: vkEnumeratePhysicalDevices result %d, %u device(s)",(int)vr,n);
     for(uint32_t i=0;i<n;i++){ VkPhysicalDeviceProperties p; memset(&p,0,sizeof p); props(pd[i],&p);
@@ -656,11 +736,17 @@ HRESULT kh_gfxc_device_new(KCtx *g,u32 level,u64 adapter_shown,ID3D12Device **ou
     (void)g; *out=NULL;
     pthread_mutex_lock(&vm); HRESULT hr=instance_get(); pthread_mutex_unlock(&vm);
     if(FAILED(hr)) return hr;
-    struct vkd3d_device_create_info dci; memset(&dci,0,sizeof dci); dci.type=VKD3D_STRUCTURE_TYPE_DEVICE_CREATE_INFO; dci.minimum_feature_level=(D3D_FEATURE_LEVEL)level; dci.instance=vk_inst;
+    struct vkd3d_optional_device_extensions_info ode; memset(&ode,0,sizeof ode); ode.type=VKD3D_STRUCTURE_TYPE_OPTIONAL_DEVICE_EXTENSIONS_INFO;
+    ode.extensions=opt_dev_ext; ode.extension_count=(uint32_t)(sizeof opt_dev_ext/sizeof*opt_dev_ext);
+    struct vkd3d_device_create_info dci; memset(&dci,0,sizeof dci); dci.type=VKD3D_STRUCTURE_TYPE_DEVICE_CREATE_INFO; dci.next=&ode; dci.minimum_feature_level=(D3D_FEATURE_LEVEL)level; dci.instance=vk_inst;
     ID3D12Device *dev=NULL; hr=vkd3d_create_device(&dci,&IID_ID3D12Device,(void**)&dev);
     if(FAILED(hr)||!dev){
         fprintf(stderr,"kh: gfx vkd3d: D3D12CreateDevice(adapter 0x%llx [ours, not passed on], feature level 0x%x) FAILED: vkd3d_create_device hr=0x%08x\n",P(adapter_shown),level,(unsigned)hr);
         return FAILED(hr)?hr:E_FAIL; }
+    if(!kh_gfxc_pres_ext.seen_instance||!kh_gfxc_pres_ext.seen_device)
+        kh_fatal(g,"gfx-gipa-wrapper: a vkd3d device was created but the gipa wrapper saw %s: vkd3d did not load %s through the wrapper",
+                 !kh_gfxc_pres_ext.seen_instance?"no vkCreateInstance":"no vkCreateDevice",!kh_gfxc_pres_ext.seen_instance?"vkCreateInstance":"vkCreateDevice");
+    pthread_mutex_lock(&vm); pres_ext_report(); pthread_mutex_unlock(&vm);
     *out=dev; return S_OK;
 }
 /* D3D12CreateDevice(adapter, featureLevel, riid, **ppDevice): the adapter is OUR DXGI object and is not passed on.  The game gets the host
@@ -703,18 +789,74 @@ void kh_vkd3d_serialize_rootsig(KCtx *g){
 /* ---- swap chain (the guest object is null_d3d12.c's: +32 width, +36 height, +40 present counter, +48 latency event) ------------ */
 #define SW_PTR 88                               /* guest swap-chain object: host Swap* */
 #define NBUF 3
+/* TASK36 (plan step 6): the back buffers are VkImages WE own, made on vkd3d's VkDevice with vkd3d's own settings for a committed
+ * render target (flags 0; TRANSFER_SRC|TRANSFER_DST|COLOR_ATTACHMENT|SAMPLED; OPTIMAL; EXCLUSIVE; UNDEFINED; vkd3d's format for
+ * B8G8R8A8_UNORM; memory of the first DEVICE_LOCAL type, vkd3d's rule for a DEFAULT heap) and wrapped with vkd3d_create_image_resource
+ * and today's exact D3D12_RESOURCE_DESC.  The presenter reads them directly; Plan B (Metal) would export them.
+ *   KHNMC_GFX_BACKBUFFERS=own        (default) INITIAL|PRESENT_STATE_TRANSITION, present_state COPY_SOURCE: D3D12 PRESENT is Vulkan
+ *                                    TRANSFER_SRC_OPTIMAL with TRANSFER_READ at the TRANSFER stage (vkd3d command.c 2275-2279, 2373-2444)
+ *                                    general    own images WITHOUT PRESENT_STATE_TRANSITION: PRESENT is GENERAL at the HOST stage
+ *                                    committed  the old path: vkd3d's committed resources (the presenter cannot read those: named fatal)
+ * vkd3d never destroys a wrapped VkImage (resource.c 988-989): at ResizeBuffers the old images are destroyed here, after the reference
+ * check, the gate, a fence signalled on the queue and waited for (in slices), and the presenter's own submissions. */
 typedef struct Swap { u64 obj; ID3D12CommandQueue *queue; ID3D12Device *dev; ID3D12Resource *buf[NBUF]; u32 w,h;
     ID3D12CommandAllocator *alloc; ID3D12GraphicsCommandList *list; ID3D12Fence *fence; u64 fence_val;
-    ID3D12Resource *rb; u64 rb_size; D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp; u8 *seen; } Swap;
+    ID3D12Resource *rb; u64 rb_size; D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp; u8 *seen;
+    int bbmode; const KhVk *vk; VkImage img[NBUF]; VkDeviceMemory mem[NBUF]; KhPresenter *pres; } Swap;
 static Swap *swap_of(KCtx *g,u64 o,const char *what){ Swap *s=(Swap*)(uintptr_t)rd64(g,o+SW_PTR); if(!s||s->obj!=o) kh_fatal(g,"gfx-swapchain-state: %s on swap chain 0x%llx that has no vkd3d back buffers",what,P(o)); return s; }
 #define HRCHK(expr,what) do{ HRESULT hr_=(expr); if(FAILED(hr_)) kh_fatal(g,"gfx-vkd3d-call: %s failed, hr=0x%08x (swap chain %ux%u)",what,(unsigned)hr_,s->w,s->h); }while(0)
+static void bb_image_make(KCtx *g,Swap *s,int i,const D3D12_RESOURCE_DESC *rd){
+    const KhVk *v=s->vk; VkImageCreateInfo ic; memset(&ic,0,sizeof ic); ic.sType=VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO; ic.flags=0; ic.imageType=VK_IMAGE_TYPE_2D;
+    ic.format=vkd3d_get_vk_format(DXGI_FORMAT_B8G8R8A8_UNORM); ic.extent.width=(u32)rd->Width; ic.extent.height=rd->Height; ic.extent.depth=1; ic.mipLevels=1; ic.arrayLayers=1;
+    ic.samples=VK_SAMPLE_COUNT_1_BIT; ic.tiling=VK_IMAGE_TILING_OPTIMAL; ic.usage=VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_SAMPLED_BIT;
+    ic.sharingMode=VK_SHARING_MODE_EXCLUSIVE; ic.initialLayout=VK_IMAGE_LAYOUT_UNDEFINED;
+    if(ic.format==VK_FORMAT_UNDEFINED) kh_fatal(g,"gfx-backbuffer-image: vkd3d has no Vulkan format for B8G8R8A8_UNORM");
+#if defined(VK_USE_PLATFORM_METAL_EXT)
+    /* Apple, only when VK_EXT_metal_objects was enabled: each image can later be exported as an MTLTexture (Plan B needs no second change) */
+    VkExportMetalObjectCreateInfoEXT ex; memset(&ex,0,sizeof ex); ex.sType=VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT; ex.exportObjectType=VK_EXPORT_METAL_OBJECT_TYPE_METAL_TEXTURE_BIT_EXT;
+    if(kh_gfxc_pres_ext.metal_objects) ic.pNext=&ex;
+#endif
+    VkResult r=kh_vk_create_image(v,&ic,&s->img[i]); if(r!=VK_SUCCESS) kh_fatal(g,"gfx-backbuffer-image: vkCreateImage(%ux%u B8G8R8A8) failed: VkResult %d",ic.extent.width,ic.extent.height,(int)r);
+    kh_vko_note(VKO_IMAGE,1);
+    VkMemoryRequirements mr; kh_vk_image_memreq(v,s->img[i],&mr); int t=kh_vk_memtype(v,mr.memoryTypeBits,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if(t<0) kh_fatal(g,"gfx-backbuffer-image: no DEVICE_LOCAL memory type for a back buffer (type bits 0x%x)",mr.memoryTypeBits);
+    VkMemoryAllocateInfo ma; memset(&ma,0,sizeof ma); ma.sType=VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO; ma.allocationSize=mr.size; ma.memoryTypeIndex=(u32)t;
+    r=kh_vk_alloc(v,&ma,&s->mem[i]); if(r!=VK_SUCCESS) kh_fatal(g,"gfx-backbuffer-image: vkAllocateMemory(%llu bytes, type %d) failed: VkResult %d",P(mr.size),t,(int)r);
+    kh_vko_note(VKO_MEM,1);
+    r=kh_vk_bind_image(v,s->img[i],s->mem[i]); if(r!=VK_SUCCESS) kh_fatal(g,"gfx-backbuffer-image: vkBindImageMemory failed: VkResult %d",(int)r);
+    struct vkd3d_image_resource_create_info ri; memset(&ri,0,sizeof ri); ri.type=VKD3D_STRUCTURE_TYPE_IMAGE_RESOURCE_CREATE_INFO; ri.vk_image=s->img[i]; ri.desc=*rd;
+    ri.flags=VKD3D_RESOURCE_INITIAL_STATE_TRANSITION|(s->bbmode==BB_OWN?VKD3D_RESOURCE_PRESENT_STATE_TRANSITION:0); ri.present_state=D3D12_RESOURCE_STATE_COPY_SOURCE;
+    HRCHK(vkd3d_create_image_resource(s->dev,&ri,&s->buf[i]),"vkd3d_create_image_resource(own B8G8R8A8 back buffer)");
+    atomic_fetch_add(&n_bb_images_made,1);
+}
+/* the images of the buffers just released: called once nothing can use them any more (bb_drain) */
+static void bb_images_free(Swap *s){
+    for(int i=0;i<NBUF;i++){ if(s->img[i]){ kh_vk_destroy_image(s->vk,s->img[i]); kh_vko_note(VKO_IMAGE,0); s->img[i]=VK_NULL_HANDLE; atomic_fetch_add(&n_bb_images_freed,1); }
+        if(s->mem[i]){ kh_vk_free(s->vk,s->mem[i]); kh_vko_note(VKO_MEM,0); s->mem[i]=VK_NULL_HANDLE; } }
+}
+/* before own images are destroyed: the gate (this is a submission outside the game's queue calls), a fence signalled on the queue and
+ * waited for in slices (5 expired = gfx-backbuffer-drain; a stopped process costs one slice), then the presenter's submissions */
+static void bb_drain(KCtx *g,Swap *s,const char *why){
+    kh_gfx_gate_park("back-buffer drain (ResizeBuffers / release)");
+    u64 want=++s->fence_val; HRCHK(ID3D12CommandQueue_Signal(s->queue,s->fence,want),"ID3D12CommandQueue::Signal(back-buffer drain)");
+    unsigned expired=0; u64 dl=kh_host_ns()+(u64)kh_stuck_slice_ms*1000000ull;
+    for(;;){ UINT64 done=ID3D12Fence_GetCompletedValue(s->fence);
+        if(done==~0ull) kh_fatal(g,"gfx-device-removed: the fence reports a removed device during the back-buffer drain (%s)",why);
+        if(done>=want) break;
+        struct timespec ts={0,200000}; nanosleep(&ts,0); u64 now=kh_host_ns();
+        if(now>=dl){ if(++expired>=5) kh_fatal(g,"gfx-backbuffer-drain: the queue did not reach the drain fence within 5 slices of %u ms (%s; fence at %llu, want %llu)",kh_stuck_slice_ms,why,P(done),P(want)); dl=now+(u64)kh_stuck_slice_ms*1000000ull; } }
+    if(s->pres) kh_present_quiesce(s->pres);
+    atomic_fetch_add(&n_bb_drains,1);
+}
+static void bb_info(const Swap *s,KhPresentBuffers *bb){ memset(bb,0,sizeof *bb); bb->w=s->w; bb->h=s->h; bb->n=NBUF; bb->general=s->bbmode==BB_GENERAL; for(int i=0;i<NBUF;i++) bb->image[i]=(u64)(uintptr_t)s->img[i]; }
 
 static void buffers_make(KCtx *g,Swap *s,u32 w,u32 h){
     s->w=w; s->h=h;
     D3D12_HEAP_PROPERTIES def; memset(&def,0,sizeof def); def.Type=D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd; memset(&rd,0,sizeof rd); rd.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width=w; rd.Height=h; rd.DepthOrArraySize=1; rd.MipLevels=1;
     rd.Format=DXGI_FORMAT_B8G8R8A8_UNORM; rd.SampleDesc.Count=1; rd.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    for(int i=0;i<NBUF;i++){ HRCHK(ID3D12Device_CreateCommittedResource(s->dev,&def,D3D12_HEAP_FLAG_NONE,&rd,D3D12_RESOURCE_STATE_PRESENT,NULL,&IID_ID3D12Resource,(void**)&s->buf[i]),"CreateCommittedResource(B8G8R8A8 back buffer, ALLOW_RENDER_TARGET, state PRESENT)"); }
+    if(s->bbmode==BB_COMMITTED){ for(int i=0;i<NBUF;i++){ HRCHK(ID3D12Device_CreateCommittedResource(s->dev,&def,D3D12_HEAP_FLAG_NONE,&rd,D3D12_RESOURCE_STATE_PRESENT,NULL,&IID_ID3D12Resource,(void**)&s->buf[i]),"CreateCommittedResource(B8G8R8A8 back buffer, ALLOW_RENDER_TARGET, state PRESENT)"); } }
+    else for(int i=0;i<NBUF;i++) bb_image_make(g,s,i,&rd);
     UINT64 total=0; ID3D12Device_GetCopyableFootprints(s->dev,&rd,0,1,0,&s->fp,NULL,NULL,&total);
     if(!total||s->fp.Footprint.RowPitch<4*w) kh_fatal(g,"gfx-vkd3d-call: GetCopyableFootprints for the back buffer gave %llu bytes, row pitch %u",P(total),s->fp.Footprint.RowPitch);
     D3D12_HEAP_PROPERTIES rbh; memset(&rbh,0,sizeof rbh); rbh.Type=D3D12_HEAP_TYPE_READBACK;
@@ -734,13 +876,19 @@ void kh_vkd3d_swap_attach(KCtx *g,u64 sc,u64 queue,u64 desc){
     Swap *s=calloc(1,sizeof *s); if(!s) kh_fatal(g,"gfx-swapchain-state: out of memory"); s->obj=sc; s->w=rd32(g,sc+32); s->h=rd32(g,sc+36);
     s->queue=(ID3D12CommandQueue*)rq; ID3D12CommandQueue_AddRef(s->queue);
     HRCHK(ID3D12CommandQueue_GetDevice(s->queue,&IID_ID3D12Device,(void**)&s->dev),"ID3D12CommandQueue::GetDevice");
+    s->bbmode=bb_mode_test>=0?bb_mode_test:bb_mode_env;
+    int pmode=kh_present_mode();
+    if(pmode&&s->bbmode==BB_COMMITTED) kh_fatal(g,"gfx-present-needs-own-backbuffers: KHNMC_GFX_PRESENT=%s reads the back buffers as VkImages, which KHNMC_GFX_BACKBUFFERS=committed does not have (use own or general)",pmode==1?"headless":"layer");
+    if(s->bbmode!=BB_COMMITTED) s->vk=kh_vk_for(s->dev);
     buffers_make(g,s,s->w,s->h);
     HRCHK(ID3D12Device_CreateCommandAllocator(s->dev,D3D12_COMMAND_LIST_TYPE_DIRECT,&IID_ID3D12CommandAllocator,(void**)&s->alloc),"CreateCommandAllocator(frame dump)");
     HRCHK(ID3D12Device_CreateCommandList(s->dev,0,D3D12_COMMAND_LIST_TYPE_DIRECT,s->alloc,NULL,&IID_ID3D12GraphicsCommandList,(void**)&s->list),"CreateCommandList(frame dump)");
     HRCHK(ID3D12GraphicsCommandList_Close(s->list),"ID3D12GraphicsCommandList::Close(frame dump)");
     HRCHK(ID3D12Device_CreateFence(s->dev,0,D3D12_FENCE_FLAG_NONE,&IID_ID3D12Fence,(void**)&s->fence),"CreateFence(frame dump)");
+    if(pmode){ KhPresentBuffers bb; bb_info(s,&bb); s->pres=kh_present_attach(s->dev,s->queue,&bb); }
     wr64(g,sc+SW_PTR,U(s));
-    fprintf(stderr,"kh: gfx vkd3d: swap chain 0x%llx: %d x %ux%u B8G8R8A8 back buffers on device %p (queue %p), readback %llu bytes (row pitch %u)\n",P(sc),NBUF,s->w,s->h,(void*)s->dev,(void*)s->queue,P(s->rb_size),s->fp.Footprint.RowPitch);
+    fprintf(stderr,"kh: gfx vkd3d: swap chain 0x%llx: %d x %ux%u B8G8R8A8 back buffers (%s%s) on device %p (queue %p), readback %llu bytes (row pitch %u)%s\n",P(sc),NBUF,s->w,s->h,bb_names[s->bbmode],
+            s->bbmode==BB_OWN?": our VkImages, PRESENT = TRANSFER_SRC":s->bbmode==BB_GENERAL?": our VkImages, PRESENT = GENERAL":": vkd3d's committed resources",(void*)s->dev,(void*)s->queue,P(s->rb_size),s->fp.Footprint.RowPitch,s->pres?"; presenter attached":"");
 }
 /* GetBuffer(this, index, riid, **pp) */
 void kh_vkd3d_swap_getbuffer(KCtx *g,u64 o){
@@ -757,9 +905,30 @@ void kh_vkd3d_swap_resize(KCtx *g,u64 o,u32 w,u32 h){
         if(rc!=1){ fprintf(stderr,"kh: gfx vkd3d: ResizeBuffers(%ux%u) refused: back buffer %d still has %u outstanding reference(s) -> DXGI_ERROR_INVALID_CALL\n",w,h,i,(unsigned)rc-1); SET_RAX(g,DXGI_INVALID_CALL); return; } }
     for(int i=0;i<NBUF;i++){ drop_real(g,s->buf[i]); s->buf[i]=NULL; }                 /* our reference was the last one: a guest object of the buffer dies with it */
     ID3D12Resource_Release(s->rb); s->rb=NULL;
+    if(s->bbmode!=BB_COMMITTED){ bb_drain(g,s,"ResizeBuffers"); bb_images_free(s); }   /* own images: nothing in flight uses them any more */
     buffers_make(g,s,w,h);
+    if(s->pres){ KhPresentBuffers bb; bb_info(s,&bb); kh_present_resize(s->pres,&bb); }
     fprintf(stderr,"kh: gfx vkd3d: swap chain 0x%llx resized to %ux%u\n",P(o),w,h);
     SET_RAX(g,0);
+}
+/* ---- selftest access to a swap chain (gfx_present.c's presenter selftest) ---- */
+int kh_vkd3d_swap_test_info(KCtx *g,u64 sc,KhSwapInfo *out){
+    Swap *s=(Swap*)(uintptr_t)rd64(g,sc+SW_PTR); memset(out,0,sizeof *out); if(!s||s->obj!=sc) return 0;
+    out->dev=s->dev; out->queue=s->queue; for(int i=0;i<NBUF;i++){ out->buf[i]=s->buf[i]; out->image[i]=(u64)(uintptr_t)s->img[i]; } out->bbmode=s->bbmode; out->w=s->w; out->h=s->h; out->pres=s->pres; return 1;
+}
+void kh_vkd3d_test_bbmode(int mode){ bb_mode_test=mode; }
+/* the end of a selftest swap chain: presenter teardown, every reference of ours released, own images destroyed after the drain.  The
+ * game's swap chain is never released this way (at process exit another thread may still be inside Present: the same reason the hash
+ * log is only flushed, kh_gfx_vkd3d_finish). */
+void kh_vkd3d_swap_test_release(KCtx *g,u64 sc){
+    Swap *s=swap_of(g,sc,"swap chain release (selftest)");
+    for(int i=0;i<NBUF;i++){ ID3D12Resource_AddRef(s->buf[i]); ULONG rc=ID3D12Resource_Release(s->buf[i]);
+        if(rc!=1) kh_fatal(g,"gfx-selftest-swapchain: release of swap chain 0x%llx while back buffer %d still has %u outstanding reference(s)",P(sc),i,(unsigned)rc-1); }
+    if(s->pres){ kh_present_teardown(s->pres); s->pres=NULL; }
+    for(int i=0;i<NBUF;i++){ drop_real(g,s->buf[i]); s->buf[i]=NULL; }
+    if(s->bbmode!=BB_COMMITTED){ bb_drain(g,s,"swap chain release"); bb_images_free(s); }
+    ID3D12Resource_Release(s->rb); ID3D12GraphicsCommandList_Release(s->list); ID3D12CommandAllocator_Release(s->alloc); ID3D12Fence_Release(s->fence);
+    ID3D12Device_Release(s->dev); ID3D12CommandQueue_Release(s->queue); free(s->seen); wr64(g,sc+SW_PTR,0); free(s);
 }
 
 /* ---- frame output --------------------------------------------------------------------------------------------------------------
@@ -914,13 +1083,22 @@ static void video_vblank(KCtx *g,u64 k,u64 vnow){
 /* Present / Present1: called by null_d3d12.c (which keeps the present counter, the phase log and the frame line) BEFORE the index advances */
 void kh_vkd3d_present(KCtx *g,u64 o,u64 n){
     Swap *s=swap_of(g,o,"Present");
+    /* TASK36: the suspend gate FIRST: the readback below submits on the game's queue (frame dumps, hash log, video) */
+    kh_gfx_gate_park("Present (before the frame readback)");
+    u32 idx=rd32(g,o+40)%NBUF;
     int want_dump=dump_dir[0]&&n>=dump_from&&n<=dump_to&&n%dump_every==0, want_video=video_wanted(), want_hash=hash_f!=NULL;
-    if(!want_dump&&!want_video&&!want_hash) return;
-    u64 t0=kh_host_ns(); u32 idx=rd32(g,o+40)%NBUF; const u8 *base=readback(g,s,idx,n);
-    if(want_hash) hash_frame(g,s,base,n);
-    if(want_video) video_capture(g,s,base,n);
-    if(want_dump) dump_frame(g,s,base,idx,n,t0);
-    readback_done(s);
+    if(want_dump||want_video||want_hash){
+        u64 t0=kh_host_ns(); const u8 *base=readback(g,s,idx,n);
+        if(want_hash) hash_frame(g,s,base,n);
+        if(want_video) video_capture(g,s,base,n);
+        if(want_dump) dump_frame(g,s,base,idx,n,t0);
+        readback_done(s); }
+    /* the presenter: after the readback, before null_d3d12.c advances the index.  A check present (review V36 n=1) is then compared with an
+     * INDEPENDENT reference: a D3D12 readback of the same back buffer, queued AFTER the presenter's submission (so it does not close the
+     * window between the game's work and the blit), gated like every other readback */
+    if(s->pres&&kh_present_frame(g,s->pres,idx,n)){
+        kh_gfx_gate_park("Present (check-mode reference readback)");
+        const u8 *ref=readback(g,s,idx,n); kh_present_check(s->pres,n,ref,s->fp.Footprint.RowPitch); readback_done(s); }
 }
 /* process exit (loader.c, before the reports): an open video stream is closed here and nowhere else; the report says if it was cut short */
 void kh_gfx_vkd3d_finish(void){
@@ -938,6 +1116,9 @@ void kh_gfx_vkd3d_report(FILE *f){
     fprintf(f,"kh: gfx vkd3d: bridge=%s device=%s driver-mode=%s devices-created=%llu (+%llu probes) native-calls=%llu fence-events-signalled=%llu bundles: recorded=%llu executed=%llu (%llu replayed calls) live=%llu; default-descriptor-tables=%llu on %d tracked command lists; frame-dumps=%llu%s%s\n",kh_gfx_wrap_on?"wrapped":"trampoline",vk_dev_name,drv_system?"system":"lavapipe",
             P(n_devices),P(n_probe_devices),P(kh_native_calls),P(n_events_signalled),P(n_bundles_made),P(n_bundles_run),P(n_bundle_cmds),P(n_bundles_live),P(n_default_tables),nlst,P(dumps_written),dump_dir[0]?" in ":"",dump_dir);
     if(hash_path[0]) fprintf(f,"kh: gfx hash log: %llu presents hashed into %s\n",P(hashes_written),hash_path);
+    fprintf(f,"kh: gfx vkd3d: back buffers %s: own images made %llu, destroyed %llu, drains %llu; live Vulkan objects of the runtime %lld; gipa wrapper: %llu names, vkCreateInstance %llu, vkCreateDevice %llu\n",
+            bb_names[bb_mode_env],P(n_bb_images_made),P(n_bb_images_freed),P(n_bb_drains),kh_vko_live_total(),P(gw_names),P(gw_inst_calls),P(gw_dev_calls));
+    kh_present_report(f); kh_gfx_gate_report(f);
     census_report(f);
     if(kh_gfx_wrap_on) kh_wrap_report(f);
     if(video_path[0]){
@@ -985,6 +1166,13 @@ static int st_clear_present(KCtx *g,u64 m,u64 dev,u64 q,u64 sc,u64 al,u64 cl,u64
     return ok&&(u32)GC(VT(sc,8),sc,1,0)==0;
 }
 static int raw_is(const u8 *p,size_t n,u8 r,u8 gg,u8 b){ for(size_t i=0;i<n;i+=3) if(p[i]!=r||p[i+1]!=gg||p[i+2]!=b) return 0; return 1; }
+/* TASK36 selftest helpers */
+static int ext_in(const VkExtensionProperties *x,u32 n,const char *s){ for(u32 i=0;i<n;i++) if(!strcmp(x[i].extensionName,s)) return 1; return 0; }
+int kh_vk_test_read_image(ID3D12Device *dev,ID3D12CommandQueue *q,u64 image,u32 w,u32 h,int general,u8 *out);
+typedef struct { unsigned hold_ms; u64 d_at_clear, p_at_clear, f_at_clear, dr_at_clear, fr_at_clear; ID3D12Fence *fence; } GateObs;
+static void *gate_obs_clear(void *a){ GateObs *o=(GateObs*)a; struct timespec ts={(time_t)(o->hold_ms/1000),(long)(o->hold_ms%1000)*1000000L}; nanosleep(&ts,0);
+    o->d_at_clear=atomic_load(&dumps_written); o->p_at_clear=kh_gfx_gate_parks(); if(o->fence) o->f_at_clear=ID3D12Fence_GetCompletedValue(o->fence);
+    o->dr_at_clear=atomic_load(&n_bb_drains); o->fr_at_clear=atomic_load(&n_bb_images_freed); kh_gfx_gate_clear(); return NULL; }
 
 /* ---- selftest of the shared part that needs no device (every --selftest of a binary with the backend; review U35 n=2, 4, 27) ---- */
 /* one IUnknown slot (AddRef 1, Release 2) through the object's vtable, as the lifted code calls it; neither slot reads the guest stack */
@@ -1057,6 +1245,26 @@ int kh_gfx_vkd3d_selftest(KCtx *g){
     if(!dev) goto done;
     if(kh_gfx_wrap_on){ T(kh_native_range_name(VT(dev,0),NULL)==NULL); T(kh_lookup(VT(dev,0))!=NULL); }      /* wrapped: a host-function slot of a guest-side vtable */
     else              { T(kh_native_range_name(VT(dev,0),NULL)!=NULL); T(kh_lookup(VT(dev,0))==NULL); }      /* trampoline: native vkd3d code */
+    /* TASK36 step 1: vkd3d loaded Vulkan through the gipa wrapper, and the presentation extensions it enabled are exactly the requested
+     * ones the implementation offers (optional chains: nothing forced, nothing dropped); the report line was printed */
+    { T(gw_inst_calls>=1 && gw_dev_calls>=1 && gw_names>=10 && pres_ext_printed);
+      ID3D12Device *rdv=(ID3D12Device*)real_of(g,dev,WK_DEVICE,"selftest device");
+      VkInstance vi=vkd3d_instance_get_vk_instance(vkd3d_instance_from_device(rdv)); VkPhysicalDevice vpd=vkd3d_get_vk_physical_device(rdv);
+      PFN_vkEnumerateInstanceExtensionProperties eie=(PFN_vkEnumerateInstanceExtensionProperties)vk_gipa(NULL,"vkEnumerateInstanceExtensionProperties");
+      PFN_vkEnumerateDeviceExtensionProperties ede=(PFN_vkEnumerateDeviceExtensionProperties)vk_gipa(vi,"vkEnumerateDeviceExtensionProperties");
+      T(eie!=NULL && ede!=NULL);
+      if(eie&&ede){ u32 ni=0,nd=0; eie(NULL,&ni,NULL); ede(vpd,NULL,&nd,NULL); VkExtensionProperties *xi=calloc(ni+1,sizeof*xi),*xd=calloc(nd+1,sizeof*xd);
+        if(xi&&xd){ eie(NULL,&ni,xi); ede(vpd,NULL,&nd,xd); const KhPresExt *x=&kh_gfxc_pres_ext;
+          T(x->surface==ext_in(xi,ni,"VK_KHR_surface")); T(x->headless==ext_in(xi,ni,"VK_EXT_headless_surface")); T(x->metal==ext_in(xi,ni,"VK_EXT_metal_surface"));
+          T(x->layer_settings==ext_in(xi,ni,"VK_EXT_layer_settings")); T(x->swapchain==ext_in(xd,nd,"VK_KHR_swapchain")); T(x->display_timing==ext_in(xd,nd,"VK_GOOGLE_display_timing"));
+#if defined(__APPLE__)
+          T(x->metal_objects==ext_in(xd,nd,"VK_EXT_metal_objects"));
+#else
+          T(x->metal_objects==0);                                                               /* requested on Apple only */
+#endif
+          fprintf(stderr,"kh: vkd3d selftest: offered by the implementation: surface=%d headless=%d metal=%d layer_settings=%d swapchain=%d display_timing=%d (enabled: see the presentation extensions line)\n",
+                  ext_in(xi,ni,"VK_KHR_surface"),ext_in(xi,ni,"VK_EXT_headless_surface"),ext_in(xi,ni,"VK_EXT_metal_surface"),ext_in(xi,ni,"VK_EXT_layer_settings"),ext_in(xd,nd,"VK_KHR_swapchain"),ext_in(xd,nd,"VK_GOOGLE_display_timing")); }
+        free(xi); free(xd); } }
     T((u32)GC(VT(dev,7),dev)==1);                                                             /* GetNodeCount */
     T((u32)GC(VT(dev,15),dev,2)!=0);                                                           /* GetDescriptorHandleIncrementSize(RTV) */
     /* CreateCommandQueue(desc, riid, **pp) ; IUnknown through the trampoline */
@@ -1097,6 +1305,15 @@ int kh_gfx_vkd3d_selftest(KCtx *g){
     snprintf(dump_dir,sizeof dump_dir,"%s",tmp); dump_every=1; gfx_presents=1000000;
     T((u32)GC(VT(sc,8),sc,1,0)==0); T(GC(VT(sc,36),sc)==1); T(dumps_written==save_dumps+1);
     { char path[1200]; snprintf(path,sizeof path,"%s/frame-1000001.ppm",tmp); T(ppm_is(path,96,64,64,128,191)); unlink(path); snprintf(path,sizeof path,"%s/index.tsv",tmp); T(access(path,R_OK)==0); unlink(path); }
+    /* TASK36 step 6: the back buffer the game cleared and presented IS our VkImage: a Vulkan copy of image 0 holds the clear colour
+     * (BGRA 191,128,64); the game sees the same description as for a committed resource */
+    { Swap *s=swap_of(g,sc,"selftest"); T(s->bbmode==bb_mode_env);
+      { const char *e=getenv("KHNMC_GFX_BACKBUFFERS"); if(!e||!*e) T(bb_mode_env==BB_OWN); }                       /* the default is our own images */
+      if(s->bbmode!=BB_COMMITTED){ u8 *px=malloc(4u*96u*64u); T(px!=NULL&&s->img[0]!=VK_NULL_HANDLE&&kh_vk_test_read_image(s->dev,s->queue,(u64)(uintptr_t)s->img[0],96,64,s->bbmode==BB_GENERAL,px)==0);
+          if(px){ int okc=1; for(u32 k=0;k<96u*64u;k++) if(px[4*k]!=191||px[4*k+1]!=128||px[4*k+2]!=64){ okc=0; break; } T(okc); free(px); } }
+      D3D12_HEAP_PROPERTIES def; memset(&def,0,sizeof def); def.Type=D3D12_HEAP_TYPE_DEFAULT; D3D12_RESOURCE_DESC want=ID3D12Resource_GetDesc(s->buf[0]); ID3D12Resource *cr=NULL;
+      T(SUCCEEDED(ID3D12Device_CreateCommittedResource(s->dev,&def,D3D12_HEAP_FLAG_NONE,&want,D3D12_RESOURCE_STATE_PRESENT,NULL,&IID_ID3D12Resource,(void**)&cr)));
+      if(cr){ D3D12_RESOURCE_DESC got=ID3D12Resource_GetDesc(cr); T(!memcmp(&got,&want,sizeof got)); ID3D12Resource_Release(cr); } }
     /* a bundle like the game's: created and recorded through OUR recorder objects, replayed by ExecuteBundle on the direct list; the picture
      * proves the replay (root signature, pipeline state, topology, a deep-copied vertex-buffer view and the draw all came from the bundle) */
     { static const char vs_src[]="float4 main(float2 p : POSITION) : SV_Position { return float4(p, 0.0, 1.0); }";
@@ -1191,7 +1408,17 @@ int kh_gfx_vkd3d_selftest(KCtx *g){
     /* ResizeBuffers: refused while the game holds a back buffer, then new buffers of the new size */
     T((u32)GC(VT(sc,13),sc,3,128,72,0x57,0x42)==DXGI_INVALID_CALL);
     GC(VT(rt,2),rt); rt=0;
-    T((u32)GC(VT(sc,13),sc,3,128,72,0x57,0x42)==0);
+    { u64 im0=n_bb_images_made, if0=n_bb_images_freed, dr0=n_bb_drains; long long live0=atomic_load(&kh_vko_live[VKO_IMAGE]);
+      if(bb_mode_env!=BB_COMMITTED){
+          /* TASK36 review V36 n=6: the suspend gate is checked before the back-buffer drain.  ResizeBuffers with the gate set (held 120 ms by
+           * another thread) parks there: when the gate is cleared nothing has been drained or freed yet, one more park is counted, and
+           * the resize then completes */
+          u64 p0=kh_gfx_gate_parks(); GateObs ob; memset(&ob,0,sizeof ob); ob.hold_ms=120; ob.dr_at_clear=ob.fr_at_clear=~0ull; kh_gfx_gate_set();
+          pthread_t th; T(pthread_create(&th,NULL,gate_obs_clear,&ob)==0);
+          u64 t0=kh_host_ns(); T((u32)GC(VT(sc,13),sc,3,128,72,0x57,0x42)==0); u64 dt=kh_host_ns()-t0; pthread_join(th,NULL);
+          T(dt>=100000000ull && ob.p_at_clear==p0+1 && ob.dr_at_clear==dr0 && ob.fr_at_clear==if0 && !kh_gfx_gate_is_set());
+          T(n_bb_images_made==im0+3 && n_bb_images_freed==if0+3 && n_bb_drains==dr0+1 && atomic_load(&kh_vko_live[VKO_IMAGE])==live0); }   /* TASK36: the old images are destroyed after the drain */
+      else { T((u32)GC(VT(sc,13),sc,3,128,72,0x57,0x42)==0); T(n_bb_images_made==im0 && n_bb_images_freed==if0); } }
     T((u32)GC(VT(sc,9),sc,1,GP(&IID_ID3D12Resource),m+88)==0); rt=rd64(g,m+88);
     if(rt){ u64 d=m+256; GC(VT(rt,10),rt,d); T(rd64(g,d+16)==128&&rd32(g,d+24)==72); GC(VT(rt,2),rt); rt=0; }
     /* D3D12SerializeRootSignature import -> vkd3d-utils blob -> CreateRootSignature */
@@ -1223,6 +1450,23 @@ int kh_gfx_vkd3d_selftest(KCtx *g){
       { char path[1200]; snprintf(path,sizeof path,"%s/frame-2000002.ppm",tmp); T(ppm_is(path,128,72,64,128,191)); unlink(path); snprintf(path,sizeof path,"%s/frame-2000001.ppm",tmp); T(access(path,F_OK)!=0);
         snprintf(path,sizeof path,"%s/frame-2000003.ppm",tmp); T(access(path,F_OK)!=0); snprintf(path,sizeof path,"%s/index.tsv",tmp); unlink(path); }
       dump_from=sf; dump_to=stt; dump_dir[0]=0;
+      /* TASK36: the suspend gate is checked FIRST in Present: while it is set no frame readback reaches the queue (the dump count at the
+       * moment the gate is cleared is still the old one), and the Present goes on once it is cleared */
+      { snprintf(dump_dir,sizeof dump_dir,"%s",tmp); dump_every=1; gfx_presents=3000000; u64 d0=dumps_written, p0=kh_gfx_gate_parks();
+        GateObs ob; memset(&ob,0,sizeof ob); ob.hold_ms=120; ob.d_at_clear=~0ull; kh_gfx_gate_set(); pthread_t th; T(pthread_create(&th,NULL,gate_obs_clear,&ob)==0);
+        u64 t0=kh_host_ns(); T(st_clear_present(g,m,dev,q,sc,al,cl,handle2,0.5f,0.25f,0.125f)); u64 dt=kh_host_ns()-t0; pthread_join(th,NULL);
+        T(dt>=100000000ull && ob.d_at_clear==d0 && ob.p_at_clear==p0+1 && dumps_written==d0+1 && !kh_gfx_gate_is_set());
+        char path[1200]; snprintf(path,sizeof path,"%s/frame-3000001.ppm",tmp); T(ppm_is(path,128,72,128,64,32)); unlink(path); snprintf(path,sizeof path,"%s/index.tsv",tmp); unlink(path); dump_dir[0]=0; }
+      /* TASK36: ID3D12Fence::Signal from the CPU (wrapped bridge): not held while no queue may be blocked; held (parked until the gate is
+       * cleared, the fence unchanged meanwhile) when fence signals are held, and by itself once a queue Wait was seen */
+      if(kh_gfx_wrap_on&&fence){ ID3D12Fence *rf=(ID3D12Fence*)real_of(g,fence,WK_FENCE,"selftest fence"); u64 v0=ID3D12Fence_GetCompletedValue(rf), p0=kh_gfx_gate_parks();
+        kh_gfx_gate_test_reset_queue_waits(); kh_gfx_gate_set(); T((u32)GC(VT(fence,10),fence,v0+1)==0); T(ID3D12Fence_GetCompletedValue(rf)==v0+1 && kh_gfx_gate_parks()==p0); kh_gfx_gate_clear();
+        for(int round=0;round<2;round++){
+            if(round==0) kh_gfx_gate_hold_fence_signals(1); else { kh_gfx_gate_hold_fence_signals(0); T((u32)GC(VT(q,15),q,fence,v0+1+round)==0); }   /* round 1: a queue Wait (on a value already reached) */
+            GateObs ob; memset(&ob,0,sizeof ob); ob.hold_ms=80; ob.fence=rf; kh_gfx_gate_set(); pthread_t th; T(pthread_create(&th,NULL,gate_obs_clear,&ob)==0);
+            T((u32)GC(VT(fence,10),fence,v0+2+round)==0); pthread_join(th,NULL);
+            T(ob.f_at_clear==v0+1+round && ID3D12Fence_GetCompletedValue(rf)==v0+2+round && kh_gfx_gate_parks()==p0+1+(u64)round); }
+        kh_gfx_gate_hold_fence_signals(0); kh_gfx_gate_test_reset_queue_waits(); }
       /* video stream: one picture per VIRTUAL VBLANK from the stream's first vblank on; a vblank without a new Present repeats the
        * previous picture, two Presents inside one vblank keep the later; the stream ends after KHNMC_GFX_VIDEO_FRAMES pictures.
        * 128x72 back buffer, scale 2 -> 64x36 pictures. */
@@ -1260,6 +1504,9 @@ done:
     if(kh_gfx_wrap_on) T(kh_native_calls==nat0);                                  /* the wrapped bridge: not one call through the Windows-ABI trampoline */
     st_fails+=kh_gfxc_st_fails;
     fprintf(stderr,"kh: vkd3d selftest: %d checks, %d failures (device %s, %s bridge, %s addresses)\n",st_checks,st_fails,vk_dev_name,kh_gfx_wrap_on?"wrapped":"trampoline",KH_XLATE_MODE==0?"identity":"bias");
+    /* TASK36 step 7: the presenter on the headless surface (its own suite line; SKIPPED when the extensions are missing) */
+    if(dev&&q&&fct){ char sv[sizeof dump_dir]; memcpy(sv,dump_dir,sizeof sv); dump_dir[0]=0; st_fails+=kh_present_selftest(g,0,dev,q,fct); memcpy(dump_dir,sv,sizeof sv); }
+    else fprintf(stderr,"kh: gfx present selftest: SKIPPED (the device selftest stopped before its swap chain existed)\n");
     if(kh_gfx_wrap_on) st_fails+=kh_wrap_selftest_device(g);                     /* wrapper identity, reference counts, by-value results, Map round trip */
     return st_fails;
 }

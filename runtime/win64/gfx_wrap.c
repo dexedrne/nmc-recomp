@@ -408,7 +408,8 @@ static int w_queue(KCtx *g,ID3D12CommandQueue *q,int s){
     case 10: { u32 n=(u32)A1(g); WX x; wx_init(&x,g);                            /* ExecuteCommandLists(count, lists) */
         ID3D12CommandQueue_ExecuteCommandLists(q,n,(ID3D12CommandList*const*)x_ifaces(&x,A2(g),n,WK_LIST,"ExecuteCommandLists")); wx_done(&x); atomic_fetch_add(&gfx_execs,1); return 1; }
     case 14: SET_RAX(g,(u32)ID3D12CommandQueue_Signal(q,(ID3D12Fence*)kh_wrap_real(g,A1(g),WK_FENCE,"ID3D12CommandQueue::Signal"),A2(g))); return 1;
-    case 15: SET_RAX(g,(u32)ID3D12CommandQueue_Wait(q,(ID3D12Fence*)kh_wrap_real(g,A1(g),WK_FENCE,"ID3D12CommandQueue::Wait"),A2(g))); return 1;
+    case 15: kh_gfx_gate_note_queue_wait();                                      /* TASK36: from now on a queue may be blocked (gfx_present.h) */
+             SET_RAX(g,(u32)ID3D12CommandQueue_Wait(q,(ID3D12Fence*)kh_wrap_real(g,A1(g),WK_FENCE,"ID3D12CommandQueue::Wait"),A2(g))); return 1;
     case 16: { UINT64 f=0; HRESULT hr=ID3D12CommandQueue_GetTimestampFrequency(q,A1(g)?&f:NULL); if(A1(g)) wr64(g,A1(g),f); SET_RAX(g,(u32)hr); return 1; }
     case 17: { UINT64 a=0,b=0; HRESULT hr=ID3D12CommandQueue_GetClockCalibration(q,A1(g)?&a:NULL,A2(g)?&b:NULL); if(A1(g)) wr64(g,A1(g),a); if(A2(g)) wr64(g,A2(g),b); SET_RAX(g,(u32)hr); return 1; }
     case 18: { u64 ret=A1(g); D3D12_COMMAND_QUEUE_DESC r=ID3D12CommandQueue_GetDesc(q); memcpy(hp(g,ret),&r,sizeof r); SET_RAX(g,ret); return 1; }
@@ -494,7 +495,8 @@ static int w_fence(KCtx *g,ID3D12Fence *f,int s){
     switch(s){
     case 8: SET_RAX(g,ID3D12Fence_GetCompletedValue(f)); return 1;
     case 9: SET_RAX(g,(u32)ID3D12Fence_SetEventOnCompletion(f,A1(g),(HANDLE)(uintptr_t)A2(g))); return 1;     /* the HANDLE is an id of OUR handle table (pfn_signal_event) */
-    case 10: SET_RAX(g,(u32)ID3D12Fence_Signal(f,A1(g))); return 1;
+    case 10: kh_gfx_gate_park_fence_signal();                                    /* TASK36: a CPU signal can make vkd3d submit queued work (gfx_present.h) */
+             SET_RAX(g,(u32)ID3D12Fence_Signal(f,A1(g))); return 1;
     }
     return 0;
 }

@@ -217,6 +217,17 @@ GFX_VKD3D ?= 1
 else
 GFX_VKD3D ?= 0
 endif
+# TASK36 (IOS-GRAPHICS-PLAN step 1): GFX_VULKAN_STATIC=1 links the Vulkan implementation instead of loading it at run time
+# (-DKH_GFX_VULKAN_STATIC: vkd3d gets the program's own vkGetInstanceProcAddr through the gipa wrapper; gfx_vkd3d.o then references
+# no dlopen).  Linux: -lvulkan (the loader; the runtime still selects lavapipe and refuses any device that is not a CPU), a test build
+# only, default 0.  Darwin: MoltenVK's static library MOLTENVK_STATIC (PREPARED, NOT RUN on this host), the way the iOS app links it.
+# runtime/gfx_present.c (the presenter, plan step 7) is compiled with the backend's flags; without the backend only its host part
+# (the suspend gate, the display pacing of WaitForVBlank) remains.
+GFX_VULKAN_STATIC ?= 0
+ifeq ($(filter $(GFX_VULKAN_STATIC),0 1),)
+$(error GFX_VULKAN_STATIC must be 0 or 1)
+endif
+GFX_STAMP = .gfx-vkd3d-$(GFX_VKD3D)$(if $(filter 1,$(GFX_VULKAN_STATIC)),-vkstatic)
 ifeq ($(GFX_VKD3D),1)
 ifeq ($(UNAME_S),Darwin)
 # ---- Task 21b: the wrapped bridge on arm64 macOS (vkd3d over MoltenVK, i.e. Vulkan on Metal) ------------------------------------------
@@ -237,25 +248,42 @@ VKD3D_LIBDIR ?= $(VKD3D_SRC)/build-mac
 VKHEADERS_DIR ?= $(GFX_APPLE_DIR)/vkheaders
 MOLTENVK_LIB ?= $(GFX_APPLE_DIR)/moltenvk/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib
 VKD3D_STATIC = $(VKD3D_LIBDIR)/libvkd3d-utils.a $(VKD3D_LIBDIR)/libvkd3d.a $(VKD3D_LIBDIR)/libvkd3d-shader.a $(VKD3D_LIBDIR)/libvkd3d-common.a
+ifeq ($(GFX_VULKAN_STATIC),1)
+# TASK36, PREPARED, NOT RUN: MoltenVK linked statically (the release's static xcframework; macOS slice here, the app links the ios-arm64
+# one), no dylib and no loader; the Metal surface and the Metal-objects export are compiled in (VK_USE_PLATFORM_METAL_EXT)
+MOLTENVK_STATIC ?= $(GFX_APPLE_DIR)/moltenvk/MoltenVK/static/MoltenVK.xcframework/macos-arm64_x86_64/libMoltenVK.a
+GFX_NEED = $(VKD3D_STATIC) $(VKD3D_SRC)/include/vkd3d_d3d12.h $(VKD3D_SRC)/include/vkd3d.h $(VKHEADERS_DIR)/vulkan/vulkan.h $(MOLTENVK_STATIC)
+else
 GFX_NEED = $(VKD3D_STATIC) $(VKD3D_SRC)/include/vkd3d_d3d12.h $(VKD3D_SRC)/include/vkd3d.h $(VKHEADERS_DIR)/vulkan/vulkan.h $(MOLTENVK_LIB)
+endif
 GFX_MISSING = $(filter-out $(wildcard $(GFX_NEED)),$(GFX_NEED))
 ifneq ($(strip $(GFX_MISSING)),)
-$(error GFX_VKD3D=1 on Darwin: missing $(GFX_MISSING) (VKD3D_SRC, VKD3D_LIBDIR, VKHEADERS_DIR, MOLTENVK_LIB; see tools/apple/vkd3d-build/README.md in the repo))
+$(error GFX_VKD3D=1 on Darwin: missing $(GFX_MISSING) (VKD3D_SRC, VKD3D_LIBDIR, VKHEADERS_DIR, MOLTENVK_LIB / MOLTENVK_STATIC; see tools/apple/vkd3d-build/README.md in the repo))
 endif
+ifeq ($(GFX_VULKAN_STATIC),1)
+$(O)/gfx_vkd3d.o $(O)/gfx_wrap.o $(O)/gfx_present.o: CFLAGS += -DKH_GFX_VKD3D=1 -DKH_GFX_VKD3D_STATIC=1 -DKH_GFX_VULKAN_STATIC=1 -DVK_USE_PLATFORM_METAL_EXT -DWIDL_C_INLINE_WRAPPERS -I$(VKD3D_SRC)/include -I$(VKHEADERS_DIR)
+GFX_LDFLAGS = $(VKD3D_STATIC) $(MOLTENVK_STATIC) -lc++ -framework Metal -framework QuartzCore -framework IOSurface -framework CoreGraphics -framework Foundation -framework IOKit -framework AppKit
+$(BIN): $(VKD3D_STATIC) $(MOLTENVK_STATIC)
+else
 ifeq ($(filter /%,$(MOLTENVK_LIB)),)
 $(error MOLTENVK_LIB must be an absolute path (got $(MOLTENVK_LIB)): the runtime loads exactly that file)
 endif
-$(O)/gfx_vkd3d.o $(O)/gfx_wrap.o: CFLAGS += -DKH_GFX_VKD3D=1 -DKH_GFX_VKD3D_STATIC=1 -DWIDL_C_INLINE_WRAPPERS -I$(VKD3D_SRC)/include -I$(VKHEADERS_DIR) '-DKH_GFX_VULKAN_LIB="$(MOLTENVK_LIB)"'
+$(O)/gfx_vkd3d.o $(O)/gfx_wrap.o $(O)/gfx_present.o: CFLAGS += -DKH_GFX_VKD3D=1 -DKH_GFX_VKD3D_STATIC=1 -DWIDL_C_INLINE_WRAPPERS -I$(VKD3D_SRC)/include -I$(VKHEADERS_DIR) '-DKH_GFX_VULKAN_LIB="$(MOLTENVK_LIB)"'
 GFX_LDFLAGS = $(VKD3D_STATIC)
 $(BIN): $(VKD3D_STATIC)
+endif
 else
-$(O)/gfx_vkd3d.o $(O)/gfx_wrap.o: CFLAGS += -DKH_GFX_VKD3D=1 -DWIDL_C_INLINE_WRAPPERS -I$(VKD3D_PREFIX)/include/vkd3d -I$(VKHEADERS_PREFIX)/include
+$(O)/gfx_vkd3d.o $(O)/gfx_wrap.o $(O)/gfx_present.o: CFLAGS += -DKH_GFX_VKD3D=1 -DWIDL_C_INLINE_WRAPPERS -I$(VKD3D_PREFIX)/include/vkd3d -I$(VKHEADERS_PREFIX)/include
 GFX_LDFLAGS = -L$(VKD3D_PREFIX)/lib -lvkd3d-utils -lvkd3d -ldl -Wl,--disable-new-dtags -Wl,-rpath,$(VKD3D_PREFIX)/lib
+ifeq ($(GFX_VULKAN_STATIC),1)
+$(O)/gfx_vkd3d.o $(O)/gfx_wrap.o $(O)/gfx_present.o: CFLAGS += -DKH_GFX_VULKAN_STATIC=1
+GFX_LDFLAGS += -lvulkan
 endif
 endif
-$(O)/.gfx-vkd3d-$(GFX_VKD3D):
+endif
+$(O)/$(GFX_STAMP):
 	@mkdir -p $(O) && rm -f $(O)/.gfx-vkd3d-* && touch $@
-$(O)/gfx_vkd3d.o $(O)/gfx_wrap.o $(BIN): $(O)/.gfx-vkd3d-$(GFX_VKD3D)
+$(O)/gfx_vkd3d.o $(O)/gfx_wrap.o $(O)/gfx_present.o $(BIN): $(O)/$(GFX_STAMP)
 # ---- lifted shards compiled here (every variant except the default one, which links the prebuilt archive) ----
 SHARDS_DIR ?= $(LIFTED)/shards
 SHARD_NAMES := $(patsubst %.c,%,$(notdir $(wildcard $(SHARDS_DIR)/shard_*.c)))

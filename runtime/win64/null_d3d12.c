@@ -4,6 +4,7 @@
  * persistent maps work, copyable footprints computed from the resource description.  Anything outside the documented surface is a named fatal.
  * Also: d3dcompiler_47!D3DStripShader (copy), D3D12SerializeRootSignature (blob holding the desc), D3D11CreateDevice (movie decode device). */
 #include "khnmc_rt.h"
+#include "gfx_present.h"
 #include <time.h>
 
 #define E_FAIL_ 0x80004005u
@@ -95,7 +96,10 @@ static int h_adapter(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) retur
 static int h_output(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)o;(void)c;
     if(s==10){                                                                                                        /* WaitForVBlank */
         if(kh_vclock_on){ u64 ra=guest_return_addr(g)-GS_BASE;                 /* KHNMC_CLOCK=frames: one virtual display period; rbx = GXDevice at the timing thread's two call sites (0x1288cc, 0x128f3b) */
+            kh_vsync_note_virtual();
             kh_vclock_vblank(g,(ra==0x1288cf||ra==0x128f3e)&&GA_OK(KH_RBX(g))?KH_RBX(g):0); SET_RAX(g,0); return 1; }
+        if(kh_vsync_wait()){ SET_RAX(g,0); return 1; }                       /* TASK36: a display tick source (iOS display link, KHNMC_DISPLAY=timer60) paces it (gfx_present.c) */
+        kh_vsync_note_sleep();
         struct timespec ts={0,vblank_ns}; nanosleep(&ts,0); SET_RAX(g,0); return 1; }                                 /* host clock: pace at 60 Hz (KHNMC_NULL_VBLANK_NS: another frame time, for timing experiments) */
     if(s==7){ u64 d=A1(g); memset(hp(g,d),0,0x60); utf8_to_gw(g,d,32,"\\\\.\\DISPLAY1");
         /* DesktopCoordinates RECT at +0x40, AttachedToDesktop +0x50 */ wr32(g,d+0x48,1920); wr32(g,d+0x4c,1080); wr32(g,d+0x50,1); wr64(g,d+0x58,0xAB0100); SET_RAX(g,0); return 1; }
@@ -262,10 +266,12 @@ void kh_seam_gfx_init(void){
     e=getenv("KHNMC_GFX_PSOLOG"); log_pso=e&&*e=='1';
     e=getenv("KHNMC_NULL_VBLANK_NS"); if(e&&*e){ long v=strtol(e,0,10); if(v<1000000||v>500000000) kh_fatal(NULL,"KHNMC_NULL_VBLANK_NS=%s: expected 1000000..500000000 nanoseconds",e);
         vblank_ns=v; fprintf(stderr,"kh: gfx: null backend frame sleep %ld ns instead of 16666667 (KHNMC_NULL_VBLANK_NS)\n",v); }
-    e=getenv("KHNMC_GFX");                                                    /* graphics backend: unset / "null" = this recorder, "vkd3d" = gfx_vkd3d.c, "vkd3dw" = gfx_wrap.c */
+    kh_vsync_init();                                                          /* TASK36: KHNMC_DISPLAY=timer60 (the Linux stand-in for the display link) */
+    e=getenv("KHNMC_GFX");                                                  /* graphics backend: unset / "null" = this recorder, "vkd3d" = gfx_vkd3d.c, "vkd3dw" = gfx_wrap.c */
     if(e&&!strcmp(e,"vkd3d")) kh_gfx_vkd3d_init();
     else if(e&&!strcmp(e,"vkd3dw")) kh_gfx_wrap_init();
     else if(e&&*e&&strcmp(e,"null")) kh_fatal(NULL,"gfx-backend-unknown: KHNMC_GFX=%s (known backends: null, vkd3d, vkd3dw)",e);
+    kh_present_init(kh_gfx_vkd3d_on);                                         /* TASK36 review n=5: KHNMC_GFX_PRESENT in every build, with every backend */
     C_factory=kh_com_class("dxgi:IDXGIFactory4",44,STRICT,h_factory); C_adapter=kh_com_class("dxgi:IDXGIAdapter3",24,STRICT,h_adapter); C_output=kh_com_class("dxgi:IDXGIOutput",24,STRICT,h_output);
     C_swap=kh_com_class("dxgi:IDXGISwapChain3",44,STRICT,h_swap); C_dev=kh_com_class("d3d12:ID3D12Device",48,STRICT,h_dev); C_queue=kh_com_class("d3d12:ID3D12CommandQueue",20,STRICT,h_queue);
     /* the game creates and releases about 27 allocator + list pairs per frame (bundles): they are freed at their last Release, the other classes are few and kept */

@@ -74,6 +74,61 @@ void  kh_wrap_report(FILE *f);
 int   kh_wrap_selftest_device(KCtx *g);                                              /* KHNMC_GFX=vkd3dw --selftest: checks that need a real device */
 int   kh_wrap_selftest_pure(KCtx *g);                                                /* every --selftest: structure translation under a synthetic bias, the table, named fatals */
 
+/* ---- TASK36: the Vulkan side (IOS-GRAPHICS-PLAN steps 1, 6, 7) --------------------------------------------------------------- */
+#include "gfx_present.h"
+/* step 1: the presentation extensions vkd3d ENABLED (requested as optional; seen by the gipa wrapper at vkCreateInstance and at
+ * vkCreateDevice), the REAL vkGetInstanceProcAddr, the frame-dump directory (check-mode pictures go next to the dumps) */
+typedef struct { int surface, headless, metal, swapchain, display_timing, metal_objects, layer_settings, seen_instance, seen_device; } KhPresExt;
+extern KhPresExt kh_gfxc_pres_ext;
+PFN_vkGetInstanceProcAddr kh_gfxc_vk_gipa_real(void);
+const char *kh_gfxc_dump_dir(void);
+/* Vulkan functions of one vkd3d device (gfx_present.c): core ones always, the WSI ones when the extensions are enabled */
+typedef struct KhVk KhVk;
+const KhVk *kh_vk_for(ID3D12Device *d);
+int kh_vk_memtype(const KhVk *v,u32 type_bits,VkMemoryPropertyFlags want);          /* the first matching memory type, -1 = none */
+/* the calls the own back buffers make (gfx_vkd3d.c), through that table */
+VkResult kh_vk_create_image(const KhVk *v,const VkImageCreateInfo *ci,VkImage *out);
+void     kh_vk_image_memreq(const KhVk *v,VkImage im,VkMemoryRequirements *mr);
+VkResult kh_vk_alloc(const KhVk *v,const VkMemoryAllocateInfo *ai,VkDeviceMemory *out);
+VkResult kh_vk_bind_image(const KhVk *v,VkImage im,VkDeviceMemory m);
+void     kh_vk_destroy_image(const KhVk *v,VkImage im);
+void     kh_vk_free(const KhVk *v,VkDeviceMemory m);
+/* every Vulkan object this runtime makes is counted (made / destroyed): "nothing is left after teardown" is a number */
+enum { VKO_SURFACE, VKO_SWAPCHAIN, VKO_SEM, VKO_FENCE, VKO_POOL, VKO_BUF, VKO_MEM, VKO_IMAGE, VKO_N };
+extern _Atomic long long kh_vko_live[VKO_N];
+void kh_vko_note(int kind,int made);
+long long kh_vko_live_total(void);
+/* step 6/7: the presenter of one swap chain.  The back buffers it reads are the swap chain's own VkImages (as integers: VkImage is a
+ * non-dispatchable handle); `general` = KHNMC_GFX_BACKBUFFERS=general (D3D12 PRESENT = Vulkan GENERAL, not TRANSFER_SRC) */
+typedef struct KhPresenter KhPresenter;
+typedef struct { u32 w, h, n; u64 image[3]; int general; } KhPresentBuffers;
+int  kh_present_mode(void);                                                          /* 0 off, 1 headless, 2 layer (KHNMC_GFX_PRESENT) */
+KhPresenter *kh_present_attach(ID3D12Device *dev,ID3D12CommandQueue *q,const KhPresentBuffers *bb);   /* NULL when presentation is off */
+int  kh_present_frame(KCtx *g,KhPresenter *p,u32 idx,u64 present_no);               /* after the readback, before the index advances; 1 = a check
+                                                                                       * present: the caller hands a D3D12 readback of the same
+                                                                                       * back buffer, queued after it, to kh_present_check */
+void kh_present_check(KhPresenter *p,u64 present_no,const u8 *ref,u32 ref_row_pitch); /* check mode against that independent reference (review V36 n=1) */
+void kh_present_resize(KhPresenter *p,const KhPresentBuffers *bb);                   /* new back buffers (ResizeBuffers) */
+void kh_present_quiesce(KhPresenter *p);                                             /* every submission of the presenter is complete */
+void kh_present_resume(KhPresenter *p);                                              /* the swapchain is rebuilt at the next present */
+void kh_present_teardown(KhPresenter *p);
+void kh_present_report(FILE *f);
+u64  kh_gfx_gate_last_clear_ns(void);
+/* selftest hooks of the presenter (gfx_present.c) and of the swap chain (gfx_vkd3d.c) */
+void kh_present_test_force_check(int on);
+void kh_present_test_after_acquire(void (*fn)(KhPresenter *));
+void kh_present_test_override(int mode,int fit,u32 w,u32 h);
+void kh_present_test_counters(u64 *frames,u64 *submits,u64 *presents,u64 *rebuilds,u64 *check_ok,u64 *check_fail,u64 *parked,u64 *remade);
+void kh_present_test_extent(KhPresenter *p,u32 *w,u32 *h,u32 *nimg);
+void kh_present_test_cost(u64 *n,u64 *sum,u64 *max);
+double kh_present_test_dmax(void);
+void kh_gfx_gate_test_reset_queue_waits(void);
+typedef struct { ID3D12Device *dev; ID3D12CommandQueue *queue; ID3D12Resource *buf[3]; u64 image[3]; int bbmode; u32 w, h; KhPresenter *pres; } KhSwapInfo;
+int  kh_vkd3d_swap_test_info(KCtx *g,u64 sc,KhSwapInfo *out);                       /* 0 = not a vkd3d swap chain */
+void kh_vkd3d_swap_test_release(KCtx *g,u64 sc);                                     /* presenter teardown, back buffers released and destroyed */
+void kh_vkd3d_test_bbmode(int mode);                                                 /* -1 = KHNMC_GFX_BACKBUFFERS; 0 own, 1 general, 2 committed */
+int  kh_present_selftest(KCtx *g,u64 m,u64 dev,u64 q,u64 fct);                      /* gfx_present.c, called by the vkd3d selftest */
+
 /* ---- selftest helpers: call a guest-visible function pointer like a lifted `call` (n arguments, 4 in registers) ----------------- */
 extern int kh_gfxc_st_fails;
 u64 kh_gfxc_st_call(KCtx *g,u64 target,void (*imp)(KCtx*),int n,const u64 *a);

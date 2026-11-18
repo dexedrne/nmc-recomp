@@ -246,7 +246,14 @@ int kh_selftest(KCtx *g){
 }
 static int selftest_all(KCtx *g){
     { const char *only=getenv("KHNMC_SELFTEST_ONLY");            /* task 31: one suite alone (a mutation check runs it many times); a partial run is said to be one and is no pass of the selftest */
-      if(only&&*only){ if(strcmp(only,"route31")) kh_fatal(g,"KHNMC_SELFTEST_ONLY=%s: the only suite that can run alone is route31",only);
+      if(only&&*only){
+          /* TASK36: also `vsync` (display pacing) and `gfx` (the graphics suites: null device, wrap, and with KHNMC_GFX=vkd3d* the device,
+           * back-buffer and presenter selftests): mutation checks of those run them many times */
+          if(!strcmp(only,"vsync")){ extern int kh_vsync_selftest(void); int f=kh_vsync_selftest();
+              fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=vsync): only the suite `vsync` ran, %d failures\n",f); return f; }
+          if(!strcmp(only,"gfx")){ extern int kh_gfx_selftest(KCtx *); int f=kh_gfx_selftest(g);
+              fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=gfx): only the graphics suites ran, %d failures\n",f); return f; }
+          if(strcmp(only,"route31")) kh_fatal(g,"KHNMC_SELFTEST_ONLY=%s: the suites that can run alone are route31, vsync and gfx",only);
           extern int kh_input_route31_selftest(KCtx *); int f=kh_input_route31_selftest(g);
           fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=route31): only the suite `input route Q31` ran, %d failures\n",f); return f?f:0; } }
     CHECK(rd64(g,GS_BASE+0x7534a8)!=0); /* Task 6: table 3 must exist before scripts run. */
@@ -274,6 +281,7 @@ static int selftest_all(KCtx *g){
     fails+=kh_sync_selftest(g);
     { extern int kh_sync_vclock_selftest(KCtx *); fails+=kh_sync_vclock_selftest(g); }   /* review of task 28: virtual time-outs of KHNMC_CLOCK_SYNC=all without lock-order deadlocks */
     { extern int kh_compat_selftest(void); fails+=kh_compat_selftest(); }      /* task 20: the host primitives that differ between Linux and Darwin */
+    { extern int kh_vsync_selftest(void); fails+=kh_vsync_selftest(); }        /* TASK36: WaitForVBlank paced by display ticks (gfx_present.c) */
     { extern int kh_loader_selftest(void); fails+=kh_loader_selftest(); }      /* review U35 n=24: the bias-mode reservation keeps its low guard or is a named fatal */
     input_selftest(g);
     { extern int kh_input_hold_selftest(KCtx *); fails+=kh_input_hold_selftest(g); }

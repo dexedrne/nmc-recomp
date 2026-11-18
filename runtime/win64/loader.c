@@ -157,6 +157,8 @@ void kh_exit_process(int code){
     { extern void kh_sync_report(FILE*); kh_sync_report(stderr); }
     { extern void kh_input_report(FILE*); kh_input_report(stderr); }
     kh_vclock_report(stderr);
+    { extern void kh_vsync_report(FILE*); kh_vsync_report(stderr); }                     /* TASK36: how WaitForVBlank was paced (gfx_present.c) */
+    { extern void kh_present_shell_report(FILE*); kh_present_shell_report(stderr); }     /* TASK36 review n=5: the shell's presenter calls, used or DROPPED */
     { extern void kh_gfx_vkd3d_finish(void); kh_gfx_vkd3d_finish(); }
     { extern void kh_import_counts_report(FILE*); kh_import_counts_report(stderr); }      /* KH_IMPORT_COUNTS=1 */
     { extern void kh_import_sites_report(FILE*); kh_import_sites_report(stderr); }        /* KH_IMPORT_SITES=text */
