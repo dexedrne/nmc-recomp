@@ -2,7 +2,7 @@
 # tools/ios/sync.sh : copy what the iOS build needs from this worktree to ~/Developer/KHNMC/src on the MacBook Air.
 # UNRUN: never executed (see tools/ios/common.sh).  Refuses to start without KHNMC_IOS_MACBOOK_OK=1.
 #
-#   tools/ios/sync.sh            sources: Makefile, runtime/ (with runtime/ios), lifter-rt/, tools/, gen/*.{c,h}, lifted/gen/,
+#   tools/ios/sync.sh            sources: Makefile, runtime/ (with runtime/ios), lifter-rt/, tools/, input/, gen/*.{c,h}, lifted/gen/,
 #                                lifted/shards/shard_*.c (117 files, 167 MB; rsync sends only what changed)
 #   tools/ios/sync.sh exe        + pc/kh2fm.exe          -> ~/Developer/KHNMC/pc/kh2fm.exe
 #   tools/ios/sync.sh route [D]  + the route data subset -> ~/Developer/KHNMC/route-data  (D: default ./route-subset, made by
@@ -22,12 +22,13 @@ cd "$IOS_HERE"
 what=${1:-src}; SUB=${2:-$IOS_HERE/route-subset}
 case "$what" in src|exe|route|all) ;; *) sed -n '2,11p' "$0" >&2; exit 2;; esac
 RS=(rsync -rlpD -c --delete -e "$IOS_RSH")
-for f in Makefile runtime lifter-rt tools gen lifted/gen lifted/shards; do [ -e "$f" ] || { echo "ios/sync: missing $f in $IOS_HERE" >&2; exit 2; }; done
+for f in Makefile runtime lifter-rt tools input gen lifted/gen lifted/shards; do [ -e "$f" ] || { echo "ios/sync: missing $f in $IOS_HERE" >&2; exit 2; }; done
 mac "mkdir -p ~/$IOS_RDIR/src/lifted/gen ~/$IOS_RDIR/src/lifted/shards ~/$IOS_RDIR/src/gen ~/$IOS_RDIR/pc ~/$IOS_RDIR/run"
 "${RS[@]}" Makefile "$IOS_MAC:$IOS_RDIR/src/Makefile"
 "${RS[@]}" runtime/ "$IOS_MAC:$IOS_RDIR/src/runtime/"
 "${RS[@]}" lifter-rt/ "$IOS_MAC:$IOS_RDIR/src/lifter-rt/"
 "${RS[@]}" --exclude '__pycache__' tools/ "$IOS_MAC:$IOS_RDIR/src/tools/"
+"${RS[@]}" input/ "$IOS_MAC:$IOS_RDIR/src/input/"                # the route scripts (tools/ios/mac/device_run.sh route)
 "${RS[@]}" --include '*.c' --include '*.h' --exclude '*' gen/ "$IOS_MAC:$IOS_RDIR/src/gen/"
 "${RS[@]}" lifted/gen/ "$IOS_MAC:$IOS_RDIR/src/lifted/gen/"
 "${RS[@]}" -z --include 'shard_*.c' --exclude '*' lifted/shards/ "$IOS_MAC:$IOS_RDIR/src/lifted/shards/"
