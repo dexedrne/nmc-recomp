@@ -53,6 +53,15 @@ void kh_input_host_pad_set(u16 buttons,u8 lt,u8 rt,s16 lx,s16 ly,s16 rx,s16 ry){
     for(int i=0;i<10;i++) if(fresh&(1u<<i)) fprintf(stderr,"kh: input: host pad first full deflection: %s (lt %u rt %u, left %d,%d right %d,%d)\n",what[i],lt,rt,lx,ly,rx,ry);
 }
 int kh_input_host_test(int on){ int was=host_pad_on; host_pad_on=on; pthread_mutex_lock(&input_lock); memset(&host_pad,0,sizeof host_pad); host_latched=0; pthread_mutex_unlock(&input_lock); return was; }   /* selftest */
+/* TASK41 (docs/IOS-SHELL.md "Leaving the screen" step 5): the host pad neutral, as XInputGetState reports a pad with nothing held.  A
+ * button held when the app left the screen must not stay held: its release may never arrive.  The latched taps are dropped too (a tap
+ * just before the lock must not fire after the resume).  Returns the buttons that were held or latched, | 0x10000 when a stick or trigger was off centre (0 = it was neutral already). */
+unsigned kh_input_host_pad_neutral(void){
+    pthread_mutex_lock(&input_lock); u16 was=(u16)(host_pad.buttons|host_latched); int moved=host_pad.lt||host_pad.rt||host_pad.lx||host_pad.ly||host_pad.rx||host_pad.ry;
+    if(was||moved) host_pad_changes++; memset(&host_pad,0,sizeof host_pad); host_latched=0; pthread_mutex_unlock(&input_lock);
+    if(was||moved) fprintf(stderr,"kh: input: host pad set neutral (buttons 0x%04x were held or latched%s)\n",was,moved?", a stick or trigger was off centre":"");
+    return (unsigned)was|(moved?0x10000u:0u); }
+void kh_input_host_pad_get(u16 *buttons,u16 *latched,s16 *lx){ pthread_mutex_lock(&input_lock); if(buttons) *buttons=host_pad.buttons; if(latched) *latched=host_latched; if(lx) *lx=host_pad.lx; pthread_mutex_unlock(&input_lock); }   /* selftest */
 extern _Atomic u64 gfx_presents;
 static const char *button_names[]={"DPAD_UP","DPAD_DOWN","DPAD_LEFT","DPAD_RIGHT","START","BACK","LSTICK","RSTICK","LB","RB",NULL,NULL,"A","B","X","Y","LT","RT"};
 static int number(const char *s,long long lo,long long hi,long long *v){

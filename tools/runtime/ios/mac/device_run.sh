@@ -32,6 +32,13 @@
 #   FETCH="240 920 2000 2600" copies those presents' pictures back into frames/ (each a multiple of n, each must be in this run's index);
 #   HASHLOG=1 -> KHNMC_GFX_HASHLOG=@DOCS@/hash.tsv, fetched; CLOCK=frames -> KHNMC_CLOCK=frames.  Each of these without GFX=1 route is
 #   refused, and GFX=1 play is refused (no picture reaches the screen before plan step 10).  Without GFX=1 every run is as before.
+# PRESENT=1 (TASK41, IOS-GRAPHICS-PLAN step 10; needs GFX=1): the picture on the phone's screen.  khnmc.conf also gets
+#   env KHNMC_GFX_PRESENT=layer (the presenter draws into the game view's CAMetalLayer), env KHNMC_SCREEN=layer (the game's screen is the
+#   layer's drawable: the shell hands its size over before the game starts) and env KHNMC_ASPECT=fill (task 37: the game fills that
+#   screen); PRESENT_CHECK=n adds env KHNMC_GFX_PRESENT_CHECK=n (every n-th present checked against a readback, when the surface reports
+#   TRANSFER_SRC).  The surface caps (`kh: gfx present: surface caps`), the swapchain lines and the life-cycle lines (`kh: app:`) are copied
+#   into present-report.txt.  GFX=1 PRESENT=1 play is allowed: that conf stays on the phone (the icon then starts the game with the
+#   picture); every later test run puts the null-backend play conf back.  Without PRESENT=1 nothing of this is written.
 # GFX_APP=1|0 (review X38 n=1): the signed app must have (1) / must not have (0) the graphics backend, whatever backend the run uses;
 #   checked with nm before anything is installed.  The plain (null-backend) selftest of the graphics app is `GFX_APP=1 device_run.sh
 #   selftest`.  GFX=1 implies GFX_APP=1 (GFX=1 GFX_APP=0 is refused).  Unset: no check, as before.
@@ -39,7 +46,7 @@
 MODE=${1:-selftest}; INPUT=""; FRAMES=7000; DIFF=none
 # task 39: SELFTEST_ONLY=membench|ordered|gate (environment, selftest mode only): one suite alone (KHNMC_SELFTEST_ONLY), e.g. the
 # memory-ordering microbenchmark of an ORDERED_MEM=1 app against a plain one
-SONLY=${SELFTEST_ONLY:-}; case "$SONLY" in ''|membench|ordered|gate) ;; *) echo "ios/mac: device_run: SELFTEST_ONLY must be membench, ordered or gate" >&2; exit 2;; esac
+SONLY=${SELFTEST_ONLY:-}; case "$SONLY" in ''|membench|ordered|gate|app) ;; *) echo "ios/mac: device_run: SELFTEST_ONLY must be membench, ordered, gate or app" >&2; exit 2;; esac
 case "$MODE" in
   selftest) LIMIT=${2:-1500};;
   play) LIMIT=0;;
@@ -50,7 +57,11 @@ case "$MODE" in
 esac
 DUMP_EVERY=${DUMP_EVERY:-}; FETCH=${FETCH:-}; HASHLOG=${HASHLOG:-0}; CLOCK=${CLOCK:-}
 bad(){ echo "ios/mac: device_run: $*" >&2; exit 2; }
-[ "$GFX" = 1 ] && [ "$MODE" = play ] && bad "GFX=1 play: no picture reaches the screen before IOS-GRAPHICS-PLAN step 10; play stays on the null backend"
+PRESENT=${PRESENT:-0}; PRESENT_CHECK=${PRESENT_CHECK:-}
+case "$PRESENT" in 0|1) ;; *) bad "PRESENT is 0 or 1 (got '$PRESENT')";; esac
+[ "$PRESENT" = 1 ] && [ "$GFX" != 1 ] && bad "PRESENT=1 needs GFX=1 (the picture comes from the vkd3d backend)"
+[ -z "$PRESENT_CHECK" ] || { [ "$PRESENT" = 1 ] || bad "PRESENT_CHECK needs PRESENT=1"; case "$PRESENT_CHECK" in *[!0-9]*|0*) bad "PRESENT_CHECK must be a positive number of presents (got '$PRESENT_CHECK')";; esac; }
+[ "$GFX" = 1 ] && [ "$PRESENT" != 1 ] && [ "$MODE" = play ] && bad "GFX=1 play needs PRESENT=1 (without it no picture reaches the screen); play stays on the null backend otherwise"
 if [ -n "$DUMP_EVERY$FETCH$CLOCK" ] || [ "$HASHLOG" != 0 ]; then [ "$GFX" = 1 ] && [ "$MODE" = route ] || bad "DUMP_EVERY, FETCH, HASHLOG and CLOCK are for GFX=1 route runs only"; fi
 case "$HASHLOG" in 0|1) ;; *) bad "HASHLOG is 0 or 1 (got '$HASHLOG')";; esac
 case "$CLOCK" in ''|frames) ;; *) bad "CLOCK is frames or unset (got '$CLOCK')";; esac
@@ -84,6 +95,15 @@ if [ "${SKIP_INSTALL:-0}" != 1 ]; then
 fi
 play_conf(){ { echo "# the game (tools/ios/mac/device_run.sh play): the controller is pad 0, sound on, no script, no time limit"; echo "log khnmc.log"; echo "status khnmc.status"; } > "$OUT/play.conf"; }
 play_conf
+# TASK41: the conf lines of a run with the picture on the screen (GFX=1 PRESENT=1)
+gfx_lines(){ :; }; if [ "$GFX" = 1 ]; then gfx_lines(){ echo "env KHNMC_GFX=vkd3dw"; echo "env VKD3D_DEBUG=warn"; echo "env VKD3D_SHADER_DEBUG=warn"; echo "env MVK_CONFIG_PERFORMANCE_TRACKING=1"; }; fi
+present_lines(){ echo "env KHNMC_GFX_PRESENT=layer"; echo "env KHNMC_SCREEN=layer"; echo "env KHNMC_ASPECT=fill"; [ -z "$PRESENT_CHECK" ] || echo "env KHNMC_GFX_PRESENT_CHECK=$PRESENT_CHECK"; }
+if [ "$MODE" = play ] && [ "$PRESENT" = 1 ]; then
+  { echo "# the game with its picture (tools/ios/mac/device_run.sh GFX=1 PRESENT=1 play): the controller is pad 0, sound on, no script"; echo "log khnmc.log"; echo "status khnmc.status"; gfx_lines; present_lines; } > "$OUT/gfx-play.conf"
+  cp_to "$OUT/gfx-play.conf" khnmc.conf || { say "copy of the GFX play configuration FAILED"; tail -5 "$OUT/devicectl.log"; exit 1; }
+  xcrun devicectl device process launch --device "$DEVICE" --timeout 60 --terminate-existing "$BUNDLE_ID" >> "$OUT/devicectl.log" 2>&1 || { say "launch FAILED (phone locked?)"; tail -5 "$OUT/devicectl.log"; exit 1; }
+  say "the game is running on the phone with its picture (GFX=1 PRESENT=1 play); its log: Documents/khnmc.log (fetch it with SKIP_INSTALL=1 ... or devicectl copy from)"; echo "$OUT"; exit 0
+fi
 if [ "$MODE" = play ]; then
   cp_to "$OUT/play.conf" khnmc.conf || { say "copy of the play configuration FAILED"; tail -5 "$OUT/devicectl.log"; exit 1; }
   xcrun devicectl device process launch --device "$DEVICE" --timeout 60 --terminate-existing "$BUNDLE_ID" >> "$OUT/devicectl.log" 2>&1 || { say "launch FAILED (phone locked?)"; tail -5 "$OUT/devicectl.log"; exit 1; }
@@ -98,7 +118,7 @@ fi
     echo "env KH_DUMP_THREADS=1"; echo "env KHNMC_PHASELOG=@DOCS@/phase.log"; echo "env KHNMC_FILELOG=@DOCS@/files.log"
     DV=KHNMC_DIFFICULTY; grep -qE '^[[:space:]]*@(wait|press|select|expect)([[:space:]]|$)' "$INPUT" && DV=KHNMC_ROUTE_DIFFICULTY   # as tools/route_batch.sh
     [ "$DIFF" = none ] || echo "env $DV=$DIFF"; fi
-  if [ "$GFX" = 1 ]; then echo "env KHNMC_GFX=vkd3dw"; echo "env VKD3D_DEBUG=warn"; echo "env VKD3D_SHADER_DEBUG=warn"; echo "env MVK_CONFIG_PERFORMANCE_TRACKING=1"
+  if [ "$GFX" = 1 ]; then gfx_lines; [ "$PRESENT" = 1 ] && present_lines
     [ -z "$DUMP_EVERY" ] || { echo "env KHNMC_GFX_DUMP=@DOCS@/frames"; echo "env KHNMC_GFX_DUMP_EVERY=$DUMP_EVERY"; }
     [ "$HASHLOG" = 0 ] || echo "env KHNMC_GFX_HASHLOG=@DOCS@/hash.tsv"
     [ -z "$CLOCK" ] || echo "env KHNMC_CLOCK=$CLOCK"; fi
@@ -133,6 +153,10 @@ if [ "$GFX" = 1 ]; then
   else say "GFX=1, but khnmc.log has no complete device report block (device-report.txt holds what there is)"; xrc=1; fi
   f=$(grep -a -m1 '^kh: FATAL: gfx-' "$OUT/khnmc.log"); [ -z "$f" ] || say "$f"
   say "vkd3d lines in khnmc.log: err $(grep -a -c -E '^vkd3d:([0-9]+:)?err:' "$OUT/khnmc.log"), fixme $(grep -a -c -E '^vkd3d:([0-9]+:)?fixme:' "$OUT/khnmc.log"), warn $(grep -a -c -E '^vkd3d:([0-9]+:)?warn:' "$OUT/khnmc.log"); MoltenVK errors $(grep -a -c '\[mvk-error\]' "$OUT/khnmc.log")"
+  if [ "$PRESENT" = 1 ]; then
+    grep -a -e '^kh: gfx present: ' -e '^kh: app: ' -e '^kh: ios: ' -e '^kh: screen: ' -e '^kh: vsync: ' -e '^kh: gfx gate: ' "$OUT/khnmc.log" > "$OUT/present-report.txt" 2>/dev/null
+    say "present report: $(grep -c 'surface caps' "$OUT/present-report.txt") surface-caps line(s), swapchains made/rebuilt $(grep -c -e 'swapchain made' -e 'swapchain rebuilt' "$OUT/present-report.txt"), $(grep -a -m1 '^kh: gfx present: mode=' "$OUT/khnmc.log" | cut -c1-160)"
+    grep -q 'surface caps' "$OUT/present-report.txt" || { say "PRESENT=1, but the log has no surface-caps line: the presenter never made its swapchain"; xrc=1; }; fi
   if [ "$HASHLOG" = 1 ]; then if cp_from hash.tsv; then say "hash.tsv: $(( $(wc -l < "$OUT/hash.tsv") - 1 )) presents"; else say "hash.tsv could not be fetched"; xrc=1; fi; fi
   if [ -n "$DUMP_EVERY" ]; then
     if cp_from frames/index.tsv; then

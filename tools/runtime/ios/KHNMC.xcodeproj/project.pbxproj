@@ -188,6 +188,8 @@
 					AudioToolbox,
 					"-framework",
 					GameController,
+					"-framework",
+					QuartzCore,
 					"$(KHNMC_GFX_LDFLAGS)",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = beer.vyvanse.khnmc;
@@ -232,6 +234,8 @@
 					AudioToolbox,
 					"-framework",
 					GameController,
+					"-framework",
+					QuartzCore,
 					"$(KHNMC_GFX_LDFLAGS)",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = beer.vyvanse.khnmc;

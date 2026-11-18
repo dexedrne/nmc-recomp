@@ -192,7 +192,8 @@ def generate(name, groups, target_settings):
     return ''.join(out)
 
 
-FRAMEWORKS = ['Foundation', 'UIKit', 'AVFoundation', 'AudioToolbox', 'GameController']   # audio: runtime/ios/audio_coreaudio.c (COREAUDIO=1 in mac/build.sh)
+FRAMEWORKS = ['Foundation', 'UIKit', 'AVFoundation', 'AudioToolbox', 'GameController',   # audio: runtime/ios/audio_coreaudio.c (COREAUDIO=1 in mac/build.sh)
+              'QuartzCore']   # TASK41: CAMetalLayer (the game view's layer) and CADisplayLink in runtime/ios/ios_main.m, in every app build
 PREFIX_MAP = ['-ffp-contract=off', '-ffile-prefix-map=$(KHNMC_REPO)/=khnmc/']
 
 

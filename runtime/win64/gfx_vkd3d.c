@@ -108,6 +108,7 @@ void kh_vkd3d_present(KCtx *g,u64 o,u64 n){ (void)o;(void)n; NOT_BUILT("IDXGISwa
 void kh_gfx_vkd3d_report(FILE *f){ (void)f; }
 void kh_gfx_vkd3d_finish(void){}
 int kh_gfx_vkd3d_selftest(KCtx *g){ NOT_BUILT("the vkd3d selftest"); }
+void kh_gfx_submit_counts(u64 *total,u64 *set_admitted,u64 *set_outside){ *total=*set_admitted=*set_outside=0; }   /* review A41: the KHNMC_TEST_GATE check (no backend: nothing submits) */
 #else
 /* ---- backend ------------------------------------------------------------------------------------------------------------- */
 #include "gfx_vkd3d_int.h"
@@ -316,6 +317,41 @@ static VkResult VKAPI_PTR gw_create_device(VkPhysicalDevice pd,const VkDeviceCre
         kh_gfxc_pres_ext.metal_objects=has_name(e,n,"VK_EXT_metal_objects"); kh_gfxc_pres_ext.seen_device=1; }
     return r;
 }
+/* TASK41 (plan step 11, fact 11): the vkQueueSubmit counter.  vkd3d loads every device function through the vkGetDeviceProcAddr it
+ * resolves here (vulkan_procs.h 41, utils.c 856-864), so the wrapper answers vkGetDeviceProcAddr with gw_gdpa, which answers
+ * vkGetDeviceQueue (to learn which real vkQueueSubmit belongs to each VkQueue) and vkQueueSubmit with pass-throughs.  Every submission
+ * vkd3d makes is counted; one made while the suspend gate is set is counted as admitted (a region that was let in, or the suspend drain)
+ * or as OUTSIDE an admission, the case the gate exists to exclude (e.g. queued work flushed by a CPU fence signal that nobody held:
+ * plan fact 11).  The presenter's own submissions do not come through here (it resolves its functions with the real loader). */
+static PFN_vkGetDeviceProcAddr gw_real_gdpa;
+typedef struct { VkQueue q; PFN_vkQueueSubmit submit; } GwQueue;
+static GwQueue gw_q[32]; static int gw_nq; static pthread_mutex_t gw_qm=PTHREAD_MUTEX_INITIALIZER;
+static _Atomic u64 gw_submits, gw_sub_set_admitted, gw_sub_set_outside, gw_queues_seen;
+static void VKAPI_PTR gw_get_device_queue(VkDevice d,uint32_t fam,uint32_t idx,VkQueue *q){
+    PFN_vkGetDeviceQueue real=(PFN_vkGetDeviceQueue)gw_real_gdpa(d,"vkGetDeviceQueue"); PFN_vkQueueSubmit sub=(PFN_vkQueueSubmit)gw_real_gdpa(d,"vkQueueSubmit");
+    if(!real||!sub) kh_fatal(NULL,"gfx-gipa-wrapper: the Vulkan device has no vkGetDeviceQueue / vkQueueSubmit");
+    real(d,fam,idx,q); atomic_fetch_add(&gw_queues_seen,1);
+    pthread_mutex_lock(&gw_qm); int i; for(i=0;i<gw_nq;i++) if(gw_q[i].q==*q) break;
+    if(i==gw_nq){ if(gw_nq>=32){ pthread_mutex_unlock(&gw_qm); kh_fatal(NULL,"gfx-gipa-wrapper: more than 32 VkQueues"); } gw_nq++; }
+    gw_q[i].q=*q; gw_q[i].submit=sub; pthread_mutex_unlock(&gw_qm);
+}
+static VkResult VKAPI_PTR gw_queue_submit(VkQueue q,uint32_t n,const VkSubmitInfo *si,VkFence f){
+    PFN_vkQueueSubmit real=NULL; pthread_mutex_lock(&gw_qm); for(int i=0;i<gw_nq;i++) if(gw_q[i].q==q){ real=gw_q[i].submit; break; } pthread_mutex_unlock(&gw_qm);
+    if(!real) kh_fatal(NULL,"gfx-gipa-submit-queue: vkQueueSubmit on a VkQueue that vkGetDeviceQueue never returned through the gipa wrapper");
+    atomic_fetch_add(&gw_submits,1);
+    if(kh_gfx_gate_is_set()){
+        if(kh_gfx_gate_thread_admitted()) atomic_fetch_add(&gw_sub_set_admitted,1);
+        else if(atomic_fetch_add(&gw_sub_set_outside,1)<8) fprintf(stderr,"kh: gfx gate: vkQueueSubmit by vkd3d while the suspend gate is set, on a thread that is NOT admitted (counted; the gate does not hold this path)\n"); }
+    return real(q,n,si,f);
+}
+void kh_gfx_submit_counts(u64 *total,u64 *set_admitted,u64 *set_outside){ *total=atomic_load(&gw_submits); *set_admitted=atomic_load(&gw_sub_set_admitted); *set_outside=atomic_load(&gw_sub_set_outside); }
+static PFN_vkVoidFunction VKAPI_PTR gw_gdpa(VkDevice d,const char *name){
+    PFN_vkVoidFunction f=gw_real_gdpa(d,name);
+    if(!f||!name) return f;
+    if(!strcmp(name,"vkGetDeviceQueue")) return (PFN_vkVoidFunction)gw_get_device_queue;
+    if(!strcmp(name,"vkQueueSubmit")) return (PFN_vkVoidFunction)gw_queue_submit;
+    return f;
+}
 static PFN_vkVoidFunction VKAPI_PTR kh_vk_gipa_wrap(VkInstance inst,const char *name){
     atomic_fetch_add(&gw_names,1);
     if(name&&!strcmp(name,"vkGetInstanceProcAddr")) return (PFN_vkVoidFunction)kh_vk_gipa_wrap;
@@ -323,6 +359,7 @@ static PFN_vkVoidFunction VKAPI_PTR kh_vk_gipa_wrap(VkInstance inst,const char *
     if(!f||!name) return f;
     if(!strcmp(name,"vkCreateInstance")){ gw_real_ci=(PFN_vkCreateInstance)f; return (PFN_vkVoidFunction)gw_create_instance; }
     if(!strcmp(name,"vkCreateDevice")){ gw_real_cd=(PFN_vkCreateDevice)f; return (PFN_vkVoidFunction)gw_create_device; }
+    if(!strcmp(name,"vkGetDeviceProcAddr")){ gw_real_gdpa=(PFN_vkGetDeviceProcAddr)f; return (PFN_vkVoidFunction)gw_gdpa; }   /* TASK41 */
     return f;
 }
 /* requested as OPTIONAL: a missing one is skipped by vkd3d (device.c 355-367, 415-420); a missing REQUIRED one would only be warned
@@ -1396,8 +1433,10 @@ void kh_gfx_vkd3d_report(FILE *f){
             P(n_devices),P(n_probe_devices),P(kh_native_calls),P(n_events_signalled),P(n_bundles_made),P(n_bundles_run),P(n_bundle_cmds),P(n_bundles_live),P(n_default_tables),nlst,P(dumps_written),dump_dir[0]?" in ":"",dump_dir);
     if(hash_path[0]) fprintf(f,"kh: gfx hash log: %llu presents hashed into %s\n",P(hashes_written),hash_path);
     if(band_path[0]) fprintf(f,"kh: gfx band log: %llu presents measured into %s\n",P(bands_written),band_path);
-    fprintf(f,"kh: gfx vkd3d: back buffers %s: own images made %llu, destroyed %llu, drains %llu (wait slices not counted under the gate %llu); live Vulkan objects of the runtime %lld; gipa wrapper: %llu names, vkCreateInstance %llu, vkCreateDevice %llu\n",
-            bb_names[bb_mode_env],P(n_bb_images_made),P(n_bb_images_freed),P(n_bb_drains),P(atomic_load(&n_bb_drain_free)),kh_vko_live_total(),P(gw_names),P(gw_inst_calls),P(gw_dev_calls));
+    fprintf(f,"kh: gfx vkd3d: back buffers %s: own images made %llu, destroyed %llu, drains %llu (wait slices not counted under the gate %llu); live Vulkan objects of the runtime %lld; gipa wrapper: %llu names, vkCreateInstance %llu, vkCreateDevice %llu; "
+              "vkQueueSubmit by vkd3d %llu on %llu VkQueue(s) (while the suspend gate was set: admitted %llu, OUTSIDE an admission %llu)\n",
+            bb_names[bb_mode_env],P(n_bb_images_made),P(n_bb_images_freed),P(n_bb_drains),P(atomic_load(&n_bb_drain_free)),kh_vko_live_total(),P(gw_names),P(gw_inst_calls),P(gw_dev_calls),
+            P(atomic_load(&gw_submits)),P(atomic_load(&gw_queues_seen)),P(atomic_load(&gw_sub_set_admitted)),P(atomic_load(&gw_sub_set_outside)));
     kh_present_report(f); kh_gfx_gate_report(f);
     census_line(f,"report");                                                     /* TASK38: the memory census, every 300 presents and at exit */
     census_report(f);
@@ -1868,6 +1907,7 @@ done:
     if(dev&&q&&fct){ char sv[sizeof dump_dir]; memcpy(sv,dump_dir,sizeof sv); dump_dir[0]=0; st_fails+=kh_present_selftest(g,0,dev,q,fct); memcpy(dump_dir,sv,sizeof sv); }
     else fprintf(stderr,"kh: gfx present selftest: SKIPPED (the device selftest stopped before its swap chain existed)\n");
     if(kh_gfx_wrap_on) st_fails+=kh_wrap_selftest_device(g);                     /* wrapper identity, reference counts, by-value results, Map round trip */
+    if(kh_gfx_wrap_on){ extern int kh_wrap_selftest_suspend(KCtx*); st_fails+=kh_wrap_selftest_suspend(g); }   /* TASK41: step 11 with real queues */
     return st_fails;
 }
 #endif

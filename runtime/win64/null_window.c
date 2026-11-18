@@ -13,6 +13,7 @@
  * checks that the game really built W x H (runtime/aspect.c kh_screen_check_present: the named, counted WARNING screen-not-applied
  * otherwise, in the exit report below). */
 #include "khnmc_rt.h"
+#include "khnmc_app.h"
 
 #define HWND_MAIN 0xAB0001ull
 #define HMON_MAIN 0xAB0100ull
@@ -38,8 +39,14 @@ int kh_screen_parse(const char *s,int *w,int *h){
     *w=(int)v[0]; *h=(int)v[1]; return 0;
 }
 /* the seam's configuration from the two variables (unset = NULL); every refusal is a named fatal */
+int kh_present_layer_size(uint32_t *w,uint32_t *h);
 void kh_screen_config(const char *screen,const char *khwin){
     if(!screen||!*screen) return;
+    /* TASK41: KHNMC_SCREEN=layer = the drawable size of the shell's CAMetalLayer, handed over by kh_present_set_layer BEFORE the game
+     * thread starts (runtime/ios/ios_main.m: after the first layout).  The phone's run conf says `layer`; the shell knows the size */
+    char lay[48]; if(!strcmp(screen,"layer")){ uint32_t lw=0,lh=0;
+        if(!kh_present_layer_size(&lw,&lh)) kh_fatal(NULL,"screen-layer-unset: KHNMC_SCREEN=layer but the shell handed over no layer size (kh_present_set_layer before the game starts)");
+        snprintf(lay,sizeof lay,"%ux%u",lw,lh); fprintf(stderr,"kh: screen: KHNMC_SCREEN=layer: the shell's drawable is %s\n",lay); screen=lay; }
     int w=0,h=0, r=kh_screen_parse(screen,&w,&h);
     if(r==1) kh_fatal(NULL,"screen-value-malformed: KHNMC_SCREEN=%s: expected WxH, two decimal numbers joined by a lower-case x (e.g. 1920x1350)",screen);
     if(r) kh_fatal(NULL,"screen-value-range: KHNMC_SCREEN=%s: each side must be 16..16384 pixels",screen);
@@ -54,6 +61,7 @@ void kh_seam_window_init(void){
 }
 /* the screen the seam reports (1920x1080 unless KHNMC_SCREEN); returns 1 when KHNMC_SCREEN set it */
 int kh_screen_size(int *w,int *h){ if(w) *w=scr_w; if(h) *h=scr_h; return scr_set; }
+void kh_window_client_size(int *w,int *h){ *w=win_w; *h=win_h; }      /* review A41 (verification): the form's ClientSize (GetClientRect's answer) for the PC's restore */
 void kh_screen_check_counts(u64 *presents,u64 *bad);   /* runtime/aspect.c: the built size against the screen at each present */
 void kh_screen_report(FILE *f){
     if(!scr_set) return;
@@ -86,7 +94,11 @@ IMP(U32,GetClientRect){ kh_cnt_window_calls++; u64 r=A1(g); wr32(g,r,0); wr32(g,
 IMP(U32,AdjustWindowRect){ kh_cnt_window_calls++; u64 r=A0(g); (void)r; SET_RAX(g,1); }      /* no frame in the headless window: client == window */
 IMP(U32,ScreenToClient){ SET_RAX(g,1); }
 IMP(U32,GetCursorPos){ u64 p=A0(g); wr32(g,p,(u32)(scr_w/2)); wr32(g,p+4,(u32)(scr_h/2)); SET_RAX(g,1); }
-IMP(U32,GetForegroundWindow){ kh_cnt_window_calls++; SET_RAX(g,HWND_MAIN); }            /* the window "has focus" (the pad poll is gated on it) */
+/* the window "has focus" (the pad poll is gated on it).  TASK41: while the app is not active (runtime/app_life.c: from the shell's
+ * sceneWillResignActive to its sceneDidBecomeActive, or a KHNMC_TEST_SUSPEND run) the foreground window is another one (0), as on the PC
+ * when the game's window loses focus: the game's own input update 0x105810 resets each PADDATA to neutral every frame and 0x134ff0 reads
+ * the pad only when GetForegroundWindow() is the game's window (0x13501c-0x135022), so the game sees neutral pads, exactly as on the PC */
+IMP(U32,GetForegroundWindow){ kh_cnt_window_calls++; if(__builtin_expect(!kh_app_window_active(),0)){ kh_app_note_foreground_query(); SET_RAX(g,0); return; } SET_RAX(g,HWND_MAIN); }
 IMP(U32,IsZoomed){ SET_RAX(g,win_zoomed); }
 IMP(U32,GetSystemMetrics){ int i=(int)A0(g); SET_RAX(g,(u32)(i==0?scr_w:i==1?scr_h:0)); }
 IMP(U32,MonitorFromWindow){ SET_RAX(g,HMON_MAIN); }

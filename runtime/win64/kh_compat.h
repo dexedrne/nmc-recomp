@@ -105,16 +105,34 @@ static inline int kh_cond_wait_until(pthread_cond_t *cv,pthread_mutex_t *m,const
  * number of slices that EXPIRED: a stop of any length costs the one slice it interrupts, the peer gets every remaining slice to
  * finish in.  A forward step of the wall clock costs one slice too.  The caller looks at its condition again after every call. */
 __attribute__((weak)) unsigned kh_stuck_slice_ms=1000;      /* one definition for the program (weak in every unit); the selftest shortens it */
-/* one slice on a kh_cond_init condition (monotonic).  0 = look again; ETIMEDOUT = `slices` slices have expired */
+/* TASK41 (IOS-GRAPHICS-PLAN step 11, docs/IOS-SHELL.md "Time"): NO STUCK BUDGET COUNTS TIME PARKED AT THE SUSPEND GATE.  A gate held while
+ * the process keeps running (Control Center open for a minute, a long suspend drain) parks the game's submitting threads at a frame
+ * boundary; a peer that waits for one of them (the load-list lock, the two waits for the audio pass, a frames-clock client) must not
+ * run out of its budget meanwhile.  The gate (runtime/gfx_present.c kh_gfx_gate_set / _clear) adds 1 to kh_stuck_gate_seq at every
+ * set and every clear, so the value is odd while the gate is set.  An expired slice counts against a budget only when the gate was
+ * clear for the WHOLE slice: clear at its start, clear at its end and never set in between (the same number at both ends, and even).
+ * A slice that did not count is added to kh_stuck_gate_free (reported with the gate, runtime/app_life.c).  With the gate never set the
+ * number stays 0 and every slice counts, exactly as before.  The gate's own bounded waits (kh_gfx_gate_quiesce, the suspend drain) are
+ * meant to run out while it is set and do not use these helpers. */
+__attribute__((weak)) unsigned kh_stuck_gate_seq;           /* odd = the suspend gate is set (weak in every unit, like kh_stuck_slice_ms) */
+__attribute__((weak)) unsigned long long kh_stuck_gate_free;   /* expired slices that were not counted because the gate was set */
+static inline unsigned kh_stuck_gate_now(void){ return __atomic_load_n(&kh_stuck_gate_seq,__ATOMIC_ACQUIRE); }
+/* 1 = an expired slice that began when kh_stuck_gate_now() said `at_start` counts; 0 = it overlapped a set gate (counted as free) */
+static inline int kh_stuck_slice_counts(unsigned at_start){
+    unsigned now=kh_stuck_gate_now(); if(now==at_start&&!(now&1u)) return 1;
+    __atomic_fetch_add(&kh_stuck_gate_free,1ull,__ATOMIC_RELAXED); return 0; }
+/* one slice on a kh_cond_init condition (monotonic).  0 = look again; ETIMEDOUT = `slices` slices have expired (slices that overlapped
+ * a set suspend gate do not count, see above) */
 static inline int kh_cond_wait_stuck(pthread_cond_t *cv,pthread_mutex_t *m,unsigned *expired,unsigned slices){
-    struct timespec dl; kh_mono_deadline_ms(&dl,kh_stuck_slice_ms);
-    if(kh_cond_wait_until(cv,m,&dl)==ETIMEDOUT && ++*expired>=slices) return ETIMEDOUT;
+    unsigned gs=kh_stuck_gate_now(); struct timespec dl; kh_mono_deadline_ms(&dl,kh_stuck_slice_ms);
+    if(kh_cond_wait_until(cv,m,&dl)==ETIMEDOUT && kh_stuck_slice_counts(gs) && ++*expired>=slices) return ETIMEDOUT;
     return 0; }
 /* the same on a default condition (PTHREAD_COND_INITIALIZER / pthread_cond_init(cv,NULL)): its deadline is REALTIME on every host */
 static inline int kh_cond_wait_stuck_rt(pthread_cond_t *cv,pthread_mutex_t *m,unsigned *expired,unsigned slices){
+    unsigned gs=kh_stuck_gate_now();
     struct timespec dl; clock_gettime(CLOCK_REALTIME,&dl); dl.tv_sec+=(time_t)(kh_stuck_slice_ms/1000u); dl.tv_nsec+=(long)(kh_stuck_slice_ms%1000u)*1000000L;
     if(dl.tv_nsec>=1000000000L){ dl.tv_sec++; dl.tv_nsec-=1000000000L; }
-    if(pthread_cond_timedwait(cv,m,&dl)==ETIMEDOUT && ++*expired>=slices) return ETIMEDOUT;
+    if(pthread_cond_timedwait(cv,m,&dl)==ETIMEDOUT && kh_stuck_slice_counts(gs) && ++*expired>=slices) return ETIMEDOUT;
     return 0; }
 
 /* ---- sleep to an absolute monotonic time ---- */
@@ -149,6 +167,7 @@ static inline int kh_tmutex_lock_timeout_ms(kh_tmutex *t,unsigned ms){
     return pthread_mutex_timedlock(t,&dl); }
 static inline int kh_tmutex_unlock(kh_tmutex *t){ return pthread_mutex_unlock(t); }
 #endif
-/* lock t in slices: 0, another error of the lock, or ETIMEDOUT after `slices` slices have expired (see "a peer is stuck" above) */
+/* lock t in slices: 0, another error of the lock, or ETIMEDOUT after `slices` slices have expired (see "a peer is stuck" above; slices
+ * that overlapped a set suspend gate do not count, TASK41) */
 static inline int kh_tmutex_lock_stuck(kh_tmutex *t,unsigned slices){
-    for(unsigned n=0;;){ int rc=kh_tmutex_lock_timeout_ms(t,kh_stuck_slice_ms); if(rc!=ETIMEDOUT) return rc; if(++n>=slices) return ETIMEDOUT; } }
+    for(unsigned n=0;;){ unsigned gs=kh_stuck_gate_now(); int rc=kh_tmutex_lock_timeout_ms(t,kh_stuck_slice_ms); if(rc!=ETIMEDOUT) return rc; if(kh_stuck_slice_counts(gs)&&++n>=slices) return ETIMEDOUT; } }

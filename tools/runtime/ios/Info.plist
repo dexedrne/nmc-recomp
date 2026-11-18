@@ -39,6 +39,14 @@
 		<key>UIApplicationSupportsMultipleScenes</key>
 		<false/>
 	</dict>
+	<!-- TASK41 (IOS-GRAPHICS-PLAN step 10): the game view fills the screen in landscape; no status bar (the view controller also says
+	     prefersStatusBarHidden and prefersHomeIndicatorAutoHidden); full screen only (no Split View / Slide Over on an iPad) -->
+	<key>UIStatusBarHidden</key>
+	<true/>
+	<key>UIViewControllerBasedStatusBarAppearance</key>
+	<true/>
+	<key>UIRequiresFullScreen</key>
+	<true/>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UIFileSharingEnabled</key>

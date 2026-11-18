@@ -134,6 +134,7 @@ int  kh_present_selftest(KCtx *g,u64 m,u64 dev,u64 q,u64 fct);                  
  * that Waits on it is blocked until then: the bounded waits must not count the held time) */
 typedef struct { ID3D12Fence *fence; unsigned set_ms, hold_ms; const volatile u64 *after_change; u64 from; u64 set_ns, cleared_ns; int changed; } KhGateHoldSig;
 void *kh_gfx_test_hold_then_signal(void *arg);
+void kh_gfx_submit_counts(u64 *total,u64 *set_admitted,u64 *set_outside);   /* TASK41: vkQueueSubmit calls by vkd3d (the gipa wrapper) */
 
 /* ---- selftest helpers: call a guest-visible function pointer like a lifted `call` (n arguments, 4 in registers) ----------------- */
 extern int kh_gfxc_st_fails;

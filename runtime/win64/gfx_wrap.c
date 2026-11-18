@@ -70,7 +70,9 @@
 #include <sys/wait.h>
 
 #ifndef KH_GFX_VKD3D
+#include "khnmc_app.h"
 int kh_wrap_selftest_pure(KCtx *g){ (void)g; fprintf(stderr,"kh: gfx wrap selftest: SKIPPED (the vkd3d backend is not compiled into this binary)\n"); return 0; }
+int kh_gfx_queues_drain(unsigned slices,unsigned slice_ms,KhDrainResult *r){ (void)slices;(void)slice_ms; memset(r,0,sizeof *r); return 1; }   /* TASK41: no backend, no queue */
 #else
 #include "gfx_vkd3d_int.h"
 
@@ -155,11 +157,37 @@ static u64 w_get(KCtx *g,void *real,int kind,int fresh){
 }
 u64 kh_wrap_obj(KCtx *g,void *real,int kind){ return w_get(g,real,kind,0); }
 static u64 w_lookup(const void *real){ pthread_mutex_lock(&wm); WEnt *e=wt_find(real); u64 o=e?e->obj:0; pthread_mutex_unlock(&wm); return o; }
+/* ---- TASK41 (IOS-GRAPHICS-PLAN step 11): the queue registry ----------------------------------------------------------------------
+ * Every command queue the game creates through this bridge (ID3D12Device::CreateCommandQueue, slot 8) is registered; the suspend drain
+ * (kh_gfx_queues_drain, called on the drain worker of runtime/app_life.c, never on the main thread) signals a runtime fence on EVERY one
+ * of them and polls GetCompletedValue, bounded.  The registry holds no reference: the game sees the same reference counts as before.
+ * An entry goes when the real queue dies (w_kill, under wm); the drain takes wm while it AddRefs the queues it is about to use, so a
+ * queue cannot die between being listed and being referenced.  Per queue: ExecuteCommandLists / Signal / Wait calls (a Wait means the
+ * queue may be blocked on a fence: plan fact 11).  The trampoline bridge (KHNMC_GFX=vkd3d, Linux identity builds only) does not
+ * register its queues: the drain then reports 0 queues, by name. */
+#define QREG_MAX 16
+typedef struct { ID3D12CommandQueue *q; ID3D12Fence *fence; u64 val; u64 execs, signals, waits, drains, late; } QReg;
+static QReg qreg[QREG_MAX]; static int nqreg; static pthread_mutex_t qreg_m=PTHREAD_MUTEX_INITIALIZER; static u64 qreg_made, qreg_gone;
+static void qreg_add(KCtx *g,ID3D12CommandQueue *q){
+    pthread_mutex_lock(&qreg_m);
+    for(int i=0;i<nqreg;i++) if(qreg[i].q==q){ pthread_mutex_unlock(&qreg_m); return; }
+    if(nqreg>=QREG_MAX){ pthread_mutex_unlock(&qreg_m); kh_fatal(g,"gfx-queue-registry-full: more than %d live command queues (the suspend drain must reach every one)",QREG_MAX); }
+    memset(&qreg[nqreg],0,sizeof qreg[nqreg]); qreg[nqreg++].q=q; qreg_made++; pthread_mutex_unlock(&qreg_m);
+}
+static void qreg_drop(void *real){                /* caller holds wm (w_kill): the real queue is gone */
+    pthread_mutex_lock(&qreg_m);
+    for(int i=0;i<nqreg;i++) if(qreg[i].q==real){ if(qreg[i].fence) ID3D12Fence_Release(qreg[i].fence); qreg[i]=qreg[--nqreg]; qreg_gone++; break; }
+    pthread_mutex_unlock(&qreg_m);
+}
+static void qreg_count(ID3D12CommandQueue *q,int what){
+    pthread_mutex_lock(&qreg_m); for(int i=0;i<nqreg;i++) if(qreg[i].q==q){ if(what==0) qreg[i].execs++; else if(what==1) qreg[i].signals++; else qreg[i].waits++; break; } pthread_mutex_unlock(&qreg_m);
+}
 /* caller holds wm: the real object is gone, so is its guest object */
 static void w_kill(KCtx *g,WEnt *e){
     u64 o=e->obj; int kind=e->kind; void *real=e->real; wt_del(e);
     wr64(g,o,0); wr64(g,o+16,0); wr64(g,o+W_REAL,0); wr64(g,o+W_COOKIE,0); ga_free(o); atomic_fetch_add(&n_dead[kind],1);
     if(kind==WK_LIST) kh_gfxc_track_drop(U(real));
+    if(kind==WK_QUEUE) qreg_drop(real);
 }
 /* Release through the guest object.  The table lock is held across the real Release: a new object that vkd3d places at the same address
  * cannot be wrapped before the old entry is gone. */
@@ -324,7 +352,9 @@ static int w_dev(KCtx *g,ID3D12Device *d,int s){
     switch(s){
     case 7: SET_RAX(g,ID3D12Device_GetNodeCount(d)); return 1;
     case 8: { D3D12_COMMAND_QUEUE_DESC qd; u64 pp=A3(g); void *out=NULL;         /* CreateCommandQueue(desc, riid, **pp) */
-        HRESULT hr=ID3D12Device_CreateCommandQueue(d,CP(qd,A1(g)),iidp(g,A2(g),"CreateCommandQueue"),pp?&out:NULL); w_out(g,pp,hr,out,WK_QUEUE); return 1; }
+        HRESULT hr=ID3D12Device_CreateCommandQueue(d,CP(qd,A1(g)),iidp(g,A2(g),"CreateCommandQueue"),pp?&out:NULL);
+        if(SUCCEEDED(hr)&&out) qreg_add(g,(ID3D12CommandQueue*)out);            /* TASK41: the suspend drain reaches every queue */
+        w_out(g,pp,hr,out,WK_QUEUE); return 1; }
     case 9: { u32 type=(u32)A1(g); u64 pp=A3(g); void *out=NULL;                 /* CreateCommandAllocator(type, riid, **pp): vkd3d has no bundles, ours is the recorder's */
         if(type==D3D12_COMMAND_LIST_TYPE_BUNDLE){ if(!pp) kh_fatal(g,"gfx-bundle: CreateCommandAllocator(BUNDLE) without a result pointer"); wr64(g,pp,kh_gfxc_bundle_allocator_new(g)); SET_RAX(g,0); return 1; }
         HRESULT hr=ID3D12Device_CreateCommandAllocator(d,(D3D12_COMMAND_LIST_TYPE)type,iidp(g,A2(g),"CreateCommandAllocator"),pp?&out:NULL); w_out(g,pp,hr,out,WK_ALLOCATOR); return 1; }
@@ -403,13 +433,24 @@ static int w_dev(KCtx *g,ID3D12Device *d,int s){
     }
     return 0;
 }
+/* TASK41 (plan step 11; "Review c1/c2" item 1): the game's three queue calls that can submit are ADMISSIONS at the suspend gate.  A
+ * thread that arrives while the gate is set waits here (counted, no runtime lock held) before vkd3d sees the call; one that was already
+ * inside when the gate was set holds kh_gfx_gate_quiesce until its call returned.  With the gate never set this is a mutex and two
+ * counters per call, and the call itself is unchanged. */
 static int w_queue(KCtx *g,ID3D12CommandQueue *q,int s){
     switch(s){
     case 10: { u32 n=(u32)A1(g); WX x; wx_init(&x,g);                            /* ExecuteCommandLists(count, lists) */
-        ID3D12CommandQueue_ExecuteCommandLists(q,n,(ID3D12CommandList*const*)x_ifaces(&x,A2(g),n,WK_LIST,"ExecuteCommandLists")); wx_done(&x); atomic_fetch_add(&gfx_execs,1); return 1; }
-    case 14: SET_RAX(g,(u32)ID3D12CommandQueue_Signal(q,(ID3D12Fence*)kh_wrap_real(g,A1(g),WK_FENCE,"ID3D12CommandQueue::Signal"),A2(g))); return 1;
-    case 15: kh_gfx_gate_note_queue_wait();                                      /* TASK36: from now on a queue may be blocked (gfx_present.h) */
-             SET_RAX(g,(u32)ID3D12CommandQueue_Wait(q,(ID3D12Fence*)kh_wrap_real(g,A1(g),WK_FENCE,"ID3D12CommandQueue::Wait"),A2(g))); return 1;
+        ID3D12CommandList *const *ls=(ID3D12CommandList*const*)x_ifaces(&x,A2(g),n,WK_LIST,"ExecuteCommandLists");
+        kh_gfx_gate_enter("game queue: ID3D12CommandQueue::ExecuteCommandLists"); kh_gfx_gate_assert_admitted("game queue: ID3D12CommandQueue::ExecuteCommandLists");
+        ID3D12CommandQueue_ExecuteCommandLists(q,n,ls); kh_gfx_gate_leave();
+        wx_done(&x); atomic_fetch_add(&gfx_execs,1); qreg_count(q,0); return 1; }
+    case 14: { ID3D12Fence *f=(ID3D12Fence*)kh_wrap_real(g,A1(g),WK_FENCE,"ID3D12CommandQueue::Signal");
+        kh_gfx_gate_enter("game queue: ID3D12CommandQueue::Signal"); kh_gfx_gate_assert_admitted("game queue: ID3D12CommandQueue::Signal");
+        HRESULT hr=ID3D12CommandQueue_Signal(q,f,A2(g)); kh_gfx_gate_leave(); qreg_count(q,1); SET_RAX(g,(u32)hr); return 1; }
+    case 15: { ID3D12Fence *f=(ID3D12Fence*)kh_wrap_real(g,A1(g),WK_FENCE,"ID3D12CommandQueue::Wait");
+        kh_gfx_gate_note_queue_wait();                                            /* TASK36: from now on a queue may be blocked (gfx_present.h) */
+        kh_gfx_gate_enter("game queue: ID3D12CommandQueue::Wait"); kh_gfx_gate_assert_admitted("game queue: ID3D12CommandQueue::Wait");
+        HRESULT hr=ID3D12CommandQueue_Wait(q,f,A2(g)); kh_gfx_gate_leave(); qreg_count(q,2); SET_RAX(g,(u32)hr); return 1; }
     case 16: { UINT64 f=0; HRESULT hr=ID3D12CommandQueue_GetTimestampFrequency(q,A1(g)?&f:NULL); if(A1(g)) wr64(g,A1(g),f); SET_RAX(g,(u32)hr); return 1; }
     case 17: { UINT64 a=0,b=0; HRESULT hr=ID3D12CommandQueue_GetClockCalibration(q,A1(g)?&a:NULL,A2(g)?&b:NULL); if(A1(g)) wr64(g,A1(g),a); if(A2(g)) wr64(g,A2(g),b); SET_RAX(g,(u32)hr); return 1; }
     case 18: { u64 ret=A1(g); D3D12_COMMAND_QUEUE_DESC r=ID3D12CommandQueue_GetDesc(q); memcpy(hp(g,ret),&r,sizeof r); SET_RAX(g,ret); return 1; }
@@ -495,8 +536,11 @@ static int w_fence(KCtx *g,ID3D12Fence *f,int s){
     switch(s){
     case 8: SET_RAX(g,ID3D12Fence_GetCompletedValue(f)); return 1;
     case 9: SET_RAX(g,(u32)ID3D12Fence_SetEventOnCompletion(f,A1(g),(HANDLE)(uintptr_t)A2(g))); return 1;     /* the HANDLE is an id of OUR handle table (pfn_signal_event) */
-    case 10: kh_gfx_gate_park_fence_signal();                                    /* TASK36: a CPU signal can make vkd3d submit queued work (gfx_present.h) */
-             SET_RAX(g,(u32)ID3D12Fence_Signal(f,A1(g))); return 1;
+    case 10: { /* TASK36 / TASK41: a CPU signal can make vkd3d submit the queued work of a blocked queue (plan fact 11): while a queue may
+                * be blocked it is an ADMISSION (waits while the gate is set, holds quiesce while it runs); otherwise it is not gated */
+        int adm=kh_gfx_gate_enter_if_may_block("game: ID3D12Fence::Signal (a queue may be blocked)");
+        if(adm) kh_gfx_gate_assert_admitted("game: ID3D12Fence::Signal");
+        HRESULT hr=ID3D12Fence_Signal(f,A1(g)); if(adm) kh_gfx_gate_leave(); SET_RAX(g,(u32)hr); return 1; }
     }
     return 0;
 }
@@ -562,8 +606,59 @@ void kh_wrap_serialize_rootsig(KCtx *g){
     SET_RAX(g,(u32)hr);
 }
 
+/* ---- TASK41: the suspend drain (plan step 11, "Leaving" steps 3 and 4) ------------------------------------------------------------------
+ * On the drain worker (runtime/app_life.c), after the gate was set and kh_gfx_gate_quiesce returned: on EVERY registered queue a runtime
+ * fence (one per queue, made on first use) is signalled, as an admission of the suspend drain (kh_gfx_gate_enter_drain: the only
+ * submission allowed while the gate is set), and its completion is polled with GetCompletedValue, at most `slices` expired slices of
+ * `slice_ms` for all queues together (a stopped process costs one slice; this bound is meant to run while the gate is set, so it does not
+ * use the stuck helpers).  SetEventOnCompletion(NULL) has no time-out (vkd3d command.c 1159-1177) and is not used.  The return value
+ * and *r say how many queues drained; the caller (app_life.c) holds CPU fence signals when one did not, or when a queue Wait was seen. */
+#include "khnmc_app.h"
+static KCtx *drain_g;                                                  /* the worker's context: only for a release that ends a queue */
+int kh_gfx_queues_drain(unsigned slices,unsigned slice_ms,KhDrainResult *r){
+    memset(r,0,sizeof *r); r->registered_bridge=kh_gfx_wrap_on;
+    if(!kh_gfx_vkd3d_on) return 1;                                     /* the null backend: no GPU queue exists */
+    if(!kh_gfx_wrap_on){ static int said; if(!said++) fprintf(stderr,"kh: app: suspend drain: the trampoline bridge (KHNMC_GFX=vkd3d, Linux identity builds only) registers no queue: NOT drained (counted; the iOS app uses the wrapped bridge)\n");
+        r->failed=1; return 0; }
+    if(!drain_g) drain_g=kh_new_ctx();
+    ID3D12CommandQueue *qs[QREG_MAX]; ID3D12Fence *fs[QREG_MAX]; u64 vs[QREG_MAX]; int n=0;
+    pthread_mutex_lock(&wm); pthread_mutex_lock(&qreg_m);                /* wm: no queue dies between being listed and being referenced */
+    for(int i=0;i<nqreg;i++){ qs[n]=qreg[i].q; ID3D12CommandQueue_AddRef(qs[n]); r->waits+=qreg[i].waits; n++; }
+    pthread_mutex_unlock(&qreg_m); pthread_mutex_unlock(&wm);
+    r->queues=(unsigned)n;
+    for(int i=0;i<n;i++){ fs[i]=NULL; vs[i]=0;
+        pthread_mutex_lock(&qreg_m); int k=-1; for(int j=0;j<nqreg;j++) if(qreg[j].q==qs[i]){ k=j; break; }
+        if(k>=0&&!qreg[k].fence){ ID3D12Device *d=NULL; ID3D12Fence *nf=NULL;
+            if(SUCCEEDED(ID3D12CommandQueue_GetDevice(qs[i],&IID_ID3D12Device,(void**)&d))&&d){ if(FAILED(ID3D12Device_CreateFence(d,0,D3D12_FENCE_FLAG_NONE,&IID_ID3D12Fence,(void**)&nf))) nf=NULL; ID3D12Device_Release(d); }
+            qreg[k].fence=nf; }
+        if(k>=0&&qreg[k].fence){ fs[i]=qreg[k].fence; ID3D12Fence_AddRef(fs[i]); vs[i]=++qreg[k].val; qreg[k].drains++; }
+        pthread_mutex_unlock(&qreg_m);
+        if(!fs[i]){ r->failed++; fprintf(stderr,"kh: app: suspend drain: queue %d of %d: no runtime fence could be made: not drained (counted)\n",i+1,n); continue; }
+        kh_gfx_gate_enter_drain("suspend drain: ID3D12CommandQueue::Signal");
+        kh_gfx_gate_assert_admitted("suspend drain: ID3D12CommandQueue::Signal");
+        HRESULT hr=ID3D12CommandQueue_Signal(qs[i],fs[i],vs[i]); kh_gfx_gate_leave();
+        if(FAILED(hr)){ r->failed++; fprintf(stderr,"kh: app: suspend drain: queue %d of %d: Signal failed hr=0x%08x: not drained (counted)\n",i+1,n,(unsigned)hr); ID3D12Fence_Release(fs[i]); fs[i]=NULL; continue; }
+        r->signalled++; }
+    unsigned expired=0; u64 dl=kh_host_ns()+(u64)slice_ms*1000000ull;
+    for(int i=0;i<n;i++){ if(!fs[i]) continue;
+        for(;;){ UINT64 done=ID3D12Fence_GetCompletedValue(fs[i]);
+            if(done==~0ull){ r->failed++; fprintf(stderr,"kh: app: suspend drain: queue %d of %d: the fence reports a removed device (counted)\n",i+1,n); break; }
+            if(done>=vs[i]){ r->drained++; break; }
+            if(expired>=slices){ r->late++; pthread_mutex_lock(&qreg_m); for(int j=0;j<nqreg;j++) if(qreg[j].q==qs[i]) qreg[j].late++; pthread_mutex_unlock(&qreg_m); break; }
+            struct timespec ts={0,200000}; nanosleep(&ts,0);
+            u64 now=kh_host_ns(); if(now>=dl){ expired++; dl=now+(u64)slice_ms*1000000ull; } } }
+    r->slices=expired;
+    for(int i=0;i<n;i++){ if(fs[i]) ID3D12Fence_Release(fs[i]); kh_wrap_release_real(drain_g,qs[i]); }
+    return r->drained==r->queues;
+}
 /* ---- report ------------------------------------------------------------------------------------------------------------------------- */
 void kh_wrap_report(FILE *f){
+    pthread_mutex_lock(&qreg_m);                                        /* TASK41: only when a suspend drain ran or a queue Wait was made */
+    u64 used=0; for(int i=0;i<nqreg;i++) used+=qreg[i].drains+qreg[i].waits;
+    if(used){ fprintf(f,"kh: gfx wrap: command-queue registry (TASK41): %d live (%llu registered, %llu gone)",nqreg,P(qreg_made),P(qreg_gone));
+        for(int i=0;i<nqreg;i++) fprintf(f,"; queue %d: ExecuteCommandLists %llu, Signal %llu, Wait %llu, suspend drains %llu (not complete in the bound %llu)",i+1,P(qreg[i].execs),P(qreg[i].signals),P(qreg[i].waits),P(qreg[i].drains),P(qreg[i].late));
+        fputc('\n',f); }
+    pthread_mutex_unlock(&qreg_m);
     u64 total=0; for(int k=0;k<WK_N;k++) for(int s=0;s<MAXSLOT;s++) total+=wcalls[k][s];
     fprintf(f,"kh: gfx wrap: wrapped calls=%llu, calls through the Windows-ABI trampoline=%llu, Map calls=%llu, creation calls refused by vkd3d=%llu; guest objects made / gone (live):",P(total),P(kh_native_calls),P(n_maps),P(n_create_failed));
     for(int k=0;k<WK_N;k++) if(n_made[k]) fprintf(f," %s %llu/%llu (%llu)",wk[k].iface+(strncmp(wk[k].iface,"ID3D12",6)?0:6),P(n_made[k]),P(n_dead[k]),P(n_made[k]-n_dead[k]));
@@ -907,6 +1002,69 @@ done:
     T(kh_native_calls==nat0);
     ga_free(m); st_f+=kh_gfxc_st_fails;
     fprintf(stderr,"kh: gfx wrap device selftest: %d checks, %d failures (device %s, %s addresses, bias 0x%llx)\n",st_n,st_f,kh_gfxc_device_name(),KH_XLATE_MODE==0?"identity":"bias",P(XL(g,0)));
+    return st_f;
+}
+
+/* ---- TASK41: step 11 with real queues (KHNMC_GFX=vkd3dw --selftest) ---------------------------------------------------------------
+ * The queue registry and the suspend drain; the game's queue calls as admissions; the blocked-queue case of plan fact 11: a queue Waits
+ * on a fence nobody signalled and has work queued behind it, the gate is set, a CPU ID3D12Fence::Signal from another thread must NOT
+ * reach Vulkan (the gipa wrapper's vkQueueSubmit counter) until the gate is cleared.  Everything through the guest ABI. */
+typedef struct { u64 fence, sp, val; _Atomic int state; } StSig;
+static void *st_cpu_signal(void *a){ StSig *t=(StSig*)a; KCtx *g=kh_new_ctx(); KH_RSP(g)=t->sp; atomic_store(&t->state,1);
+    GC(VT(t->fence,10),t->fence,t->val); atomic_store(&t->state,2); free(g); return NULL; }
+static int st_live_queues(void){ pthread_mutex_lock(&qreg_m); int n=nqreg; pthread_mutex_unlock(&qreg_m); return n; }
+int kh_wrap_selftest_suspend(KCtx *g){
+    extern void rt_imp_d3d12__ord101(KCtx*);
+    st_n=st_f=0; kh_gfxc_st_fails=0;
+    u64 m=ga_calloc(1,4096), stk=ga_calloc(1,0x10000), dev=0,qa=0,qb=0,fw=0,al=0,l1=0,l2=0; int n0=st_live_queues();
+    T((u32)GI(rt_imp_d3d12__ord101,0,0xb000,GP(&IID_ID3D12Device),m)==0); dev=rd64(g,m); T(dev!=0); if(!dev) goto done;
+    memset(hp(g,m+16),0,16);
+    T((u32)GC(VT(dev,8),dev,m+16,GP(&IID_ID3D12CommandQueue),m+32)==0); qa=rd64(g,m+32); T((u32)GC(VT(dev,8),dev,m+16,GP(&IID_ID3D12CommandQueue),m+40)==0); qb=rd64(g,m+40);
+    T(qa&&qb&&st_live_queues()==n0+2); if(!qa||!qb) goto done;                                            /* 1. both queues are in the registry */
+    T((u32)GC(VT(dev,36),dev,0,0,GP(&IID_ID3D12Fence),m+48)==0); fw=rd64(g,m+48);
+    T((u32)GC(VT(dev,9),dev,0,GP(&IID_ID3D12CommandAllocator),m+56)==0); al=rd64(g,m+56);
+    T((u32)GC(VT(dev,12),dev,0,0,al,0,GP(&IID_ID3D12GraphicsCommandList),m+64)==0); l1=rd64(g,m+64); if(l1) T((u32)GC(VT(l1,9),l1)==0);   /* closed before the next one records */
+    T((u32)GC(VT(dev,12),dev,0,0,al,0,GP(&IID_ID3D12GraphicsCommandList),m+72)==0); l2=rd64(g,m+72); if(l2) T((u32)GC(VT(l2,9),l2)==0);
+    T(fw&&al&&l1&&l2); if(!fw||!al||!l1||!l2) goto done;
+    /* 2. the drain with the gate set and nothing blocked: every registered queue signalled (as the drain's own admission) and reached */
+    { KhDrainResult r; u64 s0,a0,o0; kh_gfx_submit_counts(&s0,&a0,&o0); kh_gfx_gate_set();
+      T(kh_gfx_queues_drain(40,50,&r)==1 && r.queues==(unsigned)(n0+2) && r.signalled==r.queues && r.drained==r.queues && !r.late && !r.failed);
+      u64 s1,a1,o1; kh_gfx_submit_counts(&s1,&a1,&o1); T(s1>s0 && a1>a0 && o1==o0); kh_gfx_gate_clear(); }
+    /* 3. the game's three queue calls are admissions: the gate set from INSIDE each holds kh_gfx_gate_quiesce until the call returned */
+    wr64(g,m+80,l2);
+    kh_gfx_gate_test_arm("game queue: ID3D12CommandQueue::ExecuteCommandLists",50); GC(VT(qb,10),qb,1,m+80); T(kh_gfx_gate_test_result("game queue: ExecuteCommandLists"));
+    kh_gfx_gate_test_arm("game queue: ID3D12CommandQueue::Signal",50); T((u32)GC(VT(qb,14),qb,fw,0)==0); T(kh_gfx_gate_test_result("game queue: Signal"));
+    kh_gfx_gate_test_arm("game queue: ID3D12CommandQueue::Wait",50); T((u32)GC(VT(qb,15),qb,fw,0)==0); T(kh_gfx_gate_test_result("game queue: Wait"));
+    /* 4. plan fact 11.  Queue A Waits on fw (value 1, nobody signalled it) and gets a command list behind the Wait: vkd3d submits
+     *    neither.  The gate is set; the drain finds A late (B is drained) and returns 0.  A CPU Signal of fw from another thread is an
+     *    admission now (a Wait was seen): it parks, and NO vkQueueSubmit happens while the gate is set; once it is cleared the signal
+     *    goes through and vkd3d submits A's queued work */
+    { ID3D12Fence *rfw=kh_wrap_real(g,fw,WK_FENCE,"selftest"); kh_gfx_gate_test_reset_queue_waits();
+      T((u32)GC(VT(qa,15),qa,fw,1)==0); wr64(g,m+88,l1); GC(VT(qa,10),qa,1,m+88);
+      kh_gfx_gate_set(); KhDrainResult r; u64 t0=kh_host_ns();
+      T(kh_gfx_queues_drain(4,25,&r)==0 && r.late==1 && r.drained==r.queues-1 && r.waits>=1 && kh_host_ns()-t0>=90000000ull);
+      u64 s2,a2,o2; kh_gfx_submit_counts(&s2,&a2,&o2); u64 p0=kh_gfx_gate_parks();
+      StSig sg; memset(&sg,0,sizeof sg); sg.fence=fw; sg.sp=(stk+0x10000-0x40)&~15ull; sg.val=1; pthread_t th; T(pthread_create(&th,NULL,st_cpu_signal,&sg)==0);
+      for(int i=0;i<2000&&kh_gfx_gate_parks()==p0;i++){ struct timespec ts={0,1000000}; nanosleep(&ts,0); }
+      struct timespec ts={0,150000000}; nanosleep(&ts,0);
+      u64 s3,a3,o3; kh_gfx_submit_counts(&s3,&a3,&o3);
+      T(kh_gfx_gate_parks()==p0+1 && atomic_load(&sg.state)==1 && ID3D12Fence_GetCompletedValue(rfw)==0 && s3==s2 && o3==o2);
+      kh_gfx_gate_clear(); pthread_join(th,NULL);
+      int ok=0; for(int i=0;i<20000&&!ok;i++){ ok=ID3D12Fence_GetCompletedValue(rfw)>=1; if(!ok){ struct timespec t1={0,500000}; nanosleep(&t1,0); } }
+      u64 s4,a4,o4; kh_gfx_submit_counts(&s4,&a4,&o4); T(ok && atomic_load(&sg.state)==2 && s4>s3 && o4==o3);
+      kh_gfx_gate_test_reset_queue_waits(); kh_gfx_gate_hold_fence_signals(0); }
+    /* 5. the drain needs the gate: anywhere else its Signal is the named fatal gfx-gate-drain-unset (a child process) */
+    if(kh_fork_ok()){ FILE *f=kh_tmpfile(); if(f){ pid_t c=kh_fork(); if(c==0){ dup2(fileno(f),2); KhDrainResult r; kh_gfx_queues_drain(1,10,&r); _exit(99); }
+        int stt=0; if(c>0) waitpid(c,&stt,0); char out[2048]; rewind(f); size_t k=fread(out,1,sizeof out-1,f); out[k]=0; fclose(f);
+        T(c>0 && WIFEXITED(stt) && WEXITSTATUS(stt)==3 && strstr(out,"gfx-gate-drain-unset")!=NULL); } }
+    else kh_selftest_not_run("gfx wrap suspend","the drain with the gate clear (a named fatal in a child process)",1);
+done:
+    if(l1) GC(VT(l1,2),l1); if(l2) GC(VT(l2,2),l2); if(al) GC(VT(al,2),al); if(fw) GC(VT(fw,2),fw);
+    if(qa) GC(VT(qa,2),qa); if(qb) GC(VT(qb,2),qb);
+    T(st_live_queues()==n0);                                                                                /* the registry follows the queues' lives */
+    if(dev) GC(VT(dev,2),dev);
+    ga_free(m); ga_free(stk); st_f+=kh_gfxc_st_fails;
+    fprintf(stderr,"kh: gfx wrap suspend selftest: %d checks, %d failures (queue registry; the suspend drain; the game's queue calls are admissions; a blocked queue and a CPU fence signal under the gate submit nothing until it clears; the drain needs the gate)\n",st_n,st_f);
     return st_f;
 }
 #endif

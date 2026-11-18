@@ -4,6 +4,7 @@
  * persistent maps work, copyable footprints computed from the resource description.  Anything outside the documented surface is a named fatal.
  * Also: d3dcompiler_47!D3DStripShader (copy), D3D12SerializeRootSignature (blob holding the desc), D3D11CreateDevice (movie decode device). */
 #include "khnmc_rt.h"
+#include "khnmc_app.h"
 #include "gfx_present.h"
 #include <time.h>
 
@@ -209,6 +210,7 @@ static int h_swap(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1
         kh_gfx_report(stderr);
         if(gfx_presents%300==0) kh_gfx_tex_report(stderr);
         if(kh_gfx_vkd3d_on) kh_vkd3d_present(g,o,gfx_presents);            /* optional image dump of the buffer being presented */
+        else kh_app_null_present_park();                                      /* TASK41 / review A41 (verification): the game stalls at its frame boundary while the app is SUSPENDED (background); a resign alone is the PC's focus loss (the game runs on); no GPU here */
         kh_screen_check_present(g,rd32(g,o+32),rd32(g,o+36),gfx_presents);  /* task 37 review: returns at once unless KHNMC_SCREEN is set */
         if(__builtin_expect(kh_aspect_log,0)) kh_aspect_note_present(g,gfx_presents);     /* task 37: GX size fields when they change */
         wr32(g,o+40,rd32(g,o+40)+1); SET_RAX(g,0); return 1;                 /* Present / Present1 */
@@ -376,6 +378,7 @@ void kh_seam_gfx_init(void){
     else if(e&&!strcmp(e,"vkd3dw")) kh_gfx_wrap_init();
     else if(e&&*e&&strcmp(e,"null")) kh_fatal(NULL,"gfx-backend-unknown: KHNMC_GFX=%s (known backends: null, vkd3d, vkd3dw)",e);
     kh_present_init(kh_gfx_vkd3d_on);                                         /* TASK36 review n=5: KHNMC_GFX_PRESENT in every build, with every backend */
+    { extern void kh_app_test_init(void); kh_app_test_init(); }                /* TASK41: KHNMC_TEST_GATE / KHNMC_TEST_SUSPEND (nothing when unset) */
     C_factory=kh_com_class("dxgi:IDXGIFactory4",44,STRICT,h_factory); C_adapter=kh_com_class("dxgi:IDXGIAdapter3",24,STRICT,h_adapter); C_output=kh_com_class("dxgi:IDXGIOutput",24,STRICT,h_output);
     C_swap=kh_com_class("dxgi:IDXGISwapChain3",44,STRICT,h_swap); C_dev=kh_com_class("d3d12:ID3D12Device",48,STRICT,h_dev); C_queue=kh_com_class("d3d12:ID3D12CommandQueue",20,STRICT,h_queue);
     /* the game creates and releases about 27 allocator + list pairs per frame (bundles): they are freed at their last Release, the other classes are few and kept */
@@ -478,6 +481,8 @@ static int release_selftest(KCtx *g){
 #undef RCHECK
     return fails;
 }
+static void *st_unsuspend_120(void *a){ (void)a; struct timespec ts={0,120000000}; nanosleep(&ts,0); kh_app_test_suspended(0); return NULL; }   /* TASK41 */
+static void *st_gate_clear_300(void *a){ (void)a; struct timespec ts={0,300000000}; nanosleep(&ts,0); kh_gfx_gate_clear(); return NULL; }  /* review A41: the safety net of a park that must not happen */
 int kh_gfx_selftest(KCtx *g){
     u64 list=new_obj(C_list,16), bundle=new_obj(C_list,16);
     u64 before=gfx_bundles;
@@ -500,6 +505,19 @@ int kh_gfx_selftest(KCtx *g){
         for(int i=0;ok&&i<64;i++) ok=rd8(g,bd+(u64)i)==(i<40?0x11:0);
         checks++; if(!ok){ fail++; fprintf(stderr,"kh: gfx selftest FAIL: D3D12SerializeRootSignature (null device): the blob is not the 40-byte descriptor followed by zeros\n"); }
         if(bd) ga_free(bd); if(b) ga_free(b); ga_free(d); ga_free(pp); }
+    /* TASK41 / review A41 (verification): the null backend's Present parks while the app is SUSPENDED (the game stalls at its frame boundary):
+     * suspended for 120 ms by another thread, Present returns only after that, one null park counted.  It does NOT park at the gate set
+     * alone (a resign: Control Center, a call banner = the PC's focus loss, the game runs on); a thread clears that gate after 300 ms as a
+     * safety net, and Present must return well before */
+    if(!kh_gfx_vkd3d_on){ u64 sc=new_obj(C_swap,96); wr32(g,sc+32,64); wr32(g,sc+36,32); u64 np0=gfx_presents, p0=kh_app_null_parks(), gp0=kh_gfx_gate_parks();
+        kh_app_test_suspended(1); pthread_t th; int ok=pthread_create(&th,NULL,st_unsuspend_120,NULL)==0; u64 t0=kh_host_ns();
+        kh_call(g,rd64(g,rd64(g,sc)+8*8),sc,1,0,0); u64 dt=kh_host_ns()-t0; if(ok) pthread_join(th,NULL);
+        ok=ok&&dt>=100000000ull&&kh_app_null_parks()==p0+1&&!kh_app_suspended()&&gfx_presents==np0+1; gfx_presents=np0;
+        checks++; if(!ok){ fail++; fprintf(stderr,"kh: gfx selftest FAIL: the null backend's Present did not park while suspended (%.1f ms, null parks +%llu)\n",dt/1e6,(unsigned long long)(kh_app_null_parks()-p0)); kh_app_test_suspended(0); }
+        kh_gfx_gate_set(); ok=pthread_create(&th,NULL,st_gate_clear_300,NULL)==0; t0=kh_host_ns();
+        kh_call(g,rd64(g,rd64(g,sc)+8*8),sc,1,0,0); dt=kh_host_ns()-t0; if(ok) pthread_join(th,NULL); else kh_gfx_gate_clear();
+        ok=ok&&dt<100000000ull&&kh_gfx_gate_parks()==gp0&&kh_app_null_parks()==p0+1&&gfx_presents==np0+1; gfx_presents=np0;
+        checks++; if(!ok){ fail++; fprintf(stderr,"kh: gfx selftest FAIL: the null backend's Present parked at a gate set alone (a resign: %.1f ms, gate parks +%llu)\n",dt/1e6,(unsigned long long)(kh_gfx_gate_parks()-gp0)); } }
     fprintf(stderr,"kh: gfx selftest: %d checks, %d failures\n",checks,fail);
     fail+=release_selftest(g);                                                /* task 30: resources destroyed at their last Release */
     fail+=kh_wrap_selftest_pure(g);                                           /* the wrapped bridge's translation layer: needs no device, runs with every backend */

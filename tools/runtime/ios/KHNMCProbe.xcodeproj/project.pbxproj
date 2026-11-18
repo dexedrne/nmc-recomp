@@ -200,6 +200,14 @@
 					Foundation,
 					"-framework",
 					UIKit,
+					"-framework",
+					AVFoundation,
+					"-framework",
+					AudioToolbox,
+					"-framework",
+					GameController,
+					"-framework",
+					QuartzCore,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = beer.vyvanse.khnmc.probe;
 				PRODUCT_NAME = KHNMCProbe;
@@ -231,6 +239,14 @@
 					Foundation,
 					"-framework",
 					UIKit,
+					"-framework",
+					AVFoundation,
+					"-framework",
+					AudioToolbox,
+					"-framework",
+					GameController,
+					"-framework",
+					QuartzCore,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = beer.vyvanse.khnmc.probe;
 				PRODUCT_NAME = KHNMCProbe;

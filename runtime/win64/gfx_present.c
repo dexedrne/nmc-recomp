@@ -67,6 +67,25 @@ static void ns_to_ts(u64 ns,struct timespec *ts){ ts->tv_sec=(time_t)(ns/1000000
 /* the shell's presenter calls, counted in every build (section 2b; review V36 n=5) */
 extern int kh_gfx_vkd3d_on;
 static _Atomic u64 sh_layer_calls, sh_size_calls, sh_size_zero; static _Atomic int sh_presenter_layer; static const char *sh_env_mode="off (unset)";
+/* TASK41: the layer's drawable size the shell handed over (KHNMC_SCREEN=layer sizes the game's screen from it: null_window.c), and
+ * whether display ticks are wanted (the shell's display link calls kh_vsync_tick only then: the null app keeps its pacing) */
+static _Atomic u32 sh_layer_w, sh_layer_h; static _Atomic int sh_tick_mode=-1;
+int kh_present_layer_size(uint32_t *w,uint32_t *h){ u32 a=atomic_load(&sh_layer_w), b=atomic_load(&sh_layer_h); if(w) *w=a; if(h) *h=b; return a&&b; }
+static void sh_note_layer(uint32_t w,uint32_t h){ if(w&&h){ atomic_store(&sh_layer_w,w); atomic_store(&sh_layer_h,h); } }
+/* review A41 (verification): the shell hands the drawable size over in EVERY app, also one without the graphics backend (then it has no layer
+ * to hand over, and KHNMC_SCREEN=layer still sizes the game's screen from it).  No lock, no counter, no line */
+void kh_present_note_drawable(uint32_t w,uint32_t h){ sh_note_layer(w,h); }
+static _Atomic u64 sh_resume_calls, sh_size_same;          /* review A41: kh_present_resume_all calls (every build); size calls that changed nothing */
+uint64_t kh_present_resume_calls(void){ return atomic_load(&sh_resume_calls); }
+void kh_present_test_layer_size(uint32_t w,uint32_t h){ atomic_store(&sh_layer_w,w); atomic_store(&sh_layer_h,h); }   /* selftest: no counter moves */
+int kh_present_built(void){
+#ifdef KH_GFX_VKD3D
+    return 1;
+#else
+    return 0;
+#endif
+}
+int kh_present_wants_ticks(void){ return atomic_load(&sh_tick_mode); }
 
 /* ==== 1. the suspend gate (admission-counted since task 39: IOS-GRAPHICS-PLAN.md "Review c1/c2" item 1) ==========================
  * A flag alone did not stop a thread that had passed its check just before the flag was set: it could still submit after the app
@@ -81,16 +100,26 @@ static void gate_once_init(void){ kh_cond_init(&gate_idle_cv); }
 static _Atomic int gate_on, gate_hold_fences; static _Atomic u64 gate_queue_waits, gate_last_clear_ns;
 static u64 gate_sets, gate_parks, gate_parked_ns, gate_fence_parks;
 static int gate_admitted; static u64 gate_admissions, gate_refused_try, gate_q_calls, gate_q_ok, gate_q_timeout, gate_q_unset, gate_slices_free;
-#define GATE_PLACES 16
+static u64 gate_drain_admits, gate_fence_admits;                         /* TASK41: suspend-drain admissions, admitted CPU fence signals */
+#define GATE_PLACES 32                                                    /* TASK41: + the game's queue calls and the suspend drain */
 static struct { const char *where; u64 n, admits; int inside; } gate_place[GATE_PLACES]; static int gate_nplace; static u64 gate_place_more;
 static __thread int gate_tl_depth, gate_tl_place=-1, gate_tl_armed;    /* this thread's admission (never nested), its place, the test hook */
-void kh_gfx_gate_set(void){ pthread_mutex_lock(&gate_m); if(!gate_on){ atomic_store(&gate_on,1); gate_sets++; } pthread_mutex_unlock(&gate_m); }
-void kh_gfx_gate_clear(void){ pthread_mutex_lock(&gate_m); atomic_store(&gate_on,0); atomic_store(&gate_last_clear_ns,kh_host_ns()); pthread_cond_broadcast(&gate_cv); pthread_mutex_unlock(&gate_m); }
+/* TASK41: every set and every clear also moves kh_stuck_gate_seq (kh_compat.h), odd while set: no stuck budget counts a slice that
+ * overlapped a set gate.  Caller holds gate_m. */
+static void gate_on_locked(int on){
+    if(on==atomic_load(&gate_on)) return;
+    atomic_store(&gate_on,on); __atomic_add_fetch(&kh_stuck_gate_seq,1u,__ATOMIC_RELEASE);
+    if(on) gate_sets++; }
+void kh_gfx_gate_set(void){ pthread_mutex_lock(&gate_m); gate_on_locked(1); pthread_mutex_unlock(&gate_m); }
+void kh_gfx_gate_clear(void){ pthread_mutex_lock(&gate_m); gate_on_locked(0); atomic_store(&gate_last_clear_ns,kh_host_ns()); pthread_cond_broadcast(&gate_cv); pthread_mutex_unlock(&gate_m); }
 int  kh_gfx_gate_is_set(void){ return atomic_load(&gate_on); }
 void kh_gfx_gate_hold_fence_signals(int on){ atomic_store(&gate_hold_fences,on?1:0); }
 void kh_gfx_gate_note_queue_wait(void){ atomic_fetch_add(&gate_queue_waits,1); }
 u64  kh_gfx_gate_last_clear_ns(void){ return atomic_load(&gate_last_clear_ns); }
 uint64_t kh_gfx_gate_parks(void){ pthread_mutex_lock(&gate_m); u64 n=gate_parks; pthread_mutex_unlock(&gate_m); return n; }
+/* review A41 (verification): parks at the places whose name starts with prefix (the KHNMC_TEST_GATE route's check: "game queue:") */
+uint64_t kh_gfx_gate_parks_at(const char *prefix){ size_t l=strlen(prefix); u64 n=0; pthread_mutex_lock(&gate_m);
+    for(int i=0;i<gate_nplace;i++) if(!strncmp(gate_place[i].where,prefix,l)) n+=gate_place[i].n; pthread_mutex_unlock(&gate_m); return n; }
 int  kh_gfx_gate_admitted(void){ pthread_mutex_lock(&gate_m); int n=gate_admitted; pthread_mutex_unlock(&gate_m); return n; }
 /* caller holds gate_m: the index of a place (-1 when the table is full: counted as "more places") */
 static int gate_place_of(const char *where){
@@ -130,6 +159,24 @@ int kh_gfx_gate_try_enter(const char *where){
     if(atomic_load(&gate_on)){ gate_refused_try++; pthread_mutex_unlock(&gate_m); return 0; }
     gate_admit_locked(where); pthread_mutex_unlock(&gate_m); return 1;
 }
+/* TASK41: the suspend drain's own submissions (runtime/app_life.c -> gfx_wrap.c kh_gfx_queues_drain): admitted WHILE the gate is set,
+ * which is the point of them (one runtime fence Signal per queue after kh_gfx_gate_quiesce).  Anywhere else it is a named fatal. */
+void kh_gfx_gate_enter_drain(const char *where){
+    pthread_mutex_lock(&gate_m);
+    if(!atomic_load(&gate_on)){ pthread_mutex_unlock(&gate_m); kh_fatal(NULL,"gfx-gate-drain-unset: kh_gfx_gate_enter_drain(\"%s\") with the gate clear: only the suspend drain uses it, after the gate was set",where); }
+    gate_drain_admits++; gate_admit_locked(where); pthread_mutex_unlock(&gate_m);
+}
+/* TASK41 (plan fact 11, step 11 item 4): ID3D12Fence::Signal from the CPU.  While a queue may be blocked (fence signals held after a
+ * drain that did not complete, or a queue Wait was ever seen) a CPU signal can make vkd3d submit the queued work of that queue, so it is
+ * an ADMISSION: it waits while the gate is set and holds kh_gfx_gate_quiesce while it runs.  The condition is read under gate_m, in the
+ * same critical section as the admission.  Otherwise (no queue can be blocked) it is not gated at all, as before: returns 0. */
+int kh_gfx_gate_enter_if_may_block(const char *where){
+    pthread_mutex_lock(&gate_m);
+    if(!atomic_load(&gate_hold_fences)&&!atomic_load(&gate_queue_waits)){ pthread_mutex_unlock(&gate_m); return 0; }
+    if(atomic_load(&gate_on)){ gate_fence_parks++; gate_wait_locked(where); }
+    gate_fence_admits++; gate_admit_locked(where); pthread_mutex_unlock(&gate_m); return 1;
+}
+int kh_gfx_gate_thread_admitted(void){ return gate_tl_depth; }
 static u64 gate_test_left_ns; static int gate_test_left;
 void kh_gfx_gate_leave(void){
     pthread_mutex_lock(&gate_m);
@@ -148,18 +195,24 @@ void kh_gfx_gate_assert_admitted(const char *what){
     if(!gate_tl_depth) kh_fatal(NULL,"gfx-gate-not-admitted: %s on a thread that is not admitted at the suspend gate (the submission must lie between kh_gfx_gate_enter / _try_enter and kh_gfx_gate_leave)",what);
 }
 const char *kh_gfx_gate_result_name(int r){ return r==KH_GATE_QUIESCED?"quiesced":r==KH_GATE_NOT_QUIESCED?"suspend-not-quiesced":r==KH_GATE_QUIESCE_NOT_SET?"gate-not-set":"?"; }
-int kh_gfx_gate_quiesce(unsigned slices){
+int kh_gfx_gate_quiesce(unsigned slices){ return kh_gfx_gate_quiesce_bounded(slices,kh_stuck_slice_ms); }
+/* TASK41: the same with the slice length given (the suspend worker counts its bounds in 50 ms slices, runtime/app_life.c) */
+int kh_gfx_gate_quiesce_bounded(unsigned slices,unsigned slice_ms){
+    if(!slice_ms) slice_ms=kh_stuck_slice_ms;
     pthread_once(&gate_once,gate_once_init);
     pthread_mutex_lock(&gate_m); gate_q_calls++;
     if(!atomic_load(&gate_on)){ gate_q_unset++; pthread_mutex_unlock(&gate_m);
         fprintf(stderr,"kh: gfx gate: quiesce called while the gate is clear: gate-not-set (nothing waited for; set the gate first)\n"); return KH_GATE_QUIESCE_NOT_SET; }
-    unsigned expired=0; int r=KH_GATE_QUIESCED;
-    while(gate_admitted>0){ if(kh_cond_wait_stuck(&gate_idle_cv,&gate_m,&expired,slices?slices:1)==ETIMEDOUT&&gate_admitted>0){ r=KH_GATE_NOT_QUIESCED; break; } }
+    unsigned expired=0, want=slices?slices:1; int r=KH_GATE_QUIESCED;
+    /* TASK41: its own slices, not kh_cond_wait_stuck: this bound runs WHILE the gate is set by design, and the stuck helpers no longer
+     * count slices under a set gate (kh_compat.h).  A stopped process still costs only the slice it interrupts. */
+    while(gate_admitted>0){ struct timespec dl; kh_mono_deadline_ms(&dl,slice_ms);
+        if(kh_cond_wait_until(&gate_idle_cv,&gate_m,&dl)==ETIMEDOUT&&++expired>=want&&gate_admitted>0){ r=KH_GATE_NOT_QUIESCED; break; } }
     if(r==KH_GATE_QUIESCED){ gate_q_ok++; pthread_mutex_unlock(&gate_m); return r; }
     gate_q_timeout++; char who[512]; int k=0; who[0]=0;
     for(int i=0;i<gate_nplace&&k<(int)sizeof who-80;i++) if(gate_place[i].inside>0) k+=snprintf(who+k,sizeof who-(size_t)k,"%s%s x%d",k?"; ":"",gate_place[i].where,gate_place[i].inside);
     int n=gate_admitted; pthread_mutex_unlock(&gate_m);
-    fprintf(stderr,"kh: gfx gate: suspend-not-quiesced: %d thread(s) still admitted after %u expired slice(s) of %u ms (%s); the gate stays set\n",n,slices?slices:1,kh_stuck_slice_ms,k?who:"places past the table");
+    fprintf(stderr,"kh: gfx gate: suspend-not-quiesced: %d thread(s) still admitted after %u expired slice(s) of %u ms (%s); the gate stays set\n",n,slices?slices:1,slice_ms,k?who:"places past the table");
     return r;
 }
 /* a bounded wait in expired slices (5 = a named fatal at the call site) must not count time while the gate is set: GPU work and the
@@ -187,10 +240,11 @@ void kh_gfx_gate_report(FILE *f){
     pthread_mutex_lock(&gate_m);
     fprintf(f,"kh: gfx gate: set %llu time(s), %llu park(s) (%.1f ms parked in all), fence-signal parks %llu, queue Waits seen %llu, fence signals held: %s; "
               "admissions %llu (admitted now %d, try_enter refused %llu), quiesce %llu (quiesced %llu, suspend-not-quiesced %llu, gate-not-set %llu), "
-              "bounded-wait slices not counted under the gate %llu",
+              "bounded-wait slices not counted under the gate %llu; suspend-drain admissions %llu, CPU fence signals admitted %llu; stuck-budget slices not charged under the gate %llu",
             P_(gate_sets),P_(gate_parks),gate_parked_ns/1e6,P_(gate_fence_parks),P_(atomic_load(&gate_queue_waits)),
             atomic_load(&gate_hold_fences)?"yes":atomic_load(&gate_queue_waits)?"yes (a queue Wait was seen)":"no",
-            P_(gate_admissions),gate_admitted,P_(gate_refused_try),P_(gate_q_calls),P_(gate_q_ok),P_(gate_q_timeout),P_(gate_q_unset),P_(gate_slices_free));
+            P_(gate_admissions),gate_admitted,P_(gate_refused_try),P_(gate_q_calls),P_(gate_q_ok),P_(gate_q_timeout),P_(gate_q_unset),P_(gate_slices_free),
+            P_(gate_drain_admits),P_(gate_fence_admits),P_(__atomic_load_n(&kh_stuck_gate_free,__ATOMIC_RELAXED)));
     for(int i=0;i<gate_nplace;i++) fprintf(f,"%s %s=%llu park(s)/%llu admission(s)",i?";":"; by place:",gate_place[i].where,P_(gate_place[i].n),P_(gate_place[i].admits));
     if(gate_place_more) fprintf(f," +%llu at more places",P_(gate_place_more));
     fputc('\n',f); pthread_mutex_unlock(&gate_m);
@@ -206,7 +260,7 @@ static void *gate_test_quiescer(void *a){ (void)a; int r=kh_gfx_gate_quiesce(gat
     kh_gfx_gate_clear(); return NULL; }
 static void gate_test_on_admit(const char *where){                      /* caller holds gate_m, the thread was just admitted */
     (void)where; gate_test_armed_place=NULL; gate_test_fired=1; gate_tl_armed=1; gate_test_left=0; gate_test_admit_ns=kh_host_ns();
-    if(!gate_on){ atomic_store(&gate_on,1); gate_sets++; }
+    gate_on_locked(1);
     gate_test_started=pthread_create(&gate_test_th,NULL,gate_test_quiescer,NULL)==0;
 }
 void kh_gfx_gate_test_arm(const char *place,unsigned slices){ pthread_mutex_lock(&gate_m); gate_test_armed_place=place; gate_test_slices=slices; gate_test_fired=0; gate_test_started=0;
@@ -440,6 +494,7 @@ void kh_present_init(int backend_on){
 #endif
     }
     sh_env_mode=m==1?"headless":m==2?"layer":e&&*e?"off":"off (unset)";
+    atomic_store(&sh_tick_mode,m==2);                                        /* TASK41: the shell's display link ticks only for a layer run */
     if(!m){ static const char *const ks[]={"KHNMC_GFX_PRESENT_SIZE","KHNMC_GFX_PRESENT_FIT","KHNMC_GFX_PRESENT_CHECK","KHNMC_GFX_PRESENT_TOL"};
         for(int i=0;i<4;i++){ const char *v=getenv(ks[i]); if(v&&*v) fprintf(stderr,"kh: gfx present: %s=%s IGNORED: the presenter is off (KHNMC_GFX_PRESENT=%s)\n",ks[i],v,sh_env_mode); } }
 }
@@ -451,7 +506,7 @@ int kh_present_shell_line(char *buf,size_t n){
 #else
     const char *why="DROPPED: this build has no graphics backend (GFX_VKD3D=0)";
 #endif
-    int k=snprintf(buf,n,"kh: gfx present: the shell handed over a layer %llu time(s) and a size %llu time(s) (%llu of them 0x0, ignored): %s%s",P_(l),P_(s),P_(z),why,
+    int k=snprintf(buf,n,"kh: gfx present: the shell handed over a layer %llu time(s) and a size %llu time(s) (%llu of them 0x0, ignored; %llu unchanged, no rebuild): %s%s",P_(l),P_(s),P_(z),P_(atomic_load(&sh_size_same)),why,
                    why[strlen(why)-1]=='='?sh_env_mode:"");
     if(k>0&&why[strlen(why)-1]=='='&&(size_t)k+1<n) strcat(buf,")");
     return 1;
@@ -520,6 +575,7 @@ long long kh_vko_live_total(void){ long long t=0; for(int k=0;k<VKO_N;k++) t+=at
 #define VKC(expr,what) do{ VkResult r_=(expr); if(r_!=VK_SUCCESS) kh_fatal(NULL,"gfx-present-vk: %s failed: VkResult %d",what,(int)r_); }while(0)
 
 /* ---- settings ---- */
+static u64 test_mh_at; static unsigned test_mh_ms;            /* TASK41: KHNMC_TEST_MARKER_HOLD (below, kh_present_frame) */
 static int pr_mode=-1, pr_fit, pr_check; static u32 pr_w=1920, pr_h=1080; static double pr_tol_max=2.0, pr_tol_mean=0.5;
 static _Atomic u32 pr_gen; static void *pr_layer;           /* the shell's CAMetalLayer (Apple), and a generation that makes swapchains stale */
 static const char *const mode_names[]={"off","headless","layer"};
@@ -540,13 +596,20 @@ static void settings(void){
     if(e&&*e){ char *end; long v=strtol(e,&end,10); if(*end||v<0){ pthread_mutex_unlock(&pm_g); kh_fatal(NULL,"gfx-present-check: KHNMC_GFX_PRESENT_CHECK=%s (n = every n-th present, 0 = off)",e); } pr_check=(int)v; }
     e=getenv("KHNMC_GFX_PRESENT_TOL");
     if(e&&*e){ double a,b; char c; if(sscanf(e,"%lf,%lf%c",&a,&b,&c)!=2||a<0||b<0){ pthread_mutex_unlock(&pm_g); kh_fatal(NULL,"gfx-present-tol: KHNMC_GFX_PRESENT_TOL=%s (max,mean in levels)",e); } pr_tol_max=a; pr_tol_mean=b; }
+    e=getenv("KHNMC_TEST_MARKER_HOLD");                                       /* TASK41: present:N:ms (the SIGSTOP test) */
+    if(e&&*e){ unsigned long long a=0; unsigned b=0; char c=0; if(sscanf(e,"present:%llu:%u%c",&a,&b,&c)!=2||!a||!b||b>60000){ pthread_mutex_unlock(&pm_g); kh_fatal(NULL,"gfx-present-test-hold: KHNMC_TEST_MARKER_HOLD=%s (present:N:ms, N >= 1, ms 1..60000)",e); }
+        if(!m){ pthread_mutex_unlock(&pm_g); kh_fatal(NULL,"gfx-present-test-hold: KHNMC_TEST_MARKER_HOLD=%s needs the presenter (KHNMC_GFX_PRESENT=headless or layer)",e); }
+        test_mh_at=a; test_mh_ms=b; }
     pr_mode=m; pr_env_mode=m; pr_env_fit=pr_fit; pr_env_w=pr_w; pr_env_h=pr_h; pthread_mutex_unlock(&pm_g);
     if(m) fprintf(stderr,"kh: gfx present: KHNMC_GFX_PRESENT=%s%s, fit %s, check %s%s (tolerance max %.1f / mean %.2f levels)\n",mode_names[m],m==1?"":" (the shell's layer)",pr_fit?"stretch":"aspect",pr_check?"every ":"off",pr_check?"n-th present":"",pr_tol_max,pr_tol_mean);
 }
 int kh_present_mode(void){ settings(); return pr_mode; }
-void kh_present_set_layer(void *layer,uint32_t w,uint32_t h){ atomic_fetch_add(&sh_layer_calls,1); pthread_mutex_lock(&pm_g); pr_layer=layer; if(w&&h){ pr_w=w; pr_h=h; } atomic_fetch_add(&pr_gen,1); pthread_mutex_unlock(&pm_g); }
+void kh_present_set_layer(void *layer,uint32_t w,uint32_t h){ atomic_fetch_add(&sh_layer_calls,1); sh_note_layer(w,h); pthread_mutex_lock(&pm_g); pr_layer=layer; if(w&&h){ pr_w=w; pr_h=h; } atomic_fetch_add(&pr_gen,1); pthread_mutex_unlock(&pm_g); }
 /* a 0x0 size is counted and ignored (the swapchain keeps its size; a zero-size drawable is what the surface reports, see swapchain_build) */
-void kh_present_set_size(uint32_t w,uint32_t h){ atomic_fetch_add(&sh_size_calls,1); if(!w||!h){ atomic_fetch_add(&sh_size_zero,1); return; } pthread_mutex_lock(&pm_g); pr_w=w; pr_h=h; atomic_fetch_add(&pr_gen,1); pthread_mutex_unlock(&pm_g); }
+/* review A41 (verification): the shell calls this at every layout pass and every activation; the swapchain is made stale only when the size
+ * really changed (an unchanged size is counted, nothing else) */
+void kh_present_set_size(uint32_t w,uint32_t h){ atomic_fetch_add(&sh_size_calls,1); if(!w||!h){ atomic_fetch_add(&sh_size_zero,1); return; }
+    pthread_mutex_lock(&pm_g); if(w!=pr_w||h!=pr_h){ pr_w=w; pr_h=h; atomic_fetch_add(&pr_gen,1); } else atomic_fetch_add(&sh_size_same,1); pthread_mutex_unlock(&pm_g); }
 
 /* ---- the presenter object ---- */
 #define PSLOTS 3
@@ -561,7 +624,13 @@ struct KhPresenter { pthread_mutex_t m; const KhVk *vk; ID3D12Device *dev; ID3D1
     int made;                                       /* a swapchain was made once: later builds are counted as rebuilds by their reason */
     int in_marker;                                  /* a Present is in its marker wait (d), WITHOUT p->m (review Y39 n=1) */
     int chk_pending, chk_slot; u64 chk_n; u32 chk[8];   /* a check present waiting for its reference (kh_present_check): sw sh dx dy dw dh bw bh */
-    int lchk_valid; u32 lchk[8]; };                 /* the last checked present (selftest: its copy against a CPU-made picture) */
+    int lchk_valid; u32 lchk[8];                    /* the last checked present (selftest: its copy against a CPU-made picture) */
+    u32 resume_gen; };                              /* TASK41: the kh_present_resume_all generation this presenter has seen */
+/* TASK41 (plan step 11): the presenters that exist (the suspend drain waits for their slot fences) and the resume generation.  The main
+ * thread only ever bumps the generation (an atomic, no lock): p->m can be held across MoltenVK's WSI calls, which may wait for the main
+ * thread (risk R5), so the shell must never take it.  pres_list_m is held by the drain's slot-fence wait and by attach / teardown. */
+static pthread_mutex_t pres_list_m=PTHREAD_MUTEX_INITIALIZER; static KhPresenter *pres_list[8]; static int n_pres_list;
+static _Atomic u32 pr_resume_gen; static _Atomic u64 c_quiesce_all, c_quiesce_all_late;
 /* counters, all presenters */
 static _Atomic u64 c_frames, c_submits, c_presents, c_rebuild[RC_N], c_to_counted, c_to_free, c_parked_acq, c_sem_remade, c_consumed, c_slot_waits,
     c_cpu_spins, c_check_ok, c_check_fail, c_check_skipped, c_check_bars_bad, c_check_src_bad, c_sc_suboptimal, c_sc_outdated, c_sc_surface_lost,
@@ -573,6 +642,22 @@ static u64 st_cost_n, st_cost_sum, st_cost_max, st_acq_sum, st_acq_max, st_hold_
 static u64 cost_hist[HBUCK+1];                               /* present cost (d)-(f) in 10-us buckets, last = 20 ms and more */
 static void (*test_after_acquire)(KhPresenter *);
 static int  test_force_check=-1;                             /* selftest: check every present (1) */
+/* TASK41, the Linux SIGSTOP test: KHNMC_TEST_MARKER_HOLD=present:N:ms makes the marker wait (d) of present N a real bounded wait: the
+ * game's queue first Waits on a fence that a helper thread signals from the CPU ms later (absolute deadline), and a line says so.  A
+ * process stopped there and continued later costs one slice (a41/stopper.sh); counting wall time instead is gfx-present-queue-blocked. */
+static _Atomic u64 c_mh_done;
+typedef struct { ID3D12Fence *f; unsigned ms; } MhArg;
+static void *mh_signal(void *a){ MhArg *m=(MhArg*)a; struct timespec dl; kh_mono_deadline_ms(&dl,m->ms); kh_sleep_until(&dl);
+    if(FAILED(ID3D12Fence_Signal(m->f,1))) kh_fatal(NULL,"gfx-present-test-hold: ID3D12Fence::Signal from the CPU failed");
+    ID3D12Fence_Release(m->f); free(m); atomic_fetch_add(&c_mh_done,1); return NULL; }
+static void test_marker_hold(KhPresenter *p,u64 n){
+    MhArg *m=calloc(1,sizeof *m); if(!m) kh_fatal(NULL,"gfx-present-test-hold: out of memory"); m->ms=test_mh_ms;
+    if(FAILED(ID3D12Device_CreateFence(p->dev,0,D3D12_FENCE_FLAG_NONE,&IID_ID3D12Fence,(void**)&m->f))) kh_fatal(NULL,"gfx-present-test-hold: CreateFence failed");
+    if(FAILED(ID3D12CommandQueue_Wait(p->queue,m->f,1))) kh_fatal(NULL,"gfx-present-test-hold: ID3D12CommandQueue::Wait failed");
+    pthread_t th; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at,PTHREAD_CREATE_DETACHED);
+    if(pthread_create(&th,&at,mh_signal,m)) kh_fatal(NULL,"gfx-present-test-hold: the helper thread cannot be started"); pthread_attr_destroy(&at);
+    fprintf(stderr,"kh: gfx present: TEST KHNMC_TEST_MARKER_HOLD: present %llu: the game's queue waits on a fence that a helper thread signals from the CPU in %u ms; the marker wait (d) is bounded by 5 counted slices of %u ms\n",
+            P_(n),test_mh_ms,kh_stuck_slice_ms); fflush(stderr); }
 static u64 present_number_last;
 
 static VkSemaphore mk_sem(const KhVk *v){ VkSemaphoreCreateInfo ci; memset(&ci,0,sizeof ci); ci.sType=VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO; VkSemaphore s; VKC(v->CreateSemaphore(v->dev,&ci,NULL,&s),"vkCreateSemaphore"); kh_vko_note(VKO_SEM,1); return s; }
@@ -641,6 +726,16 @@ static void swapchain_build(KhPresenter *p){
     VkResult fr=v->GetPhysicalDeviceSurfaceFormatsKHR(v->pd,p->surface,&nf,fm); if(fr!=VK_SUCCESS&&fr!=VK_INCOMPLETE) kh_fatal(NULL,"gfx-present-vk: vkGetPhysicalDeviceSurfaceFormatsKHR: VkResult %d",(int)fr);
     int have=0; for(u32 i=0;i<nf;i++) if(fm[i].format==VK_FORMAT_B8G8R8A8_UNORM&&fm[i].colorSpace==VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) have=1;
     if(!have) kh_fatal(NULL,"gfx-present-format: the surface offers no B8G8R8A8_UNORM / SRGB_NONLINEAR format (%u formats)",nf);
+    if(!p->made){                                    /* TASK41 (plan step 10): the first present says what the surface offers */
+        static const char *const pmn[]={"IMMEDIATE","MAILBOX","FIFO","FIFO_RELAXED"}; char modes[160]; int k=0; modes[0]=0; u32 nm=0; VkPresentModeKHR pm[16];
+        if(v->GetPhysicalDeviceSurfacePresentModesKHR&&v->GetPhysicalDeviceSurfacePresentModesKHR(v->pd,p->surface,&nm,NULL)==VK_SUCCESS){ if(nm>16) nm=16;
+            VkResult mr=v->GetPhysicalDeviceSurfacePresentModesKHR(v->pd,p->surface,&nm,pm); if(mr!=VK_SUCCESS&&mr!=VK_INCOMPLETE) nm=0;
+            for(u32 i=0;i<nm&&k<(int)sizeof modes-24;i++) k+=snprintf(modes+k,sizeof modes-(size_t)k,"%s%s",i?" ":"",(u32)pm[i]<4?pmn[pm[i]]:"other"); }
+        else snprintf(modes,sizeof modes,"(not queried)");
+        fprintf(stderr,"kh: gfx present: surface caps (%s): usage 0x%x (TRANSFER_DST %s, TRANSFER_SRC %s, COLOR_ATTACHMENT %s), present modes [%s], images min %u max %u, current extent %ux%u (min %ux%u, max %ux%u), transforms 0x%x (current 0x%x), composite alpha 0x%x\n",
+                mode_names[p->mode],caps.supportedUsageFlags,(caps.supportedUsageFlags&VK_IMAGE_USAGE_TRANSFER_DST_BIT)?"yes":"NO",(caps.supportedUsageFlags&VK_IMAGE_USAGE_TRANSFER_SRC_BIT)?"yes":"no",
+                (caps.supportedUsageFlags&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)?"yes":"no",modes,caps.minImageCount,caps.maxImageCount,caps.currentExtent.width,caps.currentExtent.height,
+                caps.minImageExtent.width,caps.minImageExtent.height,caps.maxImageExtent.width,caps.maxImageExtent.height,caps.supportedTransforms,caps.currentTransform,caps.supportedCompositeAlpha); }
     if(!(caps.supportedUsageFlags&VK_IMAGE_USAGE_TRANSFER_DST_BIT)) kh_fatal(NULL,"gfx-present-no-transfer-dst: the surface's images do not support TRANSFER_DST (usage 0x%x): the draw path of risk R6 is not implemented",caps.supportedUsageFlags);
     pthread_mutex_lock(&pm_g); u32 want_w=pr_w, want_h=pr_h; p->gen=atomic_load(&pr_gen); pthread_mutex_unlock(&pm_g);
     VkExtent2D ex=caps.currentExtent; if(ex.width==0xFFFFFFFFu){ ex.width=want_w; ex.height=want_h; }
@@ -673,6 +768,8 @@ KhPresenter *kh_present_attach(ID3D12Device *dev,ID3D12CommandQueue *q,const KhP
     KhPresenter *p=calloc(1,sizeof *p); if(!p) kh_fatal(NULL,"gfx-present: out of memory");
     pthread_mutex_init(&p->m,NULL); p->vk=kh_vk_for(dev); p->dev=dev; p->queue=q; ID3D12Device_AddRef(dev); ID3D12CommandQueue_AddRef(q);
     p->mode=pr_mode; p->fit=pr_fit; p->check=pr_check; p->family=vkd3d_get_vk_queue_family_index(q); p->bb=*bb; p->general=bb->general; p->stale=1; p->stale_reason=RC_FIRST;
+    p->resume_gen=atomic_load(&pr_resume_gen);
+    pthread_mutex_lock(&pres_list_m); if(n_pres_list>=8){ pthread_mutex_unlock(&pres_list_m); kh_fatal(NULL,"gfx-present-list: more than 8 presenters at once"); } pres_list[n_pres_list++]=p; pthread_mutex_unlock(&pres_list_m);
     if(p->mode==2) atomic_store(&sh_presenter_layer,1);
     p->fmt=vkd3d_get_vk_format(DXGI_FORMAT_B8G8R8A8_UNORM);
     VkFormatProperties fp; p->vk->GetPhysicalDeviceFormatProperties(p->vk->pd,p->fmt,&fp); p->linear_ok=!!(fp.optimalTilingFeatures&VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
@@ -782,6 +879,7 @@ int kh_present_frame(KCtx *g,KhPresenter *p,u32 idx,u64 n){
                                                 :"gfx-present-reentry: kh_present_frame entered while another Present of the same swap chain is inside it (present %llu)",P_(p->chk_n));
         if(kh_gfx_gate_is_set()){ pthread_mutex_unlock(&p->m); continue; }
         if(atomic_load(&pr_gen)!=p->gen&&p->sc){ p->stale=1; p->stale_reason=RC_SIZE; }
+        { u32 rg=atomic_load(&pr_resume_gen); if(rg!=p->resume_gen){ p->resume_gen=rg; if(p->sc){ p->stale=1; p->stale_reason=RC_RESUME; } } }   /* TASK41: kh_present_resume_all */
         if(!p->sc||p->stale) swapchain_build(p);                                              /* (b) */
         if(!p->sc){ pthread_mutex_unlock(&p->m); atomic_fetch_add(&c_zero_size,1); return 0; }   /* zero-size drawable: nothing to present (counted) */
         s=&p->slot[p->frames%PSLOTS];
@@ -801,6 +899,7 @@ int kh_present_frame(KCtx *g,KhPresenter *p,u32 idx,u64 n){
         if(ii>=p->nimg) kh_fatal(NULL,"gfx-present-vk: vkAcquireNextImageKHR gave image %u of %u",ii,p->nimg);
         subopt=r==VK_SUBOPTIMAL_KHR; p->counted_timeouts=0; s->acquired=1; s->img=(int)ii;
         if(test_after_acquire) test_after_acquire(p);
+        if(__builtin_expect(test_mh_at!=0,0)&&n==test_mh_at) test_marker_hold(p,n);                 /* TASK41: KHNMC_TEST_MARKER_HOLD */
         /* (d) everything the game queued for this frame has left vkd3d's op queue.  WITHOUT the presenter's lock (review Y39 n=1): under
          *     a set gate this wait has no bound (its slices are not counted), and step 11's main thread takes p->m before it clears the
          *     gate (kh_present_resume, kh_present_quiesce): holding p->m here deadlocked them while a queue waited on a held CPU signal.
@@ -920,8 +1019,35 @@ void kh_present_resize(KhPresenter *p,const KhPresentBuffers *bb){ if(!p) return
 /* any thread, at any time (the main thread of step 11 before it clears the gate): the swapchain is rebuilt at the next Present */
 void kh_present_resume(KhPresenter *p){ if(!p) return; pthread_mutex_lock(&p->m); p->stale=1; p->stale_reason=RC_RESUME; pthread_mutex_unlock(&p->m); }
 static int test_in_marker(KhPresenter *p){ pthread_mutex_lock(&p->m); int r=p->in_marker; pthread_mutex_unlock(&p->m); return r; }   /* selftest */
+/* TASK41: the shell's resume (runtime/app_life.c kh_app_resume, the main thread): every presenter rebuilds its swapchain at its next
+ * Present (only OUR VkSwapchainKHR; the game sees nothing).  An atomic generation, no lock (see pres_list_m). */
+void kh_present_resume_all(void){ atomic_fetch_add(&sh_resume_calls,1); atomic_fetch_add(&pr_resume_gen,1); }
+uint64_t kh_present_parked_after_acquire(void){ return atomic_load(&c_parked_acq); }
+uint64_t kh_present_presented(void){ return atomic_load(&c_presents); }
+uint64_t kh_present_rebuilds_after_resume(void){ return atomic_load(&c_rebuild[RC_RESUME]); }
+/* TASK41: the suspend drain's step 5 (a worker thread, never the main thread): every submission of every presenter made so far is
+ * complete.  At most `slices` expired slices of `slice_ms` in all; no fatal: 1 = all complete, 0 = not (counted; *left = slots still
+ * pending).  Called after kh_gfx_gate_quiesce, so no presenter is inside a submission. */
+int kh_present_quiesce_all_bounded(unsigned slices,unsigned slice_ms,unsigned *npres,unsigned *left){
+    atomic_fetch_add(&c_quiesce_all,1); unsigned expired=0; int ok=1; *npres=0; *left=0;
+    pthread_mutex_lock(&pres_list_m); *npres=(unsigned)n_pres_list;
+    /* review A41 (verification): `slices` is the budget of ALL slots of all presenters together: once it is spent, every slot still pending is
+     * only polled (time-out 0) and counted, never waited for again */
+    for(int i=0;i<n_pres_list;i++){ KhPresenter *p=pres_list[i]; pthread_mutex_lock(&p->m);
+        for(int k=0;k<PSLOTS;k++){ PSlot *s=&p->slot[k];
+            while(s->pending){ int spent=expired>=slices; VkResult r=p->vk->WaitForFences(p->vk->dev,1,&s->fence,VK_TRUE,spent?0:(u64)slice_ms*1000000ull);
+                if(r==VK_SUCCESS){ s->pending=0; break; }
+                if(r!=VK_TIMEOUT){ pthread_mutex_unlock(&p->m); pthread_mutex_unlock(&pres_list_m); kh_fatal(NULL,"gfx-present-vk: vkWaitForFences (suspend drain) failed: VkResult %d",(int)r); }
+                if(spent||++expired>=slices){ ok=0; (*left)++; break; } } }
+        pthread_mutex_unlock(&p->m); }
+    pthread_mutex_unlock(&pres_list_m);
+    if(!ok) atomic_fetch_add(&c_quiesce_all_late,1);
+    return ok;
+}
 void kh_present_teardown(KhPresenter *p){
-    if(!p) return; const KhVk *v=p->vk; pthread_mutex_lock(&p->m); not_in_marker(p,"kh_present_teardown");
+    if(!p) return; const KhVk *v=p->vk;
+    pthread_mutex_lock(&pres_list_m); for(int i=0;i<n_pres_list;i++) if(pres_list[i]==p){ pres_list[i]=pres_list[--n_pres_list]; break; } pthread_mutex_unlock(&pres_list_m);
+    pthread_mutex_lock(&p->m); not_in_marker(p,"kh_present_teardown");
     for(int i=0;i<PSLOTS;i++){ slot_wait(p,&p->slot[i],"teardown");
         while(!slot_consume(p,&p->slot[i],"presenter: consume a parked acquire (teardown)")){ pthread_mutex_unlock(&p->m); kh_gfx_gate_park("presenter teardown"); pthread_mutex_lock(&p->m); } }
     queue_idle(p); swapchain_destroy(p,p->sc,p->nimg,p->rsem); p->sc=VK_NULL_HANDLE;
@@ -943,12 +1069,14 @@ void kh_present_report(FILE *f){
     fprintf(f,"kh: gfx present: mode=%s frames=%llu submits=%llu presents=%llu; swapchains made %llu, rebuilt %llu (size %llu, out-of-date %llu, suboptimal %llu, surface-lost %llu, after-park %llu); "
               "present cost (d)-(f) mean %.3f ms p50 %s p99 %s max %.3f ms; acquire mean %.3f ms max %.3f ms; queue mutex held mean %.3f ms max %.3f ms; "
               "acquire time-outs counted %llu / not counted %llu; parked after acquire %llu (semaphores made anew %llu, consumed %llu); signal_on_cpu waits that spun %llu (slices not counted under the gate %llu); "
-              "check (against the D3D12 readback): ok %llu failed %llu (bars %llu, source copy %llu) skipped %llu, largest difference %.2f, largest mean %.3f; surface lost %llu; zero-size drawable skips %llu; live Vulkan objects of the runtime %lld\n",
+              "check (against the D3D12 readback): ok %llu failed %llu (bars %llu, source copy %llu) skipped %llu, largest difference %.2f, largest mean %.3f; surface lost %llu; zero-size drawable skips %llu; live Vulkan objects of the runtime %lld; "
+              "shell resumes %llu, suspend-drain slot-fence waits %llu (not complete in their bound %llu); test marker holds signalled %llu\n",
             mode_names[pr_mode<0?0:pr_mode],P_(c_frames),P_(c_submits),P_(c_presents),P_(c_rebuild[RC_FIRST]),P_(c_rebuild[RC_SIZE]+c_rebuild[RC_OUTDATED]+c_rebuild[RC_SUBOPTIMAL]+c_rebuild[RC_SURFACE]+c_rebuild[RC_RESUME]),
             P_(c_rebuild[RC_SIZE]),P_(c_rebuild[RC_OUTDATED]),P_(c_rebuild[RC_SUBOPTIMAL]),P_(c_rebuild[RC_SURFACE]),P_(c_rebuild[RC_RESUME]),
             st_cost_n?st_cost_sum/1e6/(double)st_cost_n:0.0,p50,p99,st_cost_max/1e6,st_cost_n?st_acq_sum/1e6/(double)st_cost_n:0.0,st_acq_max/1e6,
             st_cost_n?st_hold_sum/1e6/(double)st_cost_n:0.0,st_hold_max/1e6,P_(c_to_counted),P_(c_to_free),P_(c_parked_acq),P_(c_sem_remade),P_(c_consumed),P_(c_cpu_spins),P_(c_marker_free),
-            P_(c_check_ok),P_(c_check_fail),P_(c_check_bars_bad),P_(c_check_src_bad),P_(c_check_skipped),st_dmax,st_dmean_max,P_(c_sc_surface_lost),P_(c_zero_size),kh_vko_live_total());
+            P_(c_check_ok),P_(c_check_fail),P_(c_check_bars_bad),P_(c_check_src_bad),P_(c_check_skipped),st_dmax,st_dmean_max,P_(c_sc_surface_lost),P_(c_zero_size),kh_vko_live_total(),
+            P_(sh_resume_calls),P_(c_quiesce_all),P_(c_quiesce_all_late),P_(c_mh_done));
     pthread_mutex_unlock(&pm_g);
 }
 /* selftest access (gfx_present_test.c-style hooks kept here: the counters are static) */
@@ -1105,6 +1233,11 @@ static int pt_cpu_check(KhPresenter *p,const u8 *ref,u32 bw,u32 bh,double tmax,d
         ok=!cr.bars_bad&&cr.dmax<=tmax+1e-9&&mean<=tmean+1e-9; if(cr.dmax>cpu_dmax) cpu_dmax=cr.dmax;
         if(!ok) fprintf(stderr,"gfx present selftest: %s %d: the presented picture against the CPU-made one: largest difference %.2f, mean %.3f (tolerance %.1f / %.2f), %llu bar pixels not black\n",what,k,cr.dmax,mean,tmax,tmean,P_(cr.bars_bad)); }
     p->lchk_valid=0; pthread_mutex_unlock(&p->m); return ok; }
+/* review A41 (verification): a stand-in vkWaitForFences that never completes (the suspend drain's budget test) */
+static _Atomic int fq_timed, fq_polls;
+static VkResult VKAPI_PTR fq_wait(VkDevice d,uint32_t n,const VkFence *f,VkBool32 all,uint64_t to){ (void)d;(void)n;(void)f;(void)all;
+    if(to){ atomic_fetch_add(&fq_timed,1); struct timespec ts={(time_t)(to/1000000000ull),(long)(to%1000000000ull)}; nanosleep(&ts,0); } else atomic_fetch_add(&fq_polls,1);
+    return VK_TIMEOUT; }
 int kh_present_selftest(KCtx *g,u64 m,u64 dev,u64 q,u64 fct){
     (void)m;(void)dev;
     if(!kh_gfxc_pres_ext.headless||!kh_gfxc_pres_ext.swapchain||!kh_gfxc_pres_ext.surface){
@@ -1114,7 +1247,18 @@ int kh_present_selftest(KCtx *g,u64 m,u64 dev,u64 q,u64 fct){
 #define TS(c) do{ n++; if(!(c)){ f++; fprintf(stderr,"gfx present selftest FAIL: %s (line %d)\n",#c,__LINE__); } }while(0)
     long long live0[VKO_N]; for(int k=0;k<VKO_N;k++) live0[k]=atomic_load(&kh_vko_live[k]);
     u64 F0,S0,P0,R0,OK0,BAD0,PK0,RM0,Z0=atomic_load(&c_zero_size); kh_present_test_counters(&F0,&S0,&P0,&R0,&OK0,&BAD0,&PK0,&RM0);
-    u64 shs0=atomic_load(&sh_size_calls);                                  /* the size calls below are the test's, not the shell's */
+    u64 shs0=atomic_load(&sh_size_calls), shsame0=atomic_load(&sh_size_same);   /* the size calls below are the test's, not the shell's */
+    /* 0. review A41 (verification): the suspend drain's slot-fence wait spends its budget ONCE over all slots: a stand-in presenter whose
+     *    slots are all pending, with fences that never complete, gets exactly `slices` timed waits, then only polls (time-out 0) */
+    { static KhVk fv; memset(&fv,0,sizeof fv); fv.WaitForFences=fq_wait; KhPresenter *fp=calloc(1,sizeof *fp); TS(fp!=NULL);
+      if(fp){ pthread_mutex_init(&fp->m,NULL); fp->vk=&fv; for(int k=0;k<PSLOTS;k++) fp->slot[k].pending=1;
+          pthread_mutex_lock(&pres_list_m); int added=n_pres_list<8; if(added) pres_list[n_pres_list++]=fp; pthread_mutex_unlock(&pres_list_m); TS(added);
+          atomic_store(&fq_timed,0); atomic_store(&fq_polls,0); unsigned np=0,left=0; u64 t0=kh_host_ns();
+          int r=kh_present_quiesce_all_bounded(2,10,&np,&left); u64 dt=kh_host_ns()-t0;
+          TS(r==0 && left==PSLOTS && atomic_load(&fq_timed)==2 && atomic_load(&fq_polls)==PSLOTS-1 && dt<60000000ull);
+          if(!(atomic_load(&fq_timed)==2)) fprintf(stderr,"gfx present selftest: 0: %d timed slot-fence waits for a budget of 2 slices, %d polls, %u slots left, %.1f ms\n",atomic_load(&fq_timed),atomic_load(&fq_polls),left,dt/1e6);
+          pthread_mutex_lock(&pres_list_m); for(int i=0;i<n_pres_list;i++) if(pres_list[i]==fp){ pres_list[i]=pres_list[--n_pres_list]; break; } pthread_mutex_unlock(&pres_list_m);
+          pthread_mutex_destroy(&fp->m); free(fp); } }
     double tm=pr_tol_max, tn=pr_tol_mean; u64 gm=ga_calloc(1,256); PT t; memset(&t,0,sizeof t);
     kh_present_test_override(1,0,200,100); kh_present_test_force_check(1); kh_vkd3d_test_bbmode(0);
     /* A: 96x64 own images (3:2) into 200x100 (2:1): pillarbox 150x100 at x = 25 */
@@ -1150,7 +1294,10 @@ int kh_present_selftest(KCtx *g,u64 m,u64 dev,u64 q,u64 fct){
     { u64 x,r0,r1,ok0,ok1,bad0,bad1; kh_present_test_counters(&x,&x,&x,&r0,&ok0,&bad0,&x,&x);
       kh_present_set_size(160,120); for(int k=0;k<2;k++){ TS(pt_frame(&t,g,sc,1,-1,NULL)); TS(pt_cpu_check(t.si.pres,pat128,128,72,tm,tn,"after a size change",k)); }
       kh_present_test_counters(&x,&x,&x,&r1,&ok1,&bad1,&x,&x); u32 w,h,ni; kh_present_test_extent(t.si.pres,&w,&h,&ni);
-      TS(r1==r0+1 && w==160 && h==120 && ok1==ok0+2 && bad1==bad0); TS(rect_is(160,120,0,15,160,90)); }   /* 16:9 into 4:3: letterbox 160x90 at y = 15 */
+      TS(r1==r0+1 && w==160 && h==120 && ok1==ok0+2 && bad1==bad0); TS(rect_is(160,120,0,15,160,90));    /* 16:9 into 4:3: letterbox 160x90 at y = 15 */
+      /* review A41 (verification): the same size again (a layout pass, an activation): counted, no rebuild */
+      u64 r2,ss0=atomic_load(&sh_size_same); kh_present_set_size(160,120); TS(pt_frame(&t,g,sc,1,-1,NULL)); TS(pt_cpu_check(t.si.pres,pat128,128,72,tm,tn,"after the same size again",0));
+      kh_present_test_counters(&x,&x,&x,&r2,&x,&x,&x,&x); TS(r2==r1 && atomic_load(&sh_size_same)==ss0+1); }
     /* 5. the gate set right after a successful acquire, held 60 ms, cleared: the acquire is consumed, its semaphore made anew, the
      *    swapchain rebuilt, and the present goes on (and passes its check) */
     { u64 x,r0,r1,pk0,pk1,rm0,rm1,ok0,ok1,bad0,bad1,gp0=kh_gfx_gate_parks(); kh_present_test_counters(&x,&x,&x,&r0,&ok0,&bad0,&pk0,&rm0);
@@ -1220,7 +1367,8 @@ int kh_present_selftest(KCtx *g,u64 m,u64 dev,u64 q,u64 fct){
      *     Presents are counted zero-size skips and present nothing (before, the old swapchain was kept and presented into); with a size
      *     again the swapchain is made anew, counted as a size rebuild */
     { u64 z0=atomic_load(&c_zero_size), pr0=atomic_load(&c_presents), rz0=atomic_load(&c_rebuild[RC_SIZE]); long long sw0=atomic_load(&kh_vko_live[VKO_SWAPCHAIN]);
-      test_inject_zero=1; kh_present_set_size(160,120);                     /* the same size: a new generation, so the next Present rebuilds */
+      test_inject_zero=1; atomic_fetch_add(&pr_gen,1);                      /* a new size generation, as kh_present_set_size makes for a new size (the same size makes
+                                                                              * none since review A41), so the next Present rebuilds */
       for(int k=0;k<2;k++) TS(pt_frame(&t,g,sc,1,-1,NULL));
       TS(atomic_load(&c_zero_size)==z0+2 && atomic_load(&c_presents)==pr0 && atomic_load(&kh_vko_live[VKO_SWAPCHAIN])==sw0-1);
       TS(!pt_cpu_check(t.si.pres,pat128,128,72,tm,tn,"(expected: nothing presented)",0));
@@ -1269,16 +1417,23 @@ out:
                   bn,bw,bh,getenv("LP_NUM_THREADS")?getenv("LP_NUM_THREADS"):"(runtime default 4)",host_mean,host_max,with_mean,with_max,without_mean,with_mean-without_mean); }
       else fprintf(stderr,"kh: gfx present bench: not run (KHNMC_GFX_PRESENT_BENCH=n with n >= 2 runs it)\n"); }
     kh_present_test_override(-1,0,0,0); kh_present_test_force_check(0); kh_present_test_after_acquire(NULL); kh_vkd3d_test_bbmode(-1); kh_present_test_tol(tm,tn); ga_free(gm);
-    test_inject_present=test_inject_acquire=0; test_inject_zero=0; atomic_store(&sh_size_calls,shs0);
-    fprintf(stderr,"kh: gfx present selftest: %d checks, %d failures (headless surface: every present against the D3D12 readback AND a CPU-made picture: clear colours, patterned picture, ResizeBuffers, size change, gate after acquire, surface lost at present and at acquire, zero-size drawable, sync stress own + general, presents = submissions, nothing left)\n",n,f);
+    test_inject_present=test_inject_acquire=0; test_inject_zero=0; atomic_store(&sh_size_calls,shs0); atomic_store(&sh_size_same,shsame0);
+    fprintf(stderr,"kh: gfx present selftest: %d checks, %d failures (headless surface: every present against the D3D12 readback AND a CPU-made picture: the suspend drain's slot-fence budget, clear colours, patterned picture, ResizeBuffers, size change (and the same size: no rebuild), gate after acquire, surface lost at present and at acquire, zero-size drawable, sync stress own + general, presents = submissions, nothing left)\n",n,f);
 #undef TS
     return f;
 }
 #else
 /* no graphics backend in this build (review V36 n=5): the shell's calls are counted, the first one says so, the exit line reports them */
 void kh_present_set_layer(void *l,uint32_t w,uint32_t h){
+    sh_note_layer(w,h);
     if(!atomic_fetch_add(&sh_layer_calls,1)) fprintf(stderr,"kh: gfx present: kh_present_set_layer(%p, %ux%u) DROPPED: this build has no graphics backend (GFX_VKD3D=0): no picture (counted, reported at exit)\n",l,w,h); }
 void kh_present_set_size(uint32_t w,uint32_t h){
     if(!w||!h) atomic_fetch_add(&sh_size_zero,1);
     if(!atomic_fetch_add(&sh_size_calls,1)) fprintf(stderr,"kh: gfx present: kh_present_set_size(%ux%u) DROPPED: this build has no graphics backend (GFX_VKD3D=0) (counted, reported at exit)\n",w,h); }
+/* TASK41: no presenter exists without the backend */
+void kh_present_resume_all(void){ atomic_fetch_add(&sh_resume_calls,1); }
+uint64_t kh_present_parked_after_acquire(void){ return 0; }
+uint64_t kh_present_presented(void){ return 0; }
+uint64_t kh_present_rebuilds_after_resume(void){ return 0; }
+int kh_present_quiesce_all_bounded(unsigned slices,unsigned slice_ms,unsigned *npres,unsigned *left){ (void)slices;(void)slice_ms; *npres=0; *left=0; return 1; }
 #endif

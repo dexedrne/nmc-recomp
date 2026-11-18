@@ -32,6 +32,76 @@ static void state_dump(KCtx *g,const char *path){
     if(hb) fclose(hb);
     fclose(f); kh_warn("shell: state dump written to %s",path);
 }
+/* ---- TASK41: the PC's minimise and restore, delivered on this thread (the WinForms UI thread's place) -----------------------------
+ * On the PC the form's OnResize (IL method 529, rva 0x389e1c) calls BaseSimpleForm::suspend (IL 547, 0x38696c) when the window is
+ * minimised and BaseSimpleForm::resume (IL 548, 0x386994) when it is restored or maximised:
+ *   suspend:  if(!suspendFlg) Axa.Sound.Sys.SystemPause(true);  Axa.GX.GXDevice.suspendDevice();  suspendFlg = true;
+ *   resume:   if(!forceSuspending){ Axa.GX.GXDevice.resumeDevice(); if(suspendFlg) Axa.Sound.Sys.SystemPause(false); suspendFlg = false; }
+ * with the native functions SystemPause = 0x13b2d0 (-> 0x79a60 -> 0x9dc90: every sound of the sd system paused / resumed under its lock
+ * 0x142b81cb0), suspendDevice = 0x127eb0 and resumeDevice = 0x125a10 (GX singleton 0x1408a0970, byte +0x308 = 1 / 0).  forceSuspending
+ * is only ever set to 0 (the form's constructor).  The app shell's "background" is the PC's minimise (the game is not visible), so
+ * runtime/app_life.c posts these two requests at kh_app_suspend / kh_app_resume, and this thread runs exactly the PC's sequence, on a
+ * guest thread that is not one of the two game threads, like the UI thread on the PC.  Focus loss alone (OnDeactivate, IL 534) calls
+ * nothing of the game: the cursor and a WinForms panel only; its effect on the game is the pad gate of 0x134ff0 (null_window.c). */
+#include "khnmc_app.h"
+#define SHELL_QMAX 16
+static int shell_q[SHELL_QMAX], shell_qn, shell_in_loop, shell_suspend_flg; static u64 shell_posted, shell_minimised, shell_restored, shell_dropped;
+void kh_shell_post(int req){
+    pthread_mutex_lock(&sm); shell_posted++;
+    if(shell_qn<SHELL_QMAX){ shell_q[shell_qn++]=req; pthread_cond_broadcast(&scv); } else shell_dropped++;
+    pthread_mutex_unlock(&sm);
+    if(shell_dropped) kh_warn("shell: %llu lifecycle request(s) dropped: the queue of %d is full (ManageRun is not serving it)",(unsigned long long)shell_dropped,SHELL_QMAX);
+}
+int kh_shell_test_take(void){ pthread_mutex_lock(&sm); int r=0; if(shell_qn){ r=shell_q[0]; for(int i=1;i<shell_qn;i++) shell_q[i-1]=shell_q[i]; shell_qn--; } pthread_mutex_unlock(&sm); return r; }   /* selftest */
+void kh_shell_counts(u64 *posted,u64 *minimised,u64 *restored,int *serving){ pthread_mutex_lock(&sm); *posted=shell_posted; *minimised=shell_minimised; *restored=shell_restored; *serving=shell_in_loop; pthread_mutex_unlock(&sm); }
+/* REVIEW A41 (verification): the PC's minimise and restore are the form's OnResize (IL 529, rva 0x389e1c), not suspend / resume alone:
+ *   reason = GXDevice.getResizeReason()   (0x11c900: GX+0x430, bit 0 cleared by the read; GX = 0x1408a0970, the static of 0x11c150)
+ *   reason 2: when ClientSize equals the frame buffer (getFrameBufferSize 0x11c0b0 = GX+0x438 / +0x43c, floats) the whole event is
+ *             ignored, else reason = 100;
+ *   WindowState Minimized: suspend;  Normal / Maximized: resume;
+ *   then: reason 100 -> nothing; reason bit 0 -> resizeMainPanel(frame buffer) (a WinForms panel); otherwise, on a restore only,
+ *   GXDevice.resize(ClientSize.Width, ClientSize.Height) (IL_022d-IL_028f; native 0x124940 -> 0x124970 with the GX singleton).
+ * 0x124970 returns at once when GX+0x428 is set, or when the size equals GX+0x438 / +0x43c and GX+0x416 is 0; otherwise it requests a
+ * resize for the timing thread (under the lock GX+0x7ac8: GX+0x400 = 1, GX+0x401 = 1, the size in GX+0x408 / +0x40c, GX+0x404 = 2 when
+ * IsZoomed, else 0).  The port runs that sequence for reason 0 (ClientSize = the window seam's GetClientRect answer) and logs which
+ * branch 0x124970 takes.  Any other reason is logged and counted; the port then resumes without the resize (it never skips the resume:
+ * a game left minimised would stay frozen). */
+static u64 shell_reason_other, shell_resize_calls, shell_resize_noop;
+void kh_window_client_size(int *w,int *h);
+static u32 shell_resize_reason(KCtx *g,const char *when){
+    u32 r=(u32)kh_call(g,GS_BASE+0x11c900,0,0,0,0);        /* Axa.GX.GXDevice.getResizeReason() */
+    if(r){ pthread_mutex_lock(&sm); shell_reason_other++; pthread_mutex_unlock(&sm);
+        kh_warn("shell: %s: GXDevice.getResizeReason() = %u: the PC's OnResize would %s; the port does what reason 0 does without the resize (counted)",when,r,
+                r==2?"compare ClientSize with the frame buffer (equal: ignore the event, else no resize)":r==100?"not resize":(r&1)?"call resizeMainPanel (a WinForms panel)":"resize as for reason 0"); }
+    return r; }
+static void shell_restore_resize(KCtx *g,u32 reason){
+    if(reason) return;                                     /* logged by shell_resize_reason */
+    int cw=0,ch=0; kh_window_client_size(&cw,&ch); u64 gx=GS_BASE+0x8a0970;
+    u32 m428=rd32(g,gx+0x428), a=rd32(g,gx+0x438), b=rd32(g,gx+0x43c); u8 f416=rd8(g,gx+0x416); float fw,fh; memcpy(&fw,&a,4); memcpy(&fh,&b,4);
+    int noop=m428!=0||(fw==(float)cw&&fh==(float)ch&&!f416);
+    kh_call(g,GS_BASE+0x124940,(u64)(u32)cw,(u64)(u32)ch,0,0);   /* Axa.GX.GXDevice.resize(ClientSize.Width, ClientSize.Height) */
+    pthread_mutex_lock(&sm); shell_resize_calls++; if(noop) shell_resize_noop++; pthread_mutex_unlock(&sm);
+    kh_warn("shell: restored: GXDevice.resize(%dx%d) as the PC's OnResize: %s (frame buffer %.0fx%.0f, GX+0x428 = %u, GX+0x416 = %u)",cw,ch,
+            m428?"returned at once (GX+0x428 is set)":noop?"returned at once (the frame buffer already has that size)":"a resize was requested (GX+0x400 set)",fw,fh,m428,f416);
+}
+void kh_shell_resize_counts(u64 *calls,u64 *noop,u64 *other_reason){ pthread_mutex_lock(&sm); *calls=shell_resize_calls; *noop=shell_resize_noop; *other_reason=shell_reason_other; pthread_mutex_unlock(&sm); }
+static void shell_run(KCtx *g,int req){
+    if(req==KH_SHELL_MINIMISE){
+        (void)shell_resize_reason(g,"minimise");          /* OnResize reads it first (and clears its bit 0) */
+        int was=shell_suspend_flg;
+        if(!was) kh_call(g,GS_BASE+0x13b2d0,1,0,0,0);     /* Axa.Sound.Sys.SystemPause(true) */
+        kh_call(g,GS_BASE+0x127eb0,0,0,0,0);              /* Axa.GX.GXDevice.suspendDevice() */
+        shell_suspend_flg=1; pthread_mutex_lock(&sm); shell_minimised++; pthread_mutex_unlock(&sm);
+        kh_warn("shell: minimised, as the PC's BaseSimpleForm::suspend: %sGXDevice.suspendDevice",was?"(sound already paused) ":"SystemPause(true), ");
+    } else if(req==KH_SHELL_RESTORE){
+        u32 reason=shell_resize_reason(g,"restore");
+        kh_call(g,GS_BASE+0x125a10,0,0,0,0);              /* Axa.GX.GXDevice.resumeDevice() */
+        int was=shell_suspend_flg; if(was) kh_call(g,GS_BASE+0x13b2d0,0,0,0,0);   /* Axa.Sound.Sys.SystemPause(false) */
+        shell_suspend_flg=0; pthread_mutex_lock(&sm); shell_restored++; pthread_mutex_unlock(&sm);
+        kh_warn("shell: restored, as the PC's BaseSimpleForm::resume: GXDevice.resumeDevice%s",was?", SystemPause(false)":" (the sound was not paused)");
+        shell_restore_resize(g,reason);                    /* then OnResize's GXDevice.resize(ClientSize) */
+    } else kh_fatal(g,"shell-request-unknown: lifecycle request %d",req);
+}
 void f_579bf0(KCtx *g){                                  /* ManageRun(app) */
     u64 app=KH_RCX(g);
     if(getenv("KH_STATE_DUMP")) state_dump(g,getenv("KH_STATE_DUMP"));
@@ -43,9 +113,12 @@ void f_579bf0(KCtx *g){                                  /* ManageRun(app) */
     kh_warn("shell: GXDevice.init returned; parking until ExitApplication");
     const char *lim=getenv("KH_RUN_SECONDS"); long secs=lim?atol(lim):0; struct timespec dl; clock_gettime(CLOCK_REALTIME,&dl); dl.tv_sec+=secs;
     kh_vclock_idle(1);                                     /* TASK28: parked, idle for the frames clock's quiescence test */
-    pthread_mutex_lock(&sm);
-    while(!exit_requested){ if(secs){ if(pthread_cond_timedwait(&scv,&sm,&dl)!=0){ pthread_mutex_unlock(&sm); kh_warn("shell: KH_RUN_SECONDS=%ld elapsed, ending the run",secs); kh_exit_process(0); } } else pthread_cond_wait(&scv,&sm); }
-    pthread_mutex_unlock(&sm); kh_vclock_idle(0);
+    pthread_mutex_lock(&sm); shell_in_loop=1;
+    while(!exit_requested){
+        if(shell_qn){ int req=shell_q[0]; for(int i=1;i<shell_qn;i++) shell_q[i-1]=shell_q[i]; shell_qn--;   /* TASK41: in order */
+            pthread_mutex_unlock(&sm); kh_vclock_idle(0); shell_run(g,req); kh_vclock_idle(1); pthread_mutex_lock(&sm); continue; }
+        if(secs){ if(pthread_cond_timedwait(&scv,&sm,&dl)!=0){ pthread_mutex_unlock(&sm); kh_warn("shell: KH_RUN_SECONDS=%ld elapsed, ending the run",secs); kh_exit_process(0); } } else pthread_cond_wait(&scv,&sm); }
+    shell_in_loop=0; pthread_mutex_unlock(&sm); kh_vclock_idle(0);
     kh_warn("shell: ExitApplication requested; ManageRun returns");
     KH_RET(g);
 }

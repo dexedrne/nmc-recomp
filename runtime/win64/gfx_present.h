@@ -18,16 +18,21 @@
  *           parks again when the gate was set once more between its park and its admission;
  *         - the frame readback of kh_vkd3d_present (dumps, hash log, video) and the check-mode reference readback: their
  *           ExecuteCommandLists + Signal on the game's queue (gfx_vkd3d.c readback());
- *         - the back-buffer drain's ID3D12CommandQueue::Signal (ResizeBuffers / release).
+ *         - the back-buffer drain's ID3D12CommandQueue::Signal (ResizeBuffers / release);
+ *         - (TASK41, step 11) the game's own queue calls through gfx_wrap.c w_queue: ExecuteCommandLists, Signal and Wait;
+ *         - (TASK41) ID3D12Fence::Signal from the CPU (w_fence slot 10) while a queue may be blocked (fence signals held, or a queue
+ *           Wait was seen): kh_gfx_gate_enter_if_may_block, the condition read under the gate's mutex with the admission;
+ *         - (TASK41) the suspend drain's own Signal on every registered queue (kh_gfx_gate_enter_drain: admitted WHILE the gate is set,
+ *           only on the life worker of runtime/app_life.c, after kh_gfx_gate_quiesce).
  *       PARKS (wait while set, not admission-counted):
  *         - the top of kh_vkd3d_present (the game's Present waits while the gate is set, also when nothing is read back);
  *         - the presenter before vkAcquireNextImageKHR and after every acquire time-out; its check after the marker (e) parks
  *           after the acquire (park_after_acquire);
- *         - ID3D12Fence::Signal from the CPU (wrapped bridge, gfx_wrap.c w_fence slot 10), only while a queue may be blocked (fence
- *           signals held by kh_gfx_gate_hold_fence_signals, or a queue Wait was seen): a CPU signal can make vkd3d submit queued
- *           work (command.c 1197-1205).
- *       NOT HELD YET (plan step 11): the game's own queue calls through gfx_wrap.c w_queue (ExecuteCommandLists, Signal, Wait) and,
- *       outside the conditions above, its CPU fence signals.  So today the gate stops the RUNTIME's submissions, not the game's.
+ *         - (TASK41) the null backend's Present (null_d3d12.c), only while the app is SUSPENDED (kh_app_suspend to the resume; review
+ *           A41: a resign alone is the PC's focus loss there, the game runs on): app_life.c kh_app_null_present_park, not this gate.
+ *       NOT HELD: the game's CPU fence signals while no queue can be blocked (no Wait seen, no drain that failed): they submit nothing.
+ *       The gipa wrapper counts every vkQueueSubmit vkd3d makes; one made while the gate is set by a thread that is not admitted is
+ *       counted and logged (gfx_vkd3d.c, "OUTSIDE an admission").
  *       Every submission call of an admission is preceded by kh_gfx_gate_assert_admitted (the presenter's also when it gives the
  *       VkQueue back): a submission outside its admission is the named fatal gfx-gate-not-admitted (review Y39 n=2).
  *       The presenter's marker (d) is outside every admission: vkd3d flushes it only when it is alone in the game's queue (so never
@@ -39,8 +44,8 @@
  *     main thread while the gate is set and a Present waits there.
  *     The bounded waits after a submission (the presenter's marker wait (d), the drain's fence wait) count an expired slice only when
  *     the gate was clear for the whole slice (kh_gfx_gate_slices_*): time under a set gate never fires their named fatals.
- *     The iOS scene delegate (step 11) sets and clears it, with the queue drain and the stuck-budget exemption; today only the
- *     selftests do.
+ *     The iOS scene delegate (step 11) sets and clears it through runtime/app_life.c (khnmc_app.h: kh_app_will_resign_active,
+ *     kh_app_suspend, kh_app_resume), with the queue drain; no stuck budget of kh_compat.h counts a slice that overlapped a set gate.
  *
  *  2. DISPLAY PACING (host clock only).  IDXGIOutput::WaitForVBlank (null_d3d12.c) waits for the next display refresh when a tick
  *     source is registered: the iOS shell's CADisplayLink calls kh_vsync_tick on every refresh; on Linux KHNMC_DISPLAY=timer60 is a
@@ -75,8 +80,15 @@ void kh_gfx_gate_leave(void);                   /* after the submission call ret
 void kh_gfx_gate_assert_admitted(const char *what);   /* right before a submission call: not admitted = the named fatal gfx-gate-not-admitted */
 enum { KH_GATE_QUIESCED=0, KH_GATE_NOT_QUIESCED=1, KH_GATE_QUIESCE_NOT_SET=2 };
 int  kh_gfx_gate_quiesce(unsigned slices);      /* the gate set: wait until nothing is admitted, at most `slices` expired slices; KH_GATE_* */
+int  kh_gfx_gate_quiesce_bounded(unsigned slices,unsigned slice_ms);   /* TASK41: the same, slices of slice_ms (0 = kh_stuck_slice_ms) */
 const char *kh_gfx_gate_result_name(int r);     /* "quiesced", "suspend-not-quiesced" (logged with the places still admitted), "gate-not-set" */
 int  kh_gfx_gate_admitted(void);                /* threads admitted now */
+uint64_t kh_gfx_gate_parks_at(const char *prefix);   /* review A41: parks at the places whose name starts with prefix */
+/* TASK41 (plan step 11) */
+void kh_gfx_gate_enter_drain(const char *where);    /* the suspend drain's own Signal: admitted WHILE the gate is set (with it clear: gfx-gate-drain-unset) */
+int  kh_gfx_gate_enter_if_may_block(const char *where);   /* ID3D12Fence::Signal from the CPU: an admission (waits while set) iff a queue may be
+                                                         * blocked (fence signals held, or a queue Wait seen); 0 = not gated, nothing done */
+int  kh_gfx_gate_thread_admitted(void);         /* the calling thread is inside an admission (the gipa vkQueueSubmit counter) */
 /* a bounded wait in expired slices that does not count time under a set gate: begin, then after every poll `expired(s, N)` = 1 once N
  * slices COUNTED (the gate clear for the whole slice); s.free_ = slices not counted */
 typedef struct { uint64_t start_ns, deadline_ns; unsigned counted, free_; } KhGateSlices;
@@ -112,4 +124,18 @@ void kh_present_shell_report(FILE *f);          /* exit: the shell's kh_present_
 /* ---- 3. presenter: what the shell calls (Apple; the layer sink) -------------------------------------------------------------- */
 /* Both are counted in every build; a build without the vkd3d backend, or a run without a layer presenter, reports them as DROPPED at exit */
 void kh_present_set_layer(void *ca_metal_layer,uint32_t w_px,uint32_t h_px);   /* before the game starts (KHNMC_GFX_PRESENT=layer) */
-void kh_present_set_size(uint32_t w_px,uint32_t h_px);                         /* the drawable size changed: stored, the swapchain is rebuilt at the next present (0x0: counted, ignored) */
+void kh_present_set_size(uint32_t w_px,uint32_t h_px);                         /* the drawable size: stored; the swapchain is rebuilt at the next present only when it changed (0x0, or the same size: counted, ignored) */
+void kh_present_note_drawable(uint32_t w_px,uint32_t h_px);                    /* review A41: the drawable size alone (every app, also without the backend; no lock, no line) for KHNMC_SCREEN=layer */
+/* TASK41: the shell's view, display link and test label (no lock, any thread, every build) */
+int  kh_present_built(void);                     /* 1 = this binary has the vkd3d backend (the shell hands over its layer only then) */
+int  kh_present_wants_ticks(void);               /* -1 = not decided yet (before start-up read KHNMC_GFX_PRESENT), 1 = a layer run: the display
+                                                  * link calls kh_vsync_tick; 0 = not (the null app keeps its WaitForVBlank pacing; the link stops) */
+int  kh_present_layer_size(uint32_t *w_px,uint32_t *h_px);   /* the drawable size of the last kh_present_set_layer; 0 = none (KHNMC_SCREEN=layer) */
+/* TASK41: the shell's resume (through kh_app_resume) and its test label: no lock, any thread, every build (no backend: no-ops / 0) */
+void kh_present_resume_all(void);                /* every presenter rebuilds only its own swapchain at its next Present (an atomic generation) */
+uint64_t kh_present_presented(void);             /* swapchain presents so far (the shell hides its label after the first) */
+uint64_t kh_present_rebuilds_after_resume(void);
+uint64_t kh_present_resume_calls(void);          /* review A41: kh_present_resume_all calls (every build) */
+uint64_t kh_present_parked_after_acquire(void);  /* review A41: Presents that parked after their acquire (they also rebuild as after-park) */
+/* runtime-internal (the suspend drain's worker): every presenter's slot fences, bounded, no fatal; 1 = all complete */
+int  kh_present_quiesce_all_bounded(unsigned slices,unsigned slice_ms,unsigned *npres,unsigned *left);
