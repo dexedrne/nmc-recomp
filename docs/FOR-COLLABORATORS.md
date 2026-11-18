@@ -30,6 +30,18 @@ Tools that work on game files and need nothing but Python 3 (each says how to us
 - `tools/mod/ard_events.py`, `tools/mod/ard_barstat.py`: area files: which events (cutscenes), jumps and programs each holds.
 - `tools/graphics/pso_key.py`: decode the game's pipeline-state key.
 
+## Other projects worth knowing (not ours, not included here)
+
+- **libkh2** (https://github.com/Kozarusa/libkh2): Sora's controller from KH2 Final Mix as an embeddable library with a C ABI, in
+  the spirit of libsm64. The host engine (Unity, Godot) supplies collision triangles and input each tick; libkh2 runs the movement
+  and attack logic from the user's own PS2 disc and answers position, facing, state, motion, attack windows and the posed skeleton.
+  For a Unity PvP project this is the closest thing to the game's own movement and combat rules.
+- **kh2fm-decomp** (https://github.com/Kozarusa/kh2fm-decomp, branch `fm-source`): a matching decompilation of the PS2 KH2 Final
+  Mix executable (about 8,000 functions as C++ that compiles to the original instructions), built on GovanifY/kh2. Readable game
+  logic and names.
+- **kh2-ai-decomp** (https://github.com/thundrio-kh/kh2-ai-decomp): every vanilla AI and area script decoded with OpenKH's tools,
+  with notes on the script system calls. Useful next to `tools/mod/bdxdis.py` to see what NMC changed in a script.
+
 ## NMC's combat in two minutes (details and sources in docs/mod/MECHANICS.md)
 
 On PC almost all of it is ONE script: the party slot of Donald is turned into an invisible helper object, and its AI script
