@@ -168,4 +168,9 @@ never in a selftest; a disconnect releases the pad. Selftest: 6 new checks (ever
 only, off again), shown to fail with the right stick dropped; on the phone 122 main checks, 0 failures.
 `device_run.sh play` starts the game as the owner plays it (controller, sound, no script, no time limit); after every test run the
 play configuration is put back, so the app's icon always starts the game.
+Controller check on the iPhone with the owner's PS5 DualSense (2026-11-18, `device_run.sh play`): all 14 buttons arrive as the right
+XInput bits in the order pressed (Cross A 0x1000, Circle B 0x2000, Square X 0x4000, Triangle Y 0x8000, L1 0x100, R1 0x200, Options START
+0x10, Create BACK 0x20, L3 0x40, R3 0x80, d-pad 0x1/0x2/0x4/0x8); the right stick showed full up (+32767) during the R3 press. Triggers and
+the left stick go through the same code but the log showed only button changes; the runtime now also logs each trigger's and stick
+direction's first full deflection once.
 

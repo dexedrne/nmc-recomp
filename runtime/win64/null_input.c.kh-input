@@ -43,6 +43,14 @@ void kh_input_host_pad_set(u16 buttons,u8 lt,u8 rt,s16 lx,s16 ly,s16 rx,s16 ry){
     int logit=was!=buttons && host_pad_logged<200; if(logit) host_pad_logged++;
     pthread_mutex_unlock(&input_lock);
     if(logit) fprintf(stderr,"kh: input: host pad buttons 0x%04x (lt %u rt %u, left %d,%d right %d,%d)\n",buttons,lt,rt,lx,ly,rx,ry);
+    /* the first full deflection of each trigger and stick direction is logged once (a controller check reads them; the button lines
+     * above show only button changes) */
+    static _Atomic unsigned seen; static const char *const what[]={"L2 / LT full","R2 / RT full","left stick left","left stick right",
+        "left stick down","left stick up","right stick left","right stick right","right stick down","right stick up"};
+    unsigned now=(lt>=200?1u:0)|(rt>=200?2u:0)|(lx<=-25000?4u:0)|(lx>=25000?8u:0)|(ly<=-25000?16u:0)|(ly>=25000?32u:0)
+                |(rx<=-25000?64u:0)|(rx>=25000?128u:0)|(ry<=-25000?256u:0)|(ry>=25000?512u:0);
+    unsigned fresh=now&~atomic_fetch_or(&seen,now);
+    for(int i=0;i<10;i++) if(fresh&(1u<<i)) fprintf(stderr,"kh: input: host pad first full deflection: %s (lt %u rt %u, left %d,%d right %d,%d)\n",what[i],lt,rt,lx,ly,rx,ry);
 }
 int kh_input_host_test(int on){ int was=host_pad_on; host_pad_on=on; pthread_mutex_lock(&input_lock); memset(&host_pad,0,sizeof host_pad); host_latched=0; pthread_mutex_unlock(&input_lock); return was; }   /* selftest */
 extern _Atomic u64 gfx_presents;
