@@ -240,3 +240,14 @@ owner decides and the phone's own numbers exist (implementation notes section 6,
   (every Mac picture appears on the phone). 108 MoltenVK `[mvk-error]` lines, all the same: iOS refuses MTLCounterSampleBuffers for
   vkd3d's timestamp query pools and MoltenVK falls back to emulated timestamps (benign; worth silencing later). Pictures (game-derived,
   not committed): ~/Documents/khnmc/phone-frames/m1-20261118/.
+- **ORDERED_MEM on the phone** (A20 Pro; the graphics app, plain then `ORDERED_MEM=1`, then the plain app re-signed; implementation notes
+  section 6): the ordered app is 48 MB (plain 37 MB), all link checks pass, 117 of 117 shards built with LDAPR (rcpc) / STLR.
+  - Litmus, 4,000,000 rounds: plain accesses saw the flag ahead of the data 720,043 times, the plain build's own LD/ST 670,698
+    times; acquire/release 0, the ordered build's own LD/ST 0. **The phone reorders guest memory accesses that x86 keeps in order.**
+  - Microbenchmark (ns per step): load64 0.837 -> 0.874 (+4.3 %), load32 +4.2 %, store64 +4.2 %, load+store 0.866 -> 0.969 (+12.0 %).
+  - Story route (null backend, host clock, 12,000 frames): both 58 of 58, exit 0; pace 49.3 (plain) and 49.4 (ordered) game frames
+    per second, i.e. the pacing, not the CPU, sets the speed.
+  - **Found on the way: the null-backend app runs at about 49 fps, not 60** (`vsync: source=sleep`, 600 game frames in 12.17 s).
+    That is the sleep-based WaitForVBlank on iOS (plan fact 9: a 16.667 ms sleep overshoots); the display link of IOS-GRAPHICS-PLAN
+    step 10 (task 41) replaces it.
+  - Recommendation unchanged: `ORDERED_MEM=1` by default for the Apple targets. Owner decision pending.
