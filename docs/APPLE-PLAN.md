@@ -174,3 +174,15 @@ XInput bits in the order pressed (Cross A 0x1000, Circle B 0x2000, Square X 0x40
 the left stick go through the same code but the log showed only button changes; the runtime now also logs each trigger's and stick
 direction's first full deflection once.
 
+## The presenter on Apple's GPU (Mac mini, M4 Pro, MoltenVK 1.4.2; 2026-11-18, task 36 merged)
+- Plan step 1 on the Mac: the merged tree built with MoltenVK loaded (dylib) and linked statically (GFX_VULKAN_STATIC=1, the way the
+  iPhone app links it): the GPU selftest 170,496 checks, 0 failures, both builds; `presentation extensions: surface=1 headless=1
+  metal=1 swapchain=1 display_timing=1 metal_objects=1 layer_settings=1`.
+- Plan step 9 (headless): graphics-only selftest with the presenter at 2670x1878 (the iPhone Duo's inner screen): vkd3d 184, gfx present
+  281, wrap device 125 checks, 0 failures; the presented picture within 1 level of the D3D12 readback and of the CPU pattern. The title
+  route (2,700 game frames) with the presenter on: all 2,699 presents, swapchain made once, never rebuilt; cost per present mean
+  0.146 ms, p99 0.26 ms (lavapipe: 5.7 ms); acquire mean 0.012 ms; the check mode against the D3D12 readback: 8 ok, 0 failed, largest
+  difference 1.00 level, largest mean 0.018.
+- Seen on the way: the game creates about two command allocators and lists per frame (CreateCommandAllocator 5,540 by frame 2,700);
+  worth a look for the phone's CPU time (a pool in the wrapper), not a correctness question.
+
