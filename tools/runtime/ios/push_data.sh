@@ -2,6 +2,8 @@
 # tools/ios/push_data.sh [plan|run] : copy the game data (profile A: the data tree minus prune-A.list, plus pkgdir/) to the
 # owner's iPhone, into the KHNMC app's Documents/data and Documents/pkgdir, through the MacBook, in chunks.
 #   plan : write the chunk lists only (run-J26/ios/push/chunk-NNN.list, about CHUNK_MB each, default 2048)
+#   verify: list Documents/data and Documents/pkgdir ON THE PHONE (devicectl info files, JSON) and compare every name and byte size
+#          with manifest.tsv: missing, wrong size and extra files are listed (verify.txt); exit 0 only when all match
 #   run  : for every chunk without a .done mark: rsync it to ~/Developer/KHNMC/stage/cNNN on the Mac (the NEXT chunk is staged while
 #          the current one goes to the phone, so at most two chunks, about 4 GB, sit on the Mac: the project folder stays under its
 #          6 GB limit), check file count and bytes there, `devicectl device copy to` into the app's container (devicectl merges
@@ -55,10 +57,33 @@ stage(){ local c=$1 n=$(basename "$1" .list) k src; k=$(head -1 "$c" | cut -d' '
 send(){ local c=$1 n=$(basename "$1" .list) k; k=$(head -1 "$c" | cut -d' ' -f2)
   $RSH "$MAC" "export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer; . ~/Developer/KHNMC/state/device.env; xcrun devicectl device copy to --device \$DEVICE --timeout 7200 --domain-type appDataContainer --domain-identifier beer.vyvanse.khnmc --source ~/Developer/KHNMC/stage/$n/$k --destination Documents/$k" >> "$P/devicectl.log" 2>&1 || return 1
   $RSH "$MAC" "rm -rf ~/Developer/KHNMC/stage/$n"; }
+verify(){
+  local k; for k in data pkgdir; do
+    $RSH "$MAC" "export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer; . ~/Developer/KHNMC/state/device.env; xcrun devicectl device info files --device \$DEVICE --timeout 600 --domain-type appDataContainer --domain-identifier beer.vyvanse.khnmc --subdirectory Documents/$k --json-output ~/Developer/KHNMC/run/phone-$k.json > /dev/null 2>&1; cat ~/Developer/KHNMC/run/phone-$k.json; rm -f ~/Developer/KHNMC/run/phone-$k.json" > "$P/phone-$k.json" || return 1
+  done
+  python3 - "$P" <<'PY'
+import json,os,sys
+P=sys.argv[1]; want={}
+for l in open(os.path.join(P,'manifest.tsv')):
+    k,r,s=l.rstrip('\n').split('\t'); want[(k,r)]=int(s)
+have={}
+for k in ('data','pkgdir'):
+    for f in json.load(open(os.path.join(P,'phone-%s.json'%k)))['result']['files']:
+        if not f['resources']['isDirectory']: have[(k,f['relativePath'])]=f['metadata']['size']
+miss=[x for x in want if x not in have]; bad=[x for x in want if x in have and have[x]!=want[x]]; extra=[x for x in have if x not in want]
+with open(os.path.join(P,'verify.txt'),'w') as o:
+    for tag,lst in (('MISSING',miss),('SIZE',bad),('EXTRA',extra)):
+        for k,r in sorted(lst): o.write('%s\t%s/%s\n'%(tag,k,r))
+print('push: verify: %d of %d files on the phone with the right size (%.2f GB); missing %d, wrong size %d, extra %d (list: %s/verify.txt)'%(
+    len(want)-len(miss)-len(bad),len(want),sum(want[x] for x in want if x in have and have[x]==want[x])/1e9,len(miss),len(bad),len(extra),P))
+sys.exit(0 if not miss and not bad else 1)
+PY
+}
 case "${1:-run}" in
   plan) plan; exit;;
+  verify) verify; exit;;
   run) ;;
-  *) sed -n '2,12p' "$0" >&2; exit 2;;
+  *) sed -n '2,14p' "$0" >&2; exit 2;;
 esac
 ls "$P"/chunk-*.list >/dev/null 2>&1 || plan | tee -a "$P/push.log"
 todo=(); for c in "$P"/chunk-*.list; do [ -f "${c%.list}.done" ] || todo+=("$c"); done

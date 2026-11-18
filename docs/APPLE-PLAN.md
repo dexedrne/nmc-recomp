@@ -112,3 +112,13 @@ retries while the phone is locked, poll the status file, fetch the log). Team an
 Next on the phone: the null-backend field route (needs the route data subset in the app's Documents), then the graphics stack
 (vkd3d + MoltenVK built for iOS) for a real picture.
 
+## The game data on the iPhone, 2026-11-18
+`tools/runtime/ios/push_data.sh run` copies profile A (the data tree minus prune-A.list: 60,439 files, 41.4 GB) and pkgdir/ (0.97 GB)
+into the app's Documents/data and Documents/pkgdir: 21 chunks of 2 GB, rsync to the Mac (about 75 MB/s), then `devicectl device copy
+to` (about 45 MiB/s over the network tunnel; plugging the cable in did not change the transport), the next chunk staged while the
+current one goes to the phone, so the Mac never holds more than two chunks. `push_data.sh verify` lists the phone's folders and
+compares every name and byte size with the manifest: 60,441 of 60,441. The app marks data/, pkgdir/ and kh2fm.exe as excluded
+from iCloud backup at every start (written to Documents/khnmc-backup.txt) and keeps the screen awake while it runs.
+**Never use `devicectl device copy to --remove-existing-content`:** aimed at one sub-folder, it emptied the whole app container
+(the first full copy was lost that way and sent again). devicectl has no delete; stray files are left or removed by the app.
+

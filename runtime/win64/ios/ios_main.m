@@ -56,6 +56,7 @@ static void start_game_once(void){
     label.text=@"KHNMC test shell\n\nWhat runs is set by Documents/khnmc.conf.\nThe log and the status file named there are written into Documents.\nThe app closes when the run ends.";
     [vc.view addSubview:label];
     w.rootViewController=vc; self.window=w; [w makeKeyAndVisible];
+    [UIApplication sharedApplication].idleTimerDisabled=YES;   /* a game: the screen must not dim and lock while it runs (iOS suspends a locked app) */
     start_game_once();
 }
 @end
