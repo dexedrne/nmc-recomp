@@ -84,3 +84,18 @@ single-size `AppIcon` set in an asset catalog (one 1024x1024 image; Xcode derive
 - If a layout without extended addressing is ever needed: the second zone is almost empty, so an iOS layout of 2-4 GiB (and a
   smaller guard) is possible; the object-id windows of the main heap must keep their place (docs: implementation notes).
 
+## Measured on the iPhone Duo (A20 Pro, 12 GB, iOS 27.2), 2026-11-17: the probe app, signed with the owner's team, installed over the network
+| | no entitlements | increased-memory-limit + extended-virtual-addressing |
+|---|---|---|
+| memory the system allows the process at start | 3,368 MiB | **6,136 MiB** |
+| 12 GiB contiguous reservation (the port's layout) | FAILED (largest 6,144 MiB, 7 GiB in all) | **OK** (64 GiB and more reservable in pieces) |
+| 1,536 MiB committed and written in 64 MiB steps | done (1,825 MiB left) | done (4,594 MiB left) |
+Both builds: 16 KiB pages (mprotect at a 4 KiB offset fails, as expected), 59 threads with large stacks alive together, fork refused,
+mkstemp / tmpfile in the app's TMPDIR work, /tmp not writable, and a 16.667 ms sleep takes about 20 ms on average (frame pacing on
+the phone must follow the display link, not sleeps). Physical memory reported: 11,570 MiB.
+Conclusion: with the owner's paid team and both entitlements the port's address layout fits as it is, and its measured peak use
+(about 1.5 GiB of guest heap, 0.9 GB resident) leaves several GB of headroom. Reports: `run-J26/ios/probe/probe-{plain,ent}.txt`
+in the main work tree. How it was done: the probe project built with `CODE_SIGNING_ALLOWED=YES`, automatic signing for team
+<TEAM> and `-allowProvisioningUpdates` in a windowless `launchctl submit` job on the MacBook (the signing keychain is in the
+GUI session), then `xcrun devicectl device install app / process launch / copy from` over the network to the paired phone.
+
