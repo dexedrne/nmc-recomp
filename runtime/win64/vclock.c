@@ -56,6 +56,13 @@ int kh_vclock_on;                                   /* 1 = KHNMC_CLOCK=frames (s
 int kh_vclock_sync;
 #define VC_QUIET_GUARD_NS 60000000000ull               /* a field load takes 5..10 s of host time on one core: that is work, not a hang */
 static u64 n_quiet_waits, n_quiet_guard, n_vsleeps, quiet_host_ns; static int n_quiet_guard_logged;
+/* review U35 n=20/29: ONE guard for every wait on quiescence.  A clock client due at the current instant (the mixer, a timer, a Sleep, a
+ * wait's time-out) waits for the guest to be quiet before it runs; the clock used to charge that wait as the client's own work (30
+ * slices, vclock-client-stuck) before its 60 s guard could ever apply, and nothing let such a client go.  Now the client marks itself
+ * (quiet_wait), the clock does not charge those slices, and the client is let go by the same guard (counted, the thread named). */
+static u64 quiet_guard_ns=VC_QUIET_GUARD_NS;           /* the selftest shortens it */
+static u64 n_client_quiet_guard; static int n_client_guard_logged;
+static int stuck_record; static u64 n_stuck_recorded;  /* selftest only: a stuck client is counted instead of the named fatal */
 #define VC_HZ 60ull
 #define VC_BUSY_BOOT_NS 100000000ull
 #define VC_BUSY_RUN_NS 1000000000ull
@@ -75,7 +82,7 @@ static _Atomic u64 v_now;                           /* ns, valid when stepped */
 static u64 v_t0, host_t0;                           /* virtual / host time when stepping began */
 static _Atomic u64 n_vblank;                        /* virtual vblanks since stepping began */
 static u64 n_normal, n_multi, n_norel, n_busy, n_stall, gate_host_ns, max_gate_ns, presents_seen, ticks_seen, frames_seen; static int last_how=-1;
-typedef struct { int used; const char *name; u64 due; int prio; KThread *keyth; int keybase, keyseq; } VClient;   /* keyth: prio = keybase + key(keyth) * 8 + keyseq, read when compared */
+typedef struct { int used; const char *name; u64 due; int prio; KThread *keyth; int keybase, keyseq; int quiet_wait; u64 quiet_since; } VClient;   /* keyth: prio = keybase + key(keyth) * 8 + keyseq, read when compared; quiet_wait: due, first in line, waiting for quiescence since quiet_since (host ns) */
 static int cprio(int i);
 static VClient clients[MAXCLIENTS];
 static void (*listeners[MAXLISTEN])(KCtx *g,u64 vblank,u64 vnow_ns); static int nlisten;
@@ -156,11 +163,30 @@ int kh_vclock_vsleep(u32 ms){
     kh_vclock_client_drop(id);                                                           /* running (client_wait marked it), then the clock may leave the deadline */
     return 1;
 }
-/* a timed wait's deadline (threads.c kh_wait): reached, the clock's ordering for that instant respected and the guest quiet */
+/* caller holds vm: the client `id` is (on=1) / is no longer (on=0) waiting for quiescence at its instant; the clock re-tests */
+static void client_quiet_mark(int id,int on){
+    if(on&&!clients[id].quiet_wait){ clients[id].quiet_wait=1; clients[id].quiet_since=kh_host_ns(); pthread_cond_broadcast(&vcv); }
+    else if(!on&&clients[id].quiet_wait){ clients[id].quiet_wait=0; clients[id].quiet_since=0; pthread_cond_broadcast(&vcv); }
+}
+/* caller holds vm: a due client has waited quiet_guard_ns for quiescence; it runs anyway (counted, named): that instant is not ordered */
+static void client_let_go(int id,u64 waited_ns,const char *who,u64 t){
+    n_client_quiet_guard++;
+    if(n_client_guard_logged++<8) fprintf(stderr,"kh: vclock: quiescence guard: clock client '%s' due at virtual %llu ns let go after %.1f s of host time waiting for thread %s; its work at that instant is not ordered\n",
+                                          clients[id].name,(unsigned long long)t,waited_ns/1e9,who&&*who?who:"(unknown)");
+}
+/* a timed wait's deadline (threads.c kh_wait): reached, the clock's ordering for that instant respected and the guest quiet (or the
+ * quiescence guard passed: review U35 n=20/29; meanwhile the clock does not charge this client as stuck) */
 int kh_vclock_deadline_due(int id,u64 dl){
     if(atomic_load(&v_now)<dl) return 0;
-    pthread_mutex_lock(&vm); int ahead=0, my=cprio(id); for(int i=0;i<MAXCLIENTS;i++) if(i!=id&&clients[i].used&&clients[i].due<=dl&&cprio(i)<my){ ahead=1; break; } pthread_mutex_unlock(&vm);
-    return !ahead&&kh_threads_quiet(NULL,0);
+    pthread_mutex_lock(&vm); int ahead=0, my=cprio(id); for(int i=0;i<MAXCLIENTS;i++) if(i!=id&&clients[i].used&&clients[i].due<=dl&&cprio(i)<my){ ahead=1; break; }
+    client_quiet_mark(id,!ahead); u64 q0=clients[id].quiet_since; pthread_mutex_unlock(&vm);
+    if(ahead) return 0;
+    char who[64]=""; int go=kh_threads_quiet(who,sizeof who);
+    pthread_mutex_lock(&vm);
+    if(!go){ u64 h=kh_host_ns(); if(h-q0>=quiet_guard_ns){ client_let_go(id,h-q0,who,dl); go=1; } }
+    if(go) client_quiet_mark(id,0);
+    pthread_mutex_unlock(&vm);
+    return go;
 }
 u64 kh_vclock_now_ns(void){
     if(atomic_load(&stepped)) return atomic_load(&v_now);
@@ -202,7 +228,7 @@ void kh_vclock_wait_until_raw(u64 t){
  * the client has announced a later one.  first_due = the instant of its first piece of work. */
 int kh_vclock_client_add_prio(const char *name,u64 first_due,int prio){
     pthread_once(&vonce,vc_once); pthread_mutex_lock(&vm); int id=-1;
-    for(int i=0;i<MAXCLIENTS;i++) if(!clients[i].used){ clients[i].used=1; clients[i].name=name; clients[i].due=first_due; clients[i].prio=prio; clients[i].keyth=NULL; id=i; break; }
+    for(int i=0;i<MAXCLIENTS;i++) if(!clients[i].used){ clients[i].used=1; clients[i].name=name; clients[i].due=first_due; clients[i].prio=prio; clients[i].keyth=NULL; clients[i].quiet_wait=0; clients[i].quiet_since=0; id=i; break; }
     pthread_mutex_unlock(&vm);
     if(id<0) kh_fatal(NULL,"vclock-clients: more than %d clock clients",MAXCLIENTS);
     return id;
@@ -228,10 +254,14 @@ static void client_wait_raw(int id,u64 t){
             if(!atomic_load(&stepped)) break;
             int ahead=0; if(atomic_load(&v_now)>=t){ int my=cprio(id); for(int i=0;i<MAXCLIENTS;i++) if(i!=id&&clients[i].used&&clients[i].due<=t&&cprio(i)<my){ ahead=1; break; } }
             if(atomic_load(&v_now)>=t&&!ahead){ if(!kh_vclock_sync) break;                     /* sync=all: and nothing else of the guest is still running at t */
-                pthread_mutex_unlock(&vm); int q=kh_threads_quiet(NULL,0); pthread_mutex_lock(&vm); if(q) break;
+                client_quiet_mark(id,1);                                                       /* not this client's work: the clock does not charge it (review U35 n=20/29) */
+                char who[64]=""; pthread_mutex_unlock(&vm); int q=kh_threads_quiet(who,sizeof who); pthread_mutex_lock(&vm); if(q) break;
+                u64 h=kh_host_ns(); if(h-clients[id].quiet_since>=quiet_guard_ns){ client_let_go(id,h-clients[id].quiet_since,who,t); break; }
                 struct timespec d2; abs_in(&d2,200000ull); kh_cond_wait_until(&vcv,&vm,&d2); continue; }
+            client_quiet_mark(id,0);
             pthread_cond_wait(&vcv,&vm);
         }
+        client_quiet_mark(id,0);                                                               /* runs its work now: charged from here on */
         int done=atomic_load(&stepped); pthread_mutex_unlock(&vm);
         if(done) return;
     }
@@ -257,16 +287,20 @@ static void advance_locked(KCtx *g,u64 target){
     for(;;){
         u64 now=atomic_load(&v_now);
         unsigned stuck=0;                                                               /* slices that expired (kh_compat.h: a stopped process loses one slice, not the budget) */
-        for(;;){ int behind=-1; for(int i=0;i<MAXCLIENTS;i++) if(clients[i].used&&clients[i].due<=now){ behind=i; break; }
+        for(;;){ int behind=-1, qw=0; for(int i=0;i<MAXCLIENTS;i++) if(clients[i].used&&clients[i].due<=now){ if(behind<0) behind=i; qw|=clients[i].quiet_wait; }
             if(behind<0) break;
-            if(kh_cond_wait_stuck(&vcv,&vm,&stuck,VC_CLIENT_WAIT_S)==ETIMEDOUT){ const char *nm=clients[behind].name; u64 due=clients[behind].due; pthread_mutex_unlock(&vm);
+            /* a due client waits for the guest to be quiet (every other due client waits behind it): not stuck work, so not charged;
+             * that wait has the quiescence guard (review U35 n=20/29) */
+            if(qw){ struct timespec d; abs_in(&d,1000000000ull); kh_cond_wait_until(&vcv,&vm,&d); continue; }
+            if(kh_cond_wait_stuck(&vcv,&vm,&stuck,VC_CLIENT_WAIT_S)==ETIMEDOUT){ if(stuck_record){ n_stuck_recorded++; break; }
+                const char *nm=clients[behind].name; u64 due=clients[behind].due; pthread_mutex_unlock(&vm);
                 kh_fatal(g,"vclock-client-stuck: clock client '%s' did not finish its work due at virtual time %llu ns in %d slices of waiting, about that many seconds of this process running (the clock is at %llu ns)",nm,(unsigned long long)due,VC_CLIENT_WAIT_S,(unsigned long long)now); } }
         if(now>=target) return;
         if(kh_vclock_sync){                                                             /* nothing may still be running at `now` */
             u64 q0=0; char who[64]="";
             while(!kh_threads_quiet(who,sizeof who)){
                 u64 h=kh_host_ns(); if(!q0){ q0=h; n_quiet_waits++; }
-                if(h-q0>=VC_QUIET_GUARD_NS){ n_quiet_guard++; if(n_quiet_guard_logged++<8) fprintf(stderr,"kh: vclock: quiescence guard: thread %s still running %.1f s of host time after virtual %llu ns; the clock goes on\n",who,(h-q0)/1e9,(unsigned long long)now); break; }
+                if(h-q0>=quiet_guard_ns){ n_quiet_guard++; if(n_quiet_guard_logged++<8) fprintf(stderr,"kh: vclock: quiescence guard: thread %s still running %.1f s of host time after virtual %llu ns; the clock goes on\n",who,(h-q0)/1e9,(unsigned long long)now); break; }
                 struct timespec d2; abs_in(&d2,200000ull); kh_cond_wait_until(&vcv,&vm,&d2);
             }
             if(q0) quiet_host_ns+=kh_host_ns()-q0;
@@ -330,8 +364,8 @@ void kh_vclock_report(FILE *f){
     pthread_mutex_unlock(&vm);
     extern void kh_timer_frames_report(FILE*); kh_timer_frames_report(f);
     if(kh_vclock_sync){ extern u64 kh_threads_vwaits(void); extern u64 kh_threads_wake_waits(u64*); extern u64 kh_threads_rel_retests(void); u64 wg=0, ww=kh_threads_wake_waits(&wg);
-        fprintf(f,"kh: vclock: KHNMC_CLOCK_SYNC=all: vblanks released because the guest was quiet=%llu; clock steps that waited for running threads=%llu (%.1f s of host time), let go by the %.0f s guard=%llu; Sleep calls on the virtual clock=%llu, waits with a virtual time-out=%llu; wake-ups after which the waker waited for the woken thread=%llu, let go by the 2 s guard=%llu; quiescence tests not quiet because a thread was released during their pass=%llu\n",
-        (unsigned long long)n_quiet_rel,(unsigned long long)n_quiet_waits,quiet_host_ns/1e9,VC_QUIET_GUARD_NS/1e9,(unsigned long long)n_quiet_guard,(unsigned long long)n_vsleeps,(unsigned long long)kh_threads_vwaits(),(unsigned long long)ww,(unsigned long long)wg,(unsigned long long)kh_threads_rel_retests()); }
+        fprintf(f,"kh: vclock: KHNMC_CLOCK_SYNC=all: vblanks released because the guest was quiet=%llu; clock steps that waited for running threads=%llu (%.1f s of host time), let go by the %.0f s guard=%llu; due clock clients let go by the same guard=%llu; Sleep calls on the virtual clock=%llu, waits with a virtual time-out=%llu; wake-ups after which the waker waited for the woken thread=%llu, let go by the 2 s guard=%llu; quiescence tests not quiet because a thread was released during their pass=%llu\n",
+        (unsigned long long)n_quiet_rel,(unsigned long long)n_quiet_waits,quiet_host_ns/1e9,quiet_guard_ns/1e9,(unsigned long long)n_quiet_guard,(unsigned long long)n_client_quiet_guard,(unsigned long long)n_vsleeps,(unsigned long long)kh_threads_vwaits(),(unsigned long long)ww,(unsigned long long)wg,(unsigned long long)kh_threads_rel_retests()); }
 }
 
 /* ---- test hooks for the selftests of this and other modules (audio clock, timers, video): a stepped clock that only the test moves */
@@ -350,6 +384,12 @@ void kh_vclock_test_end(void){
     pthread_mutex_lock(&vm); kh_vclock_on=sv_on; v_t0=sv_t0; host_t0=sv_host_t0; atomic_store(&v_now,sv_now); atomic_store(&n_vblank,sv_vbl); atomic_store(&stepped,sv_stepped);
     pthread_cond_broadcast(&vcv); pthread_mutex_unlock(&vm);
 }
+/* review U35 n=20/29 (threads.c kh_sync_vclock_selftest): the quiescence guard (returns the previous value), the stuck recorder (on = a
+ * stuck client is counted instead of the named fatal; returns the count so far), the clients let go by the guard, a client's mark */
+u64 kh_vclock_test_quiet_guard(u64 ns){ pthread_mutex_lock(&vm); u64 o=quiet_guard_ns; quiet_guard_ns=ns; pthread_mutex_unlock(&vm); return o; }
+u64 kh_vclock_test_stuck_record(int on){ pthread_mutex_lock(&vm); stuck_record=on; u64 n=n_stuck_recorded; pthread_mutex_unlock(&vm); return n; }
+u64 kh_vclock_client_guard_count(void){ pthread_mutex_lock(&vm); u64 n=n_client_quiet_guard; pthread_mutex_unlock(&vm); return n; }
+int kh_vclock_test_client_quiet(int id){ pthread_mutex_lock(&vm); int q=clients[id].used&&clients[id].quiet_wait; pthread_mutex_unlock(&vm); return q; }
 
 /* ---- selftest ------------------------------------------------------------------------------------------------------------- */
 static int st_w; static _Atomic u64 st_p, st_r, st_f;

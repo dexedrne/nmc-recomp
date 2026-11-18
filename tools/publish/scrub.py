@@ -12,7 +12,10 @@ RULES is a private tab-separated file that is NOT part of this repository (it ha
   regex   <TAB> pattern <TAB> replacement
   forbid  <TAB> pattern
 Rules are applied in file order.  Lines starting with # are comments.  Binary files (a NUL byte in the first 8 KiB) are left
-alone by --tree and are reported by --scan only through their names.
+alone by --tree, but --scan searches them too: as UTF-8, as raw bytes (one character per byte, so an ASCII pattern is found
+anywhere in the file) and as UTF-16 little and big endian at both byte alignments.  So a binary file that still holds a forbidden
+pattern stops the export instead of passing as clean (review 2026-11-17: --scan used to store such a blob as clean without
+searching it).  Compressed contents (zip, PNG, PDF streams) are not unpacked: the scan's summary line counts the binary blobs.
 """
 import argparse, os, re, subprocess, sys
 
@@ -71,11 +74,26 @@ def do_tree(root, subs):
     return changed
 
 
+def is_binary(b):
+    return b'\0' in b[:8192]
+
+
+def blob_texts(b):
+    """Every form a blob's contents are searched in (see the module's docstring)."""
+    texts = [b.decode('utf-8', 'replace')]
+    if is_binary(b):
+        texts.append(b.decode('latin-1'))
+        for enc in ('utf-16-le', 'utf-16-be'):
+            texts.append(b.decode(enc, 'replace'))
+            texts.append(b[1:].decode(enc, 'replace'))
+    return texts
+
+
 def do_scan(repo, forbid):
     def git(*a):
         return subprocess.run(['git', '-C', repo] + list(a), check=True, stdout=subprocess.PIPE).stdout
     commits = git('rev-list', '--all').decode().split()
-    hits, seen_blobs = [], {}
+    hits, seen_blobs, binary = [], {}, set()
     for c in commits:
         meta = git('log', '-1', '--format=%an%n%ae%n%cn%n%ce%n%B', c).decode('utf-8', 'replace')
         for i, rx in enumerate(forbid):
@@ -91,14 +109,13 @@ def do_scan(repo, forbid):
                     hits.append((c[:10], 'file name ' + name, i))
             if sha not in seen_blobs:
                 b = git('cat-file', 'blob', sha)
-                bad = []
-                if b'\0' not in b[:8192]:
-                    t = b.decode('utf-8', 'replace')
-                    bad = [i for i, rx in enumerate(forbid) if rx.search(t)]
-                seen_blobs[sha] = bad
+                if is_binary(b):
+                    binary.add(sha)
+                texts = blob_texts(b)
+                seen_blobs[sha] = [i for i, rx in enumerate(forbid) if any(rx.search(t) for t in texts)]
             for i in seen_blobs[sha]:
-                hits.append((c[:10], 'contents of ' + name, i))
-    return len(commits), len(seen_blobs), hits
+                hits.append((c[:10], 'contents of ' + name + (' (binary)' if sha in binary else ''), i))
+    return len(commits), len(seen_blobs), len(binary), hits
 
 
 def main():
@@ -113,14 +130,15 @@ def main():
     elif a.stdin:
         sys.stdout.write(rewrite(sys.stdin.read(), subs))
     else:
-        ncommit, nblob, hits = do_scan(a.scan, forbid)
+        ncommit, nblob, nbin, hits = do_scan(a.scan, forbid)
         if hits:
             uniq = sorted(set(hits))
             for c, where, i in uniq[:60]:
                 print('scrub: FORBIDDEN pattern #%d in commit %s: %s' % (i + 1, c, where))
             print('scrub: %d hit(s) in %d commits (%d distinct blobs): NOT publishable' % (len(uniq), ncommit, nblob))
             sys.exit(1)
-        print('scrub: scan clean: %d commits, %d distinct blobs, %d forbidden patterns, 0 hits' % (ncommit, nblob, len(forbid)))
+        print('scrub: scan clean: %d commits, %d distinct blobs (%d binary, searched as bytes and UTF-16; compressed contents are '
+              'not unpacked), %d forbidden patterns, 0 hits' % (ncommit, nblob, nbin, len(forbid)))
 
 
 if __name__ == '__main__':

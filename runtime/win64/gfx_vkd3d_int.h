@@ -60,6 +60,7 @@ void kh_gfxc_census_dsv(ID3D12Resource *res,u32 view_format);                   
 u64  kh_gfxc_bundle_allocator_new(KCtx *g);                                          /* CreateCommandAllocator(BUNDLE) */
 u64  kh_gfxc_bundle_new(KCtx *g,u64 allocator,u64 pso);                              /* CreateCommandList(BUNDLE): allocator and pso as the game passed them */
 int  kh_gfxc_is_bundle(KCtx *g,u64 o);
+int  kh_gfxc_selftest_pure(KCtx *g);                                                 /* every --selftest: bundle reference counts, fence events, video report (no device) */
 void kh_gfxc_bundle_replay(KCtx *g,ID3D12GraphicsCommandList *l,u64 bundle);         /* ExecuteBundle */
 
 /* ---- the wrapped bridge (gfx_wrap.c) -------------------------------------------------------------------------------------------- */

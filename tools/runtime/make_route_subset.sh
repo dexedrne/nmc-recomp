@@ -20,6 +20,11 @@
 #      (KHNMC_FILELOG: HIT / MISS, source, size, name; sorted) is identical to the file log of a full-tree run AND no path under
 #      the two roots has another outcome than in the full-tree logs (an open or stat that succeeded there and fails here, or
 #      the reverse, or a path the full-tree runs never touched) AND every byte range read from a large file was copied.
+#      "Every run is ok" is read from route_batch's records, in -c mode too: <run dir>/exit is 0 and the run's row of
+#      summary.tsv says ok, for each subset run AND for each reference run (the run directory of every open log the subset was
+#      built from: full-<d> for the -d list, or the -L logs).  "A full-tree run" means one of those reference runs (the
+#      files.log next to its open.log), never another full-* directory that happens to be in ./run-subset; no reference file
+#      log at all is a failure, not a skipped comparison (review 2026-11-17).
 #      "A full-tree run", not "the full-tree run of the same difficulty": the route has two outcomes on a loaded machine (the
 #      scripted battle starts, 323 log lines, or does not within the 7,000 frames, 317 lines; the difficulty setting does not
 #      change the list), so each subset run is matched to the outcome class it landed in, and the classes are printed.  Counters
@@ -29,7 +34,9 @@ set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 OUT="$HERE/route-subset"; BIN="$HERE/khnmc"; GFR=7000; DIFFS="none 0 1 2 3"; LOGS=""; VERIFY=1; KEEP=0; CHECKONLY=0
 while getopts "o:b:g:d:L:nkc" o; do case "$o" in o) OUT=$OPTARG;; b) BIN=$OPTARG;; g) GFR=$OPTARG;; d) DIFFS=$OPTARG;; L) LOGS=$OPTARG;; n) VERIFY=0;; k) KEEP=1;; c) CHECKONLY=1;;
-  *) sed -n '2,25p' "$0" >&2; exit 2;; esac; done
+  *) sed -n '2,32p' "$0" >&2; exit 2;; esac; done
+[ -n "${DIFFS//[[:space:]]/}" ] || { echo "make_route_subset: -d: no difficulty setting given (nothing would be built or verified)" >&2; exit 2; }
+need_logs(){ local f; for f in $LOGS; do [ -f "$f" ] || { echo "make_route_subset: no open log $f" >&2; exit 2; }; done; }
 DATA="$HERE/data-full"; PKG="$HERE/pkgdir"; SHIM="$HERE/obj-tools/openlog_shim.so"; WORK="$HERE/run-subset"
 for f in "$BIN" "$DATA" "$PKG" "$HERE/tools/openlog_shim.c" "$HERE/tools/route_subset.py" "$HERE/tools/route_batch.sh"; do [ -e "$f" ] || { echo "make_route_subset: missing $f" >&2; exit 2; }; done
 if [ "$CHECKONLY" = 0 ]; then
@@ -54,12 +61,14 @@ run_set(){ local tag=$1; shift; local pids=() d fail=0 n=0
 if [ "$CHECKONLY" = 1 ]; then
   [ -n "$LOGS" ] || for d in $DIFFS; do LOGS="$LOGS $WORK/full-$d/r01/open.log"; done
   for d in $DIFFS; do [ -f "$WORK/subset-$d/r01/open.log" ] || { echo "make_route_subset: -c: no run $WORK/subset-$d" >&2; exit 2; }; done
+  need_logs
 else
 if [ -z "$LOGS" ]; then
   echo "make_route_subset: step 2: logging runs on the full tree ($DIFFS)"
   run_set full || { echo "make_route_subset: a logging run on the full tree failed (see $WORK/full-*.log)" >&2; exit 1; }
   for d in $DIFFS; do LOGS="$LOGS $WORK/full-$d/r01/open.log"; done
 fi
+need_logs
 # shellcheck disable=SC2086
 python3 "$HERE/tools/route_subset.py" --data "$DATA" --pkgdir "$PKG" --out "$OUT" $LOGS || exit 1
 du -sh "$OUT" | sed 's/^/make_route_subset: on disk: /'
@@ -98,13 +107,30 @@ kept = {}
 for ln in open(os.path.join(out, 'MANIFEST.tsv')).read().splitlines()[1:]:
     f = ln.split('\t')
     if f[1] == 'ranges': kept[f[0]] = [tuple(int(x) for x in s.split('-')) for s in f[4].split()]
-import glob, hashlib
+import hashlib
 def flog(path): return sorted(open(path, errors='replace').read().splitlines())
-classes = {}                                                    # sorted game file log of a full-tree run -> the runs that produced it
-for f in sorted(glob.glob(os.path.join(work, 'full-*', 'r01', 'files.log'))):
-    classes.setdefault(tuple(flog(f)), []).append(os.path.basename(os.path.dirname(os.path.dirname(f))))
+def run_failed(rdir):
+    """None when route_batch's records say the run passed (rdir/exit is 0, and its row of ../summary.tsv says ok), else why not"""
+    try: ex = open(os.path.join(rdir, 'exit')).read().strip()
+    except OSError: return 'no exit record %s' % os.path.join(rdir, 'exit')
+    if ex != '0': return 'exit status %s' % ex
+    summ = os.path.join(os.path.dirname(rdir), 'summary.tsv')
+    try: rows = [r.split('\t') for r in open(summ, errors='replace').read().splitlines()[1:]]
+    except OSError: return 'no summary %s' % summ
+    res = [r[2] for r in rows if len(r) > 2 and r[0] == os.path.basename(rdir)]
+    return None if res == ['ok'] else 'result %s in %s' % (','.join(res) or 'missing', summ)
+def run_name(rdir): return os.path.basename(os.path.dirname(rdir)) + ('' if os.path.basename(rdir) == 'r01' else '/' + os.path.basename(rdir))
+classes = {}                                                    # sorted game file log of a reference run -> the runs that produced it
+for lg in full_logs:                                            # the reference runs: the run directory of every open log given
+    rdir = os.path.dirname(os.path.abspath(lg)); why = run_failed(rdir)
+    if why: print('VERIFY reference run %s (%s) did not pass: %s' % (run_name(rdir), rdir, why)); bad += 1; continue
+    f = os.path.join(rdir, 'files.log')
+    if os.path.isfile(f): classes.setdefault(tuple(flog(f)), []).append(run_name(rdir))
+    else: print('VERIFY reference run %s: no game file log %s' % (run_name(rdir), f))
 for k, v in classes.items(): print('VERIFY full-tree outcome class: %d file-log lines (list sha256 %s): %s' % (len(k), hashlib.sha256('\n'.join(k).encode()).hexdigest()[:12], ' '.join(v)))
 for d in diffs.split():
+    why = run_failed(os.path.join(work, 'subset-%s' % d, 'r01'))
+    if why: print('VERIFY difficulty %s: the subset run did not pass: %s' % (d, why)); bad += 1
     sub_log = os.path.join(work, 'subset-%s' % d, 'r01', 'open.log')
     sub, srng = outcomes([sub_log], [('data', os.path.join(out, 'data')), ('pkgdir', os.path.join(out, 'pkgdir'))])
     for key, r in sorted(sub.items()):
@@ -113,8 +139,10 @@ for d in diffs.split():
     for path, spans in sorted(srng.items()):
         for o, n in sorted(spans):
             if not any(lo <= o and o + n <= hi for lo, hi in kept.get(path, [])): print('VERIFY difficulty %s: bytes %d+%d of %s were read but are not in the subset' % (d, o, n, path)); bad += 1
-    fl = tuple(flog(os.path.join(work, 'subset-%s' % d, 'r01', 'files.log')))
-    if not classes: print('VERIFY difficulty %s: no full-tree file log to compare with (logs were given with -L): file logs not compared' % d)
+    sfl = os.path.join(work, 'subset-%s' % d, 'r01', 'files.log')
+    if not os.path.isfile(sfl): print('VERIFY difficulty %s: no game file log %s: NOT verified' % (d, sfl)); bad += 1; continue
+    fl = tuple(flog(sfl))
+    if not classes: print('VERIFY difficulty %s: no reference run has a game file log to compare with: NOT verified' % d); bad += 1
     elif fl not in classes:
         near = min(classes, key=lambda k: len(set(k) ^ set(fl)))
         print('VERIFY difficulty %s: the game file log of the subset run (%d lines) equals NO full-tree run; against the nearest (%d lines):' % (d, len(fl), len(near))); bad += 1

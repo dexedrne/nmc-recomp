@@ -263,6 +263,15 @@ static u64 item_enter(KCtx *g){
 static struct kh_item_obs item_obs; static pthread_mutex_t item_obs_lock=PTHREAD_MUTEX_INITIALIZER;
 u64 kh_mod_item_obs(struct kh_item_obs *out){ pthread_mutex_lock(&item_obs_lock); if(out) *out=item_obs; u64 s=item_obs.seq; pthread_mutex_unlock(&item_obs_lock); return s; }
 void kh_mod_item_obs_test_set(const struct kh_item_obs *in){ pthread_mutex_lock(&item_obs_lock); item_obs=*in; pthread_mutex_unlock(&item_obs_lock); }   /* selftest only */
+/* publishes one application: its seq, and (review U35 routes n=5) the drain / heal seq when the target's HP or MP went down / up */
+static u64 item_obs_publish(struct kh_item_obs *ob){
+    int down=(ob->hp_call&&ob->hp_after<ob->hp_before)||(ob->mp_call&&ob->mp_after<ob->mp_before);
+    int up=(ob->hp_call&&ob->hp_after>ob->hp_before)||(ob->mp_call&&ob->mp_after>ob->mp_before);
+    pthread_mutex_lock(&item_obs_lock);
+    ob->seq=item_obs.seq+1; ob->drain_seq=down?ob->seq:item_obs.drain_seq; ob->heal_seq=up?ob->seq:item_obs.heal_seq; item_obs=*ob;
+    pthread_mutex_unlock(&item_obs_lock); return ob->seq;
+}
+u64 kh_mod_item_obs_test_apply(const struct kh_item_obs *in){ struct kh_item_obs ob=*in; return item_obs_publish(&ob); }   /* selftest only */
 u64 kh_input_game_frames(void);
 static void item_hp(KCtx *g,u64 sheet,s32 amount,int flag){ item_hp_calls++; item_last_hp=amount; item_call(g,0x3c0c30,sheet,(u32)amount,0,(u64)flag); }
 static void item_mp(KCtx *g,u64 sheet,s32 amount,int flag){ item_mp_calls++; item_last_mp=amount; item_call(g,0x3c0cd0,sheet,(u32)amount,(u64)flag,0); }
@@ -301,7 +310,7 @@ static void item_stock_apply(KCtx *g,int difficulty){
     if(id==0x117) item_call(g,0x3c0950,sheet,pct,0,0);
     /* the sheet after the adds, before 0x3c07e0 drops the reference (the engine's add writes the sheet itself) */
     ob.hp_after=(s32)rd32(g,sheet); ob.mp_after=(s32)rd32(g,sheet+0x180); ob.game_frame=kh_input_game_frames();
-    pthread_mutex_lock(&item_obs_lock); ob.seq=item_obs.seq+1; item_obs=ob; pthread_mutex_unlock(&item_obs_lock);
+    item_obs_publish(&ob);
     if(!kh_item_mock_sink)
         fprintf(stderr,"kh: item apply #%llu game-frame=%llu id=%u cmd=%u cmd+0x2f=%u (%s) target=%u user=%u mult=%u pct=%u: HP %d -> %d of %d (amount %d%s), MP %d -> %d of %d (amount %d%s)\n",
                 (unsigned long long)ob.seq,(unsigned long long)ob.game_frame,id,ob.cmd,ob.byte2f,reversed?"REVERSED: / -10000":"/ 10000",ob.target,user,mult,pct,

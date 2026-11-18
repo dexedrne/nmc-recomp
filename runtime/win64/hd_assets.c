@@ -280,6 +280,10 @@ static int ntfs_cmp(const void *x,const void *y){
     for(;;a++,b++){ int ca=toupper(*a),cb=toupper(*b); if(ca!=cb) return ca<cb?-1:1; if(!ca) return 0; }
 }
 static void free_files(HdFile *f,int n){ for(int i=0;i<n;i++) free(f[i].host); free(f); }
+/* readdir that tells the end of a directory (NULL, errno 0) from a failed read (NULL, errno set: the listing is incomplete).
+ * hd_readdir is readdir; only the selftest replaces it, to make a read fail part-way. */
+static struct dirent *(*hd_readdir)(DIR *)=readdir;
+static struct dirent *next_ent(DIR *d){ errno=0; return hd_readdir(d); }
 
 /* breadth-first listing of `top` (host path), as Panacea's ScanFolder walks it; returns -1 and sets err on failure */
 static int scan_files(const char *top,HdFile **out,int *count,char *err,size_t cap){
@@ -290,12 +294,14 @@ static int scan_files(const char *top,HdFile **out,int *count,char *err,size_t c
         HdDir cur=q[qi++]; DIR *d=opendir(cur.host);
         if(!d){ snprintf(err,cap,"cannot open directory %s: %s",cur.host,strerror(errno)); goto done; }
         char **names=NULL; int nn=0,ncap=0; struct dirent *de;
-        while((de=readdir(d))){
+        while((de=next_ent(d))){
             if(!strcmp(de->d_name,".")||!strcmp(de->d_name,"..")) continue;
             if(nn==ncap){ ncap=ncap?ncap*2:32; names=realloc(names,sizeof *names*(size_t)ncap); if(!names){ closedir(d); snprintf(err,cap,"out of memory"); goto done; } }
             names[nn++]=strdup(de->d_name);
         }
-        closedir(d);
+        { int rerr=errno,cerr=closedir(d)?errno:0;                                    /* rerr: readdir's NULL was a failed read, not the end */
+          if(rerr||cerr){ snprintf(err,cap,"cannot %s directory %s: %s",rerr?"read":"close",cur.host,strerror(rerr?rerr:cerr));
+              for(int i=0;i<nn;i++) free(names[i]); free(names); goto done; } }
         qsort(names,(size_t)nn,sizeof *names,ntfs_cmp);
         for(int i=0;i<nn;i++){
             char path[4096],rel[1024]; struct stat st;
@@ -560,7 +566,7 @@ static char **chk_files; static size_t chk_n,chk_cap;
 /* every regular file below host/ as a tree path; the top-level remastered folder, dot directories and the two list files are not game files.  Returns 0, or -1 (errno says why). */
 static int chk_walk(const char *host,const char *rel){
     DIR *d=opendir(host); if(!d) return -1; struct dirent *de; int rc=0;
-    while(!rc&&(de=readdir(d))){
+    while(!rc&&(de=next_ent(d))){
         if(!strcmp(de->d_name,".")||!strcmp(de->d_name,"..")) continue;
         char h[8192],r[4096]; struct stat st;
         if(snprintf(h,sizeof h,"%s/%s",host,de->d_name)>=(int)sizeof h||snprintf(r,sizeof r,"%s%s%s",rel,*rel?"/":"",de->d_name)>=(int)sizeof r){ errno=ENAMETOOLONG; rc=-1; break; }
@@ -572,7 +578,8 @@ static int chk_walk(const char *host,const char *rel){
             if(!(chk_files[chk_n]=strdup(r))){ errno=ENOMEM; rc=-1; break; } chk_n++;
         }
     }
-    int e=errno; closedir(d); errno=e; return rc;
+    if(!rc&&errno) rc=-1;                           /* the loop ended on a NULL with errno set: a failed read, the list would be incomplete */
+    int e=errno; if(closedir(d)&&!rc){ rc=-1; e=errno; } errno=e; return rc;
 }
 static int str_cmp(const void *a,const void *b){ return strcmp(*(char *const *)a,*(char *const *)b); }
 static unsigned char *read_whole(const char *path,int64_t *n){
@@ -670,6 +677,14 @@ static int st_cfg_child(const char *root,const char *modlist,const char *package
         _exit(pkg_state==want_pkg_state&&prov_state==want_prov_state&&prov_nohd_ignored==want_nohd?0:1); }
     int st=-1; if(waitpid(pid,&st,0)!=pid||!WIFEXITED(st)) return -1; return WEXITSTATUS(st);
 }
+/* the selftest's hd_readdir: the reads of one directory (st_rd_dev/st_rd_ino) fail with EIO once st_rd_left of its entries were read */
+static dev_t st_rd_dev; static ino_t st_rd_ino; static int st_rd_left;
+static struct dirent *st_readdir(DIR *d){ struct stat s;
+    if(!fstat(dirfd(d),&s)&&s.st_dev==st_rd_dev&&s.st_ino==st_rd_ino&&st_rd_left--<=0){ errno=EIO; return NULL; }
+    return readdir(d);
+}
+static int st_rd_fail(const char *path,int left){ struct stat s; if(stat(path,&s)) return 0; st_rd_dev=s.st_dev; st_rd_ino=s.st_ino; st_rd_left=left; hd_readdir=st_readdir; return 1; }
+static void st_chk_clear(void){ for(size_t i=0;i<chk_n;i++) free(chk_files[i]); chk_n=0; }
 int kh_hd_selftest(KCtx *g){
     char dir[KH_TMP_MAX]; int bad=0,checks=0; kh_tmp_path(dir,sizeof dir,"khnmc-hd-XXXXXX");   /* host_env.c: /tmp, or the app container on iOS */
 #define TEST(c) do { checks++; if(!(c)){ fprintf(stderr,"hd selftest FAIL (line %d): %s\n",__LINE__,#c); bad++; } } while(0)
@@ -841,6 +856,19 @@ int kh_hd_selftest(KCtx *g){
       TEST(prov_add("obj/bfs.bar")&&put_file(dir,"remastered/obj/bfs.bar/sub/a","1",1)&&put_file(dir,"remastered/obj/bfs.bar/z","2",1)&&put_file(dir,"remastered/obj/bfs.bar/B","3",1)&&put_file(dir,"remastered/obj/bfs.bar/_u","4",1)
          &&prov_add("remastered/obj/bfs.bar/sub/a")&&prov_add("remastered/obj/bfs.bar/z")&&prov_add("remastered/obj/bfs.bar/B")&&prov_add("remastered/obj/bfs.bar/_u"));
       TEST(BUILD("obj/bfs.bar",b4)); if(t) TEST(t->n==4&&!strcmp(t->e[0].name,"B")&&!strcmp(t->e[1].name,"z")&&!strcmp(t->e[2].name,"_u")&&!strcmp(t->e[3].name,"sub/a")); table_free(t); }
+    /* a directory read that fails part-way (EIO from readdir) is an error, never the end of the directory: the scan and --hd-check's walk */
+    { char w[KH_TMP_MAX+64],ws[KH_TMP_MAX+64]; HdFile *fl=NULL; int nf=-1; snprintf(w,sizeof w,"%s/rdtree",dir); snprintf(ws,sizeof ws,"%s/rdtree/sub",dir);
+      TEST(put_file(dir,"rdtree/a","1",1)&&put_file(dir,"rdtree/b","2",1)&&put_file(dir,"rdtree/c","3",1)&&put_file(dir,"rdtree/sub/d","4",1)&&put_file(dir,"rdtree/sub/e","5",1));
+      TEST(!scan_files(w,&fl,&nf,err,sizeof err)&&nf==5); free_files(fl,nf); fl=NULL;                          /* every read succeeds: the whole tree */
+      TEST(st_rd_fail(ws,1)); err[0]=0;                                                                         /* the nested folder fails after 1 entry */
+      TEST(scan_files(w,&fl,&nf,err,sizeof err)==-1&&!fl&&!nf&&strstr(err,"cannot read directory")&&strstr(err,"rdtree/sub")&&strstr(err,strerror(EIO))); if(fl){ free_files(fl,nf); fl=NULL; }
+      TEST(st_rd_fail(w,2)); err[0]=0;                                                                          /* the top folder fails after 2 entries */
+      TEST(scan_files(w,&fl,&nf,err,sizeof err)==-1&&!fl&&!nf&&strstr(err,"cannot read directory")&&strstr(err,strerror(EIO))); if(fl){ free_files(fl,nf); fl=NULL; }
+      hd_readdir=readdir;
+      st_chk_clear(); TEST(!chk_walk(w,"")&&chk_n==5); st_chk_clear();
+      TEST(st_rd_fail(w,2)); errno=0; TEST(chk_walk(w,"")==-1&&errno==EIO&&chk_n<5); st_chk_clear();             /* the top directory fails after 2 entries */
+      TEST(st_rd_fail(ws,0)); errno=0; TEST(chk_walk(w,"")==-1&&errno==EIO&&chk_n<5); st_chk_clear();            /* a nested one: the failure reaches the top */
+      hd_readdir=readdir; free(chk_files); chk_files=NULL; chk_cap=0; }
     /* a mod file name over 31 characters in a scanned folder, a malformed container: named errors */
     make_bar(bar,1,0);
     TEST(prov_add("obj/long.bar")&&put_file(dir,"remastered/obj/long.bar/0123456789012345678901234567890123456789.dds","L",1)&&prov_add("remastered/obj/long.bar/0123456789012345678901234567890123456789.dds"));

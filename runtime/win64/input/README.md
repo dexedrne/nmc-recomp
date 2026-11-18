@@ -91,7 +91,10 @@ A step that does not see its state within its time-out ends the run with a named
 frame F, now game frame G, present P); game state now: <every state>`. The run's end prints
 `kh: route report: k of n steps done; difficulty D; met at game frame: L<line>:<condition>=<frame> ...` and, if the run ended
 first, `ROUTE INCOMPLETE ... waiting at line N` (route_batch.sh / route_one.py count that run as DIVERGED). Two steps' presses
-are always separated by at least one released frame, so the game sees every press as a new one. `KHNMC_ROUTE_END=exit` ends the
+are always separated by at least one released frame, so the game sees every press as a new one: a step without relative lines
+hands over in the tick it is met, unless its last frame had a button or trigger down; then one released frame comes first (review
+U35, routes n=4: `@press A until X` then `@wait Y` + `+1 +1 A` used to be one continuous A).  The stick alone does not count, so
+a chain of `@goto` steps keeps walking. `KHNMC_ROUTE_END=exit` ends the
 run (exit 0, with all reports) when the last step is done; the default `idle` keeps the pad released until KH_RUN_GAME_FRAMES.
 `KHNMC_ROUTE_TRACE=1` prints every state whenever one changes (`kh: route trace game-frame=N ...`): how the values above were
 found, and the first thing to look at when a route stops somewhere new (a new host, the iOS Simulator, a device).

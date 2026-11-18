@@ -20,6 +20,9 @@ Before taking it: `pgrep -x xcodebuild`; anything printed means someone is build
 "Stop" is exit status 75 with a line that says why.  Nothing waits and nothing is retried here: the caller decides.
 On exit, also on SIGHUP / SIGTERM / SIGINT (an ssh session that drops): the command's process group gets SIGTERM (its own traps
 run: the simulator scripts delete their simulator there), then the file is truncated and removed, as the Mac's rules ask.
+Because the file is removed, a participant that opened it just before the removal could lock the removed inode while the next
+one locks a new file at the same path: so after taking the lock the wrapper checks that the path still names the inode it
+locked, and stops (busy) when it does not.  (A participant outside this project that skips that check is not covered.)
 An EMPTY existing file is the leftover of an fcntl-style user and means free.
 Exit status: the command's; 75 = busy, not started; 2 = usage.
 """
@@ -60,6 +63,15 @@ def main():
         sys.stderr.write('maclock: %s does not exist\n' % os.path.dirname(LOCK))
         return 2
     fd = os.open(LOCK, os.O_RDWR | os.O_CREAT, 0o644)
+    pause = os.environ.get('KHNMC_MACLOCK_TEST_PAUSE')     # tests only (test_maclock.sh): a directory; wait here for <dir>/go
+    if pause:
+        open(os.path.join(pause, 'opened'), 'w').close()
+        for _ in range(600):
+            if os.path.exists(os.path.join(pause, 'go')):
+                break
+            time.sleep(0.05)
+        else:
+            sys.stderr.write('maclock: test pause: no %s/go after 30 s: going on\n' % pause)
     try:
         fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as e:
@@ -67,6 +79,17 @@ def main():
             os.close(fd)
             busy('%s is locked by another process (fcntl or flock)' % LOCK)
         raise
+    # The holder removes the file when it is done (release()).  If it did that between our open and our lockf, the lock we now
+    # hold is on a removed inode that nobody else will open: the next participant creates a new file at the path, locks THAT one,
+    # and both would run.  The lock counts only while the path still names the inode we locked.
+    st, here = os.fstat(fd), None
+    try:
+        here = os.stat(LOCK)
+    except OSError:
+        pass
+    if here is None or (here.st_ino, here.st_dev) != (st.st_ino, st.st_dev):
+        os.close(fd)                                    # nothing written; a file now at the path is not touched
+        busy('%s was removed or replaced while this step was taking it (its previous holder released it at that moment)' % LOCK)
     os.lseek(fd, 0, os.SEEK_SET)
     content = os.read(fd, 4096).decode('utf-8', 'replace').strip()
     if content and not content.startswith(MARK):

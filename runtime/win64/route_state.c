@@ -354,13 +354,12 @@ int kh_route_enemies(KCtx *g,float px,float pz,float *nx,float *nz,float *nd){
     }
     if(nd) *nd=best; return n;
 }
+/* review U35 routes n=5: ANY application since the baseline, not only the last one (0x3c4ab0 applies a Mega item to each party member
+ * in one frame; the last record alone hid a drain of an earlier target, so `@expect not item-drain` could pass on a drained Sora) */
 static int item_cond(int kind,const KhRouteBase *b){
-    struct kh_item_obs o; u64 seq=kh_mod_item_obs(&o);
+    struct kh_item_obs o; kh_mod_item_obs(&o);
     if(kind==KR_ITEM_USES) return 0;
-    if(seq<=b->items) return 0;
-    int down=(o.hp_call&&o.hp_after<o.hp_before)||(o.mp_call&&o.mp_after<o.mp_before);
-    int up=(o.hp_call&&o.hp_after>o.hp_before)||(o.mp_call&&o.mp_after>o.mp_before);
-    return kind==KR_ITEM_DRAIN?down:up;
+    return (kind==KR_ITEM_DRAIN?o.drain_seq:o.heal_seq)>b->items;
 }
 
 int kh_route_cursor(KCtx *g,int kind){

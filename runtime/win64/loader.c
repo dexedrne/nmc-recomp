@@ -31,6 +31,59 @@ static int exit_code_main=-1; static int selftest; static int hd_check; static c
 
 #define RD16(p) (*(const u16*)(p))
 #define RD32(p) (*(const u32*)(p))
+/* Bias mode: the guest-space reservation and its low guard (review U35 n=24).  KHNMC_LOW_GUARD unset or "on" used to fall back to an
+ * unguarded layout, with a warning, whenever the host refused the larger reservation: an explicit "on" did not guarantee the guard, and
+ * null or low guest pointers then reached host memory at bias + address.  Now:
+ *   unset  the guard is kept: the full arena, else the arena halved down to the smallest one ga_init lays out with an id zone and a far
+ *          zone (image + id zone + one window); if even that is refused, the named fatal low-guard-refused (no silent fallback);
+ *   on     the guard with the full arena, or the named fatal low-guard-refused;
+ *   off    no guard, the full arena (the old layout; the loader says so loudly).
+ * reserve(len) returns a PROT_NONE reservation or NULL.  Returns the arena size (0 = a refusal, the reason in err) and sets *m_out (the
+ * host address of guest GS_BASE) and *guard_out (GS_BASE or 0).  Pure policy: the selftest drives it with a fake reserve. */
+u64 kh_guest_reserve(const char *lge,u64 size,void *(*reserve)(u64 len),void **m_out,u64 *guard_out,char *err,size_t cap){
+    int off=lge&&!strcmp(lge,"off"), on=lge&&!strcmp(lge,"on");
+    if(lge&&*lge&&!off&&!on){ snprintf(err,cap,"low-guard-value: KHNMC_LOW_GUARD=%s (on = the guard below the image or nothing, off = no guard; unset = the guard, with a smaller arena if need be)",lge); return 0; }
+    if(off){ void *m=reserve(size); if(!m){ snprintf(err,cap,"guest-space-reserve: the host refused a reservation of %llu bytes (KHNMC_LOW_GUARD=off)",(unsigned long long)size); return 0; }
+        *m_out=m; *guard_out=0; return size; }
+    const u64 floor=(u64)(GA_ID_WINDOWS+1)*GA_WIN;              /* below this, ga_init has no far zone: one zone, the id layout lost */
+    u64 sz=size;
+    for(;;){ void *low=reserve(GS_BASE+sz); if(low){ *m_out=(u8*)low+GS_BASE; *guard_out=GS_BASE; return sz; }
+        if(on||sz/2<floor) break; sz/=2; }
+    snprintf(err,cap,"low-guard-refused: the host refused a reservation of guest 0 .. 0x%llx (the low guard below the image plus an arena of %llu MiB)%s; with KHNMC_LOW_GUARD=off the game runs without the guard, where a null or low guest pointer reads or writes host memory at bias + address instead of faulting",
+             (unsigned long long)(GS_BASE+sz),(unsigned long long)(sz>>20),on?" and KHNMC_LOW_GUARD=on asks for the full arena":", also with every smaller arena down to the smallest");
+    return 0;
+}
+static void *reserve_none(u64 len){ void *p=mmap(0,len,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0); return p==MAP_FAILED?NULL:p; }
+/* selftest of kh_guest_reserve (both builds): a fake host that grants reservations up to a limit; nothing is mapped */
+static u64 lst_limit, lst_req[8]; static int lst_n;
+static void *lst_reserve(u64 len){ if(lst_n<8) lst_req[lst_n]=len; lst_n++; return len<=lst_limit?(void*)(uintptr_t)0x10000000ull:NULL; }
+int kh_loader_selftest(void){
+    int checks=0,fails=0;
+#define LCHECK(c) do{ checks++; if(!(c)){ fails++; fprintf(stderr,"loader selftest FAIL: %s (line %d)\n",#c,__LINE__); } }while(0)
+    const u64 G=1ull<<30, full=0x300000000ull, fake=0x10000000ull, floor=GS_BASE+(u64)(GA_ID_WINDOWS+1)*GA_WIN; void *m=NULL; u64 gd=0, sz; char err[512];
+    /* a host that grants everything: the full arena with the guard (unset and on) */
+    for(int i=0;i<2;i++){ lst_limit=~0ull; lst_n=0; m=NULL; gd=7; sz=kh_guest_reserve(i?"on":NULL,full,lst_reserve,&m,&gd,err,sizeof err);
+        LCHECK(sz==full && gd==GS_BASE && m==(void*)(uintptr_t)(fake+GS_BASE) && lst_n==1 && lst_req[0]==GS_BASE+full); }
+    /* KHNMC_LOW_GUARD=on, and the host refuses the guarded 17 GiB: the named fatal, and no unguarded reservation (it used to fall back) */
+    lst_limit=12*G; lst_n=0; err[0]=0; sz=kh_guest_reserve("on",full,lst_reserve,&m,&gd,err,sizeof err);
+    LCHECK(sz==0 && lst_n==1 && !strncmp(err,"low-guard-refused:",18));
+    /* unset: the guard is kept with a smaller arena (12 -> 6 -> 3 GiB), never the unguarded layout */
+    lst_limit=12*G; lst_n=0; gd=0; sz=kh_guest_reserve(NULL,full,lst_reserve,&m,&gd,err,sizeof err);
+    LCHECK(sz==6*G && gd==GS_BASE && lst_n==2 && lst_req[1]==GS_BASE+6*G && m==(void*)(uintptr_t)(fake+GS_BASE));
+    lst_limit=GS_BASE+3*G; lst_n=0; gd=0; sz=kh_guest_reserve("",full,lst_reserve,&m,&gd,err,sizeof err);
+    LCHECK(sz==3*G && gd==GS_BASE && lst_n==3 && GS_BASE+sz>=floor);                         /* the smallest arena keeps an id zone and a far zone */
+    lst_limit=GS_BASE+3*G-1; lst_n=0; err[0]=0; sz=kh_guest_reserve(NULL,full,lst_reserve,&m,&gd,err,sizeof err);   /* nothing guarded fits */
+    LCHECK(sz==0 && lst_n==3 && !strncmp(err,"low-guard-refused:",18));
+    for(int i=0;i<lst_n&&i<8;i++) LCHECK(lst_req[i]>=floor);                                   /* every attempt was a guarded one */
+    /* off: the old layout without the guard; an unknown value: a named error, nothing reserved */
+    lst_limit=~0ull; lst_n=0; gd=7; sz=kh_guest_reserve("off",full,lst_reserve,&m,&gd,err,sizeof err);
+    LCHECK(sz==full && gd==0 && lst_n==1 && lst_req[0]==full && m==(void*)(uintptr_t)fake);
+    lst_n=0; err[0]=0; sz=kh_guest_reserve("yes",full,lst_reserve,&m,&gd,err,sizeof err);
+    LCHECK(sz==0 && lst_n==0 && !strncmp(err,"low-guard-value:",16));
+#undef LCHECK
+    fprintf(stderr,"kh: loader selftest: %d checks, %d failures\n",checks,fails);
+    return fails;
+}
 static int load_image(void){
     int fd=open(exe_path,O_RDONLY); if(fd<0){ perror(exe_path); return -1; }
     struct stat st; fstat(fd,&st); u8 *f=mmap(0,st.st_size,PROT_READ,MAP_PRIVATE,fd,0); close(fd); if(f==MAP_FAILED){ perror("mmap exe"); return -1; }
@@ -54,15 +107,16 @@ static int load_image(void){
      * whatever the host has at bias + address (on macOS: often a system library): lifted code then reads garbage or writes into
      * the host and no report is made (review 2026-11-17: the Linux identity runs had reported real faults at guest 0x4, 0x8, 0x30,
      * 0x4c, 0x458).  So the reservation starts at guest 0: GS_BASE (5 GiB) more of address space, never committed.
-     * KHNMC_LOW_GUARD=off, or a host that will not give that much, falls back to the old layout, and says so loudly. */
-    const char *lge=getenv("KHNMC_LOW_GUARD"); void *lowm=MAP_FAILED, *m; int lg_off=lge&&!strcmp(lge,"off");
-    if(lge&&*lge&&!lg_off&&strcmp(lge,"on")){ fprintf(stderr,"kh: KHNMC_LOW_GUARD=%s (on or off)\n",lge); return -1; }
-    if(!lg_off) lowm=mmap(0,GS_BASE+guest_space_size,PROT_NONE,flags,-1,0);
-    if(lowm!=MAP_FAILED){ m=(u8*)lowm+GS_BASE; gs_low_guard=GS_BASE; }
-    else { m=mmap(0,guest_space_size,PROT_NONE,flags,-1,0); gs_low_guard=0; }
-    if(m==MAP_FAILED){ perror("mmap guest space"); return -1; } gs_bias=(uintptr_t)m-GS_BASE;
-    if(!gs_low_guard) fprintf(stderr,"kh: guest space: WARNING: NO LOW GUARD (%s): guest addresses below 0x%llx are NOT reserved; a null or low wild guest pointer may read or write host memory at bias + address without a fault\n",
-                              lg_off?"KHNMC_LOW_GUARD=off":"the host refused the larger reservation",(unsigned long long)GS_BASE);
+     * Only KHNMC_LOW_GUARD=off gives the old layout (and says so loudly); a host that will not give that much gets a smaller arena with
+     * the guard, or the named fatal low-guard-refused (kh_guest_reserve above). */
+    (void)want; (void)flags;
+    void *m=NULL; char err[512]; u64 full=guest_space_size;
+    u64 sz=kh_guest_reserve(getenv("KHNMC_LOW_GUARD"),guest_space_size,reserve_none,&m,&gs_low_guard,err,sizeof err);
+    if(!sz) kh_fatal(NULL,"%s",err);
+    guest_space_size=sz; gs_bias=(uintptr_t)m-GS_BASE;
+    if(sz!=full) fprintf(stderr,"kh: guest space: the host refused the guarded reservation with the full arena of %llu MiB: the arena is %llu MiB (the far zone is smaller), the low guard is kept\n",(unsigned long long)(full>>20),(unsigned long long)(sz>>20));
+    if(!gs_low_guard) fprintf(stderr,"kh: guest space: WARNING: NO LOW GUARD (KHNMC_LOW_GUARD=off): guest addresses below 0x%llx are NOT reserved; a null or low wild guest pointer may read or write host memory at bias + address without a fault\n",
+                              (unsigned long long)GS_BASE);
     if(mprotect(m,image_hi-GS_BASE,PROT_READ|PROT_WRITE)){ perror("kh: commit image"); return -1; }
 #endif
     gs_host_base=(uintptr_t)m; gs_size=guest_space_size;

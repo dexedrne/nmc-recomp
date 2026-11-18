@@ -10,8 +10,16 @@
      back (`output muted of (get volume settings)` must be `true`) before `simctl create` / `simctl boot`.
   4. every xcodebuild call keeps Xcode's derived data and module cache inside ~/Developer/KHNMC (`-derivedDataPath "$KROOT/...`
      and `MODULE_CACHE_DIR="$KROOT/...`); mac/cleanup.sh removes that derived-data folder with the other intermediates.
+  5. every `simctl list` names at most ONE category (devices | devicetypes | runtimes | pairs): its syntax is
+     `list [-j] [-v] [CATEGORY] [SEARCH TERM | available]`, so a second category word is only a search term, and the JSON then
+     holds the first category's section alone.  A `-j` call piped into a parser must request every section the parser reads
+     (no category = all of them).
+  6. sync.sh copies the sources of every work tree into the ONE fixed ~/Developer/KHNMC/src.  Those copies must not keep this
+     machine's modification times (rsync -a / -t): a changed file could arrive with a time OLDER than the object the Mac compiled
+     from the previous copy, and mac/build.sh's make would keep the stale object.  They compare by content (-c) instead, so
+     exactly the changed files get a fresh time there; every source copy goes through that one rsync definition.
 Exit 0 when every check holds, 1 otherwise (each failure named)."""
-import os, re, sys
+import os, re, shlex, sys
 
 D = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__)))
 fails, n = [], 0
@@ -98,6 +106,48 @@ if dd:
     cl = ' '.join(t for _, t in lines('mac/cleanup.sh'))
     check(re.search(r'objects\)[^;]*rm -rf[^;]*"\$KROOT/%s"' % re.escape(dd.group(1)), cl) is not None,
           'mac/cleanup.sh: `objects` does not remove the derived-data folder $KROOT/%s' % dd.group(1))
+
+# 5. simctl list: one category; a JSON parser reads only sections that were asked for
+CATS = ('devices', 'devicetypes', 'runtimes', 'pairs')
+sl = 0
+for f in macs:
+    ls = lines('mac/' + f)
+    for k, (no, t) in enumerate(ls):
+        m = re.search(r'\bxcrun\s+simctl\s+list\b([^|;)]*)', t)
+        if not m:
+            continue
+        sl += 1
+        words = m.group(1).split()
+        cats = [w for w in words if not w.startswith('-') and w in CATS]
+        check(len(cats) <= 1, 'mac/%s:%d: `simctl list` names %d categories (%s): the second is only a search term'
+              % (f, no, len(cats), ' '.join(cats)))
+        if '-j' in words or '--json' in words:
+            py = re.search(r"python3\s+-c\s+'([^']*)'", '\n'.join(x for _, x in ls[k:k + 40]))
+            check(py is not None, 'mac/%s:%d: `simctl list -j` is not read by a python3 -c parser this check knows' % (f, no))
+            if py and cats:
+                read = set(re.findall(r'(?:\[|\.get\()\s*"(%s)"' % '|'.join(CATS), py.group(1)))
+                check(read <= {cats[0]}, 'mac/%s:%d: the parser reads %s but `simctl list -j %s` returns only "%s"'
+                      % (f, no, '/'.join(sorted(read - {cats[0]})), cats[0], cats[0]))
+check(sl >= 2, 'expected `simctl list` calls in mac/*.sh (sim_run.sh, cleanup.sh), found %d' % sl)
+
+# 6. sync.sh: source copies without the local modification times, compared by content
+sy = lines('sync.sh')
+rs = [t for _, t in sy if re.match(r'\s*RS=\(', t)]
+check(len(rs) == 1, 'sync.sh: expected one RS=( rsync ... ) definition for the source copies, found %d' % len(rs))
+if len(rs) == 1:
+    toks = shlex.split(rs[0][rs[0].index('(') + 1:rs[0].rindex(')')])
+    short = ''.join(x[1:] for x in toks if x.startswith('-') and not x.startswith('--'))
+    longs = [x for x in toks if x.startswith('--')]
+    check(toks[:1] == ['rsync'], 'sync.sh: RS is not an rsync command: %s' % rs[0].strip()[:100])
+    check('a' not in short and 't' not in short and not {'--archive', '--times'} & set(longs),
+          'sync.sh: the source copies keep this machine\'s modification times (rsync -a / -t): make on the Mac can keep stale objects')
+    check('c' in short or '--checksum' in longs, 'sync.sh: the source copies do not compare by content (rsync -c)')
+src_copies = 0
+for no, t in sy:
+    if re.search(r'\$IOS_MAC:\$IOS_RDIR/src/', t) and re.search(r'\brsync\b|\$\{RS\[@\]\}', t):
+        src_copies += 1
+        check(t.lstrip().startswith('"${RS[@]}"'), 'sync.sh:%d: a source copy that does not use "${RS[@]}": %s' % (no, t.strip()[:100]))
+check(src_copies >= 7, 'sync.sh: expected at least 7 source copies into $IOS_RDIR/src, found %d' % src_copies)
 
 for f in fails:
     print('test_mac_rules: FAIL: ' + f)

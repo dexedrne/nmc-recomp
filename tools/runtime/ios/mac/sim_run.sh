@@ -46,14 +46,16 @@ osascript -e 'set volume with output muted' >/dev/null 2>&1 || { say "could not 
 muted=$(osascript -e 'output muted of (get volume settings)' 2>/dev/null)
 [ "$muted" = "true" ] || { say "the system output reads as muted='${muted:-<nothing>}', not 'true': no simulator is created or booted"; exit 1; }
 say "system output muted and read back as muted (left muted)"
-PICK=$(xcrun simctl list -j devicetypes runtimes | python3 -c 'import json,sys
+# `simctl list` takes ONE category (a second word is only a search term), so no category here: the JSON then holds every section
+PICK=$(xcrun simctl list -j | python3 -c 'import json,sys
 j=json.load(sys.stdin)
+if "runtimes" not in j: sys.exit("simctl list -j printed no runtimes section")
 rts=[r for r in j["runtimes"] if r.get("isAvailable") and r.get("platform","iOS")=="iOS" and "iOS" in r.get("name","")]
 if not rts: sys.exit("no available iOS simulator runtime")
 key=lambda r: tuple(int(x) for x in r["version"].split(".") if x.isdigit())
 rt=max(rts,key=key)
 sup=[d["identifier"] for d in rt.get("supportedDeviceTypes",[]) if d.get("productFamily")=="iPhone"]
-if not sup: sup=[d["identifier"] for d in j["devicetypes"] if d.get("productFamily")=="iPhone"]
+if not sup: sup=[d["identifier"] for d in j.get("devicetypes",[]) if d.get("productFamily")=="iPhone"]
 if not sup: sys.exit("no iPhone device type")
 print(sup[-1],rt["identifier"],rt["version"])') || { say "cannot choose a device type and runtime"; exit 1; }
 set -- $PICK; DT=$1; RT=$2

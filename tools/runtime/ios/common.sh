@@ -19,18 +19,30 @@
 #   * never the simulator named "iPhone Duo", never a simulator we did not create, never a physical device, never devicectl.
 # GUARD: every driver refuses to do anything unless KHNMC_IOS_MACBOOK_OK=1 is in the environment.  That variable is the
 # owner's word that the MacBook Air may be used now; scripts require explicit configuration.
+# DRIVER LOCK: every work tree on this machine copies into the SAME ~/Developer/KHNMC/src (sync.sh), and it does so before
+# maclock.py on the Mac can say "busy".  So ios_guard also takes a flock on ONE file outside every work tree
+# (~/.cache/khnmc-ios-driver.lock) and the driver keeps it to its end (copy, steps, log fetch): a second driver, from any work
+# tree, stops with 75.  A driver started by the holder (build.sh -> sync.sh) shares the holder's lock (inherited fd 9).
 IOS_MAC=${KHNMC_IOS_MAC:-user@macbook}
 IOS_RDIR=Developer/KHNMC                       # relative to the remote home; fixed on purpose
 IOS_HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 IOS_SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ServerAliveCountMax=6)
 IOS_RSH="ssh -o BatchMode=yes -o ConnectTimeout=20"
 IOS_ENV='export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer; export LC_ALL=C;'
+IOS_DRIVER_LOCK=${KHNMC_IOS_DRIVER_LOCK_FILE:-$HOME/.cache/khnmc-ios-driver.lock}   # the variable: tests only (test_maclock.sh)
 
 ios_guard(){
-  [ "${KHNMC_IOS_MACBOOK_OK:-}" = 1 ] && return 0
-  echo "tools/ios: NOT STARTED.  These scripts are UNRUN and use another person's MacBook Air; the owner withdrew it on 2026-11-17." >&2
-  echo "tools/ios: they run only with KHNMC_IOS_MACBOOK_OK=1, which says the owner has allowed that machine for this run." >&2
-  exit 2
+  if [ "${KHNMC_IOS_MACBOOK_OK:-}" != 1 ]; then
+    echo "tools/ios: NOT STARTED.  These scripts are UNRUN and use another person's MacBook Air; the owner withdrew it on 2026-11-17." >&2
+    echo "tools/ios: they run only with KHNMC_IOS_MACBOOK_OK=1, which says the owner has allowed that machine for this run." >&2
+    exit 2
+  fi
+  # the driver lock (see DRIVER LOCK above); fd 9 stays open, and the lock held, until this driver and its children end
+  command -v flock > /dev/null || { echo "tools/ios: flock(1) (util-linux) is missing: the driver lock cannot be taken" >&2; exit 2; }
+  if ! [ /dev/fd/9 -ef "$IOS_DRIVER_LOCK" ]; then
+    mkdir -p "$(dirname "$IOS_DRIVER_LOCK")" && exec 9>> "$IOS_DRIVER_LOCK" || { echo "tools/ios: cannot open the driver lock $IOS_DRIVER_LOCK" >&2; exit 2; }
+  fi
+  flock -n 9 || { echo "tools/ios: BUSY, not started: another tools/ios driver on this machine (any work tree) holds $IOS_DRIVER_LOCK; it may be copying to the MacBook Air or building there.  Run this again later (no retry loop here)" >&2; exit 75; }
 }
 
 # mac CMD            : one remote shell command (not a build or simulator step: no lock)

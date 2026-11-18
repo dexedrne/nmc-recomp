@@ -4,7 +4,10 @@
 # Cases: a free lock (no file / an EMPTY file = the leftover of an fcntl-style user) runs the command, holds our line in the
 # file while it runs and removes the file afterwards; a description that is not ours = busy (75), file untouched; an fcntl
 # lock held by another process = busy (75); our own stale line with no holder = taken over; the command's exit status is
-# passed on; SIGTERM to the wrapper reaches the command's process group and the lock is released.
+# passed on; SIGTERM to the wrapper reaches the command's process group and the lock is released; the file removed or replaced
+# between the wrapper's open and its lockf (the previous holder released it at that moment) = busy (75), nothing started.
+# Also the Linux-side driver lock of common.sh (ios_guard; needs flock(1)): one tools/ios driver at a time on this machine, from
+# any work tree, a driver started by the holder (build.sh -> sync.sh) runs, a second one = busy (75), free again afterwards.
 # It does not test the Mac's rule that lockf and flock exclude each other (measured there, see maclock.py), nor pgrep on a Mac.
 set -u
 D=${1:-}; [ -n "$D" ] && [ -d "$D" ] && [ -z "$(ls -A "$D")" ] || { echo "usage: $0 EMPTY_SCRATCH_DIR" >&2; exit 2; }
@@ -37,6 +40,41 @@ t "the lock file exists while the long command runs" '[ -s "$L" ]'
 kill -TERM $wp; wait $wp; rc=$?
 t "SIGTERM: the command's own trap ran" '[ -e "$D/cleaned" ]'
 t "SIGTERM: exit 143 and the lock is released" '[ $rc = 143 ] && [ ! -e "$L" ]'
+# the previous holder releases (truncate + remove) between the wrapper's open and its lockf: the lock it then gets is on a
+# removed inode, which the next participant never sees (it creates a new file and locks that one)
+mkdir "$D/p1"
+KHNMC_MACLOCK_TEST_PAUSE="$D/p1" python3 "$HERE/maclock.py" -- touch "$D/ran-orphan" 2> "$D/err5" & bp=$!
+for i in $(seq 100); do [ -e "$D/p1/opened" ] && break; sleep 0.1; done
+W -- true 2> "$D/err5a"; rc_a=$?
+touch "$D/p1/go"; wait $bp; rc=$?
+t "file removed between open and lockf: the holder ran and released" '[ $rc_a = 0 ] && [ ! -e "$L" ]'
+t "file removed between open and lockf: 75, nothing started" '[ $rc = 75 ] && [ ! -e "$D/ran-orphan" ] && grep -q "removed or replaced" "$D/err5"'
+mkdir "$D/p2"
+KHNMC_MACLOCK_TEST_PAUSE="$D/p2" python3 "$HERE/maclock.py" -- touch "$D/ran-replaced" 2> "$D/err6" & bp=$!
+for i in $(seq 100); do [ -e "$D/p2/opened" ] && break; sleep 0.1; done
+rm -f "$L"; : > "$L"; ino=$(ls -i "$L" | cut -d' ' -f1)
+touch "$D/p2/go"; wait $bp; rc=$?
+t "file replaced between open and lockf: 75, nothing started" '[ $rc = 75 ] && [ ! -e "$D/ran-replaced" ] && grep -q "removed or replaced" "$D/err6"'
+t "file replaced between open and lockf: the new file is untouched" '[ -e "$L" ] && [ "$(ls -i "$L" | cut -d" " -f1)" = "$ino" ] && [ ! -s "$L" ]'
+rm -f "$L"
+# the driver lock of common.sh (Linux side: flock(1))
+if command -v flock > /dev/null 2>&1; then
+  DL="$D/driver.lock"
+  drv(){ KHNMC_IOS_MACBOOK_OK=1 KHNMC_IOS_DRIVER_LOCK_FILE="$DL" bash -c ". '$HERE/common.sh'; ios_guard; $1"; }
+  drv "bash -c \". '$HERE/common.sh'; ios_guard; touch '$D/nested-ran'\"; touch '$D/drv-ready'; while [ ! -e '$D/drv-go' ]; do sleep 0.1; done" 2> "$D/err-d1" & dp=$!
+  for i in $(seq 100); do [ -e "$D/drv-ready" ] && break; sleep 0.1; done
+  t "driver lock: a driver started by the holder (build.sh -> sync.sh) runs" '[ -e "$D/drv-ready" ] && [ -e "$D/nested-ran" ]'
+  drv "touch '$D/drv-ran'" 2> "$D/err-d2"; rc=$?
+  t "driver lock: a second driver while one runs: 75, nothing started" '[ $rc = 75 ] && [ ! -e "$D/drv-ran" ] && grep -q "BUSY" "$D/err-d2"'
+  touch "$D/drv-go"; wait $dp; rc=$?
+  t "driver lock: the holder ended normally" '[ $rc = 0 ]'
+  drv "touch '$D/drv-ran2'" 2> "$D/err-d3"; rc=$?
+  t "driver lock: free again once the holder ended" '[ $rc = 0 ] && [ -e "$D/drv-ran2" ]'
+  KHNMC_IOS_MACBOOK_OK= KHNMC_IOS_DRIVER_LOCK_FILE="$DL" bash -c ". '$HERE/common.sh'; ios_guard; touch '$D/drv-ran3'" 2> /dev/null; rc=$?
+  t "driver lock: without KHNMC_IOS_MACBOOK_OK=1: 2, nothing started" '[ $rc = 2 ] && [ ! -e "$D/drv-ran3" ]'
+else
+  echo "test_maclock: SKIPPED the 5 driver-lock cases: no flock(1) on this machine (the tools/ios drivers run on Linux)" >&2
+fi
 W 2>/dev/null; rc=$?
 t "usage error is 2" '[ $rc = 2 ]'
 echo "test_maclock: $ok passed, $bad failed"

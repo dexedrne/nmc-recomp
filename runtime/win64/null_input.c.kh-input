@@ -100,7 +100,10 @@ static void hold_check(KCtx *g,u64 present){
  * counter n.  A step met at tick n has its anchor at counter n-1 (the frame in which the state was seen): `+A +B` presses counters
  * anchor+A .. anchor+B, so `+1` is the very next frame (A >= 1 is required).  The next step starts at the tick that ends the first
  * frame after the last relative press, a frame with nothing pressed: two steps' presses are always separated by at least one
- * released frame, so the game sees every press as a new one.  A step without relative lines hands over in the same tick. */
+ * released frame, so the game sees every press as a new one.  A step without relative lines hands over in the same tick, unless the
+ * frame that just ended had a button or trigger down (review U35 routes n=4: `@press A until field` then `@wait field` + `+1 +1 A` was
+ * one continuous A): then the next frame is released first, and the next step starts at the tick that ends it.  The stick alone does
+ * not count, so a chain of @goto steps keeps walking. */
 typedef struct { int kind, arg, neg; } Cond;
 enum { ST_WAIT, ST_PRESS, ST_SELECT, ST_EXPECT, ST_GOTO, ST_FIGHT, ST_SKIP, ST_TALK, ST_REACT, ST_WARP, ST_WARPLIST };   /* task 33: the debug warp (runtime/warp.c) */
 static const char *st_name[]={"@wait","@press","@select","@expect","@goto","@fight","@skip","@talk","@react","@warp","@warp list"};
@@ -347,8 +350,9 @@ static void route_tick(KCtx *g,u64 n){
                 break;
             }
         }
-        /* step_phase == 2: the relative presses; done once the frame after the last one (released) has ended */
-        if(!s->nrel || n-1>=step_anchor+s->maxb+1){ cur_step++; step_phase=0; continue; }
+        /* step_phase == 2: the relative presses; done once the frame after the last one (released) has ended.  Without relative lines:
+         * at once, or (route_pad = the pad of the frame that just ended) after one released frame, which phase 2 publishes */
+        if(s->nrel ? n-1>=step_anchor+s->maxb+1 : !(route_pad.buttons||route_pad.lt||route_pad.rt)){ cur_step++; step_phase=0; continue; }
         break;
     }
     ScriptPad pad={0};
@@ -760,7 +764,11 @@ static int t_cur(KCtx *g,int kind){ (void)g; return t_cursor[kind]; }
 static char t_path[KH_TMP_MAX];
 static int t_load(KCtx *g,const char *txt){
     kh_tmp_path(t_path,sizeof t_path,"khnmc-route-XXXXXX"); int fd=mkstemp(t_path); if(fd<0) return 0;
-    int ok=write(fd,txt,strlen(txt))==(ssize_t)strlen(txt); close(fd); kh_input_load(g,t_path); unlink(t_path); return ok; }
+    int ok=write(fd,txt,strlen(txt))==(ssize_t)strlen(txt); close(fd); kh_input_load(g,t_path); unlink(t_path);
+    /* review U35 routes n=8/9: a synthetic route must never end the process (KHNMC_ROUTE_END=exit; kh_selftest removes it).  Set all the
+     * same, the load fails its check and the route stays idle at its end, so the remaining checks still run and count */
+    if(route_exit_at_end){ route_exit_at_end=0; ok=0; fprintf(stderr,"input route selftest: KHNMC_ROUTE_END=exit reached a synthetic route\n"); }
+    return ok; }
 static u16 t_pad(void){ return route_pad.buttons; }
 /* ticks n0..n1 (inclusive) with the recorded table; bits[k] = buttons of counter n0+k (the pad each tick computes for the next frame) */
 static void t_run(KCtx *g,u64 n0,u64 n1,u16 *bits){ for(u64 n=n0;n<=n1;n++){ route_tick(g,n); if(bits) bits[n-n0]=t_pad();
@@ -818,6 +826,21 @@ int kh_input_route_selftest(KCtx *g){
     t_run(g,1,13,b); RCHECK(b[0]==0x1000 && b[1]==0x1000 && b[2]==0 && b[5]==0 && b[6]==0x1000 && b[7]==0x1000 && b[8]==0 && b[12]==0x1000);
     t_val[KR_FIELD]=1; t_run(g,14,16,b);              /* tick 14: counter 13 was pressed -> anchor 14, X on counter 15, nothing on 14 */
     RCHECK(steps[0].met==14 && b[0]==0 && b[1]==0x4000 && b[2]==0);
+    /* 5b. review U35 routes n=4: a pressing step WITHOUT relative lines whose last frame was pressed hands over after one released frame:
+     *     A on counter 1, met at tick 2, counter 2 released, the wait starts and is met at tick 3, its +1 A on counter 3 (before: the wait
+     *     started at tick 2 and pressed counter 2, one continuous A).  A press of the same button by the next @press: the same frame. */
+    memset(t_val,0,sizeof t_val);
+    RCHECK(t_load(g,"@press A until field\n@wait field\n+1 +1 A\n")); t_run(g,1,1,b); RCHECK(b[0]==0x1000 && cur_step==0);
+    t_val[KR_FIELD]=1; t_run(g,2,5,b);
+    RCHECK(steps[0].met==2 && steps[1].started==3 && steps[1].met==3 && b[0]==0 && b[1]==0x1000 && b[2]==0 && route_done);
+    memset(t_val,0,sizeof t_val);
+    RCHECK(t_load(g,"@press A until field\n@press A until battle\n")); t_run(g,1,1,b); t_val[KR_FIELD]=1; t_run(g,2,4,b);
+    RCHECK(steps[0].met==2 && steps[1].started==3 && b[0]==0 && b[1]==0x1000 && b[2]==0x1000);
+    /* ... and a pressing step whose last frame had nothing down still hands over in the same tick (A on counters 1, 2; 3 released) */
+    memset(t_val,0,sizeof t_val);
+    RCHECK(t_load(g,"@press A until field every 6 hold 2\n@wait field\n+1 +1 B\n")); t_run(g,1,3,b); RCHECK(b[0]==0x1000 && b[1]==0x1000 && b[2]==0);
+    t_val[KR_FIELD]=1; t_run(g,4,5,b);
+    RCHECK(steps[0].met==4 && steps[1].met==4 && b[0]==0x2000 && b[1]==0);   /* counter 3 was released: B on counter 4 */
     /* 6. @select down (1 -> 3) and up (3 -> 0): one DPAD press per row, released frames between, then the relative confirm */
     memset(t_val,0,sizeof t_val); t_cursor[KR_NEWGAME_CHOICE]=1; t_cursor_step=1;
     RCHECK(t_load(g,"@select newgame-choice 3 timeout 300\n+1 +3 A\n")); t_run(g,1,40,b);
@@ -991,6 +1014,10 @@ int kh_input_route29_selftest(KCtx *g){
     t29_x=0; t29_z=0; t29_cam=0; NCHECK(t_load(g,"@goto 0 300 radius 30\n+1 +1 A\n"));
     { u64 n=1; for(;n<=60 && !steps[0].met;n++) t29_run(g,n,n,0,300); u64 m=steps[0].met;
       NCHECK(m>0 && route_pad.lx==0 && route_pad.ly==0 && route_pad.buttons==0); t29_run(g,m+1,m+1,0,300); NCHECK(route_pad.buttons==0x1000); }
+    /* review U35 routes n=4: the stick alone does not hold a hand-off back: the next @goto starts in the tick the first is met and keeps walking */
+    t29_x=0; t29_z=0; t29_cam=0; NCHECK(t_load(g,"@goto 0 300 radius 30\n@goto 0 600 radius 30\n"));
+    { u64 n=1; for(;n<=60 && !steps[0].met;n++) t29_run(g,n,n,0,300); u64 m=steps[0].met;
+      NCHECK(m>0 && steps[1].started==m && route_pad.ly>0 && route_pad.buttons==0); }
     /* the camera turns while he walks: the stick follows it */
     t29_x=0; t29_z=0; t29_maxdev=0; NCHECK(t_load(g,"@goto -400 -300 radius 30\n"));
     for(u64 n=1;n<=60;n++){ t29_cam=0.05f*(float)n; t29_run(g,n,n,-400,-300); }
@@ -1117,13 +1144,23 @@ int kh_input_route29_selftest(KCtx *g){
         /* item conditions: the item handler's record, counted from the step's baseline */
         { struct kh_item_obs sv_o, o; kh_mod_item_obs(&sv_o); u64 s0=sv_o.seq; KhRouteBase b={990,0,s0};
           NCHECK(!kh_route_cond_eval(g,KR_ITEM_USES,1,1000,&b) && !kh_route_cond_eval(g,KR_ITEM_DRAIN,-1,1000,&b) && !kh_route_cond_eval(g,KR_ITEM_HEAL,-1,1000,&b));
-          memset(&o,0,sizeof o); o.seq=s0+1; o.id=1; o.hp_call=1; o.hp_before=45; o.hp_after=21; o.mp_before=o.mp_after=120; kh_mod_item_obs_test_set(&o);
+          memset(&o,0,sizeof o); o.id=1; o.hp_call=1; o.hp_before=45; o.hp_after=21; o.mp_before=o.mp_after=120; kh_mod_item_obs_test_apply(&o);
           NCHECK(kh_route_cond_eval(g,KR_ITEM_USES,1,1000,&b) && !kh_route_cond_eval(g,KR_ITEM_USES,2,1000,&b) && kh_route_cond_eval(g,KR_ITEM_DRAIN,-1,1000,&b) && !kh_route_cond_eval(g,KR_ITEM_HEAL,-1,1000,&b));
-          o.hp_after=60; kh_mod_item_obs_test_set(&o); NCHECK(kh_route_cond_eval(g,KR_ITEM_HEAL,-1,1000,&b) && !kh_route_cond_eval(g,KR_ITEM_DRAIN,-1,1000,&b));
-          o.hp_after=45; kh_mod_item_obs_test_set(&o); NCHECK(!kh_route_cond_eval(g,KR_ITEM_HEAL,-1,1000,&b) && !kh_route_cond_eval(g,KR_ITEM_DRAIN,-1,1000,&b));   /* at the floor or the cap: no visible change */
-          o.id=3; o.hp_call=0; o.mp_call=1; o.hp_after=10; o.mp_before=120; o.mp_after=0; kh_mod_item_obs_test_set(&o);
+          b.items=kh_mod_item_obs(NULL); o.hp_after=60; kh_mod_item_obs_test_apply(&o); NCHECK(kh_route_cond_eval(g,KR_ITEM_HEAL,-1,1000,&b) && !kh_route_cond_eval(g,KR_ITEM_DRAIN,-1,1000,&b));
+          b.items=kh_mod_item_obs(NULL); o.hp_after=45; kh_mod_item_obs_test_apply(&o); NCHECK(!kh_route_cond_eval(g,KR_ITEM_HEAL,-1,1000,&b) && !kh_route_cond_eval(g,KR_ITEM_DRAIN,-1,1000,&b));   /* at the floor or the cap: no visible change */
+          b.items=kh_mod_item_obs(NULL); o.id=3; o.hp_call=0; o.mp_call=1; o.hp_after=10; o.mp_before=120; o.mp_after=0; kh_mod_item_obs_test_apply(&o);
           NCHECK(kh_route_cond_eval(g,KR_ITEM_DRAIN,-1,1000,&b) && !kh_route_cond_eval(g,KR_ITEM_HEAL,-1,1000,&b));                 /* an Ether: MP only (HP is not its business) */
-          KhRouteBase b2={990,0,s0+1}; NCHECK(!kh_route_cond_eval(g,KR_ITEM_DRAIN,-1,1000,&b2) && !kh_route_cond_eval(g,KR_ITEM_USES,1,1000,&b2));   /* before the step: not counted */
+          KhRouteBase b2={990,0,kh_mod_item_obs(NULL)}; NCHECK(!kh_route_cond_eval(g,KR_ITEM_DRAIN,-1,1000,&b2) && !kh_route_cond_eval(g,KR_ITEM_USES,1,1000,&b2));   /* before the step: not counted */
+          /* review U35 routes n=5: several applications in one frame (0x3c4ab0: a Mega-Potion on each party member, one 0x3c4b80 call
+           * each).  A drain of the first target stays visible after a later target's application without a change, and a heal after
+           * it makes both conditions hold (before: only the last record was read, so the drain was lost) */
+          b.items=kh_mod_item_obs(NULL); memset(&o,0,sizeof o); o.id=5; o.hp_call=1; o.hp_before=45; o.hp_after=21; kh_mod_item_obs_test_apply(&o);   /* Sora: drained */
+          o.target=1; o.hp_before=o.hp_after=80; kh_mod_item_obs_test_apply(&o);                                                                     /* Donald: at his cap */
+          NCHECK(kh_route_cond_eval(g,KR_ITEM_USES,2,1000,&b) && kh_route_cond_eval(g,KR_ITEM_DRAIN,-1,1000,&b) && !kh_route_cond_eval(g,KR_ITEM_HEAL,-1,1000,&b));
+          o.target=2; o.hp_before=30; o.hp_after=70; kh_mod_item_obs_test_apply(&o);                                                                  /* Goofy: healed */
+          NCHECK(kh_route_cond_eval(g,KR_ITEM_DRAIN,-1,1000,&b) && kh_route_cond_eval(g,KR_ITEM_HEAL,-1,1000,&b));
+          b.items=kh_mod_item_obs(NULL); o.hp_before=o.hp_after=70; kh_mod_item_obs_test_apply(&o);                                                  /* a later step: neither */
+          NCHECK(!kh_route_cond_eval(g,KR_ITEM_DRAIN,-1,1000,&b) && !kh_route_cond_eval(g,KR_ITEM_HEAL,-1,1000,&b) && kh_route_cond_eval(g,KR_ITEM_USES,1,1000,&b));
           kh_mod_item_obs_test_set(&sv_o); }
         /* the map report prints one line with every measurement */
         { FILE *f=kh_tmpfile(); if(f){ kh_route_map_report(g,f,"selftest"); rewind(f); char l[1024]=""; size_t nr=fread(l,1,sizeof l-1,f); l[nr]=0; fclose(f);
@@ -1346,7 +1383,7 @@ static int t31_tgt(KCtx *g,int kind,int arg){ (void)g; return kind==KR_MESSAGE_C
 void kh_phase_test_set_initial_first(int state,long long present);
 static struct kh_item_obs t31_obs; static long long t31_obs_at=-1;
 static void t31_item_body(void){ kh_input_load(t_g,t_child_path);
-    for(u64 n=1;n<=60;n++){ if((long long)n==t31_obs_at){ struct kh_item_obs ob=t31_obs; ob.seq=kh_mod_item_obs(NULL)+1; ob.game_frame=n; kh_mod_item_obs_test_set(&ob); } route_tick(t_g,n); }
+    for(u64 n=1;n<=60;n++){ if((long long)n==t31_obs_at){ struct kh_item_obs ob=t31_obs; ob.game_frame=n; kh_mod_item_obs_test_apply(&ob); } route_tick(t_g,n); }
     _exit(route_done?0:5); }
 static void t31_hold_body(void){ kh_input_load(t_g,t_child_path); hold_check(t_g,263); fprintf(stderr,"present 263 polled\n"); hold_check(t_g,264); fprintf(stderr,"present 264 polled\n");
     hold_check(t_g,100000); fprintf(stderr,"present 100000 polled\n"); _exit(0); }

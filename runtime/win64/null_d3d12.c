@@ -301,7 +301,10 @@ void kh_gfx_tex_report(FILE *f){
 /* ---- free functions (imports) ------------------------------------------------------------------------------------------- */
 IMP(dxgi,CreateDXGIFactory1){ kh_cnt_gfx_calls++; u64 fct=kh_com_obj(C_factory,0); wr64(g,A1(g),fct); SET_RAX(g,0); }
 IMP(d3d12,ord101){ kh_cnt_gfx_calls++; /* D3D12CreateDevice(adapter, featureLevel, riid, **ppDevice) */ if(kh_gfx_vkd3d_on){ kh_vkd3d_create_device(g); return; } u64 pp=A3(g); if(!o_device) o_device=kh_com_obj(C_dev,0); if(pp){ wr64(g,pp,o_device); } SET_RAX(g,0); }
-IMP(d3d12,D3D12SerializeRootSignature){ kh_cnt_gfx_calls++; if(kh_gfx_vkd3d_on){ kh_vkd3d_serialize_rootsig(g); return; } u64 b=mk_blob(g,A0(g),0x40); wr64(g,A2(g),b); if(A3(g)) wr64(g,A3(g),0); SET_RAX(g,0); }
+/* the null blob: 0x40 bytes as before, holding the 40-byte Win64 D3D12_ROOT_SIGNATURE_DESC and zeros (review U35 n=9: 64 bytes were read) */
+IMP(d3d12,D3D12SerializeRootSignature){ kh_cnt_gfx_calls++; if(kh_gfx_vkd3d_on){ kh_vkd3d_serialize_rootsig(g); return; }
+    u64 b=mk_blob(g,0,0x40), d=rd64(g,b+32); memset(hp(g,d),0,0x40); if(A0(g)) memcpy(hp(g,d),hp(g,A0(g)),40);
+    wr64(g,A2(g),b); if(A3(g)) wr64(g,A3(g),0); SET_RAX(g,0); }
 IMP(d3dcompiler_47,D3DStripShader){ kh_cnt_gfx_calls++; u64 b=mk_blob(g,A0(g),A1(g)); wr64(g,A3(g),b); SET_RAX(g,0); }
 
 /* ---- task 30 selftest: a resource is destroyed at its last Release ------------------------------------------------------------ */
@@ -376,7 +379,18 @@ int kh_gfx_selftest(KCtx *g){
     kh_call(g,rd64(g,rd64(g,swap)+19*8),swap,out,0,0);
     fail+=rd32(g,out+16)!=1 || rd32(g,out+20)!=0xa5a5a5a5u || rd64(g,out+24)!=0xa5a5a5a5a5a5a5a5ull;
     ga_free(out);
-    fprintf(stderr,"kh: gfx selftest: 2 checks, %d failures\n",fail);
+    int checks=2;
+    /* review U35 n=9: the null D3D12SerializeRootSignature reads the 40-byte D3D12_ROOT_SIGNATURE_DESC and nothing after it (it read
+     * 64 bytes); the blob keeps its 0x40 bytes, the 24 after the descriptor are zero */
+    if(!kh_gfx_vkd3d_on){ u64 d=ga_alloc(64,16), pp=ga_alloc(16,16); memset(hp(g,d),0xAA,64); memset(hp(g,d),0x11,40); wr64(g,pp,0); wr64(g,pp+8,0x55);
+        u64 sv[5]={KH_RSP(g),KH_RCX(g),KH_RDX(g),KH_R8(g),KH_R9(g)}, sp=((sv[0]-0x100)&~15ull)-8; wr64(g,sp,0x7ff7ffff0000ull);
+        KH_RSP(g)=sp; KH_RCX(g)=d; KH_RDX(g)=1; KH_R8(g)=pp; KH_R9(g)=pp+8; rt_imp_d3d12__D3D12SerializeRootSignature(g);   /* (desc, version 1, **blob, **error) */
+        int ok=KH_RSP(g)==sp+8&&(u32)KH_RAX(g)==0; KH_RSP(g)=sv[0]; KH_RCX(g)=sv[1]; KH_RDX(g)=sv[2]; KH_R8(g)=sv[3]; KH_R9(g)=sv[4];
+        u64 b=rd64(g,pp), bd=b?rd64(g,b+32):0; ok=ok&&b&&bd&&rd64(g,b+40)==0x40&&rd64(g,pp+8)==0;
+        for(int i=0;ok&&i<64;i++) ok=rd8(g,bd+(u64)i)==(i<40?0x11:0);
+        checks++; if(!ok){ fail++; fprintf(stderr,"kh: gfx selftest FAIL: D3D12SerializeRootSignature (null device): the blob is not the 40-byte descriptor followed by zeros\n"); }
+        if(bd) ga_free(bd); if(b) ga_free(b); ga_free(d); ga_free(pp); }
+    fprintf(stderr,"kh: gfx selftest: %d checks, %d failures\n",checks,fail);
     fail+=release_selftest(g);                                                /* task 30: resources destroyed at their last Release */
     fail+=kh_wrap_selftest_pure(g);                                           /* the wrapped bridge's translation layer: needs no device, runs with every backend */
     if(kh_gfx_vkd3d_on) fail+=kh_gfx_vkd3d_selftest(g);                       /* KHNMC_GFX=vkd3d / vkd3dw ./khnmc --selftest: device, clear, present, image dump */

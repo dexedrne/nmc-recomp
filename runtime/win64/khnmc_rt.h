@@ -214,8 +214,8 @@ typedef struct KWaitObj {
     int signaled, manual; long count, maxcount;       /* event: signaled/manual; semaphore: count/maxcount; mutex: owner/recursion */
     u64 owner; int recurse; KThread *thread;         /* mutex / thread */
     _Atomic int refs;                                 /* the handle + every thread currently inside a wait/signal on the object */
-    u64 gen;                                          /* manual-reset event: bumped by SetEvent / pulse, releases every thread waiting at that moment */
-    int waiters, pulse_tokens;                        /* threads blocked on the object; auto-reset pulses granted to them */
+    u64 gen;                                          /* manual-reset event: bumped by SetEvent / pulse, releases every thread waiting at that moment; auto-reset: bumped by every token granted */
+    int waiters, pulse_tokens;                        /* threads blocked on the object; auto-reset releases (SetEvent, pulse) granted to them (threads.c) */
     u64 satisfied;                                    /* TASK28: waits on the object that returned WAIT_OBJECT_0 (k32.c timer clients) */
     struct KThread *last_taker;                       /* TASK28: the thread whose wait it satisfied last (KHNMC_CLOCK_SYNC=all wake hand-off) */
 } KWaitObj;

@@ -590,10 +590,11 @@ static u64 sg_obj(SynG *s,int kind,u64 real){
 #define GV(T,a) ((T)(uintptr_t)(a))            /* a guest address as the pointer VALUE inside a guest structure */
 static int outside(const SynG *s,const void *p){ return (const u8*)p<s->mem||(const u8*)p>=s->mem+s->cap; }
 static void w_forget(KCtx *g,void *real){ pthread_mutex_lock(&wm); WEnt *e=wt_find(real); if(e) w_kill(g,e); pthread_mutex_unlock(&wm); }   /* test objects on fake pointers: no real Release */
-/* the named fatals: each case runs in a child, which must end with exit code 3 (kh_fatal) and the expected name on stderr */
+/* the named fatals: each case runs in a child, which must end with exit code 3 (kh_fatal) and the expected name on stderr.  The host
+ * seam (host_env.c) gives the capture file and the child; callers ask kh_fork_ok() first (review U35 n=14: tmpfile and fork directly) */
 static int fatal_case(KCtx *g,int which,const char *expect){
-    FILE *f=tmpfile(); if(!f) return 0;
-    fflush(stderr); pid_t child=fork();
+    FILE *f=kh_tmpfile(); if(!f) return 0;
+    fflush(stderr); pid_t child=kh_fork();
     if(child==0){ dup2(fileno(f),2); void *fake=(void*)(uintptr_t)0x7e5700aa00000000ull;
         switch(which){
         case 0: { u64 o=kh_wrap_obj(g,fake,WK_DEVICE); GC(VT(o,11),o,0,0,0); break; }                      /* ID3D12Device::CreateComputePipelineState */
@@ -781,7 +782,9 @@ int kh_wrap_selftest_pure(KCtx *g){
     /* a host address handed to the game is host - bias: XL() of it is the host address again, and a guest write lands there */
     { u8 *h=malloc(64); memset(h,0,64); u64 ga=host_to_guest(g,h,"selftest"); T((void*)XL(g,ga)==(void*)h); T(hp(g,ga+8)==(void*)(h+8)); T(ga==GP(h)); T(host_to_guest(g,NULL,"selftest")==0);
       wr32(g,ga+4,0xfeedf00du); u32 v; memcpy(&v,h+4,4); T(v==0xfeedf00du); h[9]=0x5a; T(rd8(g,ga+9)==0x5a); T(KH_XLATE_MODE==0?ga==U(h):ga!=U(h)); free(h); }
-    /* named fatals */
+    /* named fatals (in a child process; none on a host without fork, e.g. iOS: reported as not run) */
+    if(!kh_fork_ok()) kh_selftest_not_run("gfx wrap","the named fatals gfx-wrap-unwrapped-method, -foreign-object, -dead-object, -private-interface, -feature and the wrong-interface case (8 children)",8);
+    else {
     T(fatal_case(g,0,"gfx-wrap-unwrapped-method: ID3D12Device::CreateComputePipelineState"));
     T(fatal_case(g,1,"gfx-wrap-unwrapped-method: ID3D12GraphicsCommandList::Dispatch"));
     T(fatal_case(g,2,"gfx-wrap-unwrapped-method: ID3D12Device::(a method of a later interface version) (vtable slot 44)"));
@@ -789,10 +792,10 @@ int kh_wrap_selftest_pure(KCtx *g){
     T(fatal_case(g,4,"is a ID3D12Fence, a ID3D12Resource is needed"));
     T(fatal_case(g,5,"gfx-wrap-dead-object: ID3D12Fence::GetCompletedValue"));
     T(fatal_case(g,6,"gfx-wrap-private-interface"));
-    T(fatal_case(g,7,"gfx-wrap-feature"));
+    T(fatal_case(g,7,"gfx-wrap-feature")); }
     free(s.mem); st_f+=kh_gfxc_st_fails;
     fprintf(stderr,"kh: gfx wrap selftest: %d checks, %d failures (structure translation under a synthetic bias of 0x%llx; process bias 0x%llx)\n",st_n,st_f,P(x.bias),P(XL(g,0)));
-    return st_f;
+    return st_f+kh_gfxc_selftest_pure(g);                                        /* the part both bridges share that needs no device either (gfx_vkd3d.c) */
 }
 /* KHNMC_GFX=vkd3dw --selftest: what needs real objects.  Everything goes through the guest ABI (the vtable slots), like the lifted code */
 int kh_wrap_selftest_device(KCtx *g){

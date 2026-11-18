@@ -121,6 +121,7 @@ static struct vkd3d_instance *vk_inst; static pthread_mutex_t vm=PTHREAD_MUTEX_I
 static _Atomic u64 n_devices, n_probe_devices, n_events_signalled, n_bundles_made, n_bundles_run, n_bundle_cmds, n_bundles_live, n_default_tables;
 static int C_balloc, C_bundle;
 static int h_balloc(KCtx *g,u64 o,int s,const char *c); static int h_bundle(KCtx *g,u64 o,int s,const char *c);
+static void bundle_classes(void){ C_balloc=kh_com_class("vkd3d:BundleAllocator",9,COM_STRICT,h_balloc); C_bundle=kh_com_class("vkd3d:BundleCommandList",60,COM_STRICT,h_bundle); }   /* idempotent */
 #define P(x) ((unsigned long long)(x))
 #define U(x) ((u64)(uintptr_t)(x))
 
@@ -219,7 +220,7 @@ void kh_gfxc_init_common(const char *label){
     video_setup();
     e=getenv("KHNMC_GFX_TRACE"); kh_native_trace=e&&*e=='1';
     kh_fiber_host_stack=16ull<<20;          /* vkd3d and the Vulkan driver run on the calling fiber's host stack */
-    C_balloc=kh_com_class("vkd3d:BundleAllocator",9,COM_STRICT,h_balloc); C_bundle=kh_com_class("vkd3d:BundleCommandList",60,COM_STRICT,h_bundle);
+    bundle_classes();
     kh_gfx_vkd3d_on=1;
     fprintf(stderr,"kh: gfx backend: %s; address model: %s; frame dump: %s%s every %llu presents",label,KH_XLATE_MODE==0?"identity":"bias",dump_dir[0]?"to ":"off",dump_dir,P(dump_every));
     if(dump_from||dump_to!=~0ull) fprintf(stderr,", presents %llu..%llu only",P(dump_from),P(dump_to));
@@ -229,10 +230,11 @@ void kh_gfxc_init_common(const char *label){
 }
 
 /* ---- vkd3d instance --------------------------------------------------------------------------------------------------------- */
-static HRESULT sig_event(HANDLE h){                                           /* called by vkd3d's fence worker thread */
-    KWaitObj *w=h_get(U(h),HK_EVENT);
-    if(!w) kh_fatal(NULL,"gfx-fence-event-handle: a fence completed and wants to signal handle %p, which is not an event of this runtime",h);
-    pthread_mutex_lock(&w->m); w->signaled=1; pthread_cond_broadcast(&w->cv); pthread_mutex_unlock(&w->m);
+/* called by vkd3d's fence worker thread: SetEvent, as Windows does when the fence reaches the value.  kh_event_set holds a reference
+ * to the event while it signals (a CloseHandle on another thread meanwhile is legal) and releases one blocked waiter of an auto-reset
+ * event per completion (review U35 n=2: the bit was set here directly, so two completions before the woken waiter ran released one) */
+static HRESULT sig_event(HANDLE h){
+    if(!kh_event_set(U(h))) kh_fatal(NULL,"gfx-fence-event-handle: a fence completed and wants to signal handle %p, which is not an event of this runtime",h);
     atomic_fetch_add(&n_events_signalled,1); return S_OK;
 }
 static const char *pd_type(VkPhysicalDeviceType t){ switch(t){ case VK_PHYSICAL_DEVICE_TYPE_CPU: return "CPU"; case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return "INTEGRATED_GPU";
@@ -421,13 +423,13 @@ static void bundle_rec(KCtx *g,Bundle *b,int slot,u64 a0,u64 a1,u64 a2,u64 a3,u6
 static u64 b_real(KCtx *g,u64 shown,int kind,const char *what){ return shown?U(real_of(g,shown,kind,what)):0; }
 static int h_balloc(KCtx *g,u64 o,int s,const char *c){ (void)c;
     if(s>=3&&s<=6){ SET_RAX(g,0); return 1; }
-    if(s==2){ u64 r=rd64(g,o+16); if(r) r--; wr64(g,o+16,r); SET_RAX(g,r); if(!r){ wr64(g,o,0); ga_free(o); } return 1; }
+    if(s==2){ int last=0; u64 r=kh_com_ref_drop(g,o,&last); SET_RAX(g,r); if(last){ wr64(g,o,0); ga_free(o); } return 1; }   /* Release: atomic, as AddRef (com.c; review U35 n=4) */
     if(s==8){ SET_RAX(g,0); return 1; }                                         /* Reset */
     return 0; }
 static int h_bundle(KCtx *g,u64 o,int s,const char *c){ (void)c; Bundle *b=bundle_of(g,o);
     switch(s){
-    case 2: { u64 r=rd64(g,o+16); if(r) r--; wr64(g,o+16,r); SET_RAX(g,r);
-              if(!r){ free(b->cmd); free(b->blob); free(b); wr64(g,o,0); wr64(g,o+B_PTR,0); ga_free(o); atomic_fetch_sub(&n_bundles_live,1); } return 1; }   /* Release: the recording dies with the last reference */
+    case 2: { int last=0; u64 r=kh_com_ref_drop(g,o,&last); SET_RAX(g,r);                 /* atomic, as AddRef (com.c; review U35 n=4) */
+              if(last){ free(b->cmd); free(b->blob); free(b); wr64(g,o,0); wr64(g,o+B_PTR,0); ga_free(o); atomic_fetch_sub(&n_bundles_live,1); } return 1; }   /* Release: the recording dies with the last reference */
     case 3: case 4: case 5: case 6: SET_RAX(g,0); return 1;                     /* private data, SetName */
     case 8: SET_RAX(g,D3D12_COMMAND_LIST_TYPE_BUNDLE); return 1;                /* GetType */
     case 9: if(!b->open){ fprintf(stderr,"kh: gfx vkd3d: bundle 0x%llx: Close on a closed bundle -> E_FAIL\n",P(o)); SET_RAX(g,(u32)E_FAIL); return 1; }
@@ -927,6 +929,11 @@ void kh_gfx_vkd3d_finish(void){
      * line-buffered, so a flush is all the exit needs. */
     if(hash_f){ if(fflush(hash_f)||ferror(hash_f)) fprintf(stderr,"kh: gfx hash log: ERROR: writing %s failed (%s)\n",hash_path,strerror(errno)); }
     if(!video_path[0]) return; pthread_mutex_lock(&vid_m); if(video_f){ vid_cut=!vid_done; video_close(); } else if(!vid_done) vid_cut=vid_armed; vid_done=1; pthread_mutex_unlock(&vid_m); }
+/* the stream's state in the report; caller holds vid_m.  kh_gfx_vkd3d_finish marks every stream done, so "complete" is every picture
+ * written and a stream the run cut short reads INCOMPLETE (review U35 n=27: vid_done was checked first) */
+static const char *video_state(void){
+    return vid_cut?" (INCOMPLETE: the run ended first)":vid_written>=video_max?" (complete)":video_f?" (open)":vid_armed?" (armed, no picture written yet)":" (not started: its first vblank has not been reached)";
+}
 void kh_gfx_vkd3d_report(FILE *f){
     fprintf(f,"kh: gfx vkd3d: bridge=%s device=%s driver-mode=%s devices-created=%llu (+%llu probes) native-calls=%llu fence-events-signalled=%llu bundles: recorded=%llu executed=%llu (%llu replayed calls) live=%llu; default-descriptor-tables=%llu on %d tracked command lists; frame-dumps=%llu%s%s\n",kh_gfx_wrap_on?"wrapped":"trampoline",vk_dev_name,drv_system?"system":"lavapipe",
             P(n_devices),P(n_probe_devices),P(kh_native_calls),P(n_events_signalled),P(n_bundles_made),P(n_bundles_run),P(n_bundle_cmds),P(n_bundles_live),P(n_default_tables),nlst,P(dumps_written),dump_dir[0]?" in ":"",dump_dir);
@@ -934,9 +941,9 @@ void kh_gfx_vkd3d_report(FILE *f){
     census_report(f);
     if(kh_gfx_wrap_on) kh_wrap_report(f);
     if(video_path[0]){
-        pthread_mutex_lock(&vid_m); int open=video_f!=NULL||vid_cut; pthread_mutex_unlock(&vid_m);
+        pthread_mutex_lock(&vid_m); const char *state=video_state(); pthread_mutex_unlock(&vid_m);
         fprintf(f,"kh: gfx video: %s: %llu of %llu pictures written%s (rgb24 %ux%u, scale 1/%d, 60 per second of game time; picture 0 = virtual vblank %llu); repeats=%llu replaced-presents=%llu captures=%llu vblanks-before-the-first-picture=%llu%s\n",video_path,P(vid_written),P(video_max),
-                vid_done?" (complete)":vid_cut?" (INCOMPLETE: the run ended first)":open?" (open)":vid_armed?" (armed, no picture written yet)":" (not started: its first vblank has not been reached)",vid_w,vid_h,video_scale,P(video_first),P(vid_repeats),P(vid_replaced),P(vid_captures),P(vid_before_first),
+                state,vid_w,vid_h,video_scale,P(video_first),P(vid_repeats),P(vid_replaced),P(vid_captures),P(vid_before_first),
                 kh_vclock_on?"":" [KHNMC_CLOCK is not frames]");
     }
 }
@@ -978,6 +985,64 @@ static int st_clear_present(KCtx *g,u64 m,u64 dev,u64 q,u64 sc,u64 al,u64 cl,u64
     return ok&&(u32)GC(VT(sc,8),sc,1,0)==0;
 }
 static int raw_is(const u8 *p,size_t n,u8 r,u8 gg,u8 b){ for(size_t i=0;i<n;i+=3) if(p[i]!=r||p[i+1]!=gg||p[i+2]!=b) return 0; return 1; }
+
+/* ---- selftest of the shared part that needs no device (every --selftest of a binary with the backend; review U35 n=2, 4, 27) ---- */
+/* one IUnknown slot (AddRef 1, Release 2) through the object's vtable, as the lifted code calls it; neither slot reads the guest stack */
+static u64 st_slot(KCtx *g,u64 o,int slot){ u64 sp0=KH_RSP(g); KH_RSP(g)=sp0-8; KH_RCX(g)=o; kh_dispatch(g,VT(o,slot)); u64 r=KH_RAX(g); KH_RSP(g)=sp0; return r; }
+typedef struct { u64 al, bl, sp; int rounds; _Atomic int zero; } BRace;
+static void *st_bundle_race(void *p){ BRace *r=(BRace*)p; KCtx *g=kh_new_ctx(); KH_RSP(g)=r->sp;      /* a guest thread of its own: the handlers set rax */
+    for(int i=0;i<r->rounds;i++){ st_slot(g,r->al,1); st_slot(g,r->bl,1); if(!st_slot(g,r->al,2)) r->zero++; if(!st_slot(g,r->bl,2)) r->zero++; }
+    free(g); return NULL; }
+typedef struct { u64 h; _Atomic u32 res; _Atomic int done; } FWait;
+static void st_fence_waiter(KCtx *g){ FWait *w=(FWait*)(uintptr_t)A0(g); atomic_store(&w->res,kh_wait(g,w->h,1500)); atomic_store(&w->done,1); KH_RET(g); }
+int kh_gfxc_selftest_pure(KCtx *g){
+    int n=0, f=0;
+#define TP(c) do{ n++; if(!(c)){ f++; fprintf(stderr,"vkd3d shared-part selftest FAIL: %s (line %d)\n",#c,__LINE__); } }while(0)
+    /* n=4: AddRef and Release of a bundle and a bundle allocator on 8 threads at once (the game AddRefs both).  The test holds 2^20
+     * references of its own, so a lost update can never take a count to 0 here; afterwards both counts must be exactly that again. */
+    { bundle_classes(); u64 al=kh_gfxc_bundle_allocator_new(g), bl=kh_gfxc_bundle_new(g,al,0), live=n_bundles_live;
+      TP(rd64(g,al+16)==1 && rd64(g,bl+16)==1 && kh_gfxc_is_bundle(g,bl));
+      enum { NT=8 }; const u64 base=1ull<<20; u64 stk=ga_calloc(NT,256); wr64(g,al+16,base); wr64(g,bl+16,base);
+      BRace r[NT]; pthread_t t[NT]; for(int i=0;i<NT;i++){ r[i].al=al; r[i].bl=bl; r[i].sp=stk+256ull*(u64)i+192; r[i].rounds=20000; atomic_store(&r[i].zero,0);
+          if(pthread_create(&t[i],NULL,st_bundle_race,&r[i])) kh_fatal(g,"gfx-selftest-thread: the bundle reference-count selftest cannot start host thread %d",i); }
+      int zero=0; for(int i=0;i<NT;i++){ pthread_join(t[i],NULL); zero+=atomic_load(&r[i].zero); }
+      TP(rd64(g,al+16)==base && rd64(g,bl+16)==base); TP(zero==0 && n_bundles_live==live);
+      if(rd64(g,al+16)==base && rd64(g,bl+16)==base){                               /* the last reference destroys, the one before does not */
+          wr64(g,al+16,2); wr64(g,bl+16,2);
+          TP(st_slot(g,bl,2)==1 && kh_gfxc_is_bundle(g,bl) && n_bundles_live==live); TP(st_slot(g,bl,2)==0 && n_bundles_live==live-1);
+          TP(st_slot(g,al,2)==1 && rd64(g,al)==kh_com_vtbl(C_balloc)); TP(st_slot(g,al,2)==0); }
+      ga_free(stk); }
+    /* n=2: a fence completion is SetEvent on the game's event: two completions before either of two blocked waiters of an auto-reset
+     * event has run release both (one blocked waiter per SetEvent, as on Windows) and leave the event reset */
+    { u64 ev=kh_mk_event_h(0,0); FWait w[2]; for(int i=0;i<2;i++){ w[i].h=ev; atomic_store(&w[i].res,0xdeadu); atomic_store(&w[i].done,0); kh_spawn_hostfn_thread(g,"gfx_selftest_fence_waiter",st_fence_waiter,(u64)(uintptr_t)&w[i]); }
+      int blocked=0; struct timespec ts={0,200000}; for(int i=0;i<15000&&!blocked;i++){ int wt=0; u64 sat=0; if(!kh_wobj_waitstate(ev,&wt,&sat)&&wt>=2) blocked=1; else nanosleep(&ts,0); }
+      TP(blocked);
+      u64 s0=n_events_signalled; sig_event((HANDLE)(uintptr_t)ev); sig_event((HANDLE)(uintptr_t)ev); TP(n_events_signalled==s0+2);
+      int done=0; for(int i=0;i<15000&&done<2;i++){ done=atomic_load(&w[0].done)+atomic_load(&w[1].done); if(done<2) nanosleep(&ts,0); }
+      TP(done==2 && atomic_load(&w[0].res)==0 && atomic_load(&w[1].res)==0); TP(kh_wait(g,ev,0)==0x102);
+      h_close(ev); }
+    /* n=27: the video report.  kh_gfx_vkd3d_finish marks every stream done; one the run cut short must still read INCOMPLETE */
+    { pthread_mutex_lock(&vid_m); char sv_path[sizeof video_path]; memcpy(sv_path,video_path,sizeof video_path); FILE *sv_f=video_f, *sv_ix=video_ix;
+      int sv_armed=vid_armed, sv_done=vid_done, sv_cut=vid_cut; u64 sv_max=video_max, sv_wr=vid_written; pthread_mutex_unlock(&vid_m);
+      snprintf(video_path,sizeof video_path,"(selftest: no file)"); video_ix=NULL; video_max=1000; const char *st;
+      /* open, 10 of 1000 pictures written, then the run ends */
+      video_f=kh_tmpfile(); TP(video_f!=NULL); vid_armed=1; vid_done=vid_cut=0; atomic_store(&vid_written,10);
+      pthread_mutex_lock(&vid_m); st=video_state(); pthread_mutex_unlock(&vid_m); TP(strstr(st,"(open)")!=NULL);
+      kh_gfx_vkd3d_finish(); pthread_mutex_lock(&vid_m); st=video_state(); pthread_mutex_unlock(&vid_m); TP(video_f==NULL && strstr(st,"INCOMPLETE")!=NULL);
+      /* armed, no picture written yet, then the run ends */
+      video_f=NULL; vid_armed=1; vid_done=vid_cut=0; atomic_store(&vid_written,0);
+      kh_gfx_vkd3d_finish(); pthread_mutex_lock(&vid_m); st=video_state(); pthread_mutex_unlock(&vid_m); TP(strstr(st,"INCOMPLETE")!=NULL);
+      /* never armed: the run ended before its first vblank */
+      video_f=NULL; vid_armed=0; vid_done=vid_cut=0; atomic_store(&vid_written,0);
+      kh_gfx_vkd3d_finish(); pthread_mutex_lock(&vid_m); st=video_state(); pthread_mutex_unlock(&vid_m); TP(strstr(st,"not started")!=NULL);
+      /* every picture written: the stream ended itself and stays complete through the finish */
+      video_f=NULL; vid_armed=1; vid_done=1; vid_cut=0; atomic_store(&vid_written,1000);
+      kh_gfx_vkd3d_finish(); pthread_mutex_lock(&vid_m); st=video_state(); pthread_mutex_unlock(&vid_m); TP(strstr(st,"(complete)")!=NULL);
+      pthread_mutex_lock(&vid_m); memcpy(video_path,sv_path,sizeof video_path); video_f=sv_f; video_ix=sv_ix; vid_armed=sv_armed; vid_done=sv_done; vid_cut=sv_cut; video_max=sv_max; atomic_store(&vid_written,sv_wr); pthread_mutex_unlock(&vid_m); }
+#undef TP
+    fprintf(stderr,"kh: gfx vkd3d shared-part selftest: %d checks, %d failures (bundle reference counts on 8 threads, fence events, video report)\n",n,f);
+    return f;
+}
 int kh_gfx_vkd3d_selftest(KCtx *g){
     extern void rt_imp_d3d12__ord101(KCtx*), rt_imp_d3d12__D3D12SerializeRootSignature(KCtx*), rt_imp_dxgi__CreateDXGIFactory1(KCtx*);
     st_checks=st_fails=0; kh_gfxc_st_fails=0; u64 nat0=kh_native_calls;

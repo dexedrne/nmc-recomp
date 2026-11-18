@@ -216,7 +216,19 @@ static void input_selftest(KCtx *g){
     kh_input_load(g,getenv("KHNMC_INPUT_SCRIPT")); ga_free(out);
 }
 
+static int selftest_all(KCtx *g);
+/* review U35 routes n=8/9: the route suites load synthetic routes through kh_input_load, which reads KHNMC_ROUTE_END.  Inherited `exit`
+ * made the first synthetic route's end call kh_exit_process(0): the selftest ended there with status 0, the later suites never ran and
+ * failures already counted were lost.  The variable is removed for the whole selftest and put back afterwards. */
 int kh_selftest(KCtx *g){
+    const char *e=getenv("KHNMC_ROUTE_END"); char *sv=e?strdup(e):NULL;
+    if(e && !sv) kh_fatal(g,"selftest: allocation failed (saving KHNMC_ROUTE_END)");
+    unsetenv("KHNMC_ROUTE_END");
+    int f=selftest_all(g);
+    if(sv){ setenv("KHNMC_ROUTE_END",sv,1); free(sv); }
+    return f;
+}
+static int selftest_all(KCtx *g){
     { const char *only=getenv("KHNMC_SELFTEST_ONLY");            /* task 31: one suite alone (a mutation check runs it many times); a partial run is said to be one and is no pass of the selftest */
       if(only&&*only){ if(strcmp(only,"route31")) kh_fatal(g,"KHNMC_SELFTEST_ONLY=%s: the only suite that can run alone is route31",only);
           extern int kh_input_route31_selftest(KCtx *); int f=kh_input_route31_selftest(g);
@@ -246,6 +258,7 @@ int kh_selftest(KCtx *g){
     fails+=kh_sync_selftest(g);
     { extern int kh_sync_vclock_selftest(KCtx *); fails+=kh_sync_vclock_selftest(g); }   /* review of task 28: virtual time-outs of KHNMC_CLOCK_SYNC=all without lock-order deadlocks */
     { extern int kh_compat_selftest(void); fails+=kh_compat_selftest(); }      /* task 20: the host primitives that differ between Linux and Darwin */
+    { extern int kh_loader_selftest(void); fails+=kh_loader_selftest(); }      /* review U35 n=24: the bias-mode reservation keeps its low guard or is a named fatal */
     input_selftest(g);
     { extern int kh_input_hold_selftest(KCtx *); fails+=kh_input_hold_selftest(g); }
     { extern int kh_input_route_selftest(KCtx *); fails+=kh_input_route_selftest(g); }   /* task 27: state-driven route steps */

@@ -9,15 +9,19 @@
 #                                tools/make_route_subset.sh), content hash list compared on both sides
 #   tools/ios/sync.sh all [D]    all three
 # Game-derived material (lifted C, gen/, the exe, the route subset) goes to ~/Developer/KHNMC and nowhere else on that machine.
-# rsync --delete acts inside the listed directories of ~/Developer/KHNMC/src only.  No lock: copying is neither a build nor a
-# simulator step; do not run it while one of OUR builds is running there.
+# rsync --delete acts inside the listed directories of ~/Developer/KHNMC/src only.  The Mac's shared lock is not taken (copying is
+# neither a build nor a simulator step); this machine's driver lock is (common.sh ios_guard, shared with a calling driver), so
+# no other tools/ios driver from any work tree copies or builds meanwhile.
+# The source copies do NOT keep this machine's modification times and compare by content (-c): a changed file gets a fresh
+# time on the Mac, so mac/build.sh's make rebuilds its objects even when its time here is older than an object compiled there
+# from another work tree's copy; unchanged files keep their time there.
 set -euo pipefail
 . "$(dirname "$0")/common.sh"
 ios_guard
 cd "$IOS_HERE"
 what=${1:-src}; SUB=${2:-$IOS_HERE/route-subset}
-case "$what" in src|exe|route|all) ;; *) sed -n '2,13p' "$0" >&2; exit 2;; esac
-RS=(rsync -a --delete -e "$IOS_RSH")
+case "$what" in src|exe|route|all) ;; *) sed -n '2,11p' "$0" >&2; exit 2;; esac
+RS=(rsync -rlpD -c --delete -e "$IOS_RSH")
 for f in Makefile runtime lifter-rt tools gen lifted/gen lifted/shards; do [ -e "$f" ] || { echo "ios/sync: missing $f in $IOS_HERE" >&2; exit 2; }; done
 mac "mkdir -p ~/$IOS_RDIR/src/lifted/gen ~/$IOS_RDIR/src/lifted/shards ~/$IOS_RDIR/src/gen ~/$IOS_RDIR/pc ~/$IOS_RDIR/run"
 "${RS[@]}" Makefile "$IOS_MAC:$IOS_RDIR/src/Makefile"

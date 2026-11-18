@@ -171,6 +171,11 @@ struct kh_item_obs {
     s32 hp_before, hp_after, hp_max, mp_before, mp_after, mp_max;   /* the target's sheet: +0, +4, +0x180, +0x184 */
     s32 hp_amount, mp_amount;      /* the amounts the DLL's formula handed to 0x3c0c30 / 0x3c0cd0 (0 when that call was not made) */
     int hp_call, mp_call;          /* whether the HP / MP add was called for this id */
+    /* review U35 routes n=5: seq of the last application that lowered / raised its target's HP or MP (0 = none yet).  Exe 0x3c4ab0 applies
+     * a Mega-Potion / Mega-Ether / Megalixir (5..7) or 0x83 to each party member, one 0x3c4b80 call each in one frame: the record above
+     * is only the last of them, these keep an earlier target's drain / heal visible to `item-drain` / `item-heal`. */
+    u64 drain_seq, heal_seq;
 };
 u64  kh_mod_item_obs(struct kh_item_obs *out);                     /* copies the last record, returns seq */
-void kh_mod_item_obs_test_set(const struct kh_item_obs *in);       /* selftest only */
+void kh_mod_item_obs_test_set(const struct kh_item_obs *in);       /* selftest only: replaces the record as it is (save / restore) */
+u64  kh_mod_item_obs_test_apply(const struct kh_item_obs *in);     /* selftest only: records *in as a new application, as item_stock_apply does */
