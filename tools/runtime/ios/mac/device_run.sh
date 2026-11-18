@@ -1,7 +1,12 @@
 #!/bin/bash
-# tools/ios/mac/device_run.sh [selftest] [LIMIT_S] : run the signed app (mac/sign_app.sh) on the owner's own iPhone, over the
-# network (the phone is paired with this Mac; `xcrun devicectl list devices` shows it "available (paired)").  Run on the MacBook
-# from ~/Developer/KHNMC/src, over ssh is fine (devicectl needs no keychain).
+# tools/ios/mac/device_run.sh selftest [LIMIT_S]
+# tools/ios/mac/device_run.sh route INPUT [GAME_FRAMES] [DIFFICULTY] [LIMIT_S]
+#   run the signed app (mac/sign_app.sh) on the owner's own iPhone, over the network or the cable (the phone is paired with this
+#   Mac; `xcrun devicectl list devices` shows it "available (paired)").  Run on the MacBook from ~/Developer/KHNMC/src, over ssh
+#   is fine (devicectl needs no keychain).
+#   route: the null-backend game with the scripted controller INPUT (a file of src/, e.g. input/route-story.txt) as Documents/input.txt,
+#   KH_RUN_GAME_FRAMES (default 7000), DIFFICULTY none (default) or 0..3, on the game data that tools/ios/push_data.sh put into
+#   Documents/data and Documents/pkgdir; phase.log and files.log come back with the log.
 #   1. install the app; 2. put khnmc.conf (`arg --selftest`, log + status file), a fresh status file and kh2fm.exe into the app's
 #      Documents; 3. start it, retrying every 20 s while iOS refuses because the phone is LOCKED (WAIT_UNLOCK_S, default 1800);
 #   4. read Documents/khnmc.status every 15 s until "exit N" (LIMIT_S, default 1500), then copy khnmc.log back.
@@ -11,7 +16,14 @@
 # iOS suspends it otherwise.
 # First runs 2026-11-18 (iPhone, A20 Pro, iOS 27.2): 169,479 checks, 0 failures, about 16 s; 381 checks need fork() and are NOT RUN.
 . "$(dirname "$0")/lib.sh"
-MODE=${1:-selftest}; LIMIT=${2:-1500}; case "$MODE" in selftest) ;; *) sed -n '2,6p' "$0" >&2; exit 2;; esac
+MODE=${1:-selftest}; INPUT=""; FRAMES=7000; DIFF=none
+case "$MODE" in
+  selftest) LIMIT=${2:-1500};;
+  route) INPUT=${2:-}; FRAMES=${3:-7000}; DIFF=${4:-none}; LIMIT=${5:-2400}
+         [ -f "$INPUT" ] || { echo "ios/mac: device_run: route needs an input script of src/ (got '${INPUT}')" >&2; exit 2; }
+         case "$DIFF" in none|0|1|2|3) ;; *) echo "ios/mac: device_run: DIFFICULTY is none or 0..3" >&2; exit 2;; esac;;
+  *) sed -n '2,9p' "$0" >&2; exit 2;;
+esac
 [ -f "$STATE/device.env" ] && . "$STATE/device.env"
 : "${DEVICE:?ios/mac: device_run: no DEVICE in $STATE/device.env}"
 APP="$KROOT/build/app-signed/sym/Release-iphoneos/KHNMC.app"
@@ -27,10 +39,17 @@ if [ "${SKIP_INSTALL:-0}" != 1 ]; then
   [ -f "$KROOT/pc/kh2fm.exe" ] || { say "no $KROOT/pc/kh2fm.exe (tools/ios/sync.sh exe)"; exit 2; }
   say "install"; xcrun devicectl device install app --device "$DEVICE" --timeout 300 "$APP" >> "$OUT/devicectl.log" 2>&1 \
     || { say "install FAILED"; tail -5 "$OUT/devicectl.log"; exit 1; }
-  { echo "# written by tools/ios/mac/device_run.sh ($MODE)"; echo "log khnmc.log"; echo "status khnmc.status"; echo "arg --selftest"; } > "$OUT/khnmc.conf"
-  cp_to "$OUT/khnmc.conf" khnmc.conf || { say "copy of khnmc.conf FAILED"; tail -5 "$OUT/devicectl.log"; exit 1; }
   cp_to "$KROOT/pc/kh2fm.exe" kh2fm.exe || { say "copy of kh2fm.exe FAILED"; tail -5 "$OUT/devicectl.log"; exit 1; }
 fi
+{ echo "# written by tools/ios/mac/device_run.sh ($MODE ${INPUT})"; echo "log khnmc.log"; echo "status khnmc.status"
+  if [ "$MODE" = selftest ]; then echo "arg --selftest"
+  else echo "env KHNMC_INPUT_SCRIPT=@DOCS@/input.txt"; echo "env KH_RUN_GAME_FRAMES=$FRAMES"; echo "env KH_RUN_SECONDS=$((LIMIT-120))"
+    echo "env KH_DUMP_THREADS=1"; echo "env KHNMC_PHASELOG=@DOCS@/phase.log"; echo "env KHNMC_FILELOG=@DOCS@/files.log"
+    DV=KHNMC_DIFFICULTY; grep -qE '^[[:space:]]*@(wait|press|select|expect)([[:space:]]|$)' "$INPUT" && DV=KHNMC_ROUTE_DIFFICULTY   # as tools/route_batch.sh
+    [ "$DIFF" = none ] || echo "env $DV=$DIFF"; fi
+} > "$OUT/khnmc.conf"
+cp_to "$OUT/khnmc.conf" khnmc.conf || { say "copy of khnmc.conf FAILED"; tail -5 "$OUT/devicectl.log"; exit 1; }
+if [ "$MODE" = route ]; then cp "$INPUT" "$OUT/input.txt"; cp_to "$OUT/input.txt" input.txt || { say "copy of the input script FAILED"; exit 1; }; fi
 cp_to "$OUT/status.init" khnmc.status || { say "copy of the status file FAILED"; tail -5 "$OUT/devicectl.log"; exit 1; }
 tw=$SECONDS; n=0
 until xcrun devicectl device process launch --device "$DEVICE" --timeout 60 --terminate-existing "$BUNDLE_ID" >> "$OUT/devicectl.log" 2>&1; do
@@ -45,6 +64,7 @@ while [ $((SECONDS-t0)) -lt "$LIMIT" ]; do
   case "$st" in "exit "*) break;; esac
 done
 cp_from khnmc.log
+if [ "$MODE" = route ]; then cp_from phase.log; cp_from files.log; fi
 say "status after $((SECONDS-t0)) s: '${st:-<none>}'; log lines: $(wc -l < "$OUT/khnmc.log" 2>/dev/null | tr -d ' ')"
 echo "$OUT"
 case "$st" in "exit 0") exit 0;; "exit "*) exit 1;; *) exit 124;; esac
