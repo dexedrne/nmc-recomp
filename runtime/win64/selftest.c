@@ -213,6 +213,19 @@ static void input_selftest(KCtx *g){
     CHECK(rd64(g,GS_BASE+0x8bb2a8+0x18)==0x4308);
     CHECK(rd16(g,data)==0x4308);
     gfx_presents=saved_present; ga_free(data);
+    /* the host pad (2026-11-18, the iPhone's controller): with no script it is pad 0, every field including the right stick; a change
+     * makes a new packet number; with it off again pad 0 is absent (1167).  A script, when loaded, always wins. */
+    { extern void kh_input_host_pad_set(u16,u8,u8,s16,s16,s16,s16); extern int kh_input_host_test(int);
+      kh_input_load(g,NULL); int was=kh_input_host_test(1);
+      kh_input_host_pad_set(0x1000|0x0200|0x0010,200,7,-12345,23456,32767,-32768);
+      CHECK(kh_input_state(g,0,out,1)==0); u32 p0=rd32(g,out);
+      CHECK(rd16(g,out+4)==0x1210 && rd8(g,out+6)==200 && rd8(g,out+7)==7 && (s16)rd16(g,out+8)==-12345 && (s16)rd16(g,out+10)==23456
+            && (s16)rd16(g,out+12)==32767 && (s16)rd16(g,out+14)==-32768);
+      CHECK(kh_input_state(g,0,out,2)==0 && rd32(g,out)==p0);                                   /* unchanged: the same packet */
+      kh_input_host_pad_set(0,0,0,0,0,100,0); CHECK(kh_input_state(g,0,out,3)==0 && rd32(g,out)==p0+1 && rd16(g,out+4)==0 && (s16)rd16(g,out+12)==100);
+      CHECK(kh_input_state(g,1,out,3)==1167);                                                   /* pad 0 only */
+      kh_input_host_test(0); CHECK(kh_input_state(g,0,out,4)==1167);
+      kh_input_host_test(was); }
     kh_input_load(g,getenv("KHNMC_INPUT_SCRIPT")); ga_free(out);
 }
 

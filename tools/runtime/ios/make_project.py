@@ -184,7 +184,7 @@ def generate(name, groups, target_settings):
     return ''.join(out)
 
 
-FRAMEWORKS = ['Foundation', 'UIKit', 'AVFoundation', 'AudioToolbox']   # audio: runtime/ios/audio_coreaudio.c (COREAUDIO=1 in mac/build.sh)
+FRAMEWORKS = ['Foundation', 'UIKit', 'AVFoundation', 'AudioToolbox', 'GameController']   # audio: runtime/ios/audio_coreaudio.c (COREAUDIO=1 in mac/build.sh)
 PREFIX_MAP = ['-ffp-contract=off', '-ffile-prefix-map=$(KHNMC_REPO)/=khnmc/']
 
 

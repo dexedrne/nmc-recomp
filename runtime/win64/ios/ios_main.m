@@ -20,6 +20,8 @@
  * beer.vyvanse.khnmc (tools/ios/make_project.py). */
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
+#import <GameController/GameController.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +31,39 @@
 int kh_main(int argc,char **argv);
 int kh_coreaudio_start(void);                 /* runtime/ios/audio_coreaudio.c (COREAUDIO=1) */
 extern void (*kh_audio_pull_ready)(void);     /* runtime/khnmc_audio_out.h: called once the mixer's pull ring exists */
+void kh_input_host_pad_set(unsigned short buttons,unsigned char lt,unsigned char rt,short lx,short ly,short rx,short ry);   /* null_input.c */
+
+/* The controller (GameController framework) is XInput pad 0 (KHNMC_INPUT=host, set below unless khnmc.conf says otherwise): every
+ * change of any element sends the whole state.  Buttons by position, as the PC game sees an Xbox pad: A (bottom; cross on a
+ * DualSense) = 0x1000, B (right) = 0x2000, X (left) = 0x4000, Y (top) = 0x8000, LB/RB 0x100/0x200, the menu button START 0x10, the
+ * options button BACK 0x20, the stick clicks 0x40/0x80, the d-pad 0x1/0x2/0x4/0x8; triggers 0..255; sticks -32767..32767 (up = +). */
+static short pad_axis(float v){ if(!(v>=-1.0f)) v=-1.0f; if(v>1.0f) v=1.0f; return (short)lrintf(v*32767.0f); }
+static unsigned char pad_trigger(float v){ if(!(v>=0.0f)) v=0.0f; if(v>1.0f) v=1.0f; return (unsigned char)lrintf(v*255.0f); }
+static void pad_send(GCExtendedGamepad *p){
+    unsigned short b=0;
+    if(p.dpad.up.pressed) b|=0x0001; if(p.dpad.down.pressed) b|=0x0002; if(p.dpad.left.pressed) b|=0x0004; if(p.dpad.right.pressed) b|=0x0008;
+    if(p.buttonMenu.pressed) b|=0x0010; if(p.buttonOptions.pressed) b|=0x0020;
+    if(p.leftThumbstickButton.pressed) b|=0x0040; if(p.rightThumbstickButton.pressed) b|=0x0080;
+    if(p.leftShoulder.pressed) b|=0x0100; if(p.rightShoulder.pressed) b|=0x0200;
+    if(p.buttonA.pressed) b|=0x1000; if(p.buttonB.pressed) b|=0x2000; if(p.buttonX.pressed) b|=0x4000; if(p.buttonY.pressed) b|=0x8000;
+    kh_input_host_pad_set(b,pad_trigger(p.leftTrigger.value),pad_trigger(p.rightTrigger.value),
+                          pad_axis(p.leftThumbstick.xAxis.value),pad_axis(p.leftThumbstick.yAxis.value),
+                          pad_axis(p.rightThumbstick.xAxis.value),pad_axis(p.rightThumbstick.yAxis.value));
+}
+static void pad_attach(GCController *c){
+    GCExtendedGamepad *p=c.extendedGamepad;
+    if(!p){ fprintf(stderr,"kh: ios: controller '%s' has no extended gamepad profile: not used\n",c.vendorName.UTF8String?:"?"); return; }
+    p.valueChangedHandler=^(GCExtendedGamepad *gp,GCControllerElement *el){ (void)el; pad_send(gp); };
+    pad_send(p);
+    fprintf(stderr,"kh: ios: controller connected: %s\n",c.vendorName.UTF8String?:"?");
+}
+static void setup_controllers(void){
+    for(GCController *c in GCController.controllers) pad_attach(c);
+    [[NSNotificationCenter defaultCenter] addObserverForName:GCControllerDidConnectNotification object:nil queue:NSOperationQueue.mainQueue
+        usingBlock:^(NSNotification *n){ pad_attach((GCController *)n.object); }];
+    [[NSNotificationCenter defaultCenter] addObserverForName:GCControllerDidDisconnectNotification object:nil queue:NSOperationQueue.mainQueue
+        usingBlock:^(NSNotification *n){ (void)n; kh_input_host_pad_set(0,0,0,0,0,0,0); fprintf(stderr,"kh: ios: controller disconnected: pad released\n"); }];
+}
 
 /* Sound: the mixer runs in pull mode (KHNMC_AUDIO=pull unless khnmc.conf says otherwise) and the RemoteIO unit pulls from it.  The
  * session is SoloAmbient, the iOS default for games: it follows the ring/silent switch and stops other apps' audio while it plays.
@@ -73,7 +108,8 @@ static void start_game_once(void){
     label.text=@"KHNMC test shell\n\nWhat runs is set by Documents/khnmc.conf.\nThe log and the status file named there are written into Documents.\nThe app closes when the run ends.";
     [vc.view addSubview:label];
     w.rootViewController=vc; self.window=w; [w makeKeyAndVisible];
-    [UIApplication sharedApplication].idleTimerDisabled=YES;   /* a game: the screen must not dim and lock while it runs (iOS suspends a locked app) */
+    [UIApplication sharedApplication].idleTimerDisabled=YES;
+    setup_controllers();   /* a game: the screen must not dim and lock while it runs (iOS suspends a locked app) */
     start_game_once();
 }
 @end
@@ -117,6 +153,7 @@ static void exclude_game_data_from_backup(void){
 int main(int argc,char *argv[]){
     @autoreleasepool {
         exclude_game_data_from_backup();
+        setenv("KHNMC_INPUT","host",0);       /* the controller is pad 0 (a route script, when set, wins; never in a selftest) */
         setenv("KHNMC_AUDIO","pull",0);       /* khnmc.conf may still set another mode (env KHNMC_AUDIO=null for silent test runs) */
         setup_sound_session();
         /* the two directories only the system can name; runtime/host_env.c takes everything else from them */

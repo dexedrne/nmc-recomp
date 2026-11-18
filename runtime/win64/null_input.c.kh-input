@@ -29,6 +29,20 @@ static int scripted;
 static ScriptPad last_pad;
 static u32 packet;
 static pthread_mutex_t input_lock=PTHREAD_MUTEX_INITIALIZER;
+/* host pad (2026-11-18, the iPhone): the platform shell's game controller as XInput pad 0.  KHNMC_INPUT=host turns it on when no input
+ * script is loaded and the run is not a selftest; the shell (runtime/ios/ios_main.m: GameController framework) writes the whole state
+ * with kh_input_host_pad_set from its own thread.  Unlike a script, it drives the right stick (the camera) too. */
+static int host_pad_on; static ScriptPad host_pad; static u64 host_pad_changes, host_pad_logged;
+static int pad_source(void){ return scripted||host_pad_on; }
+void kh_input_host_pad_set(u16 buttons,u8 lt,u8 rt,s16 lx,s16 ly,s16 rx,s16 ry){
+    ScriptPad p={buttons,lt,rt,lx,ly,rx,ry}; u16 was;
+    pthread_mutex_lock(&input_lock); was=host_pad.buttons;
+    if(memcmp(&p,&host_pad,sizeof p)){ host_pad=p; host_pad_changes++; }
+    int logit=was!=buttons && host_pad_logged<200; if(logit) host_pad_logged++;
+    pthread_mutex_unlock(&input_lock);
+    if(logit) fprintf(stderr,"kh: input: host pad buttons 0x%04x (lt %u rt %u, left %d,%d right %d,%d)\n",buttons,lt,rt,lx,ly,rx,ry);
+}
+int kh_input_host_test(int on){ int was=host_pad_on; host_pad_on=on; pthread_mutex_lock(&input_lock); memset(&host_pad,0,sizeof host_pad); pthread_mutex_unlock(&input_lock); return was; }   /* selftest */
 extern _Atomic u64 gfx_presents;
 static const char *button_names[]={"DPAD_UP","DPAD_DOWN","DPAD_LEFT","DPAD_RIGHT","START","BACK","LSTICK","RSTICK","LB","RB",NULL,NULL,"A","B","X","Y","LT","RT"};
 static int number(const char *s,long long lo,long long hi,long long *v){
@@ -653,15 +667,16 @@ invalid: kh_fatal(g,"scripted XInput: invalid %s line %u%s%s",path,lineno,*why?"
     } else kh_warn("scripted XInput pad 0: %zu ranges from %s",nranges,path);
 }
 u32 kh_input_state(KCtx *g,u32 slot,u64 out,u64 frame){
-    if(!scripted||slot) return 1167;
+    if(!pad_source()||slot) return 1167;
     if(!out) return 87;
     ScriptPad pad={0};
     pthread_mutex_lock(&input_lock);
     if(nsteps) pad=route_pad;                               /* a route: the pad route_tick computed for this game frame */
-    else for(size_t i=0;i<nranges;i++) if(frame>=ranges[i].start && frame<=ranges[i].end) pad=ranges[i].pad;
+    else if(scripted){ for(size_t i=0;i<nranges;i++) if(frame>=ranges[i].start && frame<=ranges[i].end) pad=ranges[i].pad; }
+    else pad=host_pad;                                      /* the shell's controller (KHNMC_INPUT=host) */
     if(!packet || memcmp(&last_pad,&pad,sizeof pad)){ packet++; last_pad=pad; }
     wr32(g,out,packet); wr16(g,out+4,pad.buttons); wr8(g,out+6,pad.lt); wr8(g,out+7,pad.rt);
-    wr16(g,out+8,(u16)pad.lx); wr16(g,out+10,(u16)pad.ly); wr16(g,out+12,0); wr16(g,out+14,0);
+    wr16(g,out+8,(u16)pad.lx); wr16(g,out+10,(u16)pad.ly); wr16(g,out+12,(u16)pad.rx); wr16(g,out+14,(u16)pad.ry);   /* scripts leave rx/ry 0 */
     pthread_mutex_unlock(&input_lock); return 0;
 }
 static void input_get(KCtx *g){ kh_cnt_input_calls++; u64 pr=atomic_load(&gfx_presents), sf=nsteps?atomic_load(&game_frames):script_frame(pr); if(!nsteps) hold_check(g,pr);
@@ -678,14 +693,20 @@ static int h_dev(KCtx *g,u64 o,int s,const char *c){ (void)o;(void)c;
     SET_RAX(g,0); return 1; }
 void kh_seam_input_init(void){ kh_input_load(NULL,getenv("KHNMC_INPUT_SCRIPT"));
     { const char *e=getenv("KH_RUN_GAME_FRAMES"); if(e&&*e) run_game_frames=strtoull(e,0,0); }
-    if(scripted){
+    { const char *im=getenv("KHNMC_INPUT"); extern int kh_run_is_selftest;
+      if(im&&*im&&strcmp(im,"host")&&strcmp(im,"script")) kh_fatal(NULL,"KHNMC_INPUT=%s: known values are host (the platform's game controller as pad 0) and script (KHNMC_INPUT_SCRIPT only)",im);
+      if(im&&!strcmp(im,"host")){
+          if(scripted) kh_warn("input: KHNMC_INPUT=host is not used: an input script is loaded (KHNMC_INPUT_SCRIPT)");
+          else if(kh_run_is_selftest) kh_warn("input: KHNMC_INPUT=host is not used in a selftest run");
+          else { host_pad_on=1; kh_warn("input: host pad 0: the platform's game controller (KHNMC_INPUT=host)"); } } }
+    if(pad_source()){
         u64 get=kh_host_fn("XInputGetState",rt_imp_xinput1_4__XInputGetState);
         const char *aliases[]={"XInputGetState","XInputGetStateEx","#2","#100"};
         for(size_t i=0;i<sizeof aliases/sizeof *aliases;i++) kh_register_proc("xinput1_4.dll",aliases[i],get);
     }
     C_di=kh_com_class("di:IDirectInput8",16,0,h_di); C_dev=kh_com_class("di:IDirectInputDevice8",40,0,h_dev); }
 IMP(xinput1_4,ord2){ input_get(g); }
-IMP(xinput1_4,ord3){ kh_cnt_input_calls++; SET_RAX(g,scripted && (u32)A0(g)==0?0:1167); }
+IMP(xinput1_4,ord3){ kh_cnt_input_calls++; SET_RAX(g,pad_source() && (u32)A0(g)==0?0:1167); }
 IMP(dinput8,DirectInput8Create){ kh_cnt_input_calls++; wr64(g,A3(g),kh_com_obj(C_di,16)); SET_RAX(g,0); }
 IMP(setupapi,SetupDiGetClassDevsW){ kh_cnt_input_calls++; SET_RAX(g,(u64)-1); kh_set_last_error(13); }
 IMP(setupapi,SetupDiEnumDeviceInterfaces){ kh_cnt_input_calls++; kh_set_last_error(259); SET_RAX(g,0); }
@@ -697,11 +718,11 @@ IMP(hid,HidD_GetHidGuid){ kh_cnt_input_calls++; memset(hp(g,A0(g)),0,16); }
 #define SCRIPT_PRODUCT 0x028e045e
 void orig_f_131ef0(KCtx *g);
 void f_131ef0(KCtx *g){
-    if(scripted && (u32)A1(g)==SCRIPT_PRODUCT){ SET_RAX(g,1); KH_RET(g); return; }
+    if(pad_source() && (u32)A1(g)==SCRIPT_PRODUCT){ SET_RAX(g,1); KH_RET(g); return; }
     orig_f_131ef0(g);
 }
 void kh_input_attach(KCtx *g){
-    if(!scripted) return;
+    if(!pad_source()) return;
     u64 pad=GS_BASE+0x8bb2a8;
     wr32(g,pad+0x48,SCRIPT_PRODUCT);
     memset(hp(g,pad+0x50),0xff,24); /* identity profile for the virtual candidate */

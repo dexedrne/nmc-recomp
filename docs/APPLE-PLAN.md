@@ -159,3 +159,13 @@ in a child that fails without the guard: checked by removing it); the CoreAudio 
 NaN to 0 before the speaker; device_run.sh writes `env KHNMC_AUDIO=null` for every test run unless SOUND=1. After the fix the
 phone's selftest is silent and passes (169,479 checks... the audio-out suite's new fork case is NOT RUN on iOS, as designed).
 
+## The controller (2026-11-18)
+The app reads a game controller through the GameController framework (runtime/win64/ios/ios_main.m) and hands the runtime the whole
+state on every change (`kh_input_host_pad_set`, runtime/win64/null_input.c): XInput pad 0 with every button by position (A bottom /
+cross, B right, X left, Y top, LB/RB, menu = START, options = BACK, stick clicks, d-pad), both triggers and BOTH sticks (a script never
+drove the right stick; the camera needs it). `KHNMC_INPUT=host` (the app's default) turns it on when no input script is loaded and
+never in a selftest; a disconnect releases the pad. Selftest: 6 new checks (every field incl. the right stick, packet numbers, pad 0
+only, off again), shown to fail with the right stick dropped; on the phone 122 main checks, 0 failures.
+`device_run.sh play` starts the game as the owner plays it (controller, sound, no script, no time limit); after every test run the
+play configuration is put back, so the app's icon always starts the game.
+

@@ -185,6 +185,8 @@
 					AVFoundation,
 					"-framework",
 					AudioToolbox,
+					"-framework",
+					GameController,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = beer.vyvanse.khnmc;
 				PRODUCT_NAME = KHNMC;
@@ -225,6 +227,8 @@
 					AVFoundation,
 					"-framework",
 					AudioToolbox,
+					"-framework",
+					GameController,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = beer.vyvanse.khnmc;
 				PRODUCT_NAME = KHNMC;
