@@ -27,3 +27,20 @@ vkd3d's warnings there: no geometry shaders, no pipeline statistics queries, no 
 stream output, no sampler min/max filtering, D24S8 mapped to D32F_S8. The game uses no geometry/tessellation/compute shaders; whether
 any of its pipeline states turns depth clipping OFF is not checked yet (that would need the missing extension).
 Left on the Mac mini: `~/khnmc-work/gfxprobe/` (59 MB: source, headers, MoltenVK dylib, static libs, probe, `probe.out`).
+
+## iOS build (2026-11-18, MacBook Air, Xcode 27.2, iPhoneOS SDK 27.2; plan step 2 of docs/IOS-GRAPHICS-PLAN.md)
+The prepared tree (the steps above, done on Linux) and the headers go to `~/Developer/KHNMC/deps/` on the MacBook Air (owner approved
+11/18: vkd3d and MoltenVK there), with MoltenVK's iOS static library and headers from the release archive
+(`MoltenVK/MoltenVK/static/MoltenVK.xcframework/ios-arm64/libMoltenVK.a`, `MoltenVK/MoltenVK/include`) in `deps/moltenvk-ios/`. Then:
+
+    export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer     # an ssh session has none: xcrun finds no iphoneos SDK without it
+    cd ~/Developer/KHNMC/deps/vkd3d-2.1
+    VKHEADERS=$HOME/Developer/KHNMC/deps/vkheaders SPIRVHEADERS=$HOME/Developer/KHNMC/deps/spirv \
+    CC="xcrun --sdk iphoneos clang -target arm64-apple-ios17.0" OUT=build-iphoneos JOBS=2 \
+    EXTRA_CFLAGS="-ffile-prefix-map=$PWD/=vkd3d/" nice -n 10 sh build_khnmc.sh
+
+Result: the four archives (33 objects: common 5, shader 19, vkd3d 7, utils 2), every object LC_BUILD_VERSION platform 2 (iOS),
+minos 17.0; 555 imported names, none of the 23 that tools/check_ios_symbols.py forbids (`dlopen` is imported: vkd3d uses it only
+when it is given no vkGetInstanceProcAddr, and the iOS build gives it one); `strings | grep -c /Users/` = 0. The whole deps folder is
+65 MB. Use THIS directory's build_khnmc.sh (an older copy with `xargs -I` fails on macOS: "command line cannot be assembled").
+
