@@ -251,3 +251,10 @@ owner decides and the phone's own numbers exist (implementation notes section 6,
     That is the sleep-based WaitForVBlank on iOS (plan fact 9: a 16.667 ms sleep overshoots); the display link of IOS-GRAPHICS-PLAN
     step 10 (task 41) replaces it.
   - Recommendation unchanged: `ORDERED_MEM=1` by default for the Apple targets. Owner decision pending.
+- **Owner decision 2026-11-18: `ORDERED_MEM=1` is the default for the Apple targets.** Makefile: `ORDERED_MEM ?= 1` when IOS_SDK is
+  set or the host is Darwin, 0 elsewhere (Linux unchanged); tools/ios/mac/build.sh and sign_app.sh default to 1; tools/darwin_route.sh
+  starts ./khnmc-om by default; tools/ios/common.sh passes an explicit ORDERED_MEM from Linux to the Mac. The names follow the variant
+  (ordered = obj-om, obj-iphoneos-om, khnmc-om), so plain and ordered objects never mix; `ORDERED_MEM=0` builds the plain variant.
+  Checked: Mac mini default `make` = ORDERED_MEM 1 / khnmc-om, its selftest 170,158 / 0 with "acquire/release ... 117 lifted shards";
+  MacBook default build = obj-iphoneos-om, 48 MB, signed with ORDERED_MEM=1. The phone's selftest of the default app waits for the
+  phone (it was unavailable to the MacBook at 09:35).

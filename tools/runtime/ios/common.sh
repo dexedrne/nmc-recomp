@@ -33,6 +33,8 @@ IOS_ENV='export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer; export
 # without it the remote commands are as before
 case "${GFX:-0}" in 0|1) ;; *) echo "tools/ios: GFX must be 0 or 1 (got '${GFX}')" >&2; exit 2;; esac
 [ "${GFX:-0}" = 1 ] && IOS_ENV="$IOS_ENV export GFX=1;"
+# ORDERED_MEM (owner 2026-11-18: default 1 on the Mac, in mac/build.sh and mac/sign_app.sh): an explicit value here reaches the Mac's scripts
+case "${ORDERED_MEM-unset}" in unset) ;; 0|1) IOS_ENV="$IOS_ENV export ORDERED_MEM=$ORDERED_MEM;";; *) echo "tools/ios: ORDERED_MEM must be 0 or 1 (got '${ORDERED_MEM}')" >&2; exit 2;; esac
 IOS_DRIVER_LOCK=${KHNMC_IOS_DRIVER_LOCK_FILE:-$HOME/.cache/khnmc-ios-driver.lock}   # the variable: tests only (test_maclock.sh)
 
 ios_guard(){

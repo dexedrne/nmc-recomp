@@ -64,6 +64,17 @@ endif
 # ./khnmc-om), and the identity build compiles the shards here instead of linking the prebuilt (plain) archive.  ORDERED_MEM=0 or unset
 # changes no command line and no object.  OM_RCPC=1 (default with ORDERED_MEM=1 on a Mac) adds the rcpc target feature: LDAPR instead
 # of LDAR (macOS arm64 targets have it already; the iOS 17 floor is the A12, which has it; OM_RCPC=0 measures LDAR).
+# Owner decision 2026-11-18: ORDERED_MEM=1 is the DEFAULT for the Apple targets (macOS and the iPhone SDK builds): both CPUs reorder guest
+# accesses that x86 keeps in order (docs/APPLE-PLAN.md "ORDERED_MEM on Apple silicon" and "... on the phone": litmus 1.7M / 720k of 4M
+# reads out of order with plain accesses, 0 with acquire/release; cost about 4 % per access, no visible cost in the game).  Elsewhere the
+# default stays 0.  `ORDERED_MEM=0` on the command line still builds the plain variant; the directory and binary names follow the
+# variant, not the default (ordered = the -om names everywhere), so objects of the two variants never meet.
+ifneq ($(IOS_SDK),)
+ORDERED_MEM ?= 1
+endif
+ifeq ($(UNAME_S),Darwin)
+ORDERED_MEM ?= 1
+endif
 ORDERED_MEM ?= 0
 ifeq ($(filter $(ORDERED_MEM),0 1),)
 $(error ORDERED_MEM must be 0 or 1)

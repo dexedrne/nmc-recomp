@@ -27,8 +27,8 @@
 #                                               (tools/ios/probe/probe_host.c + probe_core.c; TOUCH_MIB default 64, at most 256
 #                                               on this shared machine): a test of the PROGRAM on arm64 Darwin, not an answer
 #                                               about an iPhone.  Result: $RUN/probe/mac-probe.txt
-#   env: KHNMC_MAC_BIN (task 39): the binary `selftest` and `run` start there, ./khnmc (default) or ./khnmc-om (the build of
-#        tools/darwin_build.sh with MAKE_ARGS="ORDERED_MEM=1"; nothing else is accepted)
+#   env: KHNMC_MAC_BIN (task 39): the binary `selftest` and `run` start there: ./khnmc-om (DEFAULT since the owner's decision of
+#        2026-11-18: tools/darwin_build.sh builds ORDERED_MEM=1 by default on the Mac) or ./khnmc (MAKE_ARGS="ORDERED_MEM=0"); nothing else
 #   env: KHNMC_MAC, KHNMC_MAC_DIR (default khnmc-work/build-j26) as in tools/darwin_build.sh; KHNMC_RUN_DIR = where results go
 #        here (default run-J26); KHNMC_MAC_NICE (default 10) and KHNMC_MAC_MIN_FREE (default 30: `memory_pressure` free
 #        percentage below which nothing is started; the reading is printed before every run)
@@ -48,7 +48,7 @@ case "$RDIR" in *..*|*" "*) echo "darwin_route: bad KHNMC_MAC_DIR" >&2; exit 2;;
 for v in "$NICE" "$MINFREE"; do case "$v" in ''|*[!0-9]*) echo "darwin_route: KHNMC_MAC_NICE / KHNMC_MAC_MIN_FREE must be numbers" >&2; exit 2;; esac; done
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ServerAliveCountMax=10)
 cmd=${1:-}; [ $# -gt 0 ] && shift
-MBIN=${KHNMC_MAC_BIN:-./khnmc}; case "$MBIN" in ./khnmc|./khnmc-om) ;; *) echo "darwin_route: KHNMC_MAC_BIN must be ./khnmc or ./khnmc-om (got $MBIN)" >&2; exit 2;; esac
+MBIN=${KHNMC_MAC_BIN:-./khnmc-om}; case "$MBIN" in ./khnmc|./khnmc-om) ;; *) echo "darwin_route: KHNMC_MAC_BIN must be ./khnmc or ./khnmc-om (got $MBIN)" >&2; exit 2;; esac
 busy(){ "${SSH[@]}" "$MAC" 'pgrep -u "$(id -u)" -x khnmc.bin >/dev/null || pgrep -u "$(id -u)" -x khnmc >/dev/null || pgrep -u "$(id -u)" -x khnmc-om >/dev/null || pgrep -u "$(id -u)" -x khnmc-iospaths >/dev/null' && { echo "darwin_route: a khnmc process is already running on the Mac mini: one run at a time" >&2; return 0; }; return 1; }
 # the scripts that run there (route_one.py, ios_paths_selftest.sh, wav_compare.py) are this worktree's: same rsync as darwin_build.sh
 # task 27: and input/ (route_one.py's default route, input/route-field-battle.txt, is read there)

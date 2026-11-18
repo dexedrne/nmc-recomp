@@ -14,10 +14,11 @@
 #   archive's backend must match GFX, either way); xcodebuild then gets KHNMC_GFX_LDFLAGS.  launchctl does not pass the caller's
 #   environment: put it into the job's command, `... && GFX=1 tools/ios/mac/sign_app.sh ent'`.  A failed check is written to sign.log
 #   ("sign_app: FAILED ...") and nothing is built or signed.
-# ORDERED_MEM=1 (environment; task 39): sign the variant whose libraries `ORDERED_MEM=1 mac/build.sh iphoneos` made (obj-iphoneos-om/).
+# ORDERED_MEM (environment; task 39): DEFAULT 1 (owner 2026-11-18): sign the variant whose libraries mac/build.sh iphoneos made in
+# obj-iphoneos-om/; ORDERED_MEM=0 signs the plain variant (obj-iphoneos/, built with `ORDERED_MEM=0 mac/build.sh iphoneos`).
 . "$(dirname "$0")/lib.sh"
 V=${1:-ent}; case "$V" in ent|plain) ;; *) sed -n '2,4p' "$0" >&2; exit 2;; esac
-OM=${ORDERED_MEM:-0}; case "$OM" in 0|1) ;; *) echo "ios/mac: sign_app: ORDERED_MEM must be 0 or 1" >&2; exit 2;; esac
+OM=${ORDERED_MEM:-1}; case "$OM" in 0|1) ;; *) echo "ios/mac: sign_app: ORDERED_MEM must be 0 or 1" >&2; exit 2;; esac
 XLIBS=(); [ "$OM" = 1 ] && XLIBS=("KHNMC_LIBS=$PWD/obj-iphoneos-om")
 [ -f "$STATE/device.env" ] && . "$STATE/device.env"
 : "${TEAM:?ios/mac: sign_app: no TEAM in $STATE/device.env}"

@@ -16,14 +16,15 @@
 #   checked in the archive, and xcodebuild gets KHNMC_GFX_LDFLAGS (the Makefile's GFX_APP_LDFLAGS); the link checks then allow exactly
 #   mktemp (MoltenVK imports it).  Without GFX=1 every step is as before.
 #   ORDERED_MEM=1 (environment; task 39): the variant with acquire/release guest accesses (Makefile ORDERED_MEM=1): its libraries are in
-#   obj-<sdk>-om/ and xcodebuild links those (KHNMC_LIBS); then sign it with `ORDERED_MEM=1 tools/ios/mac/sign_app.sh`.  Default 0.
+#   obj-<sdk>-om/ and xcodebuild links those (KHNMC_LIBS); then sign it with tools/ios/mac/sign_app.sh.  DEFAULT 1 (owner 2026-11-18);
+#   ORDERED_MEM=0 builds the plain variant into obj-<sdk>/, signed with `ORDERED_MEM=0 tools/ios/mac/sign_app.sh`.
 . "$(dirname "$0")/lib.sh"
 SDK=${1:-}; T=$(sdk_triple "$SDK") || exit 2
 [ "$GFX" = 1 ] && [ "$SDK" != iphoneos ] && { echo "ios/mac: build: GFX=1 is for the device SDK only (MoltenVK's iOS library has no simulator slice): the $SDK app keeps the null backend" >&2; exit 2; }
 LOG="$RUNS/build-$SDK.log"; : > "$LOG"
 # every memory gate: mem_gate ends with `exit 3`, which in a pipeline ends only its subshell, hence the PIPESTATUS check
 mem_gate "the $SDK build" | tee -a "$LOG"; [ "${PIPESTATUS[0]}" = 0 ] || exit 3
-OM=${ORDERED_MEM:-0}; case "$OM" in 0|1) ;; *) echo "ios/mac: build: ORDERED_MEM must be 0 or 1" >&2; exit 2;; esac
+OM=${ORDERED_MEM:-1}; case "$OM" in 0|1) ;; *) echo "ios/mac: build: ORDERED_MEM must be 0 or 1" >&2; exit 2;; esac
 OL="obj-$SDK"; XLIBS=(); [ "$OM" = 1 ] && { OL="obj-$SDK-om"; XLIBS=("KHNMC_LIBS=$PWD/$OL"); }
 # no build-machine paths in the objects (debug info, __FILE__): the same two variables in EVERY make call of this script
 MK=(nice -n $NICE make IOS_SDK="$SDK" COREAUDIO=1 ORDERED_MEM="$OM" "EXTRA=-ffile-prefix-map=$SRC/=khnmc/" "LIFT_EXTRA=-ffile-prefix-map=$SRC/=khnmc/")
