@@ -3,6 +3,14 @@
 
     python3 tools/ios/make_project.py           write both projects
     python3 tools/ios/make_project.py --check   fail if a written project is out of date
+    python3 tools/ios/make_project.py --show-ldflags   print the app's OTHER_LDFLAGS as written, and as xcodebuild expands them with
+                                                the environment's KHNMC_GFX_LDFLAGS (writes nothing)
+
+  KHNMC_GFX_LDFLAGS (TASK38, IOS-GRAPHICS-PLAN G3): a build setting of the app target, EMPTY in the project, appended to its
+  OTHER_LDFLAGS.  tools/ios/mac/build.sh and sign_app.sh with GFX=1 pass it on xcodebuild's command line (the four vkd3d archives,
+  libMoltenVK.a, -lc++, Metal / QuartzCore / IOSurface / CoreGraphics: `make -s IOS_SDK=iphoneos GFX_VKD3D=1 print-GFX_APP_LDFLAGS`),
+  because the app force-loads libkhnmc-rt.a, and a library built with the graphics backend links only with them.  Without it the link
+  line is the one it always was.
 
   tools/ios/KHNMC.xcodeproj        the test shell: runtime/ios/ios_main.m linked with the game as two static libraries that
                                    `make IOS_SDK=<sdk> applib` leaves in obj-<sdk>/ (libkhnmc-rt.a force-loaded: every hand-written
@@ -188,20 +196,26 @@ FRAMEWORKS = ['Foundation', 'UIKit', 'AVFoundation', 'AudioToolbox', 'GameContro
 PREFIX_MAP = ['-ffp-contract=off', '-ffile-prefix-map=$(KHNMC_REPO)/=khnmc/']
 
 
+def app_settings():
+    return {'INFOPLIST_FILE': 'Info.plist',
+            'PRODUCT_BUNDLE_IDENTIFIER': 'beer.vyvanse.khnmc',
+            # the owner's icon (docs/APPLE-PLAN.md "App icon"): a single-size set; its PNG is NOT in the repository,
+            # tools/ios/sync.sh copies it from ~/Documents/khnmc/app-icon/ into the Mac's copy of the catalog
+            'ASSETCATALOG_COMPILER_APPICON_NAME': 'AppIcon',
+            # obj-iphoneos / obj-iphonesimulator: what `make IOS_SDK=$(PLATFORM_NAME) applib` writes (Makefile)
+            'KHNMC_LIBS': '$(KHNMC_REPO)/obj-$(PLATFORM_NAME)',
+            'OTHER_CFLAGS': PREFIX_MAP,
+            # TASK38: empty here; GFX=1 builds pass it to xcodebuild (see the top of this file)
+            'KHNMC_GFX_LDFLAGS': '',
+            'OTHER_LDFLAGS': ['-Wl,-force_load,$(KHNMC_LIBS)/libkhnmc-rt.a', '$(KHNMC_LIBS)/libkh2loose.a']
+                             + [x for f in FRAMEWORKS for x in ('-framework', f)] + ['$(KHNMC_GFX_LDFLAGS)']}
+
+
 def projects():
     app = generate('KHNMC',
                    [('App shell', [('../../runtime/ios/ios_main.m', 'ios_main.m')]),
                     ('App', [('Info.plist', 'Info.plist'), ('Assets.xcassets', 'Assets.xcassets')])],
-                   {'INFOPLIST_FILE': 'Info.plist',
-                    'PRODUCT_BUNDLE_IDENTIFIER': 'beer.vyvanse.khnmc',
-                    # the owner's icon (docs/APPLE-PLAN.md "App icon"): a single-size set; its PNG is NOT in the repository,
-                    # tools/ios/sync.sh copies it from ~/Documents/khnmc/app-icon/ into the Mac's copy of the catalog
-                    'ASSETCATALOG_COMPILER_APPICON_NAME': 'AppIcon',
-                    # obj-iphoneos / obj-iphonesimulator: what `make IOS_SDK=$(PLATFORM_NAME) applib` writes (Makefile)
-                    'KHNMC_LIBS': '$(KHNMC_REPO)/obj-$(PLATFORM_NAME)',
-                    'OTHER_CFLAGS': PREFIX_MAP,
-                    'OTHER_LDFLAGS': ['-Wl,-force_load,$(KHNMC_LIBS)/libkhnmc-rt.a', '$(KHNMC_LIBS)/libkh2loose.a']
-                                     + [x for f in FRAMEWORKS for x in ('-framework', f)]})
+                   app_settings())
     probe = generate('KHNMCProbe',
                      [('Probe', [('probe/probe_main.m', 'probe_main.m'), ('probe/probe_core.c', 'probe_core.c')]),
                       ('App', [('probe/Info.plist', 'Info.plist')])],
@@ -266,7 +280,20 @@ def sane(text):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--check', action='store_true')
+    p.add_argument('--show-ldflags', action='store_true')
     a = p.parse_args()
+    if a.show_ldflags:
+        import os
+        import shlex
+        written = app_settings()['OTHER_LDFLAGS']
+        gfx = os.environ.get('KHNMC_GFX_LDFLAGS', '')
+        print('make_project: KHNMC OTHER_LDFLAGS as written: ' + ' '.join(written))
+        print('make_project: KHNMC_GFX_LDFLAGS = %s' % (gfx if gfx.strip() else '(empty: the link line it always was)'))
+        out = []
+        for x in written:
+            out += shlex.split(gfx) if x == '$(KHNMC_GFX_LDFLAGS)' else [x]
+        print('make_project: KHNMC OTHER_LDFLAGS expanded (%d words): %s' % (len(out), ' '.join(out)))
+        return
     for path, text in projects():
         bad = sane(text) if path.suffix == '.pbxproj' else (None if '<Scheme' in text and 'BlueprintIdentifier' in text else 'bad scheme text')
         if bad:

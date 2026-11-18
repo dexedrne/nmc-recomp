@@ -30,6 +30,10 @@
 #   IOS_SDK=iphonesimulator|iphoneos   PREPARED, NOT RUN (no iOS SDK on the machines this was written on): `make IOS_SDK=... applib`
 #                    compiles everything for that SDK with xcrun clang (arm64, bias mode, rename hooks, obj-<sdk>/); the app
 #                    itself is linked by the Xcode project tools/ios/make_project.py writes.  See tools/ios/.
+#   TASK38: `make IOS_SDK=iphoneos GFX_VKD3D=1 applib` puts the graphics backend (wrapped bridge, vkd3d 2.1 for iOS, MoltenVK linked
+#                    statically) into libkhnmc-rt.a; the app then links with KHNMC_GFX_LDFLAGS = `make -s IOS_SDK=iphoneos GFX_VKD3D=1
+#                    print-GFX_APP_LDFLAGS` (tools/ios/mac/build.sh and sign_app.sh, GFX=1).  IOS_SDK=iphonesimulator GFX_VKD3D=1 is
+#                    an error (no simulator slice of MoltenVK).  `make IOS_PATHS=1 GFX_VKD3D=1 hostshell` is the same link on Linux.
 #   GEN_PREBUILT=1   $(GEN)/mod_static_lifted.c and the three tables are INPUTS (copied from the Linux dev host, where the lifter
 #                    environment lives) and are never regenerated; a missing one is an error that says so.  Default on Darwin.
 ROOT ?= .
@@ -44,8 +48,13 @@ endif
 ifeq ($(IOS_PATHS),1)
 IOSSFX = -iospaths
 IOSFLAGS = -DKH_IOS_PATHS=1
-# no vkd3d backend in such a build (an iOS build is a bias build, which never has it; its selftest also uses a fixed /tmp)
+# TASK38 (IOS-GRAPHICS-PLAN step 3): such a build has the vkd3d backend only when the command line asks for it (`make IOS_PATHS=1
+# GFX_VKD3D=1 ...`: the wrapped bridge KHNMC_GFX=vkd3dw, the one a bias build has; the vkd3d selftest's files go to kh_tmp_path, not a
+# fixed /tmp).  Otherwise it has none, as before (the old reason, "an iOS build is a bias build, which never has it", predates the
+# wrapped bridge).  GFX_VKD3D from the environment is ignored here, as it always was.
+ifneq ($(origin GFX_VKD3D),command line)
 GFX_VKD3D = 0
+endif
 endif
 # PREPARED, NOT RUN: an iOS SDK as the target (needs Xcode; arm64 only)
 IOS_MIN ?= 17.0
@@ -69,7 +78,8 @@ XLATE ?= 2
 HOOKMODE ?= rename
 OL ?= obj
 BIN ?= khnmc$(IOSSFX)
-# the vkd3d backend is OFF on Darwin unless `make GFX_VKD3D=1` asks for it (Task 21b, block below); IOS_PATHS=1 keeps it off
+# the vkd3d backend is OFF on Darwin unless `make GFX_VKD3D=1` asks for it (Task 21b, block below); IOS_PATHS=1 keeps it off unless the
+# command line asks (TASK38)
 GFX_VKD3D ?= 0
 LDEXPORT =
 GEN_PREBUILT ?= 1
@@ -236,6 +246,20 @@ GFX_VULKAN_STATIC ?= 0
 ifeq ($(filter $(GFX_VULKAN_STATIC),0 1),)
 $(error GFX_VULKAN_STATIC must be 0 or 1)
 endif
+# TASK38 (IOS-GRAPHICS-PLAN step 3, G1): an iPhone app cannot load a Vulkan library at run time, so IOS_SDK=iphoneos GFX_VKD3D=1 always
+# links MoltenVK statically (GFX_VULKAN_STATIC=1).  The Simulator has no graphics backend: MoltenVK's iOS static library has only an
+# ios-arm64 slice, so a Simulator build keeps the null backend.
+ifeq ($(IOS_SDK)-$(GFX_VKD3D),iphoneos-1)
+ifeq ($(GFX_VULKAN_STATIC),0)
+ifeq ($(origin GFX_VULKAN_STATIC),command line)
+$(error IOS_SDK=iphoneos GFX_VKD3D=1 GFX_VULKAN_STATIC=0: an iPhone app links MoltenVK statically, always; leave GFX_VULKAN_STATIC out)
+endif
+endif
+GFX_VULKAN_STATIC = 1
+endif
+ifeq ($(IOS_SDK)-$(GFX_VKD3D),iphonesimulator-1)
+$(error IOS_SDK=iphonesimulator GFX_VKD3D=1: there is no graphics backend for the Simulator (MoltenVK's iOS static library, MoltenVK.xcframework/ios-arm64, has no simulator slice: IOS-GRAPHICS-PLAN G1); build the Simulator app without GFX_VKD3D=1, i.e. with the null backend)
+endif
 GFX_STAMP = .gfx-vkd3d-$(GFX_VKD3D)$(if $(filter 1,$(GFX_VULKAN_STATIC)),-vkstatic)
 ifeq ($(GFX_VKD3D),1)
 ifeq ($(UNAME_S),Darwin)
@@ -251,13 +275,36 @@ ifeq ($(UNAME_S),Darwin)
 #   * only the wrapped bridge exists there (bias addresses, arm64: no Windows-ABI trampoline), and the runtime picks no driver on its
 #     own: KHNMC_GFX=vkd3dw KHNMC_GFX_DRIVER=system selects the Metal device.
 # A missing piece is an error here, by name, not a build without graphics.
+ifeq ($(IOS_SDK),iphoneos)
+# ---- TASK38 (IOS-GRAPHICS-PLAN step 3, G1-G4): the iPhone app ------------------------------------------------------------------------
+# `make IOS_SDK=iphoneos GFX_VKD3D=1 applib` (tools/ios/mac/build.sh with GFX=1) on the MacBook Air: vkd3d 2.1 built for iOS
+# (tools/apple/vkd3d-build/README.md in the repo, "iOS build": four archives in build-iphoneos, compiled against deps/vkheaders) and
+# MoltenVK's iOS static library with its headers (deps/moltenvk-ios, from the 1.4.2 release archive).  The graphics objects are
+# compiled against the SAME Vulkan headers vkd3d was compiled with (VKHEADERS_DIR, first on the include path); MOLTENVK_INCLUDE comes
+# after it and is there for MoltenVK's own private API header only (the memory census: gpuMemoryAllocated, -DKH_GFX_MVK_API).
+# The app itself is linked by Xcode: GFX_APP_LDFLAGS is what tools/ios/mac/build.sh and sign_app.sh hand to xcodebuild as
+# KHNMC_GFX_LDFLAGS (`make -s IOS_SDK=iphoneos GFX_VKD3D=1 print-GFX_APP_LDFLAGS`); Foundation and UIKit are already in the project.
+GFX_APPLE_DIR ?= $(HOME)/Developer/KHNMC/deps
+VKD3D_SRC ?= $(GFX_APPLE_DIR)/vkd3d-2.1
+VKD3D_LIBDIR ?= $(VKD3D_SRC)/build-iphoneos
+VKHEADERS_DIR ?= $(GFX_APPLE_DIR)/vkheaders
+MOLTENVK_STATIC ?= $(GFX_APPLE_DIR)/moltenvk-ios/static/MoltenVK.xcframework/ios-arm64/libMoltenVK.a
+MOLTENVK_INCLUDE ?= $(GFX_APPLE_DIR)/moltenvk-ios/include
+else
 GFX_APPLE_DIR ?= $(HOME)/khnmc-work/gfxprobe
 VKD3D_SRC ?= $(GFX_APPLE_DIR)/vkd3d-2.1
 VKD3D_LIBDIR ?= $(VKD3D_SRC)/build-mac
 VKHEADERS_DIR ?= $(GFX_APPLE_DIR)/vkheaders
 MOLTENVK_LIB ?= $(GFX_APPLE_DIR)/moltenvk/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib
+endif
 VKD3D_STATIC = $(VKD3D_LIBDIR)/libvkd3d-utils.a $(VKD3D_LIBDIR)/libvkd3d.a $(VKD3D_LIBDIR)/libvkd3d-shader.a $(VKD3D_LIBDIR)/libvkd3d-common.a
-ifeq ($(GFX_VULKAN_STATIC),1)
+ifeq ($(IOS_SDK),iphoneos)
+GFX_NEED = $(VKD3D_STATIC) $(VKD3D_SRC)/include/vkd3d_d3d12.h $(VKD3D_SRC)/include/vkd3d.h $(VKHEADERS_DIR)/vulkan/vulkan.h $(MOLTENVK_STATIC) $(MOLTENVK_INCLUDE)/MoltenVK/mvk_private_api.h
+GFX_MISSING = $(filter-out $(wildcard $(GFX_NEED)),$(GFX_NEED))
+ifneq ($(strip $(GFX_MISSING)),)
+$(error IOS_SDK=iphoneos GFX_VKD3D=1: missing $(GFX_MISSING) (GFX_APPLE_DIR=$(GFX_APPLE_DIR): VKD3D_SRC, VKD3D_LIBDIR, VKHEADERS_DIR, MOLTENVK_STATIC, MOLTENVK_INCLUDE; see tools/apple/vkd3d-build/README.md in the repo, "iOS build"))
+endif
+else ifeq ($(GFX_VULKAN_STATIC),1)
 # TASK36, PREPARED, NOT RUN: MoltenVK linked statically (the release's static xcframework; macOS slice here, the app links the ios-arm64
 # one), no dylib and no loader; the Metal surface and the Metal-objects export are compiled in (VK_USE_PLATFORM_METAL_EXT)
 MOLTENVK_STATIC ?= $(GFX_APPLE_DIR)/moltenvk/MoltenVK/static/MoltenVK.xcframework/macos-arm64_x86_64/libMoltenVK.a
@@ -269,7 +316,15 @@ GFX_MISSING = $(filter-out $(wildcard $(GFX_NEED)),$(GFX_NEED))
 ifneq ($(strip $(GFX_MISSING)),)
 $(error GFX_VKD3D=1 on Darwin: missing $(GFX_MISSING) (VKD3D_SRC, VKD3D_LIBDIR, VKHEADERS_DIR, MOLTENVK_LIB / MOLTENVK_STATIC; see tools/apple/vkd3d-build/README.md in the repo))
 endif
-ifeq ($(GFX_VULKAN_STATIC),1)
+ifeq ($(IOS_SDK),iphoneos)
+# TASK38: the iPhone flags.  -DKH_GFX_MVK_API: the census reads MoltenVK's statistics (runtime/gfx_vkd3d.c).  The frameworks MoltenVK
+# needs on iOS (its UserGuide: Metal, QuartzCore, IOSurface, CoreGraphics, Foundation, UIKit; no IOKit, no AppKit) and libc++ (MoltenVK
+# is C++).  GFX_LDFLAGS (a link the Makefile would make itself) = GFX_APP_LDFLAGS + the two frameworks the Xcode project already has.
+$(O)/gfx_vkd3d.o $(O)/gfx_wrap.o $(O)/gfx_present.o: CFLAGS += -DKH_GFX_VKD3D=1 -DKH_GFX_VKD3D_STATIC=1 -DKH_GFX_VULKAN_STATIC=1 -DVK_USE_PLATFORM_METAL_EXT -DKH_GFX_MVK_API=1 -DWIDL_C_INLINE_WRAPPERS -I$(VKD3D_SRC)/include -I$(VKHEADERS_DIR) -I$(MOLTENVK_INCLUDE)
+GFX_APP_LDFLAGS = $(VKD3D_STATIC) $(MOLTENVK_STATIC) -lc++ -framework Metal -framework QuartzCore -framework IOSurface -framework CoreGraphics
+GFX_LDFLAGS = $(GFX_APP_LDFLAGS) -framework Foundation -framework UIKit
+$(BIN): $(VKD3D_STATIC) $(MOLTENVK_STATIC)
+else ifeq ($(GFX_VULKAN_STATIC),1)
 $(O)/gfx_vkd3d.o $(O)/gfx_wrap.o $(O)/gfx_present.o: CFLAGS += -DKH_GFX_VKD3D=1 -DKH_GFX_VKD3D_STATIC=1 -DKH_GFX_VULKAN_STATIC=1 -DVK_USE_PLATFORM_METAL_EXT -DWIDL_C_INLINE_WRAPPERS -I$(VKD3D_SRC)/include -I$(VKHEADERS_DIR)
 GFX_LDFLAGS = $(VKD3D_STATIC) $(MOLTENVK_STATIC) -lc++ -framework Metal -framework QuartzCore -framework IOSurface -framework CoreGraphics -framework Foundation -framework IOKit -framework AppKit
 $(BIN): $(VKD3D_STATIC) $(MOLTENVK_STATIC)
@@ -368,6 +423,7 @@ $(O)/loader_app.o: $(ROOT)/runtime/loader.c $(wildcard $(ROOT)/runtime/*.h)
 	@mkdir -p $(O) && $(CC) $(CFLAGS) -DKH_MAIN_NAME=kh_main -c $< -o $@
 $(O)/libkhnmc-rt.a: $(APP_RTOBJ) $(LIFTOBJ) $(HOOK_OBJ)
 	rm -f $@ && ar rcs $@ $(APP_RTOBJ) $(LIFTOBJ) $(HOOK_OBJ)
+	$(if $(filter 1,$(GFX_VKD3D)),@nm -g $@ > $@.syms 2>/dev/null && test -s $@.syms || { echo "applib: nm could not read $@ (non-zero exit status or no symbols): whether it has the graphics backend is unknown" >&2; rm -f $@ $@.syms; exit 1; }; grep -q ' T _*kh_gfxc_device_new$$' $@.syms || { echo "applib: GFX_VKD3D=1 but $@ has no graphics backend (no kh_gfxc_device_new: gfx_vkd3d.o was compiled without KH_GFX_VKD3D)" >&2; rm -f $@ $@.syms; exit 1; }; rm -f $@.syms)
 applib: $(O)/libkhnmc-rt.a $(OL)/libkh2loose.a
 ifeq ($(UNAME_S),Darwin)
 APP_WHOLE = -Wl,-force_load,$(O)/libkhnmc-rt.a
@@ -380,7 +436,7 @@ hostshell: $(O)/hostshell.ok
 $(O)/hostshell.ok: $(BIN)-shell tools/check_hook_link.py tools/check_mod_static_link.py tools/check_ios_symbols.py
 	python3 tools/check_hook_link.py --bin $(BIN)-shell --objs $(APP_RTOBJ) $(LIFTOBJ) $(HOOK_OBJ) --hooks $(HOOKS_UNIQ) --wrap $(WRAP_FNS) $(if $(HOOK_OBJ),--forwarders $(HOOK_OBJ)) $(if $(filter 1,$(HOOK_STRICT)),--strict)
 	python3 tools/check_mod_static_link.py --bin $(BIN)-shell --obj $(O) --skip $(O)/loader.o --funcs "$(MOD_LIFT_FUNCS)" --chained "$(MOD_STATIC_CHAINED) $(MOD_NEVERLAND_HOOKS)" --replaced "$(MOD_STATIC_REPLACED)" --choice "$(MOD_MOOSE_FUNCS)" --dll-replaces "$(MOD_DLL_REPLACES)"
-	$(if $(filter 1,$(IOS_PATHS)),python3 tools/check_ios_symbols.py --bin $(BIN)-shell)
+	$(if $(filter 1,$(IOS_PATHS)),python3 tools/check_ios_symbols.py --bin $(BIN)-shell $(IOS_SYMBOLS_ALLOW))
 	@touch $@
 # the same three checks for a program linked elsewhere from these libraries (the app binary Xcode links: tools/ios/mac/build.sh);
 # PREPARED, NOT RUN with an app binary:  make IOS_SDK=<sdk> appcheck APP_BIN=<path to KHNMC.app/KHNMC>
@@ -388,12 +444,18 @@ appcheck:
 	@test -n "$(APP_BIN)" && test -f "$(APP_BIN)" || { echo "appcheck: APP_BIN=<linked program> is required" >&2; exit 2; }
 	python3 tools/check_hook_link.py --bin $(APP_BIN) --objs $(APP_RTOBJ) $(LIFTOBJ) $(HOOK_OBJ) --hooks $(HOOKS_UNIQ) --wrap $(WRAP_FNS) $(if $(HOOK_OBJ),--forwarders $(HOOK_OBJ)) $(if $(filter 1,$(HOOK_STRICT)),--strict)
 	python3 tools/check_mod_static_link.py --bin $(APP_BIN) --obj $(O) --skip $(O)/loader.o --funcs "$(MOD_LIFT_FUNCS)" --chained "$(MOD_STATIC_CHAINED) $(MOD_NEVERLAND_HOOKS)" --replaced "$(MOD_STATIC_REPLACED)" --choice "$(MOD_MOOSE_FUNCS)" --dll-replaces "$(MOD_DLL_REPLACES)"
-	python3 tools/check_ios_symbols.py --bin $(APP_BIN)
+	python3 tools/check_ios_symbols.py --bin $(APP_BIN) $(IOS_SYMBOLS_ALLOW)
 # Task 26: a KH_IOS_PATHS program must not import what an iOS app cannot use (fork, system, popen, exec*, posix_spawn, tmpfile, ...)
+# TASK38 (IOS-GRAPHICS-PLAN G4): a graphics build (GFX_VKD3D=1) may import exactly one of those names, mktemp, and only because
+# MoltenVK's iOS static library imports _mktemp (and _mkfifo, which is not on the list), apparently for its GPU-capture pipe (llvm-nm of
+# the 1.4.2 release's MoltenVK.xcframework/ios-arm64/libMoltenVK.a).  Every other forbidden import still fails the check.  On Linux the
+# hostshell links vkd3d's SHARED libraries and dlopens the Vulkan loader, so there the check sees the runtime's own imports only (it
+# says whether an allowed name was imported at all); only the app's appcheck sees MoltenVK's and vkd3d's.
+IOS_SYMBOLS_ALLOW = $(if $(filter 1,$(GFX_VKD3D)),--allow mktemp)
 ifeq ($(IOS_PATHS),1)
 all: $(O)/ios_symbols.ok
 $(O)/ios_symbols.ok: $(BIN) tools/check_ios_symbols.py
-	python3 tools/check_ios_symbols.py --bin $(BIN) && touch $@
+	python3 tools/check_ios_symbols.py --bin $(BIN) $(IOS_SYMBOLS_ALLOW) && touch $@
 endif
 # arm64 compile check of the hand-written runtime only (no lifted shards): clang -arch arm64 on macOS
 arm64check:

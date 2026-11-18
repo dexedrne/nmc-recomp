@@ -48,6 +48,15 @@
  * needs x86-64 and the identity address model, and in any other build KHNMC_GFX=vkd3d is the named fatal gfx-vkd3d-needs-identity. */
 #define _GNU_SOURCE
 #ifdef KH_GFX_VKD3D
+/* TASK38 (IOS-GRAPHICS-PLAN step 4): the memory census reads phys_footprint (task_info) on Apple and os_proc_available_memory on iOS.
+ * System headers first, before vkd3d's Windows-style macros (interface, WINAPI, __stdcall) exist. */
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE && !TARGET_OS_MACCATALYST
+#include <os/proc.h>
+#endif
+#endif
 #define COBJMACROS
 /* The D3D12 interface GUIDs (IID_ID3D12Device ...).  vkd3d's SHARED libraries do not export them, so this file defines them (INITGUID)
  * for the whole program.  vkd3d's STATIC libraries (KH_GFX_VKD3D_STATIC: the Darwin build, Makefile) define every one of them in their
@@ -64,6 +73,10 @@
 #include <vkd3d_d3d12.h>
 #include <vkd3d.h>
 #include <vkd3d_utils.h>
+/* TASK38: MoltenVK's private API (gpuMemoryAllocated for the memory census), iPhone build only (KH_GFX_MVK_API, Makefile) */
+#ifdef KH_GFX_MVK_API
+#include <MoltenVK/mvk_private_api.h>
+#endif
 #endif
 #include "khnmc_rt.h"
 #include <unistd.h>
@@ -118,6 +131,7 @@ static int drv_system;
 enum { BB_OWN, BB_GENERAL, BB_COMMITTED };
 static const char *const bb_names[]={"own","general","committed"};
 static int bb_mode_env, bb_mode_test=-1;
+static long long memlow_test=-1;   /* review X38 n=2: KHNMC_GFX_TEST_MEMORY_AVAILABLE_MIB (tests only), see the gfx-memory-low soft stop */
 static _Atomic u64 n_bb_images_made, n_bb_images_freed, n_bb_drains;
 static char dump_dir[1024]; static u64 dump_every=300; static _Atomic u64 dumps_written; static u64 dump_from, dump_to=~0ull;
 static FILE *hash_f; static char hash_path[1024]; static _Atomic u64 hashes_written;
@@ -227,6 +241,8 @@ void kh_gfxc_init_common(const char *label){
     e=getenv("KHNMC_GFX_BACKBUFFERS"); bb_mode_env=BB_OWN;                  /* TASK36: own VkImages (default), general, committed */
     if(e&&*e){ if(!strcmp(e,"own")) bb_mode_env=BB_OWN; else if(!strcmp(e,"general")) bb_mode_env=BB_GENERAL; else if(!strcmp(e,"committed")) bb_mode_env=BB_COMMITTED;
         else kh_fatal(NULL,"gfx-backbuffers-mode: KHNMC_GFX_BACKBUFFERS=%s (own = our VkImages, PRESENT = TRANSFER_SRC; general = our VkImages, PRESENT = GENERAL; committed = vkd3d's resources, the old path)",e); }
+    e=getenv("KHNMC_GFX_TEST_MEMORY_AVAILABLE_MIB");                     /* review X38 n=2: TESTS ONLY, a reading for the gfx-memory-low soft stop */
+    if(e&&*e){ char *end; unsigned long long v=strtoull(e,&end,10); if(*end||e[0]<'0'||e[0]>'9'||v>(1ull<<40)) kh_fatal(NULL,"gfx-memory-test: KHNMC_GFX_TEST_MEMORY_AVAILABLE_MIB=%s is not a number of MiB",e); memlow_test=(long long)v; }
     e=getenv("KHNMC_GFX_HASHLOG");
     if(e&&*e){ if(snprintf(hash_path,sizeof hash_path,"%s",e)>=(int)sizeof hash_path) kh_fatal(NULL,"gfx-hashlog: KHNMC_GFX_HASHLOG is too long");
         hash_f=fopen(hash_path,"w"); if(!hash_f) kh_fatal(NULL,"gfx-hashlog: cannot create %s (%s)",hash_path,strerror(errno));
@@ -731,6 +747,205 @@ static void learn_entry_points(KCtx *g,ID3D12Device *dev){
 }
 #endif
 const char *kh_gfxc_device_name(void){ return vk_dev_name; }
+
+/* ---- TASK38 (IOS-GRAPHICS-PLAN step 4): the device report, the memory census and the BC decision -----------------------------------
+ * One block at the first device (lines `kh: gfx device report: ...`), about the physical device vkd3d really uses
+ * (vkd3d_get_vk_physical_device), before the game gets that device:
+ *   textureCompressionBC (and ASTC_LDR / ETC2, the alternatives of plan C1); the optimal-tiling features of the game's formats, mapped
+ *   to Vulkan exactly as vkd3d maps them (vkd3d_get_vk_format): BC1/2/3 UNORM (DXGI 71/74/77), B8G8R8A8_UNORM (87) and its only depth
+ *   format D32_FLOAT_S8X24_UINT (20 -> D32_SFLOAT_S8_UINT); framebuffer and sampled-image sample counts; memory heaps and types, and
+ *   VK_EXT_memory_budget's numbers when the implementation offers it; which presentation extensions the implementation OFFERS (the
+ *   enabled ones are the `presentation extensions` line); the memory census line (below).
+ * A field this build or host does not have prints `absent (why)`, never a number.
+ * gfx-no-bc: a BC format the game uses that cannot be SAMPLED in optimal tiling ends the run here, by name, before the game creates
+ * its first texture (MoltenVK enables BC on iOS only "where supported by the GPU": plan R1; plan step C1 would then come first).
+ *   KHNMC_GFX_TEST_NO_BC=1   TESTS ONLY: the report treats the three BC formats as not sampleable, to show that fatal on a device
+ *                            that has them (it can only make a run fail, never pass).
+ * The memory census (plan step 4, R11): one line `kh: gfx memory census (<when>): ...` in the report block and with every backend
+ * report (every 300 presents and at exit: null_d3d12.c).  phys_footprint (Apple: task_info TASK_VM_INFO), os_proc_available_memory
+ * (iOS), MoltenVK's gpuMemoryAllocated (iPhone build; needs MoltenVK's performance tracking, MVK_CONFIG_PERFORMANCE_TRACKING=1, or its
+ * update count says 0), on Linux the process's RSS as the stand-in, the VK_EXT_memory_budget numbers, and the fixed budget that
+ * QueryVideoMemoryInfo answers today. */
+u64 kh_dxgi_budget_answer(void);                                     /* null_d3d12.c: QueryVideoMemoryInfo's (fixed) budget */
+/* vk = 0: Vulkan format from vkd3d_get_vk_format.  The depth format has a fixed one: vkd3d's public vkd3d_get_vk_format looks depth
+ * formats up through a DEVICE and is given none (vkd3d 2.1 utils.c 424-430, 442-468: an assertion, then a NULL dereference; found on
+ * lavapipe in TASK38), so the report uses the row of vkd3d's own table (utils.c 128: D32_FLOAT_S8X24_UINT -> D32_SFLOAT_S8_UINT, never
+ * overridden; only the D24S8 formats are) */
+typedef struct { const char *name; DXGI_FORMAT dxgi; VkFormat vk; } RepFmt;
+static const RepFmt rep_fmt[]={{"BC1_UNORM",DXGI_FORMAT_BC1_UNORM,0},{"BC2_UNORM",DXGI_FORMAT_BC2_UNORM,0},{"BC3_UNORM",DXGI_FORMAT_BC3_UNORM,0},
+                               {"B8G8R8A8_UNORM",DXGI_FORMAT_B8G8R8A8_UNORM,0},{"D32_FLOAT_S8X24_UINT",DXGI_FORMAT_D32_FLOAT_S8X24_UINT,VK_FORMAT_D32_SFLOAT_S8_UINT}};
+static VkFormat rep_vk_format(int i){ return rep_fmt[i].vk?rep_fmt[i].vk:vkd3d_get_vk_format(rep_fmt[i].dxgi); }
+static const char *const rep_iext[]={"VK_KHR_surface","VK_EXT_headless_surface","VK_EXT_metal_surface","VK_EXT_layer_settings"};
+static const char *const rep_dext[]={"VK_KHR_swapchain","VK_GOOGLE_display_timing","VK_KHR_present_id","VK_KHR_present_wait","VK_EXT_metal_objects","VK_EXT_memory_budget"};
+enum { NREPFMT=5, NBC=3, NREPIEXT=4, NREPDEXT=6, REP_DEXT_BUDGET=5 };
+typedef struct { int printed, lines, tcbc, test_no_bc, unsampled, memlow_armed, iext[NREPIEXT], dext[NREPDEXT]; VkFormat vkf[NREPFMT]; VkFormatFeatureFlags feat[NREPFMT]; } RepState;
+static RepState rep; static pthread_mutex_t rep_m=PTHREAD_MUTEX_INITIALIZER;
+/* census state: the report's physical device and budget query, and the device of the last swap chain (MoltenVK's statistics) */
+static pthread_mutex_t cen_m=PTHREAD_MUTEX_INITIALIZER; static VkPhysicalDevice cen_pd; static PFN_vkGetPhysicalDeviceMemoryProperties2 cen_mp2;
+static int cen_budget; static ID3D12Device *cen_dev; static u64 cen_lines;
+#if defined(__APPLE__)
+static u64 cen_peak;                                                   /* the largest phys_footprint a census has seen */
+#endif
+/* the BC decision (pure; selftested): which of the game's BC formats (the first NBC of rep_fmt) cannot be SAMPLED in optimal tiling */
+static int bc_unsampled(const VkFormatFeatureFlags *feat,char *why,size_t cap){
+    int n=0; if(cap) why[0]=0;
+    for(int i=0;i<NBC;i++) if(!(feat[i]&VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)){ size_t l=strlen(why); if(l<cap) snprintf(why+l,cap-l,"%s%s",n?", ":"",rep_fmt[i].name); n++; }
+    return n;
+}
+static void feat_text(char *b,size_t cap,VkFormatFeatureFlags f){
+    static const struct { VkFormatFeatureFlags bit; const char *n; } fb[]={{VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT,"sampled"},{VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT,"filter_linear"},
+        {VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT,"color_attachment"},{VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT,"blend"},{VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT,"depth_stencil"},
+        {VK_FORMAT_FEATURE_BLIT_SRC_BIT,"blit_src"},{VK_FORMAT_FEATURE_BLIT_DST_BIT,"blit_dst"},{VK_FORMAT_FEATURE_TRANSFER_SRC_BIT,"transfer_src"},{VK_FORMAT_FEATURE_TRANSFER_DST_BIT,"transfer_dst"},
+        {VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT,"storage"}};
+    size_t l=(size_t)snprintf(b,cap,"0x%x (",(unsigned)f); int k=0;
+    for(size_t i=0;i<sizeof fb/sizeof*fb&&l<cap;i++) if(f&fb[i].bit) l+=(size_t)snprintf(b+l,cap-l,"%s%s",k++?" ":"",fb[i].n);
+    if(l<cap) snprintf(b+l,cap-l,"%s)",k?"":"none");
+}
+static void sc_text(char *b,size_t cap,VkSampleCountFlags s){
+    size_t l=0; int k=0; b[0]=0;
+    for(u32 bit=1;bit<=64&&l<cap;bit<<=1) if(s&bit) l+=(size_t)snprintf(b+l,cap-l,"%s%u",k++?",":"",bit);
+    if(!k) snprintf(b,cap,"none");
+}
+static int ext_in(const VkExtensionProperties *x,u32 n,const char *s){ for(u32 i=0;i<n;i++) if(!strcmp(x[i].extensionName,s)) return 1; return 0; }
+/* the census text (one line).  dev: the device whose MoltenVK statistics are read (NULL = the last swap chain's) */
+static void census_text(char *b,size_t cap,ID3D12Device *dev){
+    size_t l=0; b[0]=0;
+#define CAT(...) do{ if(l<cap) l+=(size_t)snprintf(b+l,cap-l,__VA_ARGS__); }while(0)
+    pthread_mutex_lock(&cen_m);
+#if defined(__APPLE__)
+    { task_vm_info_data_t vi; mach_msg_type_number_t cnt=TASK_VM_INFO_COUNT; memset(&vi,0,sizeof vi);
+      if(task_info(mach_task_self(),TASK_VM_INFO,(task_info_t)&vi,&cnt)==KERN_SUCCESS){ u64 pf=(u64)vi.phys_footprint; if(pf>cen_peak) cen_peak=pf;
+          CAT("phys_footprint=%llu MiB (peak seen %llu MiB)",P(pf>>20),P(cen_peak>>20)); }
+      else CAT("phys_footprint=ERROR (task_info TASK_VM_INFO failed)"); }
+#if TARGET_OS_IPHONE && !TARGET_OS_MACCATALYST
+    CAT(" os_proc_available_memory=%llu MiB",P((u64)os_proc_available_memory()>>20));
+#else
+    CAT(" os_proc_available_memory=absent (iOS only)");
+#endif
+#else
+    CAT("phys_footprint=absent (Apple only: task_info TASK_VM_INFO) os_proc_available_memory=absent (iOS only)");
+#endif
+#ifdef KH_GFX_MVK_API
+    { ID3D12Device *d=dev?dev:cen_dev;
+      if(!d) CAT(" gpuMemoryAllocated=absent (no live swap chain to read it from)");
+      else { MVKPerformanceStatistics ps; memset(&ps,0,sizeof ps); size_t sz=sizeof ps; VkResult r=vkGetPerformanceStatisticsMVK(vkd3d_get_vk_device(d),&ps,&sz);
+          if(r!=VK_SUCCESS) CAT(" gpuMemoryAllocated=ERROR (vkGetPerformanceStatisticsMVK result %d, %zu of %zu bytes: MoltenVK's private API differs from the headers' version %d)",(int)r,sz,sizeof ps,MVK_PRIVATE_API_VERSION);
+          else CAT(" gpuMemoryAllocated=%.0f KiB (max %.0f KiB, %u updates%s)",ps.device.gpuMemoryAllocated.latest,ps.device.gpuMemoryAllocated.maximum,ps.device.gpuMemoryAllocated.count,
+                   ps.device.gpuMemoryAllocated.count?"":"; 0 = MoltenVK's performance tracking is off: MVK_CONFIG_PERFORMANCE_TRACKING=1"); } }
+#else
+    (void)dev; CAT(" gpuMemoryAllocated=absent (MoltenVK's statistics are read in the iPhone build only: KH_GFX_MVK_API)");
+#endif
+#if defined(__linux__)
+    { long now=-1,peak=-1; FILE *s=fopen("/proc/self/status","r"); char ln[256];
+      if(s){ while(fgets(ln,sizeof ln,s)){ if(!strncmp(ln,"VmRSS:",6)) now=strtol(ln+6,0,10)/1024; else if(!strncmp(ln,"VmHWM:",6)) peak=strtol(ln+6,0,10)/1024; } fclose(s); }
+      CAT(" rss=%ld MiB (peak %ld MiB; /proc/self/status, Linux's stand-in for phys_footprint)",now,peak); }
+#endif
+    if(!cen_pd) CAT("; VK_EXT_memory_budget: no device yet");
+    else if(!cen_budget) CAT("; VK_EXT_memory_budget=absent (not offered by this implementation)");
+    else { VkPhysicalDeviceMemoryBudgetPropertiesEXT bp; memset(&bp,0,sizeof bp); bp.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+        VkPhysicalDeviceMemoryProperties2 mp; memset(&mp,0,sizeof mp); mp.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2; mp.pNext=&bp; cen_mp2(cen_pd,&mp);
+        CAT("; VK_EXT_memory_budget:"); for(u32 i=0;i<mp.memoryProperties.memoryHeapCount&&i<VK_MAX_MEMORY_HEAPS;i++) CAT(" heap%u budget=%llu MiB usage=%llu MiB",i,P(bp.heapBudget[i]>>20),P(bp.heapUsage[i]>>20)); }
+    CAT("; QueryVideoMemoryInfo answers budget=%llu MiB (fixed: null_d3d12.c)",P(kh_dxgi_budget_answer()>>20));
+    cen_lines++; pthread_mutex_unlock(&cen_m);
+#undef CAT
+}
+static void census_line(FILE *f,const char *when){ char b[2048]; census_text(b,sizeof b,NULL); fprintf(f,"kh: gfx memory census (%s): %s\n",when,b); }
+/* ---- review X38 n=2 (IOS-GRAPHICS-PLAN step 5; verification correction 6): the gfx-memory-low soft stop -----------------------------------
+ * At every Present (kh_vkd3d_present: after the suspend gate, before the frame readback), where os_proc_available_memory exists (iOS):
+ * below MEMLOW_MARGIN_MIB the run ends BY NAME instead of by a jetsam kill that leaves nothing: `kh: FATAL: gfx-memory-low: ...`, a
+ * census line, then kh_exit_process(3), which writes every exit report (the census among them) and the status `exit 3`.  Elsewhere
+ * there is no reading and the stop is not armed; the device report says which.
+ *   KHNMC_GFX_TEST_MEMORY_AVAILABLE_MIB=n   TESTS ONLY: a reading of n MiB.  Where a real reading exists the lower of the two counts,
+ *                                           so it can only stop a run, never keep one going. */
+#define MEMLOW_MARGIN_MIB 512ull
+static atomic_int memlow_fired;
+static int memlow_fires(int have,u64 avail_mib){ return have&&avail_mib<MEMLOW_MARGIN_MIB; }          /* the decision (pure; selftested) */
+static int memlow_read(u64 *mib){                                                                    /* 1 and *mib when there is a reading */
+    int have=0; u64 v=0;
+#if defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_MACCATALYST
+    v=(u64)os_proc_available_memory()>>20; have=1;
+#endif
+    if(memlow_test>=0&&(!have||(u64)memlow_test<v)){ v=(u64)memlow_test; have=1; }
+    *mib=v; return have;
+}
+static void memlow_check(u64 n){
+    void kh_exit_process(int);
+    u64 mib; int have=memlow_read(&mib);
+    if(!memlow_fires(have,mib)||atomic_exchange(&memlow_fired,1)) return;
+    fprintf(stderr,"kh: FATAL: gfx-memory-low: os_proc_available_memory=%llu MiB%s is below the margin of %llu MiB at present %llu: the run ends here with its reports "
+                   "(status 3) instead of being killed by iOS (IOS-GRAPHICS-PLAN step 5)\n",P(mib),memlow_test>=0?" [TEST: KHNMC_GFX_TEST_MEMORY_AVAILABLE_MIB]":"",P(MEMLOW_MARGIN_MIB),P(n));
+    census_line(stderr,"gfx-memory-low");
+    kh_exit_process(3);
+}
+/* the report block, once per process, at the first device (kh_gfxc_device_new; no other lock held).  Ends the run with gfx-no-bc when
+ * a BC format the game uses cannot be sampled: after the block is printed and every lock is released. */
+#define REPL(...) do{ fprintf(stderr,"kh: gfx device report: " __VA_ARGS__); rep.lines++; }while(0)
+static void dev_report(KCtx *g,ID3D12Device *dev){
+    pthread_mutex_lock(&rep_m); if(rep.printed){ pthread_mutex_unlock(&rep_m); return; }
+    rep.printed=1; const char *e=getenv("KHNMC_GFX_TEST_NO_BC"); rep.test_no_bc=e&&!strcmp(e,"1");
+    VkInstance vi=vkd3d_instance_get_vk_instance(vkd3d_instance_from_device(dev)); VkPhysicalDevice pd=vkd3d_get_vk_physical_device(dev);
+#define RG(T,n,inst) T n=(T)vk_gipa(inst,#n)
+    RG(PFN_vkGetPhysicalDeviceProperties,vkGetPhysicalDeviceProperties,vi); RG(PFN_vkGetPhysicalDeviceFeatures,vkGetPhysicalDeviceFeatures,vi);
+    RG(PFN_vkGetPhysicalDeviceFormatProperties,vkGetPhysicalDeviceFormatProperties,vi); RG(PFN_vkGetPhysicalDeviceMemoryProperties,vkGetPhysicalDeviceMemoryProperties,vi);
+    RG(PFN_vkEnumerateDeviceExtensionProperties,vkEnumerateDeviceExtensionProperties,vi); RG(PFN_vkEnumerateInstanceExtensionProperties,vkEnumerateInstanceExtensionProperties,NULL);
+    RG(PFN_vkGetPhysicalDeviceMemoryProperties2,vkGetPhysicalDeviceMemoryProperties2,vi);
+#undef RG
+    if(!vkGetPhysicalDeviceMemoryProperties2) vkGetPhysicalDeviceMemoryProperties2=(PFN_vkGetPhysicalDeviceMemoryProperties2)vk_gipa(vi,"vkGetPhysicalDeviceMemoryProperties2KHR");
+    const char *missing=!vkGetPhysicalDeviceProperties?"vkGetPhysicalDeviceProperties":!vkGetPhysicalDeviceFeatures?"vkGetPhysicalDeviceFeatures":!vkGetPhysicalDeviceFormatProperties?"vkGetPhysicalDeviceFormatProperties":
+                        !vkGetPhysicalDeviceMemoryProperties?"vkGetPhysicalDeviceMemoryProperties":!vkEnumerateDeviceExtensionProperties?"vkEnumerateDeviceExtensionProperties":!vkEnumerateInstanceExtensionProperties?"vkEnumerateInstanceExtensionProperties":NULL;
+    if(missing){ pthread_mutex_unlock(&rep_m); kh_fatal(g,"gfx-device-report: the Vulkan library (%s) gives no %s for the device report",vk_lib_name,missing); }
+    VkPhysicalDeviceProperties pp; memset(&pp,0,sizeof pp); vkGetPhysicalDeviceProperties(pd,&pp);
+    VkPhysicalDeviceFeatures ft; memset(&ft,0,sizeof ft); vkGetPhysicalDeviceFeatures(pd,&ft); rep.tcbc=(int)ft.textureCompressionBC;
+    REPL("BEGIN: '%s' type=%s vendor=0x%x device=0x%x api=%u.%u.%u driver=0x%x (the physical device vkd3d uses); built with Vulkan headers %u.%u.%u\n",pp.deviceName,pd_type(pp.deviceType),pp.vendorID,pp.deviceID,
+         VK_API_VERSION_MAJOR(pp.apiVersion),VK_API_VERSION_MINOR(pp.apiVersion),VK_API_VERSION_PATCH(pp.apiVersion),pp.driverVersion,
+         VK_API_VERSION_MAJOR(VK_HEADER_VERSION_COMPLETE),VK_API_VERSION_MINOR(VK_HEADER_VERSION_COMPLETE),VK_API_VERSION_PATCH(VK_HEADER_VERSION_COMPLETE));
+    REPL("textureCompressionBC=%d (textureCompressionASTC_LDR=%d, textureCompressionETC2=%d)\n",(int)ft.textureCompressionBC,(int)ft.textureCompressionASTC_LDR,(int)ft.textureCompressionETC2);
+    for(int i=0;i<NREPFMT;i++){ VkFormatProperties fp; memset(&fp,0,sizeof fp); rep.vkf[i]=rep_vk_format(i);
+        if(rep.vkf[i]!=VK_FORMAT_UNDEFINED) vkGetPhysicalDeviceFormatProperties(pd,rep.vkf[i],&fp);
+        rep.feat[i]=fp.optimalTilingFeatures; if(rep.test_no_bc&&i<NBC) rep.feat[i]&=~(VkFormatFeatureFlags)VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+        char t[300]; feat_text(t,sizeof t,rep.feat[i]);
+        REPL("format %s (DXGI %d -> VkFormat %d%s): optimalTilingFeatures=%s%s\n",rep_fmt[i].name,(int)rep_fmt[i].dxgi,(int)rep.vkf[i],rep_fmt[i].vk?", vkd3d's table row":"",t,rep.test_no_bc&&i<NBC?" [TEST: KHNMC_GFX_TEST_NO_BC=1 removed sampled]":""); }
+    { char a[64],b2[64],c[64],d[64],s1[64],s2[64]; const VkPhysicalDeviceLimits *L=&pp.limits;
+      sc_text(a,sizeof a,L->framebufferColorSampleCounts); sc_text(b2,sizeof b2,L->framebufferDepthSampleCounts); sc_text(c,sizeof c,L->framebufferStencilSampleCounts);
+      sc_text(d,sizeof d,L->framebufferNoAttachmentsSampleCounts); sc_text(s1,sizeof s1,L->sampledImageColorSampleCounts); sc_text(s2,sizeof s2,L->sampledImageDepthSampleCounts);
+      REPL("sample counts: framebuffer color=%s depth=%s stencil=%s no-attachments=%s; sampled image color=%s depth=%s\n",a,b2,c,d,s1,s2); }
+    VkPhysicalDeviceMemoryProperties mp; memset(&mp,0,sizeof mp); vkGetPhysicalDeviceMemoryProperties(pd,&mp);
+    for(u32 i=0;i<mp.memoryHeapCount&&i<VK_MAX_MEMORY_HEAPS;i++)
+        REPL("memory heap %u: %llu MiB%s%s\n",i,P(mp.memoryHeaps[i].size>>20),mp.memoryHeaps[i].flags&VK_MEMORY_HEAP_DEVICE_LOCAL_BIT?" DEVICE_LOCAL":"",mp.memoryHeaps[i].flags&VK_MEMORY_HEAP_MULTI_INSTANCE_BIT?" MULTI_INSTANCE":"");
+    { char t[1600]; size_t l=0; t[0]=0;
+      for(u32 i=0;i<mp.memoryTypeCount&&i<VK_MAX_MEMORY_TYPES&&l<sizeof t;i++){ VkMemoryPropertyFlags pf=mp.memoryTypes[i].propertyFlags;
+          l+=(size_t)snprintf(t+l,sizeof t-l," %u:heap%u%s%s%s%s%s",i,mp.memoryTypes[i].heapIndex,pf&VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT?",DEVICE_LOCAL":"",pf&VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT?",HOST_VISIBLE":"",
+                              pf&VK_MEMORY_PROPERTY_HOST_COHERENT_BIT?",HOST_COHERENT":"",pf&VK_MEMORY_PROPERTY_HOST_CACHED_BIT?",HOST_CACHED":"",pf&VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT?",LAZILY_ALLOCATED":""); }
+      REPL("memory types (%u):%s\n",mp.memoryTypeCount,t); }
+    { u32 ni=0,nd=0; vkEnumerateInstanceExtensionProperties(NULL,&ni,NULL); vkEnumerateDeviceExtensionProperties(pd,NULL,&nd,NULL);
+      VkExtensionProperties *xi=calloc(ni+1,sizeof*xi), *xd=calloc(nd+1,sizeof*xd);
+      if(!xi||!xd){ pthread_mutex_unlock(&rep_m); kh_fatal(g,"gfx-device-report: out of memory"); }
+      vkEnumerateInstanceExtensionProperties(NULL,&ni,xi); vkEnumerateDeviceExtensionProperties(pd,NULL,&nd,xd);
+      char t[600]; size_t l=(size_t)snprintf(t,sizeof t,"instance");
+      for(int i=0;i<NREPIEXT;i++){ rep.iext[i]=ext_in(xi,ni,rep_iext[i]); if(l<sizeof t) l+=(size_t)snprintf(t+l,sizeof t-l," %s=%d",rep_iext[i],rep.iext[i]); }
+      if(l<sizeof t) l+=(size_t)snprintf(t+l,sizeof t-l,"; device");
+      for(int i=0;i<NREPDEXT;i++){ rep.dext[i]=ext_in(xd,nd,rep_dext[i]); if(l<sizeof t) l+=(size_t)snprintf(t+l,sizeof t-l," %s=%d",rep_dext[i],rep.dext[i]); }
+      free(xi); free(xd);
+      REPL("extensions OFFERED by the implementation (1 = offered; what vkd3d enabled is the `presentation extensions` line): %s\n",t); }
+    pthread_mutex_lock(&cen_m); cen_pd=pd; cen_mp2=vkGetPhysicalDeviceMemoryProperties2; cen_budget=rep.dext[REP_DEXT_BUDGET]&&vkGetPhysicalDeviceMemoryProperties2!=NULL; pthread_mutex_unlock(&cen_m);
+    if(rep.dext[REP_DEXT_BUDGET]&&!vkGetPhysicalDeviceMemoryProperties2) REPL("VK_EXT_memory_budget is offered but there is no vkGetPhysicalDeviceMemoryProperties2: the census has no budget numbers\n");
+    else REPL("VK_EXT_memory_budget=%d (%s)\n",rep.dext[REP_DEXT_BUDGET],rep.dext[REP_DEXT_BUDGET]?"its heap budget and usage are in the census line":"absent: no budget numbers in the census line");
+    REPL("MoltenVK Metal features (argumentBuffersTier, supportedSampleCounts)=absent (not read: vkGetPhysicalDeviceMetalFeaturesMVK is declared in mvk_deprecated_api.h, which needs the IOSurface headers; the Vulkan sample counts are above)\n");
+    { char t[2048]; census_text(t,sizeof t,dev); REPL("memory census: %s\n",t); }
+    { u64 m; rep.memlow_armed=memlow_read(&m);                                                   /* review X38 n=2 */
+      if(rep.memlow_armed) REPL("memory soft stop gfx-memory-low: armed: os_proc_available_memory below %llu MiB at a Present ends the run by name (status 3, reports written); now %llu MiB%s\n",
+                                P(MEMLOW_MARGIN_MIB),P(m),memlow_test>=0?" [TEST: KHNMC_GFX_TEST_MEMORY_AVAILABLE_MIB]":"");
+      else REPL("memory soft stop gfx-memory-low: not armed (no os_proc_available_memory on this platform: iOS only)\n"); }
+    char why[128]; rep.unsampled=bc_unsampled(rep.feat,why,sizeof why);
+    if(rep.unsampled) REPL("BC decision: NOT sampleable in optimal tiling: %s (textureCompressionBC=%d) -> named fatal gfx-no-bc: plan step C1 (CPU decode) comes before any game picture\n",why,rep.tcbc);
+    else REPL("BC decision: BC1, BC2 and BC3 UNORM are sampleable in optimal tiling (textureCompressionBC=%d): the game's BC textures are used as they are\n",rep.tcbc);
+    int unsampled=rep.unsampled, tcbc=rep.tcbc, test=rep.test_no_bc; rep.lines++;
+    fprintf(stderr,"kh: gfx device report: END (%d lines)\n",rep.lines);
+    pthread_mutex_unlock(&rep_m);
+    if(unsampled) kh_fatal(g,"gfx-no-bc: the Vulkan device '%s' cannot sample %s in optimal tiling (textureCompressionBC=%d)%s: the game's textures are 71%% BC3 and cannot be drawn. "
+                             "IOS-GRAPHICS-PLAN step C1 (decode BC on the CPU) or the ASTC transcode must come first",vk_dev_name,why,tcbc,test?" [TEST: KHNMC_GFX_TEST_NO_BC=1]":"");
+}
+#undef REPL
 /* the vkd3d instance (made once) and a NEW device of at least `level` on it.  S_OK and *out, or the failing HRESULT (reported here) */
 HRESULT kh_gfxc_device_new(KCtx *g,u32 level,u64 adapter_shown,ID3D12Device **out){
     (void)g; *out=NULL;
@@ -747,6 +962,7 @@ HRESULT kh_gfxc_device_new(KCtx *g,u32 level,u64 adapter_shown,ID3D12Device **ou
         kh_fatal(g,"gfx-gipa-wrapper: a vkd3d device was created but the gipa wrapper saw %s: vkd3d did not load %s through the wrapper",
                  !kh_gfxc_pres_ext.seen_instance?"no vkCreateInstance":"no vkCreateDevice",!kh_gfxc_pres_ext.seen_instance?"vkCreateInstance":"vkCreateDevice");
     pthread_mutex_lock(&vm); pres_ext_report(); pthread_mutex_unlock(&vm);
+    dev_report(g,dev);                                                           /* TASK38: once, at the first device; may end the run (gfx-no-bc) */
     *out=dev; return S_OK;
 }
 /* D3D12CreateDevice(adapter, featureLevel, riid, **ppDevice): the adapter is OUR DXGI object and is not passed on.  The game gets the host
@@ -886,6 +1102,7 @@ void kh_vkd3d_swap_attach(KCtx *g,u64 sc,u64 queue,u64 desc){
     HRCHK(ID3D12GraphicsCommandList_Close(s->list),"ID3D12GraphicsCommandList::Close(frame dump)");
     HRCHK(ID3D12Device_CreateFence(s->dev,0,D3D12_FENCE_FLAG_NONE,&IID_ID3D12Fence,(void**)&s->fence),"CreateFence(frame dump)");
     if(pmode){ KhPresentBuffers bb; bb_info(s,&bb); s->pres=kh_present_attach(s->dev,s->queue,&bb); }
+    pthread_mutex_lock(&cen_m); cen_dev=s->dev; pthread_mutex_unlock(&cen_m);  /* TASK38: the census reads MoltenVK's statistics of this device */
     wr64(g,sc+SW_PTR,U(s));
     fprintf(stderr,"kh: gfx vkd3d: swap chain 0x%llx: %d x %ux%u B8G8R8A8 back buffers (%s%s) on device %p (queue %p), readback %llu bytes (row pitch %u)%s\n",P(sc),NBUF,s->w,s->h,bb_names[s->bbmode],
             s->bbmode==BB_OWN?": our VkImages, PRESENT = TRANSFER_SRC":s->bbmode==BB_GENERAL?": our VkImages, PRESENT = GENERAL":": vkd3d's committed resources",(void*)s->dev,(void*)s->queue,P(s->rb_size),s->fp.Footprint.RowPitch,s->pres?"; presenter attached":"");
@@ -928,6 +1145,7 @@ void kh_vkd3d_swap_test_release(KCtx *g,u64 sc){
     for(int i=0;i<NBUF;i++){ drop_real(g,s->buf[i]); s->buf[i]=NULL; }
     if(s->bbmode!=BB_COMMITTED){ bb_drain(g,s,"swap chain release"); bb_images_free(s); }
     ID3D12Resource_Release(s->rb); ID3D12GraphicsCommandList_Release(s->list); ID3D12CommandAllocator_Release(s->alloc); ID3D12Fence_Release(s->fence);
+    pthread_mutex_lock(&cen_m); if(cen_dev==s->dev) cen_dev=NULL; pthread_mutex_unlock(&cen_m);   /* TASK38: no census read of a device that may be gone */
     ID3D12Device_Release(s->dev); ID3D12CommandQueue_Release(s->queue); free(s->seen); wr64(g,sc+SW_PTR,0); free(s);
 }
 
@@ -1085,6 +1303,7 @@ void kh_vkd3d_present(KCtx *g,u64 o,u64 n){
     Swap *s=swap_of(g,o,"Present");
     /* TASK36: the suspend gate FIRST: the readback below submits on the game's queue (frame dumps, hash log, video) */
     kh_gfx_gate_park("Present (before the frame readback)");
+    memlow_check(n);                                                    /* review X38 n=2: the gfx-memory-low soft stop, before a dump allocates */
     u32 idx=rd32(g,o+40)%NBUF;
     int want_dump=dump_dir[0]&&n>=dump_from&&n<=dump_to&&n%dump_every==0, want_video=video_wanted(), want_hash=hash_f!=NULL;
     if(want_dump||want_video||want_hash){
@@ -1119,6 +1338,7 @@ void kh_gfx_vkd3d_report(FILE *f){
     fprintf(f,"kh: gfx vkd3d: back buffers %s: own images made %llu, destroyed %llu, drains %llu; live Vulkan objects of the runtime %lld; gipa wrapper: %llu names, vkCreateInstance %llu, vkCreateDevice %llu\n",
             bb_names[bb_mode_env],P(n_bb_images_made),P(n_bb_images_freed),P(n_bb_drains),kh_vko_live_total(),P(gw_names),P(gw_inst_calls),P(gw_dev_calls));
     kh_present_report(f); kh_gfx_gate_report(f);
+    census_line(f,"report");                                                     /* TASK38: the memory census, every 300 presents and at exit */
     census_report(f);
     if(kh_gfx_wrap_on) kh_wrap_report(f);
     if(video_path[0]){
@@ -1166,8 +1386,7 @@ static int st_clear_present(KCtx *g,u64 m,u64 dev,u64 q,u64 sc,u64 al,u64 cl,u64
     return ok&&(u32)GC(VT(sc,8),sc,1,0)==0;
 }
 static int raw_is(const u8 *p,size_t n,u8 r,u8 gg,u8 b){ for(size_t i=0;i<n;i+=3) if(p[i]!=r||p[i+1]!=gg||p[i+2]!=b) return 0; return 1; }
-/* TASK36 selftest helpers */
-static int ext_in(const VkExtensionProperties *x,u32 n,const char *s){ for(u32 i=0;i<n;i++) if(!strcmp(x[i].extensionName,s)) return 1; return 0; }
+/* TASK36 selftest helpers (ext_in: with the device report, TASK38) */
 int kh_vk_test_read_image(ID3D12Device *dev,ID3D12CommandQueue *q,u64 image,u32 w,u32 h,int general,u8 *out);
 typedef struct { unsigned hold_ms; u64 d_at_clear, p_at_clear, f_at_clear, dr_at_clear, fr_at_clear; ID3D12Fence *fence; } GateObs;
 static void *gate_obs_clear(void *a){ GateObs *o=(GateObs*)a; struct timespec ts={(time_t)(o->hold_ms/1000),(long)(o->hold_ms%1000)*1000000L}; nanosleep(&ts,0);
@@ -1264,7 +1483,53 @@ int kh_gfx_vkd3d_selftest(KCtx *g){
 #endif
           fprintf(stderr,"kh: vkd3d selftest: offered by the implementation: surface=%d headless=%d metal=%d layer_settings=%d swapchain=%d display_timing=%d (enabled: see the presentation extensions line)\n",
                   ext_in(xi,ni,"VK_KHR_surface"),ext_in(xi,ni,"VK_EXT_headless_surface"),ext_in(xi,ni,"VK_EXT_metal_surface"),ext_in(xi,ni,"VK_EXT_layer_settings"),ext_in(xd,nd,"VK_KHR_swapchain"),ext_in(xd,nd,"VK_GOOGLE_display_timing")); }
-        free(xi); free(xd); } }
+        /* TASK38 (plan step 4): the device report block was printed once, for the device vkd3d uses, and says what that device says */
+        T(rep.printed==1 && !rep.test_no_bc);
+        if(xi&&xd){ for(int i=0;i<NREPIEXT;i++) T(rep.iext[i]==ext_in(xi,ni,rep_iext[i])); for(int i=0;i<NREPDEXT;i++) T(rep.dext[i]==ext_in(xd,nd,rep_dext[i])); }
+        free(xi); free(xd); }
+      PFN_vkGetPhysicalDeviceFeatures gf=(PFN_vkGetPhysicalDeviceFeatures)vk_gipa(vi,"vkGetPhysicalDeviceFeatures");
+      PFN_vkGetPhysicalDeviceFormatProperties gfp=(PFN_vkGetPhysicalDeviceFormatProperties)vk_gipa(vi,"vkGetPhysicalDeviceFormatProperties");
+      PFN_vkGetPhysicalDeviceMemoryProperties gmp=(PFN_vkGetPhysicalDeviceMemoryProperties)vk_gipa(vi,"vkGetPhysicalDeviceMemoryProperties");
+      T(gf&&gfp&&gmp);
+      if(gf&&gfp&&gmp){ VkPhysicalDeviceFeatures ft; memset(&ft,0,sizeof ft); gf(vpd,&ft); T(rep.tcbc==(int)ft.textureCompressionBC);
+        int same=0; for(int i=0;i<NREPFMT;i++){ VkFormatProperties fp; memset(&fp,0,sizeof fp); VkFormat vf=rep_vk_format(i); gfp(vpd,vf,&fp); same+=rep.vkf[i]==vf&&vf!=VK_FORMAT_UNDEFINED&&rep.feat[i]==fp.optimalTilingFeatures; }
+        T(same==NREPFMT);                                                                        /* the features printed are the device's, for vkd3d's own format mapping */
+        T(rep.vkf[2]==VK_FORMAT_BC3_UNORM_BLOCK && rep.vkf[4]==VK_FORMAT_D32_SFLOAT_S8_UINT);
+        VkPhysicalDeviceMemoryProperties mp; memset(&mp,0,sizeof mp); gmp(vpd,&mp);
+        T(rep.lines==16+(int)mp.memoryHeapCount);                                                /* BEGIN..END: 15 lines + one per heap (review X38 n=2: + the soft-stop line) */
+        fprintf(stderr,"kh: vkd3d selftest: device report: %d lines, textureCompressionBC=%d, BC formats not sampleable %d, VK_EXT_memory_budget=%d\n",rep.lines,rep.tcbc,rep.unsampled,rep.dext[REP_DEXT_BUDGET]); }
+      /* the BC decision on made-up feature sets: none missing, BC3 alone missing, all three missing (by name, in order) */
+      { const VkFormatFeatureFlags S=VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT, L=VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT|VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        VkFormatFeatureFlags all[NBC]={S|L,S,S|L}, no3[NBC]={S|L,S|L,L}, none[NBC]={L,0,L}; char why[128];
+        T(bc_unsampled(all,why,sizeof why)==0 && !why[0]); T(bc_unsampled(no3,why,sizeof why)==1 && !strcmp(why,"BC3_UNORM"));
+        T(bc_unsampled(none,why,sizeof why)==3 && !strcmp(why,"BC1_UNORM, BC2_UNORM, BC3_UNORM")); T(rep.unsampled==bc_unsampled(rep.feat,why,sizeof why)); }
+      /* review X38 n=2: the gfx-memory-low decision (below 512 MiB, only with a reading), and where the stop is armed: iOS, or a test reading */
+      { T(!memlow_fires(0,0) && memlow_fires(1,0) && memlow_fires(1,511) && !memlow_fires(1,512) && !memlow_fires(1,6000));
+        u64 m=0; int have=memlow_read(&m); T(rep.memlow_armed==have && !atomic_load(&memlow_fired));
+#if defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_MACCATALYST
+        T(have==1);
+#else
+        T(have==(memlow_test>=0) && (!have||m==(u64)memlow_test));
+#endif
+        fprintf(stderr,"kh: vkd3d selftest: gfx-memory-low soft stop %s (margin %llu MiB)\n",have?"armed":"not armed",P(MEMLOW_MARGIN_MIB)); }
+      /* the census: what this host does not have says absent; what it has is a number; the budget numbers iff the extension is offered */
+      { char t[2048]; u64 n0=cen_lines; census_text(t,sizeof t,rdv); T(cen_lines==n0+1);
+        char want[96]; snprintf(want,sizeof want,"QueryVideoMemoryInfo answers budget=%llu MiB",P(kh_dxgi_budget_answer()>>20)); T(strstr(t,want)!=NULL);
+        T((strstr(t,"VK_EXT_memory_budget: heap0 budget=")!=NULL)==(rep.dext[REP_DEXT_BUDGET]!=0) && (strstr(t,"VK_EXT_memory_budget=absent")!=NULL)==!rep.dext[REP_DEXT_BUDGET]);
+#if defined(__linux__)
+        T(strstr(t,"phys_footprint=absent")&&strstr(t,"os_proc_available_memory=absent")&&strstr(t," rss=")&&!strstr(t," rss=-1"));
+#elif defined(__APPLE__)
+        T(strstr(t,"phys_footprint=")&&!strstr(t,"phys_footprint=absent")&&!strstr(t,"phys_footprint=ERROR"));
+#endif
+#if defined(__APPLE__) && TARGET_OS_IPHONE && !TARGET_OS_MACCATALYST
+        T(!strstr(t,"os_proc_available_memory=absent"));
+#endif
+#ifdef KH_GFX_MVK_API
+        T(strstr(t,"gpuMemoryAllocated=")&&!strstr(t,"gpuMemoryAllocated=absent")&&!strstr(t,"gpuMemoryAllocated=ERROR"));
+#else
+        T(strstr(t,"gpuMemoryAllocated=absent")!=NULL);
+#endif
+        fprintf(stderr,"kh: vkd3d selftest: memory census: %s\n",t); } }
     T((u32)GC(VT(dev,7),dev)==1);                                                             /* GetNodeCount */
     T((u32)GC(VT(dev,15),dev,2)!=0);                                                           /* GetDescriptorHandleIncrementSize(RTV) */
     /* CreateCommandQueue(desc, riid, **pp) ; IUnknown through the trampoline */

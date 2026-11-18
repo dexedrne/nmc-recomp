@@ -94,11 +94,15 @@ static int h_factory(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) retur
         if(__builtin_expect(kh_aspect_log,0)) kh_aspect_note_swapchain(g,"CreateSwapChainForHwnd",d,rd32(g,sc+32),rd32(g,sc+36));
         out_obj(g,ARG(g,6),sc); SET_RAX(g,0); return 1; }
     default: return 0; } }
+/* TASK38: the budget QueryVideoMemoryInfo answers (fixed; IOS-GRAPHICS-PLAN R11: changing it can change the game's texture-heap sizing,
+ * so it is its own measured step).  The vkd3d backend's memory census prints it next to what the device and the OS say. */
+#define DXGI_BUDGET_ANSWER (6ull<<30)
+u64 kh_dxgi_budget_answer(void){ return DXGI_BUDGET_ANSWER; }
 static int h_adapter(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)o;(void)c;
     switch(s){
     case 7: { u32 i=(u32)A1(g); if(i==0){ out_obj(g,A2(g),o_output); SET_RAX(g,0); } else { out_obj(g,A2(g),0); SET_RAX(g,DXGI_NOT_FOUND); } return 1; }   /* EnumOutputs */
     case 8: case 10: { u64 d=A1(g); memset(hp(g,d),0,s==8?0x118:0x138); utf8_to_gw(g,d,128,"KHNMC null GPU (headless)"); wr32(g,d+0x100,0x106b); wr32(g,d+0x104,1); wr64(g,d+0x110,8ull<<30); wr64(g,d+0x128,0x1001); SET_RAX(g,0); return 1; }   /* GetDesc / GetDesc1 */
-    case 14: { u64 info=ARG(g,3); wr64(g,info,6ull<<30); wr64(g,info+8,64ull<<20); wr64(g,info+16,3ull<<30); wr64(g,info+24,0); SET_RAX(g,0); return 1; }   /* QueryVideoMemoryInfo(node, group, info) */
+    case 14: { u64 info=ARG(g,3); wr64(g,info,DXGI_BUDGET_ANSWER); wr64(g,info+8,64ull<<20); wr64(g,info+16,3ull<<30); wr64(g,info+24,0); SET_RAX(g,0); return 1; }   /* QueryVideoMemoryInfo(node, group, info) */
     default: return 0; } }
 static int h_output(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)o;(void)c;
     if(s==10){                                                                                                        /* WaitForVBlank */

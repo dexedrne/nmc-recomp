@@ -29,6 +29,10 @@ IOS_HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 IOS_SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ServerAliveCountMax=6)
 IOS_RSH="ssh -o BatchMode=yes -o ConnectTimeout=20"
 IOS_ENV='export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer; export LC_ALL=C;'
+# TASK38: GFX=1 (the app with the graphics backend: tools/ios/mac/lib.sh) reaches the Mac's scripts through every remote command;
+# without it the remote commands are as before
+case "${GFX:-0}" in 0|1) ;; *) echo "tools/ios: GFX must be 0 or 1 (got '${GFX}')" >&2; exit 2;; esac
+[ "${GFX:-0}" = 1 ] && IOS_ENV="$IOS_ENV export GFX=1;"
 IOS_DRIVER_LOCK=${KHNMC_IOS_DRIVER_LOCK_FILE:-$HOME/.cache/khnmc-ios-driver.lock}   # the variable: tests only (test_maclock.sh)
 
 ios_guard(){

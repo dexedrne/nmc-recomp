@@ -8,6 +8,8 @@ set -u
 . "$(dirname "$0")/common.sh"
 ios_guard
 what=${1:-both}; case "$what" in sim|device|both) ;; *) sed -n '2,7p' "$0" >&2; exit 2;; esac
+# TASK38: GFX=1 = the device app with the graphics backend (common.sh hands GFX to the Mac); the Simulator has none (no MoltenVK slice)
+[ "${GFX:-0}" = 1 ] && [ "$what" != device ] && { echo "tools/ios: GFX=1 builds the device app only (the Simulator has no graphics backend): GFX=1 tools/ios/build.sh device" >&2; exit 2; }
 "$IOS_HERE/tools/ios/sync.sh" src || exit 1
 rc=0
 if [ "$what" != device ]; then mac_step "khnmc iOS simulator build" build.sh iphonesimulator; r=$?; busy_note $r; [ $r = 0 ] || rc=$r; fi

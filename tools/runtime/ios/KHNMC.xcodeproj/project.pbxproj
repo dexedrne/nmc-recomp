@@ -167,6 +167,7 @@
 				GCC_OPTIMIZATION_LEVEL = 1;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Info.plist;
+				KHNMC_GFX_LDFLAGS = "";
 				KHNMC_LIBS = "$(KHNMC_REPO)/obj-$(PLATFORM_NAME)";
 				KHNMC_REPO = "$(SRCROOT)/../..";
 				MARKETING_VERSION = 0.1.0;
@@ -187,6 +188,7 @@
 					AudioToolbox,
 					"-framework",
 					GameController,
+					"$(KHNMC_GFX_LDFLAGS)",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = beer.vyvanse.khnmc;
 				PRODUCT_NAME = KHNMC;
@@ -209,6 +211,7 @@
 				GCC_OPTIMIZATION_LEVEL = 0;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Info.plist;
+				KHNMC_GFX_LDFLAGS = "";
 				KHNMC_LIBS = "$(KHNMC_REPO)/obj-$(PLATFORM_NAME)";
 				KHNMC_REPO = "$(SRCROOT)/../..";
 				MARKETING_VERSION = 0.1.0;
@@ -229,6 +232,7 @@
 					AudioToolbox,
 					"-framework",
 					GameController,
+					"$(KHNMC_GFX_LDFLAGS)",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = beer.vyvanse.khnmc;
 				PRODUCT_NAME = KHNMC;

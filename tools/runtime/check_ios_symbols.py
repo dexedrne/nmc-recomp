@@ -9,6 +9,9 @@ ELF `@GLIBC_x` version suffix are removed) and refuses:
                        fexecve daemon forkpty   (an iOS app is one process; the sandbox refuses the rest, `system` is not in the SDK)
   temporary files that are created outside the place the host gives (runtime/host_env.c: kh_tmpdir)
                        tmpfile tmpfile64 tmpnam tmpnam_r tempnam mktemp
+--allow NAME ...: names of the list this program may import after all, each with its reason where the build asks for it (the Makefile's
+IOS_SYMBOLS_ALLOW: `--allow mktemp` for a graphics build, because MoltenVK imports _mktemp).  A name that is not on the list is refused
+(a typo would allow nothing), and the result line says, per allowed name, whether the program imports it at all.
 `waitpid` is not on the list: the fatal-path selftests keep their (unreachable in such a build) parent halves, and waitpid exists
 on iOS.  This is a link-level proof for THIS program on THIS host; it does not replace compiling against the iOS SDK, whose
 availability attributes cover more than this list (see implementation notes, "unproven").
@@ -44,6 +47,9 @@ def main():
         if argv[2] != '--allow':
             die('unexpected argument %r' % argv[2])
         allow = set(argv[3:])
+        unknown = sorted(n for n in allow if n not in FORBIDDEN)
+        if not allow or unknown:
+            die('--allow needs names from the list (%s); not on it: %s' % (' '.join(sorted(FORBIDDEN)), ' '.join(unknown) or '(none given)'))
     try:
         allsyms = subprocess.check_output(['nm', binp], universal_newlines=True, stderr=subprocess.DEVNULL)
         text = subprocess.check_output(['nm', '-u', binp], universal_newlines=True, stderr=subprocess.DEVNULL)
@@ -71,7 +77,8 @@ def main():
     if bad:
         die('%s imports %s' % (binp, ', '.join('%s (%s)' % (n, FORBIDDEN[n]) for n in bad)))
     print('check_ios_symbols: %s: %s, %d imported symbols, none of the %d that an iOS app cannot use (fork, system, popen, exec*, posix_spawn, tmpfile, ...)%s'
-          % (binp, 'Mach-O' if macho else 'ELF', len(names), len(FORBIDDEN), '; allowed by request: ' + ' '.join(sorted(allow)) if allow else ''))
+          % (binp, 'Mach-O' if macho else 'ELF', len(names), len(FORBIDDEN),
+             '; allowed by request: ' + ', '.join('%s (%s)' % (n, 'imported' if n in names else 'not imported') for n in sorted(allow)) if allow else ''))
 
 
 if __name__ == '__main__':

@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # tools/ios_paths_selftest.sh : `--selftest` of a KH_IOS_PATHS build (make IOS_PATHS=1) the way an app would run it, on this host.
 #
-#   tools/ios_paths_selftest.sh BIN EXE OUTDIR [NICE]
+#   tools/ios_paths_selftest.sh BIN EXE OUTDIR [NICE [VAR=VALUE ...]]
 #
 # BIN = ./khnmc-iospaths, EXE = kh2fm.exe, OUTDIR = a directory of this run (created), NICE = nice level (default 10).
+# VAR=VALUE (TASK38): written into the conf as `env VAR=VALUE` lines, the way the app is told (e.g. KHNMC_GFX=vkd3dw for the graphics
+# selftest of an IOS_PATHS=1 GFX_VKD3D=1 build).  On Linux a variable that would choose the Vulkan driver (KHNMC_GFX_DRIVER, VK_ICD_FILENAMES,
+# VK_DRIVER_FILES, VK_ADD_DRIVER_FILES) is refused: the runtime selects lavapipe itself there and must stay the only one that does.
 # Builds OUTDIR/home as the app container: Documents/kh2fm.exe (a link to EXE), Documents/khnmc.conf (`arg --selftest`, a log
 # file and a status file), tmp/ ; then starts BIN with an EMPTY environment except PATH, KH_APP_HOME and KH_TMPDIR (an app has no
 # caller: what the run does must come from the conf and the container defaults), from OUTDIR as working directory.
@@ -15,11 +18,19 @@
 # Exit status: 0 only when the selftest passed AND these checks hold.  OUTDIR/home is removed first only when an earlier run of this
 # script made it (marker file).
 set -u
-[ $# -ge 3 ] || { sed -n '2,16p' "$0" >&2; exit 2; }
+[ $# -ge 3 ] || { sed -n '2,19p' "$0" >&2; exit 2; }
 abspath(){ case "$1" in /*) printf '%s\n' "$1";; *) printf '%s/%s\n' "$PWD" "$1";; esac; }
 BIN=$(abspath "$1"); EXE=$(abspath "$2"); OUT=$(abspath "$3"); NICE=${4:-10}
 [ -x "$BIN" ] && [ -f "$EXE" ] || { echo "ios_paths_selftest: missing $BIN or $EXE" >&2; exit 2; }
 case "$NICE" in ''|*[!0-9]*) echo "ios_paths_selftest: NICE must be a number" >&2; exit 2;; esac
+shift 3; [ $# -gt 0 ] && shift
+for kv in "$@"; do
+  case "$kv" in [A-Za-z_]*=*) ;; *) echo "ios_paths_selftest: '$kv' is not VAR=VALUE" >&2; exit 2;; esac
+  case "${kv%%=*}" in *[!A-Za-z0-9_]*) echo "ios_paths_selftest: bad variable name in '$kv'" >&2; exit 2;; esac
+  case "$kv" in *"
+"*) echo "ios_paths_selftest: a value must be one line: '$kv'" >&2; exit 2;; esac
+  if [ "$(uname -s)" = Linux ]; then case "${kv%%=*}" in KHNMC_GFX_DRIVER|VK_ICD_FILENAMES|VK_DRIVER_FILES|VK_ADD_DRIVER_FILES) echo "ios_paths_selftest: refusing ${kv%%=*} on Linux: the runtime selects the CPU Vulkan driver itself" >&2; exit 2;; esac; fi
+done
 H="$OUT/home"
 if [ -e "$H" ]; then [ -f "$H/.khnmc-ios-paths-home" ] || { echo "ios_paths_selftest: $H exists and is not from this script: not touching it" >&2; exit 2; }; rm -rf "$H"; fi
 mkdir -p "$H/Documents" "$H/tmp" || exit 2
@@ -31,6 +42,7 @@ log selftest.log
 status selftest.status
 arg --selftest
 CONF
+for kv in "$@"; do printf 'env %s\n' "$kv" >> "$H/Documents/khnmc.conf"; done
 before=$(cd "$OUT" && ls -A | grep -v -e '^launch\.out$' -e '^selftest\.out$' | LC_ALL=C sort | tr '\n' ' ')
 ( cd "$OUT" && env -i PATH=/usr/bin:/bin KH_APP_HOME="$H" KH_TMPDIR="$H/tmp" nice -n "$NICE" "$BIN" > "$OUT/launch.out" 2>&1 ); rc=$?
 after=$(cd "$OUT" && ls -A | grep -v -e '^launch\.out$' -e '^selftest\.out$' | LC_ALL=C sort | tr '\n' ' ')

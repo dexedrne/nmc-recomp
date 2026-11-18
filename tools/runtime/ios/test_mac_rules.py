@@ -18,6 +18,12 @@
      machine's modification times (rsync -a / -t): a changed file could arrive with a time OLDER than the object the Mac compiled
      from the previous copy, and mac/build.sh's make would keep the stale object.  They compare by content (-c) instead, so
      exactly the changed files get a fresh time there; every source copy goes through that one rsync definition.
+  7. the GFX switch (TASK38): mac/lib.sh accepts GFX=0|1 only and defines gfx_lib_check and gfx_ldflags; every xcodebuild call of
+     mac/build.sh and mac/sign_app.sh passes the GFX link flags (${GX[@]+"${GX[@]}"}, filled only when GFX=1: a graphics library
+     links only with them) and comes after a gfx_lib_check call in that script; mac/device_run.sh writes KHNMC_GFX=vkd3dw, VKD3D_DEBUG=warn
+     and VKD3D_SHADER_DEBUG=warn only inside `if [ "$GFX" = 1 ]`; the app project carries KHNMC_GFX_LDFLAGS empty and appends it to its
+     OTHER_LDFLAGS (both configurations); common.sh hands GFX=1 to the Mac.  Review X38 n=3: lib.sh defines gfx_has, and no mac/*.sh
+     pipes nm into grep (an unreadable file would read as "no backend").
 Exit 0 when every check holds, 1 otherwise (each failure named)."""
 import os, re, shlex, sys
 
@@ -148,6 +154,34 @@ for no, t in sy:
         src_copies += 1
         check(t.lstrip().startswith('"${RS[@]}"'), 'sync.sh:%d: a source copy that does not use "${RS[@]}": %s' % (no, t.strip()[:100]))
 check(src_copies >= 7, 'sync.sh: expected at least 7 source copies into $IOS_RDIR/src, found %d' % src_copies)
+
+# 7. the GFX switch (TASK38)
+lib = ' '.join(t for _, t in lines('mac/lib.sh'))
+check(re.search(r'GFX=\$\{GFX:-0\}; case "\$GFX" in 0\|1\) ;; \*\).*?exit 2', lib) is not None, 'mac/lib.sh: GFX is not limited to 0 or 1 (exit 2 otherwise)')
+check(re.search(r'\bgfx_lib_check\(\)', lib) is not None and re.search(r'\bgfx_ldflags\(\)', lib) is not None, 'mac/lib.sh: gfx_lib_check or gfx_ldflags is missing')
+for f in ('mac/build.sh', 'mac/sign_app.sh'):
+    ls = lines(f); kcheck = next((k for k, (no, t) in enumerate(ls) if re.search(r'(^|[;&|{(]\s*|\s)gfx_lib_check\s', t)), None)
+    xcs = [(k, no, t) for k, (no, t) in enumerate(ls) if re.search(r'(^|[;&|{(]\s*|nice -n \S+\s+)xcodebuild\s', t)]
+    check(bool(xcs), '%s: no xcodebuild call' % f)
+    for k, no, t in xcs:
+        check('${GX[@]+"${GX[@]}"}' in t, '%s:%d: xcodebuild without the GFX link flags ${GX[@]+"${GX[@]}"}: a GFX=1 library would not link' % (f, no))
+        check(kcheck is not None and kcheck < k, '%s:%d: xcodebuild without a gfx_lib_check before it (the archive\'s backend must match GFX)' % (f, no))
+dr = lines('mac/device_run.sh')
+for env in ('KHNMC_GFX=vkd3dw', 'VKD3D_DEBUG=warn', 'VKD3D_SHADER_DEBUG=warn'):
+    hits = [(no, t) for no, t in dr if 'env ' + env in t]
+    check(len(hits) == 1 and re.search(r'if \[ "\$GFX" = 1 \]; then.*env ' + re.escape(env), hits[0][1]) is not None,
+          'mac/device_run.sh: `env %s` is not written exactly once, inside if [ "$GFX" = 1 ]' % env)
+pbx = open(os.path.join(D, 'KHNMC.xcodeproj', 'project.pbxproj')).read()
+check(pbx.count('KHNMC_GFX_LDFLAGS = "";') == 2 and len(re.findall(r'"\$\(KHNMC_GFX_LDFLAGS\)",\n\t*\);', pbx)) == 2,
+      'KHNMC.xcodeproj: KHNMC_GFX_LDFLAGS is not empty in both configurations, or not the last word of OTHER_LDFLAGS (python3 tools/ios/make_project.py)')
+cm = ' '.join(t for _, t in lines('common.sh'))
+check(re.search(r'\[ "\$\{GFX:-0\}" = 1 \] && IOS_ENV="\$IOS_ENV export GFX=1;"', cm) is not None, 'common.sh: GFX=1 is not handed to the Mac (IOS_ENV)')
+# review X38 n=3: whether a file has the backend is asked through lib.sh's gfx_has only, which tells "nm could not read it" from "absent";
+# `nm ... | grep -q` reads an unreadable file as "no backend" (a GFX=0 signing passed on an archive nm never read)
+check(re.search(r'\bgfx_has\(\)', lib) is not None, 'mac/lib.sh: gfx_has is missing')
+for f in sorted(x for x in os.listdir(os.path.join(D, 'mac')) if x.endswith('.sh')):
+    bad = [no for no, t in lines('mac/' + f) if re.search(r'\bnm\s[^|;]*\|\s*grep\b', t)]
+    check(not bad, 'mac/%s:%s: nm piped into grep: an unreadable file would read as "no backend" (use gfx_has)' % (f, ','.join(map(str, bad))))
 
 for f in fails:
     print('test_mac_rules: FAIL: ' + f)
