@@ -34,3 +34,6 @@
 /nmc/
 __pycache__/
 .venv/
+
+# the owner's app icon (derived from the mod's emblem): copied to the Mac by tools/runtime/ios/sync.sh, never committed
+tools/runtime/ios/Assets.xcassets/AppIcon.appiconset/*.png

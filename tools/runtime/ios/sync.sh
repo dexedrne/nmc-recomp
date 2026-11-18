@@ -29,6 +29,11 @@ mac "mkdir -p ~/$IOS_RDIR/src/lifted/gen ~/$IOS_RDIR/src/lifted/shards ~/$IOS_RD
 "${RS[@]}" lifter-rt/ "$IOS_MAC:$IOS_RDIR/src/lifter-rt/"
 "${RS[@]}" --exclude '__pycache__' tools/ "$IOS_MAC:$IOS_RDIR/src/tools/"
 "${RS[@]}" input/ "$IOS_MAC:$IOS_RDIR/src/input/"                # the route scripts (tools/ios/mac/device_run.sh route)
+# the owner's app icon (docs/APPLE-PLAN.md "App icon"; derived from the mod's emblem, so never in the repository): into the Mac's copy
+# of the asset catalog, after the tools/ copy above (whose --delete removes it there each time)
+ICON=${KHNMC_APP_ICON:-$HOME/Documents/khnmc/app-icon/AppIcon-1024.png}
+[ -f "$ICON" ] || { echo "ios/sync: no app icon at $ICON (the owner's 1024x1024 AppIcon-1024.png; or set KHNMC_APP_ICON)" >&2; exit 2; }
+"${RS[@]}" "$ICON" "$IOS_MAC:$IOS_RDIR/src/tools/ios/Assets.xcassets/AppIcon.appiconset/AppIcon-1024.png"
 "${RS[@]}" --include '*.c' --include '*.h' --exclude '*' gen/ "$IOS_MAC:$IOS_RDIR/src/gen/"
 "${RS[@]}" lifted/gen/ "$IOS_MAC:$IOS_RDIR/src/lifted/gen/"
 "${RS[@]}" -z --include 'shard_*.c' --exclude '*' lifted/shards/ "$IOS_MAC:$IOS_RDIR/src/lifted/shards/"

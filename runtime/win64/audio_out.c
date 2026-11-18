@@ -30,7 +30,10 @@ static _Atomic uint64_t c_pulled, c_delivered, c_underruns, c_underrun_frames, c
 static _Atomic uint32_t c_min_fill; static _Atomic int c_min_valid;
 #define RLX memory_order_relaxed
 
+static _Atomic int device_attached;          /* a real output device pulls from the ring (kh_audio_out_attach_device) */
+void kh_audio_out_attach_device(int on){ atomic_store(&device_attached, on ? 1 : 0); }
 void kh_audio_ring_setup(int enable, uint32_t ring_frames, uint32_t target_frames){
+    if(atomic_load(&device_attached)){ fprintf(stderr, "kh: FATAL: audio-ring-rebuilt-with-device: the pull ring would be %s while a real output device reads it (its next pull would read freed or test data)\n", enable ? "rebuilt" : "disabled"); abort(); }
     if(!enable){ atomic_store(&enabled, 0); atomic_store(&started, 0); return; }
     uint32_t c = 1; while(c < ring_frames) c <<= 1;
     if(c != cap || !ring){ free(ring); ring = calloc((size_t)c * KH_AUDIO_OUT_CHANNELS, sizeof(float)); if(!ring){ fprintf(stderr, "kh: FATAL: audio-out: ring allocation of %u frames failed\n", c); abort(); } cap = c; mask = c - 1; }

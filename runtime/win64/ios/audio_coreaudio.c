@@ -43,7 +43,15 @@ static OSStatus kh_render(void *ref, AudioUnitRenderActionFlags *flags, const Au
     float *dst = (float *)io->mBuffers[0].mData;
     UInt32 cap = io->mBuffers[0].mDataByteSize / (UInt32)(sizeof(float) * KH_AUDIO_OUT_CHANNELS);
     if(frames > cap) frames = cap;
-    if(kh_audio_out_pull(dst, frames) == 0 && flags) *flags |= kAudioUnitRenderAction_OutputIsSilence;
+    if(kh_audio_out_pull(dst, frames) == 0){ if(flags) *flags |= kAudioUnitRenderAction_OutputIsSilence; return noErr; }
+    /* a hard limit before the speaker: whatever reaches the ring, nothing beyond full scale and no NaN is ever played
+     * (2026-11-18: a test signal of sample counters reached the iPhone speaker as loud noise) */
+    for(UInt32 i = 0, n = frames * KH_AUDIO_OUT_CHANNELS; i < n; i++){
+        float v = dst[i];
+        if(!(v >= -1.0f)) v = (v != v) ? 0.0f : -1.0f;          /* NaN -> 0, below -1 -> -1 */
+        else if(v > 1.0f) v = 1.0f;
+        dst[i] = v;
+    }
     return noErr;
 }
 static int kh_ca_check(OSStatus st, const char *what){
@@ -89,9 +97,10 @@ int kh_coreaudio_start(void){
         AudioUnitUninitialize(kh_unit); AudioComponentInstanceDispose(kh_unit); kh_unit = NULL; return -1;
     }
     kh_audio_out_format(&f);                                  /* what took effect */
+    kh_audio_out_attach_device(1);                            /* from here the ring may not be rebuilt (a named fatal if anything tries) */
     kh_audio_out_start();                                     /* before the unit asks for its first slice: the mixer begins to fill */
     if(kh_ca_check(AudioOutputUnitStart(kh_unit), "AudioOutputUnitStart")){
-        kh_audio_out_stop(); AudioUnitUninitialize(kh_unit); AudioComponentInstanceDispose(kh_unit); kh_unit = NULL; return -1;
+        kh_audio_out_stop(); kh_audio_out_attach_device(0); AudioUnitUninitialize(kh_unit); AudioComponentInstanceDispose(kh_unit); kh_unit = NULL; return -1;
     }
     kh_unit_running = 1;
     fprintf(stderr, "kh: audio-coreaudio: %s started, %u Hz float32 stereo, largest slice %u frames (property %u), ring target %u frames of %u\n",
@@ -107,6 +116,7 @@ void kh_coreaudio_stop(void){
     if(!kh_unit) return;
     kh_ca_check(AudioOutputUnitStop(kh_unit), "AudioOutputUnitStop");
     kh_audio_out_stop();
+    kh_audio_out_attach_device(0);                            /* the unit is stopped: it reads the ring no more */
     AudioUnitUninitialize(kh_unit); AudioComponentInstanceDispose(kh_unit); kh_unit = NULL; kh_unit_running = 0;
 }
 #endif /* KH_AUDIO_COREAUDIO */

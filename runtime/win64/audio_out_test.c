@@ -9,6 +9,13 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+pid_t kh_fork(void);                                          /* khnmc_rt.h: -1 where there is no fork (iOS) */
+void kh_selftest_not_run(const char *suite, const char *what, int checks);
 
 static int fails, checks;
 #define CHECK(c) do{ checks++; if(!(c)){ fails++; fprintf(stderr, "audio-out selftest FAIL: %s (line %d)\n", #c, __LINE__); } }while(0)
@@ -80,6 +87,15 @@ int kh_audio_out_selftest(void){
       CHECK(refused == 0 && short_pulls == 0); kh_audio_out_stats(&st); CHECK(st.underruns == 0 && st.max_fill <= f.target_frames); }
     kh_audio_out_stop();
     kh_audio_ring_setup(0, 0, 0);
+    /* 2026-11-18: with a real output device attached the ring must refuse to be rebuilt (a named fatal), never hand the device freed
+     * memory or a test's signal (a selftest's counter signal reached the iPhone speaker as loud noise).  Without the guard the child
+     * rebuilds the ring and exits 0, and this check fails. */
+    {
+        fflush(stderr); pid_t c = kh_fork();
+        if(c == 0){ int dn = open("/dev/null", O_WRONLY); if(dn >= 0) dup2(dn, 2); kh_audio_out_attach_device(1); kh_audio_ring_setup(1, 1024, 640); _exit(0); }
+        if(c > 0){ int st = 0; CHECK(waitpid(c, &st, 0) == c && !(WIFEXITED(st) && WEXITSTATUS(st) == 0)); }
+        else kh_selftest_not_run("audio-out", "the ring refuses a rebuild while a real device is attached (named fatal, in a child)", 1);
+    }
     fprintf(stderr, "kh: audio-out selftest: %d checks, %d failures (%u frames through a 1024-frame ring, %llu underruns of %u zero frames)\n", checks, fails, (unsigned)TOTAL, thr_underruns, zeros);
     return fails;
 }

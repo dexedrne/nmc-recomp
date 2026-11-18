@@ -11,6 +11,7 @@
 #      Documents; 3. start it, retrying every 20 s while iOS refuses because the phone is LOCKED (WAIT_UNLOCK_S, default 1800);
 #   4. read Documents/khnmc.status every 15 s until "exit N" (LIMIT_S, default 1500), then copy khnmc.log back.
 #   SKIP_INSTALL=1 skips steps 1 and 2 apart from the fresh status file (the app, the exe and the conf are already there).
+#   SOUND=1 (route mode only): the game's sound plays through the speaker; otherwise every test run is silent (KHNMC_AUDIO=null).
 # The phone's device id is read from ~/Developer/KHNMC/state/device.env (DEVICE=...), never from this repository.  Never names a
 # simulator.  Results in ~/Developer/KHNMC/run/device-<mode>-<time>/.  The app must stay in the foreground with the screen on:
 # iOS suspends it otherwise.
@@ -42,6 +43,8 @@ if [ "${SKIP_INSTALL:-0}" != 1 ]; then
   cp_to "$KROOT/pc/kh2fm.exe" kh2fm.exe || { say "copy of kh2fm.exe FAILED"; tail -5 "$OUT/devicectl.log"; exit 1; }
 fi
 { echo "# written by tools/ios/mac/device_run.sh ($MODE ${INPUT})"; echo "log khnmc.log"; echo "status khnmc.status"
+  # no sound in test runs unless SOUND=1 (route mode): a selftest must never reach the speaker (2026-11-18: a test signal did)
+  if [ "$MODE" = selftest ] || [ "${SOUND:-0}" != 1 ]; then echo "env KHNMC_AUDIO=null"; fi
   if [ "$MODE" = selftest ]; then echo "arg --selftest"
   else TAG=$(basename "$OUT"); echo "env KH_ROOT=@TMP@/$TAG/root"; echo "env KH_DOCS=@TMP@/$TAG/docs"   # fresh per run, as tools/route_batch.sh: a config the game saved in an earlier run changes how it boots
     echo "env KHNMC_INPUT_SCRIPT=@DOCS@/input.txt"; echo "env KH_RUN_GAME_FRAMES=$FRAMES"; echo "env KH_RUN_SECONDS=$((LIMIT-120))"

@@ -27,6 +27,7 @@ static char exe_path[1024]="/home/user/projects/kh2-nmc-analysis/pc/kh2fm.exe";
 static const char *entry_mode="crt";
 static u64 guest_space_size=0x300000000ull;   /* 12 GiB reserve, lazily committed */
 u64 gs_low_guard=0;                           /* bias mode: bytes of guest space below GS_BASE that are reserved without access (GS_BASE, or 0 = no guard) */
+int kh_run_is_selftest;                    /* --selftest: no real audio device is started (null_audio.c; 2026-11-18, a test signal reached the iPhone speaker) */
 static int exit_code_main=-1; static int selftest; static int hd_check; static const char *hd_check_report;
 
 #define RD16(p) (*(const u16*)(p))
@@ -223,7 +224,7 @@ static int kh_main_body(int argc,char **argv){
         else if(!strcmp(argv[i],"--docs")&&i+1<argc) snprintf(kh_docs,sizeof kh_docs,"%s",argv[++i]);
         else if(!strcmp(argv[i],"--entry")&&i+1<argc) entry_mode=argv[++i];
         else if(!strcmp(argv[i],"-v")) kh_verbose=1;
-        else if(!strcmp(argv[i],"--selftest")) selftest=1;
+        else if(!strcmp(argv[i],"--selftest")) selftest=kh_run_is_selftest=1;
         else if(!strcmp(argv[i],"--hd-check")){ hd_check=1; if(i+1<argc&&strncmp(argv[i+1],"--",2)) hd_check_report=argv[++i]; }
         else { fprintf(stderr,"usage: %s [--exe kh2fm.exe] [--root GAMEDIR] [--docs DIR] [--entry crt|winmain|axa|ADDR] [-v] [--selftest] [--hd-check [REPORT.tsv]]\n env: KH_TRACE=file KH_TRACE_MAX=n KH_STOP_AT_GX=1 KH_DET=1\n"
                               " --hd-check: build the HD asset table of every game file of the tree KHNMC_DATA (KHNMC_HD_PACKAGES, KHNMC_HD_MODLIST as in a run) and print the totals; no game image is loaded, nothing runs\n",argv[0]); return 2; }

@@ -42,7 +42,8 @@ def settings(d):
 
 
 def file_type(name):
-    return {'.c': 'sourcecode.c.c', '.h': 'sourcecode.c.h', '.m': 'sourcecode.c.objc', '.plist': 'text.plist.xml'}[Path(name).suffix]
+    return {'.c': 'sourcecode.c.c', '.h': 'sourcecode.c.h', '.m': 'sourcecode.c.objc', '.plist': 'text.plist.xml',
+            '.xcassets': 'folder.assetcatalog'}[Path(name).suffix]
 
 
 def generate(name, groups, target_settings):
@@ -56,7 +57,7 @@ def generate(name, groups, target_settings):
         objects.setdefault(section, []).append((ident, comment, body))
 
     app = oid('product')
-    sources, group_ids = [], []
+    sources, resources, group_ids = [], [], []
     for title, files in groups:
         children = []
         for path, fname in files:
@@ -70,6 +71,10 @@ def generate(name, groups, target_settings):
                 build = oid('build', path)
                 add('PBXBuildFile', build, f'{fname} in Sources', f'{{isa = PBXBuildFile; fileRef = {ref} /* {fname} */; }}')
                 sources.append((build, fname))
+            elif fname.endswith('.xcassets'):          # the app icon (tools/ios/Assets.xcassets): compiled by actool into the bundle
+                build = oid('build', path)
+                add('PBXBuildFile', build, f'{fname} in Resources', f'{{isa = PBXBuildFile; fileRef = {ref} /* {fname} */; }}')
+                resources.append((build, fname))
         gid = oid('group', title)
         kids = ''.join(f'\t\t\t\t{r} /* {n} */,\n' for r, n in children)
         add('PBXGroup', gid, title,
@@ -96,7 +101,7 @@ def generate(name, groups, target_settings):
     src_phase, fw_phase, res_phase = oid('phase', 'sources'), oid('phase', 'frameworks'), oid('phase', 'resources')
     phase('PBXSourcesBuildPhase', src_phase, 'Sources', sources)
     phase('PBXFrameworksBuildPhase', fw_phase, 'Frameworks', [])
-    phase('PBXResourcesBuildPhase', res_phase, 'Resources', [])
+    phase('PBXResourcesBuildPhase', res_phase, 'Resources', resources)
 
     common = {
         'ALWAYS_SEARCH_USER_PATHS': 'NO',
@@ -186,9 +191,12 @@ PREFIX_MAP = ['-ffp-contract=off', '-ffile-prefix-map=$(KHNMC_REPO)/=khnmc/']
 def projects():
     app = generate('KHNMC',
                    [('App shell', [('../../runtime/ios/ios_main.m', 'ios_main.m')]),
-                    ('App', [('Info.plist', 'Info.plist')])],
+                    ('App', [('Info.plist', 'Info.plist'), ('Assets.xcassets', 'Assets.xcassets')])],
                    {'INFOPLIST_FILE': 'Info.plist',
                     'PRODUCT_BUNDLE_IDENTIFIER': 'beer.vyvanse.khnmc',
+                    # the owner's icon (docs/APPLE-PLAN.md "App icon"): a single-size set; its PNG is NOT in the repository,
+                    # tools/ios/sync.sh copies it from ~/Documents/khnmc/app-icon/ into the Mac's copy of the catalog
+                    'ASSETCATALOG_COMPILER_APPICON_NAME': 'AppIcon',
                     # obj-iphoneos / obj-iphonesimulator: what `make IOS_SDK=$(PLATFORM_NAME) applib` writes (Makefile)
                     'KHNMC_LIBS': '$(KHNMC_REPO)/obj-$(PLATFORM_NAME)',
                     'OTHER_CFLAGS': PREFIX_MAP,

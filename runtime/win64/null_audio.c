@@ -797,7 +797,11 @@ void kh_seam_audio_init(void){
         else if(!strncmp(mode,"wav:",4)&&mode[4]&&strlen(mode+4)<sizeof wav_path){ snprintf(wav_path,sizeof wav_path,"%s",mode+4); soft_mode=1; }
         else { fprintf(stderr,"kh: FATAL: KHNMC_AUDIO=%s not understood (use: null | wav:<file> | pull | pull-test:<file>)\n",mode); fflush(stdout); kh_host_exit(2); }
     }
-    if(out_pull){ kh_audio_ring_setup(1,KH_AUDIO_OUT_RING_FRAMES,KH_AUDIO_OUT_TARGET_FRAMES); if(!out_pulltest&&kh_audio_pull_ready) kh_audio_pull_ready(); if(kh_vclock_pace_by_device()) fprintf(stderr,"kh: audio: KHNMC_AUDIO=%s with KHNMC_CLOCK=frames: the device paces the virtual clock (KHNMC_CLOCK_PACE=free implied; set it to realtime to keep the host-time floor as well)\n",mode); }                                   /* ring 16384 frames (341 ms; room for a target of 2 x 4096-frame slices), target fill 2048 (43 ms): above one 1024-frame callback + two passes */
+    if(out_pull){ kh_audio_ring_setup(1,KH_AUDIO_OUT_RING_FRAMES,KH_AUDIO_OUT_TARGET_FRAMES); if(!out_pulltest&&kh_audio_pull_ready){ extern int kh_run_is_selftest;
+        /* never a real device in a selftest run: the tests push their own signals (sample counters far above full scale) through this
+         * same ring and rebuild it; on the iPhone that reached the speaker as loud noise (2026-11-18) */
+        if(kh_run_is_selftest) fprintf(stderr,"kh: audio: selftest run: the audio device is NOT started (the tests drive the pull ring themselves)\n");
+        else kh_audio_pull_ready(); } if(kh_vclock_pace_by_device()) fprintf(stderr,"kh: audio: KHNMC_AUDIO=%s with KHNMC_CLOCK=frames: the device paces the virtual clock (KHNMC_CLOCK_PACE=free implied; set it to realtime to keep the host-time floor as well)\n",mode); }                                   /* ring 16384 frames (341 ms; room for a target of 2 x 4096-frame slices), target fill 2048 (43 ms): above one 1024-frame callback + two passes */
     { const char *pl=getenv("KHNMC_AUDIO_PEAKLOG"); if(pl&&*pl){ char path[1024]; snprintf(path,sizeof path,"%s",pl); char *c=strrchr(path,','); if(c){ *c=0; peak_thr=(float)atof(c+1); if(!(peak_thr>0.0f)) peak_thr=1.0f; }
         peak_f=fopen(path,"w"); if(!peak_f){ fprintf(stderr,"kh: FATAL: KHNMC_AUDIO_PEAKLOG: cannot create %s\n",path); fflush(stdout); kh_host_exit(2); } } }
     { const char *a=getenv("KHNMC_AUDIO_APPLY");

@@ -7,12 +7,14 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		6DEF45F05FA3A217B0E048A0 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = AE8224DEACB707490FE22FB3 /* Assets.xcassets */; };
 		EAC253D1D6B0C81F4DB24A34 /* ios_main.m in Sources */ = {isa = PBXBuildFile; fileRef = D1F860AC5E1D1D79AD68E57F /* ios_main.m */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		692E7ECCB8E1BB5BD6CB5F05 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; name = Info.plist; path = Info.plist; sourceTree = "<group>"; };
 		6C947568E980A3811F7C8015 /* KHNMC.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = KHNMC.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AE8224DEACB707490FE22FB3 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Assets.xcassets; path = Assets.xcassets; sourceTree = "<group>"; };
 		D1F860AC5E1D1D79AD68E57F /* ios_main.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; name = ios_main.m; path = ../../runtime/ios/ios_main.m; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
@@ -40,6 +42,7 @@
 			isa = PBXGroup;
 			children = (
 				692E7ECCB8E1BB5BD6CB5F05 /* Info.plist */,
+				AE8224DEACB707490FE22FB3 /* Assets.xcassets */,
 			);
 			name = App;
 			sourceTree = "<group>";
@@ -112,6 +115,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				6DEF45F05FA3A217B0E048A0 /* Assets.xcassets */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -156,6 +160,7 @@
 		D3EB934E4BC8C2D35540FAC4 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				COPY_PHASE_STRIP = NO;
 				CURRENT_PROJECT_VERSION = 1;
 				GCC_GENERATE_DEBUGGING_SYMBOLS = NO;
@@ -176,6 +181,10 @@
 					Foundation,
 					"-framework",
 					UIKit,
+					"-framework",
+					AVFoundation,
+					"-framework",
+					AudioToolbox,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = beer.vyvanse.khnmc;
 				PRODUCT_NAME = KHNMC;
@@ -192,6 +201,7 @@
 		F9A58A6CCB075254CC7109BD /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CURRENT_PROJECT_VERSION = 1;
 				GCC_GENERATE_DEBUGGING_SYMBOLS = YES;
 				GCC_OPTIMIZATION_LEVEL = 0;
@@ -211,6 +221,10 @@
 					Foundation,
 					"-framework",
 					UIKit,
+					"-framework",
+					AVFoundation,
+					"-framework",
+					AudioToolbox,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = beer.vyvanse.khnmc;
 				PRODUCT_NAME = KHNMC;

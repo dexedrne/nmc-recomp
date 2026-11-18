@@ -146,3 +146,16 @@ Story route with sound on the iPhone: `RemoteIO started, 48000 Hz float32 stereo
 Still open for sound: interruptions (a call, Siri), route changes (headphones) and background/foreground stop and start
 (docs/IOS-SHELL.md, "Suspend and resume").
 
+## App icon on the phone, and a sound incident (2026-11-18)
+The owner's icon is in the app: tools/runtime/ios/Assets.xcassets (a single-size AppIcon set; Contents.json committed, the PNG never:
+tools/runtime/ios/sync.sh copies `~/Documents/khnmc/app-icon/AppIcon-1024.png` into the Mac's copy, a named error if it is missing),
+ASSETCATALOG_COMPILER_APPICON_NAME=AppIcon; the signed app carries Assets.car and CFBundleIconName AppIcon.
+**Incident:** the first selftest after sound was wired ran with the RemoteIO unit started: the audio-out test pushes a counter signal
+(values far above full scale) through the same pull ring and rebuilds the ring, and that reached the speaker as loud noise (the
+owner: "iphone just made a scary bad sound"); the test also failed (2 checks) because the device took its frames. Fixed in four
+places: a selftest run never starts an audio device (`kh_run_is_selftest`, runtime/win64/loader.c, null_audio.c); the ring refuses to
+be rebuilt while a device is attached (`kh_audio_out_attach_device`, named fatal `audio-ring-rebuilt-with-device`, a selftest case
+in a child that fails without the guard: checked by removing it); the CoreAudio render callback clamps every sample to [-1, 1] and
+NaN to 0 before the speaker; device_run.sh writes `env KHNMC_AUDIO=null` for every test run unless SOUND=1. After the fix the
+phone's selftest is silent and passes (169,479 checks... the audio-out suite's new fork case is NOT RUN on iOS, as designed).
+
