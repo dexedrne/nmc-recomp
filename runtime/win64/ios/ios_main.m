@@ -15,7 +15,8 @@
  *     right for a test shell, to be replaced when the game has a picture (docs/IOS-SHELL.md: Metal layer, controller, audio).
  *   - a window with one label, because an app without a scene is killed by the system's launch watchdog, and so that a person
  *     who starts it sees where to look.
- * No entitlements, no network, no data in the bundle.  Bundle id beer.vyvanse.khnmc (tools/ios/make_project.py). */
+ * No network, no data in the bundle; the game data in Documents is excluded from backup (above main).  Bundle id
+ * beer.vyvanse.khnmc (tools/ios/make_project.py). */
 #import <UIKit/UIKit.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -74,8 +75,30 @@ static void start_game_once(void){
 }
 @end
 
+/* The game data lives in Documents (data/, pkgdir/, kh2fm.exe: runtime/host_env.c).  iOS backs Documents up to iCloud by default, and
+ * 42 GB of game data must never go there: the two folders are created if missing and marked excluded from backup, at every start
+ * (a folder's mark covers what is copied into it later), the exe too when it is there.  What happened is written to
+ * Documents/khnmc-backup.txt so it can be checked from the Mac (devicectl copy from). */
+static void exclude_game_data_from_backup(void){
+    NSFileManager *fm=[NSFileManager defaultManager];
+    NSString *docs=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    NSMutableString *out=[NSMutableString stringWithString:@"# written at every start by runtime/ios/ios_main.m\n"];
+    for(NSString *name in @[@"data",@"pkgdir",@"kh2fm.exe"]){
+        NSString *path=[docs stringByAppendingPathComponent:name]; BOOL dir=NO, ok=NO; NSError *err=nil;
+        if(![name hasSuffix:@".exe"] && ![fm fileExistsAtPath:path]) [fm createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:&err];
+        if([fm fileExistsAtPath:path isDirectory:&dir]){
+            NSURL *u=[NSURL fileURLWithPath:path isDirectory:dir];
+            ok=[u setResourceValue:@YES forKey:NSURLIsExcludedFromBackupKey error:&err];
+            NSNumber *v=nil; [u getResourceValue:&v forKey:NSURLIsExcludedFromBackupKey error:nil];
+            [out appendFormat:@"%@ excluded-from-backup=%@%@\n",name,(ok&&v.boolValue)?@"yes":@"NO",err?[@" error: " stringByAppendingString:err.localizedDescription]:@""];
+        } else [out appendFormat:@"%@ absent\n",name];
+    }
+    [out writeToFile:[docs stringByAppendingPathComponent:@"khnmc-backup.txt"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
 int main(int argc,char *argv[]){
     @autoreleasepool {
+        exclude_game_data_from_backup();
         /* the two directories only the system can name; runtime/host_env.c takes everything else from them */
         setenv("KH_APP_HOME",[NSHomeDirectory() fileSystemRepresentation],1);
         NSString *tmp=NSTemporaryDirectory();
