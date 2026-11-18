@@ -788,6 +788,7 @@ static void xa2_create(KCtx *g){
     kh_cnt_audio_calls++; if(!A0(g)){ SET_RAX(g,0x80004003u); KH_RET(g); return; }
     wr64(g,A0(g),new_engine(g)); SET_RAX(g,0); KH_RET(g);
 }
+void (*kh_audio_pull_ready)(void);                 /* khnmc_audio_out.h: the app shell's device start (iOS: CoreAudio) */
 void kh_seam_audio_init(void){
     const char *mode=getenv("KHNMC_AUDIO");
     if(mode&&*mode&&strcmp(mode,"null")){
@@ -796,7 +797,7 @@ void kh_seam_audio_init(void){
         else if(!strncmp(mode,"wav:",4)&&mode[4]&&strlen(mode+4)<sizeof wav_path){ snprintf(wav_path,sizeof wav_path,"%s",mode+4); soft_mode=1; }
         else { fprintf(stderr,"kh: FATAL: KHNMC_AUDIO=%s not understood (use: null | wav:<file> | pull | pull-test:<file>)\n",mode); fflush(stdout); kh_host_exit(2); }
     }
-    if(out_pull){ kh_audio_ring_setup(1,KH_AUDIO_OUT_RING_FRAMES,KH_AUDIO_OUT_TARGET_FRAMES); if(kh_vclock_pace_by_device()) fprintf(stderr,"kh: audio: KHNMC_AUDIO=%s with KHNMC_CLOCK=frames: the device paces the virtual clock (KHNMC_CLOCK_PACE=free implied; set it to realtime to keep the host-time floor as well)\n",mode); }                                   /* ring 16384 frames (341 ms; room for a target of 2 x 4096-frame slices), target fill 2048 (43 ms): above one 1024-frame callback + two passes */
+    if(out_pull){ kh_audio_ring_setup(1,KH_AUDIO_OUT_RING_FRAMES,KH_AUDIO_OUT_TARGET_FRAMES); if(!out_pulltest&&kh_audio_pull_ready) kh_audio_pull_ready(); if(kh_vclock_pace_by_device()) fprintf(stderr,"kh: audio: KHNMC_AUDIO=%s with KHNMC_CLOCK=frames: the device paces the virtual clock (KHNMC_CLOCK_PACE=free implied; set it to realtime to keep the host-time floor as well)\n",mode); }                                   /* ring 16384 frames (341 ms; room for a target of 2 x 4096-frame slices), target fill 2048 (43 ms): above one 1024-frame callback + two passes */
     { const char *pl=getenv("KHNMC_AUDIO_PEAKLOG"); if(pl&&*pl){ char path[1024]; snprintf(path,sizeof path,"%s",pl); char *c=strrchr(path,','); if(c){ *c=0; peak_thr=(float)atof(c+1); if(!(peak_thr>0.0f)) peak_thr=1.0f; }
         peak_f=fopen(path,"w"); if(!peak_f){ fprintf(stderr,"kh: FATAL: KHNMC_AUDIO_PEAKLOG: cannot create %s\n",path); fflush(stdout); kh_host_exit(2); } } }
     { const char *a=getenv("KHNMC_AUDIO_APPLY");

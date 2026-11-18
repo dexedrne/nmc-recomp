@@ -19,7 +19,7 @@ LOG="$RUNS/build-$SDK.log"; : > "$LOG"
 mem_gate "the $SDK build" | tee -a "$LOG"; [ "${PIPESTATUS[0]}" = 0 ] || exit 3
 OL="obj-$SDK"
 # no build-machine paths in the objects (debug info, __FILE__): the same two variables in EVERY make call of this script
-MK=(nice -n $NICE make IOS_SDK="$SDK" "EXTRA=-ffile-prefix-map=$SRC/=khnmc/" "LIFT_EXTRA=-ffile-prefix-map=$SRC/=khnmc/")
+MK=(nice -n $NICE make IOS_SDK="$SDK" COREAUDIO=1 "EXTRA=-ffile-prefix-map=$SRC/=khnmc/" "LIFT_EXTRA=-ffile-prefix-map=$SRC/=khnmc/")
 "${MK[@]}" "$OL/shards/.stamp" >> "$LOG" 2>&1 || { echo "ios/mac: build: the renamed shard copies could not be generated (see $LOG)" >&2; exit 1; }
 names=$(cd lifted/shards && ls shard_*.c | sed 's/\.c$//'); total=$(echo "$names" | wc -l | tr -d ' ')
 # shellcheck disable=SC2086

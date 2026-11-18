@@ -15,9 +15,11 @@
  *     right for a test shell, to be replaced when the game has a picture (docs/IOS-SHELL.md: Metal layer, controller, audio).
  *   - a window with one label, because an app without a scene is killed by the system's launch watchdog, and so that a person
  *     who starts it sees where to look.
- * No network, no data in the bundle; the game data in Documents is excluded from backup (above main).  Bundle id
+ * No network, no data in the bundle; the game data in Documents is excluded from backup (above main); sound through RemoteIO
+ * (setup_sound_session).  Bundle id
  * beer.vyvanse.khnmc (tools/ios/make_project.py). */
 #import <UIKit/UIKit.h>
+#import <AVFoundation/AVFoundation.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +27,21 @@
 
 #define KH_APP_THREAD_STACK (1u<<20)          /* keep equal to tools/ios/host_shell.c; the guest threads get their own (loader.c) */
 int kh_main(int argc,char **argv);
+int kh_coreaudio_start(void);                 /* runtime/ios/audio_coreaudio.c (COREAUDIO=1) */
+extern void (*kh_audio_pull_ready)(void);     /* runtime/khnmc_audio_out.h: called once the mixer's pull ring exists */
+
+/* Sound: the mixer runs in pull mode (KHNMC_AUDIO=pull unless khnmc.conf says otherwise) and the RemoteIO unit pulls from it.  The
+ * session is SoloAmbient, the iOS default for games: it follows the ring/silent switch and stops other apps' audio while it plays.
+ * A failed start is reported in the log and the game goes on without sound (the mixer keeps its own clock). */
+static void start_sound(void){
+    if(kh_coreaudio_start()) fprintf(stderr,"kh: ios: the audio unit did not start: no sound in this run\n");
+}
+static void setup_sound_session(void){
+    NSError *err=nil; AVAudioSession *as=[AVAudioSession sharedInstance];
+    if(![as setCategory:AVAudioSessionCategorySoloAmbient error:&err]) fprintf(stderr,"kh: ios: audio session category: %s\n",err.localizedDescription.UTF8String);
+    err=nil; if(![as setActive:YES error:&err]) fprintf(stderr,"kh: ios: audio session activation: %s\n",err.localizedDescription.UTF8String);
+    kh_audio_pull_ready=start_sound;
+}
 
 static void *game_thread(void *arg){
     (void)arg;
@@ -100,6 +117,8 @@ static void exclude_game_data_from_backup(void){
 int main(int argc,char *argv[]){
     @autoreleasepool {
         exclude_game_data_from_backup();
+        setenv("KHNMC_AUDIO","pull",0);       /* khnmc.conf may still set another mode (env KHNMC_AUDIO=null for silent test runs) */
+        setup_sound_session();
         /* the two directories only the system can name; runtime/host_env.c takes everything else from them */
         setenv("KH_APP_HOME",[NSHomeDirectory() fileSystemRepresentation],1);
         NSString *tmp=NSTemporaryDirectory();

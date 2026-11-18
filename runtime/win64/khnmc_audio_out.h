@@ -75,6 +75,9 @@ typedef struct {
 extern "C" {
 #endif
 /* device side */
+/* set by the app shell BEFORE kh_main (runtime/ios/ios_main.m: starts the CoreAudio unit); called once, on the thread that runs the
+ * runtime's start-up, right after the pull ring exists (KHNMC_AUDIO=pull; not for pull-test, which has its simulated device) */
+extern void (*kh_audio_pull_ready)(void);
 int      kh_audio_out_start(void);                                   /* 0 ok; -1: KHNMC_AUDIO=pull is not the selected backend */
 void     kh_audio_out_stop(void);
 uint32_t kh_audio_out_pull(float *interleaved, uint32_t frames);    /* real-time safe: no lock, no allocation, no system call */

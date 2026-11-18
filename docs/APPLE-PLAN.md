@@ -136,3 +136,13 @@ from iCloud backup at every start (written to Documents/khnmc-backup.txt) and ke
   (Documents/Saves/.../config1525.dat) makes it boot past the first-time screens, which a route that waits for them never sees
   (the first story run on the phone ended so: 0 of 58 steps). The runtime now creates the game's Documents folder itself.
 
+## Sound on the iPhone, 2026-11-18
+runtime/ios/audio_coreaudio.c (written on Linux for task 28, never compiled until now) is built into the iPhone library (COREAUDIO=1 in
+tools/runtime/ios/mac/build.sh) and compiled cleanly the first time; the app links AVFoundation and AudioToolbox, sets KHNMC_AUDIO=pull
+(khnmc.conf can still say `env KHNMC_AUDIO=null`), takes the SoloAmbient session (follows the silent switch), and starts the RemoteIO
+unit through a hook the runtime calls once the mixer's pull ring exists (`kh_audio_pull_ready`, runtime/khnmc_audio_out.h).
+Story route with sound on the iPhone: `RemoteIO started, 48000 Hz float32 stereo, largest slice 4096 frames, ring target 8192 of
+16384`; 9,121,920 frames delivered (190 s), 1 underrun of 960 frames, 0 overruns; the route 58 of 58 as without sound.
+Still open for sound: interruptions (a call, Siri), route changes (headphones) and background/foreground stop and start
+(docs/IOS-SHELL.md, "Suspend and resume").
+
