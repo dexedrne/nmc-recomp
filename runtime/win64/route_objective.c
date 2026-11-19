@@ -43,6 +43,7 @@
  *                    (00objentry.bin: 0x60 bytes, the model name at +8, e.g. "N_EX760_TT_SHOP_ACCE").  The object list is the one
  *                    `enemies-at-most` walks ([0x142a171c8], next = the id at +0xa90); position at +0x670. */
 #include "route_state.h"
+#include "xion_swap.h"
 #include <math.h>
 u64 kh_input_game_frames(void);
 #define NOW_WORLD   (GS_BASE+0x717008ull)
@@ -306,7 +307,15 @@ int kh_route_menu_text_seen(KCtx *g,int id){
 void kh_route_menu_text_test_reset(void){ pthread_mutex_lock(&mt_lock); mt.menu=-1; mt.page=-2; mt.n=0; mt.full=0; pthread_mutex_unlock(&mt_lock); }   /* selftest only */
 /* (A temporary caller trace of this hook, run-Q31/x47b, found the camp menu's labels looked up by the row helper 0x2f74a0 for rows
  * built from the descriptors at 0x1405badb0; the trace is not kept: route_state.c, kh_route_menu_flag, says what decides the rows.) */
-void orig_f_3ad9a0(KCtx *); void f_3ad9a0(KCtx *g){ int id=(int)(s32)(u32)KH_RCX(g); orig_f_3ad9a0(g); kh_route_message_lookup_note(id,KH_RAX(g)); kh_route_menu_text_note(g,id,KH_RAX(g)); }
+void orig_f_3ad9a0(KCtx *);
+void f_3ad9a0(KCtx *g){
+    int id=(s32)A0(g);
+    u64 overlay=kh_xkb_message(id);
+    if(overlay){ SET_RAX(g,overlay); KH_RET(g); }
+    else orig_f_3ad9a0(g);
+    kh_route_message_lookup_note(id,KH_RAX(g));
+    kh_route_menu_text_note(g,id,KH_RAX(g));
+}
 
 /* ---- reaction commands ------------------------------------------------------------------------------------------------------------ */
 /* Review of task 31: "usable" is what the field command's update 0x3b2340 would answer in the next frame as far as memory says (read in

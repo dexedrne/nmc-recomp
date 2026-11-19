@@ -10,8 +10,57 @@
 #define FC VA(0x2a10620)
 #define MICKEY VA(0x7523b8)
 
-int kh_xion_enabled;
-static int chosen,held,save_interaction,death_pending;
+int kh_xion_enabled,kh_xkb_menu;
+static u64 messages[6];
+static const char *const lines[]={
+    "Standard","Critical","Xion Knows Best","Play as Xion.\nRoxas steps in when needed.",
+    "Roxas steps in","Xion returns"
+};
+static const u16 refs[]={30000,30001,20019,30002,17205,17206,20020,30003};
+
+u64 kh_xkb_message(int id){
+    unsigned index=(id&0x7fff)-30000u;
+    return kh_xkb_menu && index<4 ? messages[index] : 0;
+}
+
+static void prepare_menu(KCtx *g){
+    if(!messages[0]){
+        for(unsigned i=0;i<6;i++){
+            const char *src=lines[i];
+            messages[i]=ga_alloc(strlen(src)+1,16);
+            u8 *dst=GUEST_PTR(messages[i]);
+            while(*src){
+                char c=*src++;
+                if(c>='a'&&c<='z') *dst++=0x9a+c-'a';
+                else if(c>='A'&&c<='Z') *dst++=0x2e + c-'A';
+                else if(c==' ') *dst++=1;
+                else if(c=='\n') *dst++=2;
+                else if(c=='.') *dst++=0x4f;   /* 0x4f = '.'; 0x4e is the Japanese full stop (OpenKH InternationalSystemDecode) */
+                else kh_fatal(g,"xkb-message-encoding");
+            }
+            *dst=0;
+        }
+    }
+    for(unsigned i=0;i<8;i++) wr32(g,VA(0x5b870c)+4*i,0x8000|refs[i]);
+}
+#define MENU_INIT(r) void orig_f_##r(KCtx *); void f_##r(KCtx *g){ \
+    if(kh_xkb_menu) prepare_menu(g); orig_f_##r(g); if(kh_xkb_menu) wr32(g,VA(0xb1d810),0); }
+MENU_INIT(2b84f0)
+MENU_INIT(2b8520)
+
+void orig_f_2b88c0(KCtx *);
+void f_2b88c0(KCtx *g){
+    if(!kh_xkb_menu){orig_f_2b88c0(g);return;}
+    u32 index=rd32(g,VA(0xb1d810));
+    if(index>=4) kh_fatal(g,"xkb-menu-choice: %u",index);
+    kh_xion_enabled=index==3;
+    wr32(g,VA(0xb1d810),index==3?1:index+1);
+    orig_f_2b88c0(g);
+    wr32(g,VA(0xb1d810),index);
+    kh_warn("xkb-choice: row %u level %u XKB %d",index,rd32(g,VA(0x9abd48)),kh_xion_enabled);
+}
+
+static int declined,save_interaction,death_pending;
 static u64 xion,roxas,command_actor,command_place;
 static u16 command_evt;
 static u64 retiring;
@@ -20,8 +69,11 @@ static s32 original_hp,original_mp,entry_hp,entry_mp;
 
 /* Guest actor addresses and gauge backups belong to the same cut as the player sheets. */
 void kh_rewind_xion(KhRecords *r){
-    KH_RECORD(r,chosen);
-    KH_RECORD(r,held);
+    extern void kh_rewind_xkb_save(KhRecords *);
+    kh_rewind_xkb_save(r);
+    KH_RECORD(r,declined);
+    KH_VALUE(r,kh_xion_enabled);
+    KH_RECORD(r,messages);
     KH_RECORD(r,save_interaction);
     KH_RECORD(r,death_pending);
     KH_RECORD(r,xion);
@@ -38,9 +90,9 @@ void kh_rewind_xion(KhRecords *r){
 }
 
 void kh_xion_init(void){
-    const char *e=getenv("KHNMC_XION_SWAP");
-    if(e&&*e&&strcmp(e,"0")&&strcmp(e,"1")) kh_fatal(NULL,"xion-swap-mode: expected 0 or 1");
-    kh_xion_enabled=e&&!strcmp(e,"1");
+    const char *e=getenv("KHNMC_XKB_MENU");
+    if(e&&*e&&strcmp(e,"0")&&strcmp(e,"1")) kh_fatal(NULL,"xkb-menu-mode: expected 0 or 1");
+    kh_xkb_menu=e&&!strcmp(e,"1");
 }
 
 static int field_supported(int world,int area,int map,int btl,int evt){
@@ -58,7 +110,7 @@ static int supported(KCtx *g,int loading){
     if(!kh_route_programs(g,NULL,&map,&btl,&evt)) return 0;
     int world=kh_route_world(g),area=kh_route_area(g);
     int allowed=field_supported(world,area,map,btl,evt);
-    if(!allowed&&loading&&chosen&&world==8&&area==9&&map==0&&btl==10&&evt==0)
+    if(!allowed&&loading&&kh_xion_enabled&&world==8&&area==9&&map==0&&btl==10&&evt==0)
         kh_warn("xion-swap-declined: mu09 0/10/0 retains Roxas: P_EX220 ptya table 28 lacks key 1");
     return allowed;
 }
@@ -127,6 +179,7 @@ static void handback(KCtx *g,const char *reason){
     wr32(g,xion+0x120,rd32(g,xion+0x120)|(1u<<19)); // native end-of-frame deletion queue
     u64 player=roxas;
     xion=roxas=0;
+    if(messages[4]) call(g,0x17b710,messages[4],0);
     if(lethal){
         u64 desc=call(g,0x4ad270,rd32(g,player),0);
         kh_call(g,rd64(g,rd64(g,desc)+0xb0),desc,player,0,0);
@@ -137,15 +190,15 @@ static void enter(KCtx *g,const KhPlayerSheet *p){
     u64 row=call(g,0x3e2e40,0,0);
     if(!row||rd16(g,row+0x24)!=792||rd64(g,PARKED)||p->chr!=1||p->hp<=0) return;
     u64 ent=call(g,0x3dfeb0,792,0);
-    if(!ent||rd16(g,ent+0x4c)!=4){ chosen=0; kh_warn("xion-swap-objentry: missing sheet 4, keeping Roxas"); return; }
+    if(!ent||rd16(g,ent+0x4c)!=4){ declined=1; kh_warn("xion-swap-objentry: missing sheet 4, keeping Roxas"); return; }
     u32 ready=call(g,0x3e0160,792,ent);
-    if(!ready||(ready&~12u)){ kh_warn("xion-swap-resources: cache status %#x, keeping Roxas",ready); chosen=0; return; }
+    if(!ready||(ready&~12u)){ kh_warn("xion-swap-resources: cache status %#x, keeping Roxas",ready); declined=1; return; }
     u64 pos=call(g,0x3b5b40,p->obj,0);
     if(!pos||!rd32(g,VA(0x2a23950))){
-        kh_warn("xion-swap-preflight: missing position or free character sheet, keeping Roxas"); chosen=0; return;
+        kh_warn("xion-swap-preflight: missing position or free character sheet, keeping Roxas"); declined=1; return;
     }
     u64 actor=call(g,0x152430,0xe60,0);
-    if(!actor){ kh_warn("xion-swap-allocation: keeping Roxas"); chosen=0; return; }
+    if(!actor){ kh_warn("xion-swap-allocation: keeping Roxas"); declined=1; return; }
     roxas=p->obj;
     call(g,0x3a80e0,0,0);
     actor_method(g,roxas,0x80); // trap_obj_hide: attachments still need their owner in the object list
@@ -161,7 +214,7 @@ static void enter(KCtx *g,const KhPlayerSheet *p){
     if(!sheet||rd64(g,ACTIVE)!=actor||rd64(g,FC+0xae0)!=actor||rd64(g,FC+0xc38)!=actor){
         actor_method(g,roxas,0x88);
         call(g,0x4151e0,MICKEY,actor); retiring=actor; wr32(g,actor+0x120,rd32(g,actor+0x120)|(1u<<19)); call(g,0x3a8140,0,0);
-        roxas=0; chosen=0; kh_warn("xion-swap-constructor: rolled back to Roxas"); return;
+        roxas=0; declined=1; kh_warn("xion-swap-constructor: rolled back to Roxas"); return;
     }
     sheet_gauges[0]=rd32(g,sheet); sheet_gauges[1]=rd32(g,sheet+4); sheet_gauges[2]=rd32(g,sheet+8);
     sheet_gauges[3]=rd32(g,sheet+0x180); sheet_gauges[4]=rd32(g,sheet+0x184);
@@ -173,12 +226,11 @@ static void enter(KCtx *g,const KhPlayerSheet *p){
     wr32(g,sheet+8,0); // permit genuine KO, the zero-result callback is MICKEY vfn22
     call(g,0x3bd2e0,roxas,actor);
     xion=actor;
+    if(messages[5]) call(g,0x17b710,messages[5],0);
     kh_warn("xion-swap: Xion object 792, HP %d/%d MP %d/%d",entry_hp,rd32(g,sheet+4),entry_mp,rd32(g,sheet+0x184));
 }
 
 void kh_xion_frame(KCtx *g,u16 buttons){
-    int chord=(buttons&0xc0)==0xc0,edge=chord&&!held;
-    held=chord;
     if(death_pending){ KCtx ctx=*g; handback(&ctx,"KO"); return; }
     u64 actor=command_actor; command_actor=0;
     if(!actor||rd64(g,ACTIVE)!=actor||rd64(g,FC+0xae0)!=actor||rd64(g,FC+0xc38)!=actor||
@@ -196,17 +248,10 @@ void kh_xion_frame(KCtx *g,u16 buttons){
         save_interaction=1; handback(&ctx,"save interaction"); return;
     }
     if(save_interaction){
-        if(kh_route_at_save_point(g)&&!edge) return;
+        if(kh_route_at_save_point(g)) return;
         save_interaction=0;
     }
-    if(edge){
-        KhReaction r; char name[40];
-        if((xion&&kh_route_at_save_point(g))||(kh_route_reaction(g,&r)&&kh_route_reaction_target(g,&r,name,sizeof name)&&!strcmp(name,"SAVE_POINT"))){
-            chosen=!chosen; kh_warn("xion-swap: save point selected %s",chosen?"Xion":"Roxas");
-            if(!chosen){ handback(&ctx,"save point"); return; }
-        }
-    }
-    if(chosen&&!xion&&!retiring&&!rd64(g,VA(0x9ba928))&&!rd8(g,VA(0x9ba8d1))&&supported(g,0)&&!rd16(g,VA(0x9acdd4))){
+    if(!declined&&!xion&&!retiring&&!rd64(g,VA(0x9ba928))&&!rd8(g,VA(0x9ba8d1))&&supported(g,0)&&!rd16(g,VA(0x9acdd4))){
         if(kh_route_mission(g)){
             KhObjective o;
             if(kh_route_world(g)!=2||kh_route_area(g)!=7||!kh_route_objective(g,&o)||o.id!=0xa7) return;
@@ -219,6 +264,7 @@ void kh_xion_frame(KCtx *g,u16 buttons){
 void orig_f_3e2eb0(KCtx *);
 void f_3e2eb0(KCtx *g){
     orig_f_3e2eb0(g);
+    if(kh_xion_enabled) declined=0;
     if(kh_xion_enabled&&supported(g,1)){
         KCtx ctx=*g;
         kh_call(&ctx,VA(0x3e0460),792,3000,7,0); // normal area cache lifetime, without flushing Drive group 5000
@@ -226,20 +272,28 @@ void f_3e2eb0(KCtx *g){
 }
 
 #define BOUNDARY(r,why,reset) void orig_f_##r(KCtx *); void f_##r(KCtx *g){ \
-    if(kh_xion_enabled){ KCtx ctx=*g; handback(&ctx,why); if(reset) chosen=0; } orig_f_##r(g); }
+    if(kh_xion_enabled){ KCtx ctx=*g; handback(&ctx,why); if(reset) declined=1; } orig_f_##r(g); }
 BOUNDARY(3ac350,"event",0)
 BOUNDARY(3a24c0,"area program",0)
 BOUNDARY(152990,"area departure",0)
-BOUNDARY(2ed110,"save",0)
+void orig_f_2ed110(KCtx *);
+void f_2ed110(KCtx *g){
+    if(kh_xion_enabled){ KCtx ctx=*g; handback(&ctx,"save"); }
+    orig_f_2ed110(g); kh_xkb_serialized();
+}
 void kh_xion_reset(KCtx *g){
-    KCtx ctx=*g; handback(&ctx,"session reset"); chosen=held=save_interaction=0;
+    KCtx ctx=*g; handback(&ctx,"session reset"); kh_xion_enabled=declined=save_interaction=0;
 }
 void orig_f_2ed0e0(KCtx *);
 void f_2ed0e0(KCtx *g){
     if(kh_xion_enabled) kh_xion_reset(g);
     int menu_load=rd64(g,KH_RSP(g))==VA(0x2e59b6);
     orig_f_2ed0e0(g);
-    if(menu_load) kh_autosave_load(g);
+    if(menu_load){
+        if(kh_xkb_menu) kh_xkb_load(g);
+        kh_autosave_load(g);
+        if(kh_xion_enabled) prepare_menu(g);
+    }
     if(kh_xion_enabled) kh_warn("xion-swap: loaded Roxas, save EXP %u munny %u",rd32(g,VA(0x9acf90)),rd32(g,VA(0x9abcf0)));
 }
 BOUNDARY(2e4950,"system menu",0)
@@ -260,7 +314,7 @@ UPDATE(414eb0,0x3a92c0)
 UPDATE(4150e0,0x3a89a0)
 
 #define RETURN(r) void orig_f_##r(KCtx *); void f_##r(KCtx *g){ \
-    if(!xion||A0(g)!=xion){ orig_f_##r(g); return; } chosen=0; handback(g,"rescue command"); KH_RET(g); }
+    if(!xion||A0(g)!=xion){ orig_f_##r(g); return; } declined=1; handback(g,"rescue command"); KH_RET(g); }
 RETURN(416030)
 RETURN(416100)
 
@@ -268,7 +322,7 @@ void orig_f_415380(KCtx *);
 void f_415380(KCtx *g){
     if(!xion||A1(g)!=xion){ orig_f_415380(g); return; }
     // Finish the damage callback and its callers before detaching their live victim.
-    chosen=0; death_pending=1; KH_RET(g);
+    declined=1; death_pending=1; KH_RET(g);
 }
 
 void orig_f_4151e0(KCtx *);
@@ -287,7 +341,7 @@ void f_414dd0(KCtx *g){
     call(g,0x2e2d60,actor,0); call(g,0x152570,actor,0); KH_RET(g);
 }
 
-int kh_xion_selftest(void){
+int kh_xion_selftest(KCtx *g){
     int failures=0;
     failures+=fraction(0,20,60)!=0;
     failures+=fraction(7,20,60)!=21;
@@ -308,7 +362,19 @@ int kh_xion_selftest(void){
     fields+=field_supported(7,5,0,0,0);   // carpet traversal
     fields+=field_supported(1,0,0,0,0);   // ending transit
     fprintf(stderr,"kh: xion field classification: %d failures\n",fields);
-    return failures+fields;
+    int prior=kh_xion_enabled;
+    for(int mode=0;mode<2;mode++){
+        KhRecords cut={0};
+        kh_xion_enabled=mode;
+        kh_records_begin(&cut,0); kh_rewind_xion(&cut); kh_records_end(&cut);
+        kh_xion_enabled=!mode;
+        kh_records_begin(&cut,1); kh_rewind_xion(&cut); kh_records_end(&cut);
+        failures+=kh_xion_enabled!=mode;
+        kh_records_free(&cut);
+    }
+    kh_xion_enabled=prior;
+    extern int kh_xkb_save_selftest(KCtx *);
+    return failures+fields+kh_xkb_save_selftest(g);
 }
 
 u64 kh_xion_progress_player(void){ return xion?roxas:0; }

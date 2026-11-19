@@ -178,6 +178,7 @@ BGLOAD_HOOKS = 3a0c60 15edd0 3f99e0 3f9850 3a64f0 3a0aa0 3a0b30 3a0bd0 19c470 4a
 # Task 27: 0x2b7420 = the New Game menu task (runtime/phase_log.c: alive between entry and return; the route's newgame-* conditions)
 INPUT_HOOKS = 3a0660 105e10 2b7420
 # Save-point Xion prototype, including the native pre-use boundaries and MICKEY lifecycle.
+INPUT_HOOKS += 2b84f0 2b8520 2b88c0 145170 100ef0 101590 1004d0
 INPUT_HOOKS += 3dca50 3ed110 3d5c70 4151e0 414dd0 3e2eb0 414e30 414eb0 4150e0 415380 416030 416100 3ac350 3a24c0 152990 2ed0e0 2ed110 3ad540 2e4950
 # Task 30 (diagnostic, runtime/route_state.c, KHNMC_TRACE_PLACE=1): YS::OBJ::set_pos 0x3b64d0 / 0x3b6510 and the rotation setters 0x3b6420 / 0x3b6560, passed through
 PLACE_HOOKS = 3b64d0 3b6510 3b6420 3b6560 3b3200 3da940 419230

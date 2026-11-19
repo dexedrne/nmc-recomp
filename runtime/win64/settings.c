@@ -16,7 +16,7 @@ enum { HP, MP, EXP, DROP, HUD_COMBO, COUNT };
 const struct kh_option kh_options[]={
     BOOL_OPT("CHEAT_INF_HP","Infinite HP","0"), BOOL_OPT("CHEAT_INF_MP","Infinite MP","0"),
     NUMBER("EXP_MULT","EXP multiplier","1",0.5,10,0.5), NUMBER("DROP_MULT","Item drop multiplier","1",0.5,10,0.5),
-    BOOL_OPT("HUD_HIDE_COMBO","Hold L3 + R3 to hide HUD (not at save points)","0"),
+    BOOL_OPT("HUD_HIDE_COMBO","Hold L3 + R3 to hide HUD","0"),
     TWEAK_OPT("DEBUG_DEBUG_ON","Enable debug commands","off"),
     TWEAK_OPT("DEBUG_SOFT_RESET","Allow debug reset to title","off"),
     NUMBER("TWEAK_DEBUG_TURBO_SPEED","Debug turbo speed","7.5",0.1,100,0.1),
@@ -25,7 +25,7 @@ const struct kh_option kh_options[]={
 #include "tweak_groups.h"
 #undef KH_GROUP
     {"KHNMC_PLAYER_LOOK","Player appearance","roxas","roxas|xion",0,0,0},
-    BOOL_OPT("XION_SWAP","Xion swap","0"), BOOL_OPT("SCENE_ROXAS","Scene Roxas","0"),
+    BOOL_OPT("XKB_MENU","Xion Knows Best difficulty menu","0"), BOOL_OPT("SCENE_ROXAS","Scene Roxas","0"),
     NUMBER("FOV_ZOOM","Portrait camera zoom","1.3",1,1.89,0.05),
     NUMBER("HUD_SCALE_CMD","Portrait command menu","1.25",0.5,3,0.05),
     NUMBER("HUD_SCALE_HP","Portrait player gauges","1.5",0.5,3,0.05),
@@ -328,10 +328,7 @@ void kh_settings_frame(KCtx *g,uint64_t frame){
     if(schedule_storage && !pending){free(schedule_storage);schedule_storage=NULL;}
     extern u16 kh_input_buttons(void);
     int enabled=atomic_load(&values[HUD_COMBO])!=0;
-    /* 11/19 (main session): L3 + R3 is also the Xion swap's chord at a save point (task 54): no HUD hiding while standing at one */
-    extern int kh_xion_enabled; extern int kh_route_at_save_point(KCtx *);
-    int at_swap_point=enabled && kh_xion_enabled && g && kh_route_at_save_point(g);
-    atomic_store(&kh_hide_hud,enabled && !at_swap_point && hide_combo(enabled,kh_input_buttons()));
+    atomic_store(&kh_hide_hud,hide_combo(enabled,kh_input_buttons()));
     if(mp_probe && frame==mp_probe){
         KhPlayerSheet p;
         if(!kh_route_player_sheet(g,&p) || p.mp<2) kh_fatal(g,"settings-mp-probe: no active player with MP");

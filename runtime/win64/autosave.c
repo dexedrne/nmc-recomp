@@ -1,5 +1,6 @@
 /* Native port of equations19's auto-save, based on Denhonator's KHPCSpeedrunTools. */
 #include "autosave.h"
+#include "xion_swap.h"
 #include "route_state.h"
 #include "warp.h"
 #include <errno.h>
@@ -101,13 +102,16 @@ static int newest(int dir){
     return -1;
 }
 
+/* The optional trailer is committed by the same rename as the checkpoint. */
+static const u8 mode_trailer[]={'k','h','X','b',1};
 static int publish(int dir,int n,const u8 *data){
     char name[40]; filename(name,n);
     int fd=openat(dir,".slot.tmp",O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW,0600);
     if(fd<0) return 0;
     FILE *f=fdopen(fd,"wb");
     if(!f){ close(fd); return 0; }
-    int ok=fwrite(data,1,SAVE_SIZE,f)==SAVE_SIZE && !fflush(f) && !fsync(fd);
+    int ok=fwrite(data,1,SAVE_SIZE,f)==SAVE_SIZE &&
+        (!kh_xion_enabled || fwrite(mode_trailer,sizeof mode_trailer,1,f)==1) && !fflush(f) && !fsync(fd);
     if(fclose(f)) ok=0;
     if(ok) ok=renameat(dir,".slot.tmp",dir,name)==0;
     if(ok){
@@ -158,12 +162,16 @@ void kh_autosave_load(KCtx *g){
     int ok=0;
     if(f){
         struct stat st;
-        if(!fstat(fd,&st) && S_ISREG(st.st_mode) && st.st_size==SAVE_SIZE){
+        if(!fstat(fd,&st) && S_ISREG(st.st_mode) && (st.st_size==SAVE_SIZE || st.st_size==SAVE_SIZE+sizeof mode_trailer)){
             u64 candidate=ga_alloc(SAVE_SIZE,16);
             const u8 *data=GUEST_PTR(candidate);
             ok=fread(GUEST_PTR(candidate),1,SAVE_SIZE,f)==SAVE_SIZE && header_ok(data) &&
                rd64(g,GS_BASE+0xbef898) && native_valid(g,candidate);
+            int tagged=st.st_size!=SAVE_SIZE;
+            u8 trailer[sizeof mode_trailer];
+            if(ok && tagged) ok=fread(trailer,sizeof trailer,1,f)==1 && !memcmp(trailer,mode_trailer,sizeof trailer) && rd32(g,candidate+0x2498)==1;
             if(ok){
+                kh_xion_enabled=kh_xkb_menu && tagged;
                 memcpy(GUEST_PTR(SAVE),data,SAVE_SIZE);
                 kh_warn("autosave-load: %s %.2s%02u",name,kh_warp_world_names[data[12]],data[13]);
             }

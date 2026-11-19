@@ -101,7 +101,7 @@ case "$CLOCK" in ''|frames) ;; *) bad "CLOCK is frames or unset (got '$CLOCK')";
 GFX_APP=${GFX_APP:-}; case "$GFX_APP" in ''|0|1) ;; *) bad "GFX_APP is 0 or 1 (got '$GFX_APP')";; esac
 CUTSCENES=${CUTSCENES:-}; CUTSCENES_PACK=${CUTSCENES_PACK:-}                 # TASK50
 # EXTRA_ENV="KHNMC_A=x KHNMC_B=y" (play and route modes; 11/19): extra switches written as `env` lines with the cutscene line
-#   (e.g. KHNMC_PLAYER_LOOK=xion KHNMC_XION_SWAP=1 KHNMC_SCENE_ROXAS=1); only KHNMC_* names, no spaces in values.
+#   (e.g. KHNMC_PLAYER_LOOK=xion KHNMC_XKB_MENU=1 KHNMC_SCENE_ROXAS=1); only KHNMC_* names, no spaces in values.
 # LOOK_PACK=DIR (11/19, task 56): every file under DIR on this Mac goes to the app's Documents/looks/xion/<same relative path>
 #   (the default KHNMC_LOOK_DIR on iOS), one devicectl copy per file; nothing on the phone is removed.
 # SCENE_ROXAS_PACK is the directory containing obj/ and remastered/ (task 64).

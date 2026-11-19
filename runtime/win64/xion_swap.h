@@ -1,6 +1,9 @@
 #pragma once
 #include "khnmc_rt.h"
-extern int kh_xion_enabled;
+extern int kh_xion_enabled, kh_xkb_menu;
+u64 kh_xkb_message(int id);
+void kh_xkb_load(KCtx *g);
+void kh_xkb_serialized(void);
 void kh_xion_reset(KCtx *g);
 void kh_xion_init(void);
 void kh_xion_command_done(KCtx *g,u64 controller,u64 actor);

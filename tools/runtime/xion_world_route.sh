@@ -5,12 +5,11 @@ world=${1:?world required}
 out=${2:?output directory required}
 door=0
 target=""
-default_difficulty=1
 case "$world" in
  al) place="4 0 0";; bb) place="0 0 1"; target="-400 -1000";; dc) place="2 0 0";;
- di) place="1 0 0";; eh) default_difficulty=0; place="7 0 1"; target="-400 50";; lk) place="10 0 0";;
+ di) place="1 0 0";; eh) place="7 0 1"; target="-400 50";; lk) place="10 0 0";;
  lm) place="1 0 0";; mu) place="7 0 0";; nm) place="3 0 1"; target="1000 -800";;
- po) place="7 0 0";; tr) place="6 0 1"; door=1; target="5 -726";; tt) default_difficulty=0; place="19 0 7"; target="400 400";; wi) default_difficulty=0; place="3 0 1"; target="100 -200";;
+ po) place="7 0 0";; tr) place="6 0 1"; door=1; target="5 -726";; tt) place="19 0 7"; target="400 400";; wi) place="3 0 1"; target="100 -200";;
  hb) place="2 0 11"; target="-1138 -681";;
  ca) place="1 5 1"; door=50; target="1180 -695";;
  he) place="14 0 0";;
@@ -29,7 +28,7 @@ world == "eh" && /^@warp tt 2 / && !intro++ {
     # The EH intro uses sheet 12 until the second encounter sets flag 0x4801.
     while ((getline line < "input/route-story.txt") > 0) {
         if (line == "@expect game-level difficulty") copying=1
-        if (copying) print line
+        if (copying && line != "@expect game-level difficulty") print line
         if (line == "@expect btl-program 0x61") break
     }
     close("input/route-story.txt")
@@ -58,8 +57,8 @@ world == "eh" && /^@expect save-exp-at-least/ { next }
 {print}
 ' input/route-xion-fight.txt >"$out/field.txt"
 gate=/opt/build-tools/heavy.sh
-export KHNMC_CLOCK=frames KHNMC_CLOCK_PACE=free KHNMC_XION_SWAP=1 KHNMC_ROUTE_END=exit
-"$gate" tools/route_batch.sh -n 1 -j 1 -s 300 -g 25000 -d "${3:-$default_difficulty}" -i "$out/field.txt" -o "$out/field" >"$out/field.log" 2>&1
+export KHNMC_CLOCK=frames KHNMC_CLOCK_PACE=free KHNMC_XKB_MENU=1 KHNMC_ROUTE_END=exit
+"$gate" tools/route_batch.sh -n 1 -j 1 -s 300 -g 25000 -d 3 -i "$out/field.txt" -o "$out/field" >"$out/field.log" 2>&1
 log="$out/field/r01/run.out"
 grep -q 'xion-swap: Xion dealt' "$log" || { echo "xion-world-route: no Xion hit" >&2; exit 1; }
 grep -q 'xion-swap: collected native prize' "$log" || { echo "xion-world-route: no native pickup" >&2; exit 1; }
@@ -68,10 +67,10 @@ awk -v room="$room" '/warp: #[0-9]+ result/ { here=($5==room) } here && /Roxas \
 cd "$out/reload/root"
 export KH_ROOT="$PWD" KH_DOCS="$out/field/r01/docs" KH_EXE="$root/pc/kh2fm.exe" KHNMC_DATA="$root/data-full" KHNMC_PKGDIR="$root/pkgdir"
 # A pickup during a fight can precede the first EXP award. Verify the actual saved value.
-saved=$(sed -n 's/.*xion-swap: Roxas (save point).*save EXP \([0-9]*\) munny \([0-9]*\)$/\1 \2/p' "$log" | tail -1)
+saved=$(sed -n 's/.*xion-swap: Roxas (save interaction).*save EXP \([0-9]*\) munny \([0-9]*\)$/\1 \2/p' "$log" | tail -1)
 [[ "$saved" =~ ^[0-9]+\ [0-9]+$ ]] || { echo "xion-world-route: missing save handback" >&2; exit 1; }
 sed "s/^@expect save-exp-at-least .*/@expect save-exp-at-least ${saved%% *}/" "$root/input/route-xion-reload.txt" >"$out/reload.txt"
 export KHNMC_PHASELOG="$out/reload/phase.log" KHNMC_FILELOG="$out/reload/files.log" KH_RUN_GAME_FRAMES=7500 KH_RUN_SECONDS=240 KHNMC_INPUT_SCRIPT="$out/reload.txt"
 "$gate" timeout 330 "$root/khnmc" >"$out/reload/run.out" 2>&1
-grep -q 'route report: 7 of 7 steps done' "$out/reload/run.out" || { echo "xion-world-route: reload incomplete" >&2; exit 1; }
+grep -q 'route report: 8 of 8 steps done' "$out/reload/run.out" || { echo "xion-world-route: reload incomplete" >&2; exit 1; }
 grep -Fxq "kh: warn: xion-swap: loaded Roxas, save EXP ${saved% *} munny ${saved#* }" "$out/reload/run.out" || { echo "xion-world-route: saved progress changed on load" >&2; exit 1; }
