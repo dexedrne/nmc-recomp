@@ -105,17 +105,34 @@ int kh_look_enabled(void){
     return env && !strcmp(env,"xion");
 }
 
-static int loose_path(KCtx *g,const char *path,const char *what,char *host,size_t cap){
+/* Restaged PC fights have their own ARD and mission but omit the arena files. */
+static const char *arena_fallback(const char *rel){
+    static const char *const arenas[][2]={
+        {"map/mu13.map","map/mu09.map"}, {"map/us/mu13.bar","map/us/mu09.bar"},
+        {"map/ca26.map","map/hb38.map"}, {"map/us/ca26.bar","map/us/hb38.bar"},
+        {"map/nm11.map","map/nm07.map"}, {"map/us/nm11.bar","map/us/nm07.bar"}
+    };
+    for(size_t i=0;i<sizeof arenas/sizeof arenas[0];i++)
+        if(!strcasecmp(rel,arenas[i][0])) return arenas[i][1];
+    return NULL;
+}
+static int loose_path(KCtx *g,const char *path,const char *what,char *host,size_t cap,const char **fallback){
     char rel[2048];
     if(!relative(g,path,rel,sizeof rel)||kh_data_denied(g,rel,what)) return 0;
     if(kh_look_key(rel)){ kh_look_path(g,rel,host,cap); return KH_FILE_LOOK; }
     const char *root=getenv("KHNMC_DATA"); if(!root) root="data";
-    return strlen(root)+strlen(rel)+2<cap && kh_resolve_ci(root,rel,host,cap);
+    if(strlen(root)+strlen(rel)+2>=cap) return 0;
+    if(kh_resolve_ci(root,rel,host,cap)) return 1;
+    const char *arena=arena_fallback(rel);
+    if(!arena || kh_data_denied(g,arena,what) || !kh_resolve_ci(root,arena,host,cap)) return 0;
+    if(fallback) *fallback=arena;
+    fprintf(stderr,"kh: arena-map-fallback: %s uses %s\n",rel,arena);
+    return 1;
 }
 /* `what` names the kind of request for the deny list: a listed file is answered exactly as an absent one (data_deny.c) */
-static FILE *open_loose(KCtx *g,const char *path,int *size,const char *what){
+static FILE *open_loose(KCtx *g,const char *path,int *size,const char *what,const char **fallback){
     char host[4096]; FILE *f=NULL; struct stat st;
-    int source=loose_path(g,path,what,host,sizeof host);
+    int source=loose_path(g,path,what,host,sizeof host,fallback);
     if(source){
         f=fopen(host,"rb");
         if(f&&(fstat(fileno(f),&st)||!S_ISREG(st.st_mode)||st.st_size>INT_MAX)){ fclose(f); f=NULL; }
@@ -126,30 +143,31 @@ static FILE *open_loose(KCtx *g,const char *path,int *size,const char *what){
 }
 /* Preflight uses the same readable, case-insensitive NMC data tree as the loader. */
 int kh_cutscene_asset_exists(KCtx *g,const char *path){
-    int size=0; FILE *f=open_loose(g,path,&size,"size");
+    int size=0; FILE *f=open_loose(g,path,&size,"size",NULL);
     if(!f) return 0;
     fclose(f); return size>0;
 }
 /* For the stream-fd layer (stream_layer.c): the same tree-relative mapping and the same file log as the loaders. */
 int kh_file_loose_path(KCtx *g,const char *path,char *host,size_t cap){
-    return loose_path(g,path,"stream",host,cap);
+    return loose_path(g,path,"stream",host,cap,NULL);
 }
 void kh_file_log_entry(KCtx *g,const char *path,const char *source,long long size){ file_log(g,path,source,size>INT_MAX?INT_MAX:(int)size); }
 int kh_file_package_fallback(const char *path){ return package_fallback(path); }
-static int register_resource(KCtx *g,u64 path,int n,u64 dst){
+static int register_resource(KCtx *g,u64 path,int n,u64 dst,const char *fallback){
     /* HD sidecars: the lifted ResourceEntry constructor runs inside SetResourceItem on this thread and pulls GetRemasteredCount/Entry/Asset (hd_assets.c). */
     char rel[2048]; const char *root=getenv("KHNMC_DATA"); if(!root) root="data";
     if(!relative(g,gstr(g,path),rel,sizeof rel)) kh_fatal(g,"hd assets: cannot derive a tree-relative path from %s",gstr(g,path));
+    if(fallback) kh_data_deny_remastered(g,fallback);
     kh_data_deny_remastered(g,rel);                    /* a deny list that names textures of this file but not the file: named fatal */
     wr32(g,GS_BASE+0x79cfd4,0);
-    HdTable *prev=kh_hd_begin(g,root,rel,(const unsigned char*)hp(g,dst),n);
+    HdTable *prev=kh_hd_begin(g,root,fallback?fallback:rel,(const unsigned char*)hp(g,dst),n);
     int ok=(s32)kh_call(g,GS_BASE+0x12f070,path,n,dst,0)!=-1;
     kh_hd_end(prev);
     return ok;
 }
 void f_1063d0(KCtx *g){
     pthread_mutex_lock(&files_lock);
-    int n=0; FILE *f=open_loose(g,gstr(g,A1(g)),&n,"size");
+    int n=0; FILE *f=open_loose(g,gstr(g,A1(g)),&n,"size",NULL);
     if(f){ fclose(f); file_log(g,gstr(g,A1(g)),"LOOSE",n); }
     else if(package_fallback(gstr(g,A1(g)))){
         const char *path=gstr(g,A1(g)); orig_f_1063d0(g);
@@ -214,7 +232,8 @@ static void load(KCtx *g,int bounded,int allocate){
     u64 path=A1(g),dst=A2(g),sizeptr=A2(g); int hd=bounded?A4(g):A3(g);
     s32 oldsize=allocate?(s32)rd32(g,sizeptr):0;
     pthread_mutex_lock(&files_lock);
-    int n=0; FILE *f=open_loose(g,gstr(g,path),&n,"load"); s64 result=allocate||bounded?0:-1;
+    const char *fallback=NULL;
+    int n=0; FILE *f=open_loose(g,gstr(g,path),&n,"load",&fallback); s64 result=allocate||bounded?0:-1;
     if(!f){
         if(package_fallback(gstr(g,path))){
             if(allocate) orig_f_106870(g); else if(bounded) orig_f_106790(g); else orig_f_106700(g);
@@ -234,7 +253,7 @@ static void load(KCtx *g,int bounded,int allocate){
     }
     result=allocate?dst:n;
     if(allocate) live_note(dst,n,gstr(g,path));
-    if(hd&&n&&!register_resource(g,path,n,dst)){ if(allocate) ga_free(dst); result=0; }
+    if(hd&&n&&!register_resource(g,path,n,dst,fallback)){ if(allocate) ga_free(dst); result=0; }
 close:
     fclose(f);
     file_log(g,gstr(g,path),"LOOSE",n);

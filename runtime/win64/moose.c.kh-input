@@ -118,6 +118,15 @@ static s32 add_bytes[5];
 static char ini_path[1024]; static const char *state="not initialised";
 static int continue_on, continue_default;                /* [kh2.hacks] attempt_continue_after_exception_...: the DLL's exception handler is installed (default: key missing) */
 int kh_moose_continue_on(void){ return continue_on; }
+/* f_4d3a20: on PC the handler drops the owner store and the three position stores. */
+void kh_moose_effect_pool_miss(KCtx *g){
+    static atomic_flag reported=ATOMIC_FLAG_INIT;
+    if(!continue_on)
+        kh_fatal(g,"effect-pool-exhausted: f_4d3a20 has no effect instance and KH2Moose exception continuation is off");
+    if(!atomic_flag_test_and_set(&reported))
+        fprintf(stderr,"kh: moose: effect-pool-exhausted: f_4d3a20 skipped stores to an unallocated effect instance\n");
+}
+
 static int patch_on[KH_MOOSE_NPATCH];                    /* the ini turns the code patch on: its function runs the body re-lifted from the patched image */
 static _Atomic u64 c_patch[KH_MOOSE_NPATCH][2];          /* calls of the function with the patch off / on */
 static _Atomic u64 c_layout, c_free_q, c_data_reset, c_data_release, c_blk_set, c_party_set, c_evict;

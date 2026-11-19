@@ -191,7 +191,7 @@ FILE_HOOKS = 1f9a80 3a9cf0 131ef0 106000 1063d0 106700 106790 106870 $(HD_HOOKS)
 IDTABLE_HOOKS = 4ad390
 FILE_HOOKS += $(IDTABLE_HOOKS)
 # KH2Moose pool sizes (runtime/moose.c): cache layout, cache free bytes, data heap release / reset (the four functions whose pool-start instruction the DLL re-encodes), reserved block sizes
-MOOSE_HOOKS = 39d590 39dab0 3e5f30 3e5f90 39e260 39e270
+MOOSE_HOOKS = 4d3a20 39d590 39dab0 3e5f30 3e5f90 39e260 39e270
 FILE_HOOKS += $(MOOSE_HOOKS)
 # Task 32 (runtime/events_stub.c, KHNMC_EVENTS=stub): 3a1f70 = find an event entry (BAR type 22) of the loaded area file by name; its only caller is the event starter 3ac350
 EVENT_HOOKS = 3a1f70 3aabe0 3ad5e0 3ad610 39afc0 2d9a30 2d0350 3df930
@@ -467,7 +467,7 @@ endif
 all: $(O)/hook_link.ok
 $(O)/hook_link.ok: $(BIN) tools/check_hook_link.py
 	python3 tools/check_hook_link.py --bin $(BIN) --objs $(RTOBJ) $(LIFTOBJ) $(HOOK_OBJ) --hooks $(HOOKS_UNIQ) --wrap $(WRAP_FNS) $(if $(HOOK_OBJ),--forwarders $(HOOK_OBJ)) $(if $(filter 1,$(HOOK_STRICT)),--strict) && touch $@
-$(O)/cheat_drop.c: $(addprefix $(SHARDS_DIR)/shard_,0051.c 0076.c 0079.c 0081.c 0083.c 0085.c 0087.c) tools/tweak_lift.py
+$(O)/cheat_drop.c: $(addprefix $(SHARDS_DIR)/shard_,0051.c 0076.c 0079.c 0081.c 0083.c 0085.c 0087.c 0103.c) tools/tweak_lift.py
 	@mkdir -p $(O)
 	python3 tools/tweak_lift.py $(SHARDS_DIR) > $@.new && mv $@.new $@
 $(O)/cheat_drop.o: $(O)/cheat_drop.c

@@ -147,12 +147,24 @@ u64 kh_events_stub_build(KCtx *g,u64 p){
 u64 kh_input_game_frames(void);
 /* Both event passes use the same object row. Keep the logical actor and slot in
  * the event table: f_2d04e0 uses the original ID to find the ANB directory. */
-enum { ACTOR_SORA = 571, NMC_ROXAS = 84, EVENT_OBJECT = 1u << 30 };
+enum { ACTOR_SORA = 571, NMC_ROXAS = 84, EVENT_OBJECT = 1u << 30,
+       DONALD_WEAPON = 575, GOOFY_WEAPON = 576, MAGES_STAFF = 108, KNIGHTS_SHIELD = 109 };
 static int scene_roxas(KCtx *g){
     const char *v=getenv("KHNMC_SCENE_ROXAS");
     if(!v || !*v || !strcmp(v,"0")) return 0;
     if(!strcmp(v,"1")) return 1;
     kh_fatal(g,"scene-roxas-mode: KHNMC_SCENE_ROXAS=%s (expected 0 or 1)",v);
+}
+
+/* A scene can name a partner's equipped weapon even with an empty party sheet.
+ * Supply the stock staff/shield prop to both event passes, without equipping it. */
+static int weapon_actor(u32 id){ return id==DONALD_WEAPON || id==GOOFY_WEAPON; }
+static u32 event_weapon(KCtx *g,u32 actor){
+    KCtx probe=*g;
+    if(kh_call(&probe,GS_BASE+0x3dfeb0,EVENT_OBJECT|actor,0,0,0)) return actor;
+    u32 prop=actor==DONALD_WEAPON?MAGES_STAFF:KNIGHTS_SHIELD;
+    fprintf(stderr,"kh: event-weapon-fallback: actor %u has no equipped model, using stock prop %u\n",actor,prop);
+    return prop;
 }
 
 void orig_f_2d0350(KCtx *g);
@@ -162,12 +174,15 @@ void f_2d0350(KCtx *g){
         fprintf(stderr,"kh: scene Roxas: frame=%llu preload P_EX100 slot=%u\n",
                 (unsigned long long)kh_input_game_frames(),(u32)A2(g));
     }
+    if(weapon_actor((u32)A1(g))) A1(g)=event_weapon(g,(u32)A1(g));
     orig_f_2d0350(g);
 }
 
+static int event_spawn_site(u64 caller){
+    return caller==GS_BASE+0x2d21db || caller==GS_BASE+0x2d2453 || caller==GS_BASE+0x2d2552;
+}
 static int sora_spawn(u32 id,u64 caller){
-    return id==(EVENT_OBJECT|ACTOR_SORA) &&
-           (caller==GS_BASE+0x2d21db || caller==GS_BASE+0x2d2453 || caller==GS_BASE+0x2d2552);
+    return id==(EVENT_OBJECT|ACTOR_SORA) && event_spawn_site(caller);
 }
 
 void orig_f_3df930(KCtx *g);
@@ -177,6 +192,12 @@ void f_3df930(KCtx *g){
         A0(g)=EVENT_OBJECT|NMC_ROXAS;
         fprintf(stderr,"kh: scene Roxas: frame=%llu spawn P_EX100\n",
                 (unsigned long long)kh_input_game_frames());
+    }
+    u32 id=(u32)A0(g);
+    if((id & EVENT_OBJECT) && weapon_actor(id ^ EVENT_OBJECT)){
+        u64 ret=rd64(g,KH_RSP(g));
+        if(event_spawn_site(ret))
+            A0(g)=EVENT_OBJECT|event_weapon(g,id & ~EVENT_OBJECT);
     }
     orig_f_3df930(g);
 }

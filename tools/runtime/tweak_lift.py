@@ -19,6 +19,13 @@ for shard,func,block,imm in [(76,"3a5650","3a5713","3a5719"),(79,"3c0b50","3c0b8
     sites.append((shard,func,block,"0x6ull",f"LD(u8,0x140{imm}ull)",2))
 sites.extend([(87,"421d60","421e02","0x64ull","LD(u8,0x140421e04ull)",1),
               (87,"421d60","421e0f","(u32)t14 * (u32)t12","(LD(u8,0x140421e16ull)==0x45 ? 0u : (u32)t14 * (u32)t12)",1)])
+# With no effect instance, KH2Moose drops these four stores. Preserve the
+# guest register updates and calls between them, including the transform.
+sites.append((103, "4d3a20", "4d3a84", "ST(u32,t1,t3);",
+              "if (t2) ST(u32,t1,t3); else kh_moose_effect_pool_miss(g);", 1))
+for store in ("ST(u32,t15,t10);", "ST(u32,t24,t23);", "ST(u32,t33,t32);"):
+    sites.append((103, "4d3a20", "4d3ae2", store,
+                  "if (t18) " + store + " else kh_moose_effect_pool_miss(g);", 1))
 bodies = {}
 for shard,func,block,old,new,count in sites:
     if func not in bodies:
@@ -31,7 +38,7 @@ for shard,func,block,old,new,count in sites:
     part = s[a:b]
     assert part.count(old)==count,(func,block,old,part.count(old))
     bodies[func] = s[:a]+part.replace(old,new)+s[b:]
-print('#include "khrt.h"\nextern float kh_drop_roll_test(float,float,u16);')
+print('#include "khrt.h"\nextern void kh_moose_effect_pool_miss(KCtx *);\nextern float kh_drop_roll_test(float,float,u16);')
 calls = sorted(set(re.findall(r"(f_[0-9a-f]+)\(g\)", "".join(bodies.values()))))
 for name in calls:
     print(f"void {name}(KCtx *g);")
