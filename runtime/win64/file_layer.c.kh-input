@@ -121,7 +121,10 @@ void kh_scene_pack_begin(void){
     if(!scene_pack){
         char host[4096];
         int ok=1;
-        for(size_t i=0;i<sizeof scene_files/sizeof *scene_files;i++){
+        if(kh_look_enabled()){
+            if(!kh_look_available(KH_SCENE_MDLX,host,sizeof host))
+                kh_fatal(NULL,"scene-xion-asset: missing %s from look pack (tools/xion/scene_model.py)",KH_SCENE_MDLX);
+        }else for(size_t i=0;i<sizeof scene_files/sizeof *scene_files;i++){
             if(kh_scene_path(scene_files[i],host,sizeof host)) continue;
             fprintf(stderr,"kh: scene Roxas: missing overlay %s; keeping Sora for this event\n",scene_files[i]);
             ok=0; break;
@@ -146,53 +149,77 @@ int kh_scene_key(const char *rel){
     return 0;
 }
 
-void kh_look_set(int xion){
+/* Menus may retain the returned guest address for the lifetime of a page. */
+static u64 name_overlays;
+static const char roxas[]="@KHINPUT(slash,data/msg/us/he.bar,15561,5,6371a57675507ca2b56b55306572693e0b838cda8d98eeecb9ec54a9dd62947b)@",xion[]="@KHINPUT(slash,data/msg/us/po.bar,13217,4,3841ba554755fe34fbbe96d4378902dcb824fa5bb69ca360c5ceb31d86e155f6)@";
+static pthread_mutex_t names_lock=PTHREAD_MUTEX_INITIALIZER;
+void kh_look_set(KCtx *g,int selected){
     pthread_mutex_lock(&files_lock);
-    player_look=!!xion;
+    pthread_mutex_lock(&names_lock);
+    player_look=!!selected;
+    for(u64 e=name_overlays;e;e=rd64(g,e)){
+        char *text=hp(g,e+16+rd32(g,e+12));
+        int old=*text==*xion?4:5, len=selected?4:5;
+        if(old!=len){
+            memmove(text+len,text+old,rd32(g,e+8));
+            memcpy(text,selected?xion:roxas,len);
+        }
+    }
+    pthread_mutex_unlock(&names_lock);
     pthread_mutex_unlock(&files_lock);
 }
 
-/* Return an immutable guest string. Duplicate message texts may share a BAR offset. */
-static u64 name_overlays;
-static pthread_mutex_t names_lock=PTHREAD_MUTEX_INITIALIZER;
 u64 kh_look_name(KCtx *g,int id,u64 original){
-    if(!original || !kh_look_enabled()) return original;
-    static const char roxas[]="@KHINPUT(slash,data/msg/us/he.bar,15561,5,6371a57675507ca2b56b55306572693e0b838cda8d98eeecb9ec54a9dd62947b)@",xion[]="@KHINPUT(slash,data/msg/us/po.bar,13217,4,3841ba554755fe34fbbe96d4378902dcb824fa5bb69ca360c5ceb31d86e155f6)@";
-    if(strncmp(gstr(g,original),roxas,5)) return original;
+    if(!original) return original;
     id&=0x7fff;
-    int suffix=rd8(g,original+5);
-    if(suffix!=0x52){ /* A leading name and colon is the speaker label in 240 NMC system lines. */
+    /* 0x453a is the camp Journal help string; its name follows a verb and a space. */
+    size_t prefix=id==0x453a?5:0;
+    if(prefix && strlen(gstr(g,original))<prefix) return original;
+    u64 name=original+prefix;
+    int len=!strncmp(gstr(g,name),roxas,5)?5:!strncmp(gstr(g,name),xion,4)?4:0;
+    if(!len) return original;
+    int suffix=rd8(g,name+len);
+    if(suffix!=0x52 || len==4){ /* A leading name and colon is the speaker label in 240 NMC system lines. */
         switch(id){
         case 0x51f: case 0x52d: case 0x534a:
         case 0x2ce8: case 0x2d0c: case 0x2e9a:
             if(suffix) return original;
             break;
-        case 0x50e5: case 0x511d: case 0x533f: /* possessive save summary titles */
-            if(suffix!=0xee) return original;
+        case 0x453a: case 0x50e5: case 0x511d: case 0x533f: /* possessive save summary titles */
+            if(suffix!=0xee && suffix!=0xec) return original;
             break;
         default: return original;
         }
     }
-    size_t end=5;
+    if(!kh_look_enabled() && player_look<0 && !getenv("KHNMC_PLAYER_LOOK")) return original;
+    size_t end=prefix+len;
     while(end<4096){
         u8 c=rd8(g,original+end++);
         if(!c) break;
         if(c<32) end+=kh_route_message_ctl_args(c);
     }
     if(end>=4096) kh_fatal(g,"look-name-message-length: %#x",id);
-    size_t tail=end-5;
+    size_t tail=end-prefix-len;
     pthread_mutex_lock(&names_lock);
+    int selected=kh_look_enabled(), n=selected?4:5;
     u64 e=name_overlays;
-    while(e && (rd32(g,e+8)!=tail || memcmp(hp(g,e+16),hp(g,original+5),tail))) e=rd64(g,e);
+    while(e){
+        char *text=hp(g,e+16);
+        if(rd32(g,e+12)==prefix && rd32(g,e+8)==tail && !memcmp(text,hp(g,original),prefix) &&
+           !memcmp(text+prefix+n,hp(g,name+len),tail)) break;
+        e=rd64(g,e);
+    }
     if(!e){
-        e=ga_alloc(16+tail,16);
+        e=ga_alloc(21+prefix+tail,16);
         if(!e) kh_fatal(g,"look-name-allocation");
-        wr64(g,e,name_overlays); wr32(g,e+8,tail);
-        memcpy(hp(g,e+12),xion,4); memcpy(hp(g,e+16),hp(g,original+5),tail);
+        wr64(g,e,name_overlays); wr32(g,e+8,tail); wr32(g,e+12,prefix);
+        memcpy(hp(g,e+16),hp(g,original),prefix);
+        memcpy(hp(g,e+16+prefix),selected?xion:roxas,n);
+        memcpy(hp(g,e+16+prefix+n),hp(g,name+len),tail);
         name_overlays=e;
     }
     pthread_mutex_unlock(&names_lock);
-    return e+12;
+    return e+16;
 }
 
 int kh_look_available(const char *rel,char *host,size_t cap){
@@ -392,7 +419,7 @@ int kh_file_selftest(KCtx *g){
     u64 name=ga_strdup("mixed.bin"),missing=ga_strdup("missing"),dst=ga_alloc(16,16),sz=ga_alloc(16,16);
 #define TEST(c) do { checks++; if(!(c)){ fprintf(stderr,"file selftest FAIL: %s\n",#c); bad++; } } while(0)
     int initial_look=player_look;
-    kh_look_set(1);
+    kh_look_set(g,1);
     TEST(kh_look_key("./OBJ//p_ex100.MDLX")==-1 && kh_look_key("obj/P_EX100_WI_KH1F.a.us")==40);
     TEST(kh_look_key("remastered/obj/P_EX100.a.us/-36.dds")==37 && !kh_look_key("remastered/obj/P_EX100.a.us/-37.dds"));
     TEST(!kh_look_key("obj/P_EX100.mset") && !kh_look_key("obj/P_EX1000.mdlx"));
@@ -404,9 +431,17 @@ int kh_file_selftest(KCtx *g){
     u64 line=kh_look_name(g,0x27a,speaker);
     TEST(line!=speaker && !memcmp(hp(g,line+4),hp(g,speaker+5),9));
     TEST(kh_look_name(g,0x27a,speaker)==line); ga_free(speaker);
-    kh_look_set(0); TEST(kh_look_name(g,0x51f,label)==label); ga_free(label);
+    u64 journal=ga_strdup("@KHINPUT(slash,data/msg/us/sys.bar,96456,12,d13da141f68b0178c5342434dea058ee95c59dfae40d8768ba1ab211596486ac)@");
+    u64 heading=kh_look_name(g,0x453a,journal);
+    TEST(heading!=journal && !memcmp(hp(g,heading+5),xion,4) && rd8(g,heading+9)==0xec);
+    u64 cached=kh_look_name(g,0x51f,label);
+    for(int i=0;i<8;i++){
+        kh_look_set(g,i&1);
+        TEST(!strcmp(gstr(g,cached),(i&1)?xion:roxas));
+        TEST(kh_look_name(g,0x51f,label)==cached);
+    }
+    kh_look_set(g,0); ga_free(label); ga_free(journal);
     TEST(!kh_look_key("obj/P_EX100.mdlx"));
-    player_look=initial_look;
     const char *pack_env=getenv("KHNMC_SCENE_ROXAS_DIR");
     char *initial_pack=pack_env?strdup(pack_env):NULL;
     char pack[KH_TMP_MAX+256],member[KH_TMP_MAX+512],resolved[4096];
@@ -436,6 +471,18 @@ int kh_file_selftest(KCtx *g){
     kh_call(g,GS_BASE+0x2cbd80,0,0,0,0);
     wr32(g,GS_BASE+0xb65210,event_state);
     TEST(!kh_look_key(KH_SCENE_MDLX) && !kh_file_loose_path(g,KH_SCENE_MDLX,resolved,sizeof resolved));
+    const char *look_env=getenv("KHNMC_LOOK_DIR");
+    char *initial_dir=look_env?strdup(look_env):NULL;
+    setenv("KHNMC_LOOK_DIR",pack,1);
+    kh_look_set(g,1); kh_scene_pack_begin();
+    TEST(kh_look_key(KH_SCENE_MDLX)==-1 && !kh_look_key(scene_files[3]));
+    TEST(kh_file_loose_path(g,KH_SCENE_MDLX,resolved,sizeof resolved)==KH_FILE_LOOK);
+    kh_scene_pack_end();
+    if(initial_dir) setenv("KHNMC_LOOK_DIR",initial_dir,1); else unsetenv("KHNMC_LOOK_DIR");
+    free(initial_dir);
+    const char *look_option=getenv("KHNMC_PLAYER_LOOK");
+    kh_look_set(g,initial_look<0?(look_option && !strcmp(look_option,"xion")):initial_look);
+    player_look=initial_look;
     for(size_t i=0;i<sizeof scene_files/sizeof *scene_files;i++){
         snprintf(member,sizeof member,"%s/%s",pack,scene_files[i]); unlink(member);
     }

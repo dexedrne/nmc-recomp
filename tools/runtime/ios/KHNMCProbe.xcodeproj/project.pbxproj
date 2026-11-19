@@ -208,6 +208,8 @@
 					GameController,
 					"-framework",
 					QuartzCore,
+					"-framework",
+					CoreMotion,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = beer.vyvanse.khnmc.probe;
 				PRODUCT_NAME = KHNMCProbe;
@@ -247,6 +249,8 @@
 					GameController,
 					"-framework",
 					QuartzCore,
+					"-framework",
+					CoreMotion,
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = beer.vyvanse.khnmc.probe;
 				PRODUCT_NAME = KHNMCProbe;

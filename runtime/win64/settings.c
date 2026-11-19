@@ -459,7 +459,7 @@ static void show_look_notice(int index,u64 frame){
 /* A Drive change destroys the actor and its weapons. Use its model and material
  * binding operations on the live render instance, retaining the pose and sheet. */
 struct look_art { char stem[40]; int mode; u64 body,face; };
-static struct look_art art[30];
+static struct look_art art[32];
 static u64 face_actor,face_instance,face_model,face_bar;
 static u64 last_switch;
 /* A frame already submitted may still reference the old instance. Retire it
@@ -510,25 +510,74 @@ static u64 look_bar(KCtx *g,const char *stem,const char *ext,u64 native){
     }
     return bar;
 }
+static struct look_art *look_art(KCtx *g,const char *stem,int target,u64 body,u64 face){
+    struct look_art *a=art;
+    while(a<art+32 && a->stem[0] && (a->mode!=target || strcmp(a->stem,stem))) ++a;
+    if(a==art+32) kh_fatal(g,"look-art-cache-full: %s",stem);
+    snprintf(a->stem,sizeof a->stem,"%s",stem); a->mode=target;
+    if(!a->body) a->body=look_bar(g,stem,"mdlx",body);
+    if(face && !a->face) a->face=look_bar(g,stem,"a.us",face);
+    return a->body && (!face || a->face)?a:NULL;
+}
+
+/* The native cache owns +0x10/+0x18 and releases them by pointer at f_3e61e0.
+ * Keep those references until teardown while all consumers see the selected BARs. */
+static u64 held_resources;
+static void publish_art(KCtx *g,u64 resource,u64 body,u64 face){
+    u64 entry=held_resources;
+    while(entry && rd64(g,entry+8)!=resource) entry=rd64(g,entry);
+    if(!entry){
+        if(rd64(g,resource+16)==body && rd64(g,resource+24)==face) return;
+        entry=ga_alloc(32,16);
+        if(!entry) kh_fatal(g,"look-resource-allocation");
+        wr64(g,entry,held_resources); wr64(g,entry+8,resource);
+        wr64(g,entry+16,rd64(g,resource+16)); wr64(g,entry+24,rd64(g,resource+24));
+        held_resources=entry;
+    }
+    wr64(g,resource+16,body); wr64(g,resource+24,face);
+}
+void orig_f_3e61e0(KCtx *);
+void f_3e61e0(KCtx *g){
+    u64 prior=0,resource=A0(g);
+    for(u64 e=held_resources;e;prior=e,e=rd64(g,e)) if(rd64(g,e+8)==resource){
+        wr64(g,resource+16,rd64(g,e+16)); wr64(g,resource+24,rd64(g,e+24));
+        if(prior) wr64(g,prior,rd64(g,e)); else held_resources=rd64(g,e);
+        ga_free(e); break;
+    }
+    orig_f_3e61e0(g);
+}
+void orig_f_3e6120(KCtx *);
+void f_3e6120(KCtx *g){
+    u64 resource=A0(g);
+    orig_f_3e6120(g);
+    if(!last_switch && !kh_scene_pack_active()) return;
+    u64 row=rd64(g,resource+8),body=rd64(g,resource+16),face=rd64(g,resource+24);
+    if(!row || !body) return;
+    char stem[33],path[64];
+    memcpy(stem,hp(g,row+8),32); stem[32]=0;
+    snprintf(path,sizeof path,"obj/%s.mdlx",stem);
+    int high=kh_scene_pack_active() && !strcmp(path,KH_SCENE_MDLX);
+    if(!high && (!last_switch || kh_player_asset_key(path)!=-1)) return;
+    KCtx ctx=*g;
+    struct look_art *a=look_art(&ctx,stem,kh_look_enabled(),body,high?0:face);
+    if(!a) kh_fatal(g,"look-resource-bind: %s",stem);
+    publish_art(g,resource,a->body,high?face:(face?a->face:0));
+}
 static int bind_look(KCtx *g,KhPlayerSheet p,const char *stem,int target){
     u64 obj=p.obj,inst=rd64(g,obj+0x7b0);
     if(!inst || !rd64(g,obj+0xa88) || !rd64(g,obj+0x920) || !rd64(g,obj+0x928) ||
         rd64(g,inst+0x20)!=rd64(g,obj+0xa88)) return 0;
-    struct look_art *a=art;
-    while(a<art+30 && a->stem[0] && (a->mode!=target || strcmp(a->stem,stem))) ++a;
-    if(a==art+30) return 0;
-    snprintf(a->stem,sizeof a->stem,"%s",stem); a->mode=target;
-    if(!a->body) a->body=look_bar(g,stem,"mdlx",rd64(g,obj+0x920));
-    if(!a->face) a->face=look_bar(g,stem,"a.us",rd64(g,obj+0x928));
-    if(!a->body || !a->face) return 0;
+    struct look_art *a=look_art(g,stem,target,rd64(g,obj+0x920),rd64(g,obj+0x928));
+    if(!a) return 0;
     u64 native=rd64(g,obj+0x920),face=a->face;
     u64 original=kh_call(g,GS_BASE+0x3a6420,native,4,0,0);
     u64 wanted=kh_call(g,GS_BASE+0x3a6420,a->body,4,0,0);
     if(!original || !wanted) return 0;
     /* All 15 X5 model members differ in length from their Roxas recipient.
      * Keep the native instance on a room/form load that already selected it. */
+    u64 selected_body=native;
     if(rd32(g,original+12)==rd32(g,wanted+12)) face=rd64(g,obj+0x928);
-    else wr64(g,obj+0x920,a->body);
+    else { selected_body=a->body; wr64(g,obj+0x920,selected_body); }
     u64 model=kh_call(g,GS_BASE+0x3e62e0,obj+0x910,0,0,0);
     u64 tex=kh_call(g,GS_BASE+0x3e6310,obj+0x910,0,0,0);
     wr64(g,obj+0x920,native);
@@ -553,6 +602,7 @@ static int bind_look(KCtx *g,KhPlayerSheet p,const char *stem,int target){
         wr64(g,obj+0x7b0,inst);
         wr64(g,obj+0x7e0,tex);
     }
+    publish_art(g,obj+0x910,selected_body,face);
     face_bar=face; face_actor=obj; face_instance=inst; face_model=model;
     if(!changed) return 1;
     /* f_180900 refreshes dk::FACE separately from gauge visibility (f_16c250). */
@@ -597,9 +647,9 @@ static void look_frame(KCtx *g,int target,u64 frame){
         }
     }
     KCtx ctx=*g;
-    kh_look_set(target);
+    kh_look_set(&ctx,target);
     if(!bind_look(&ctx,player,stem,target)){
-        if(!refresh) kh_look_set(!target);
+        if(!refresh) kh_look_set(&ctx,!target);
         line="Appearance resources unavailable";
         goto feedback;
     }
@@ -724,6 +774,7 @@ void kh_rewind_look(KhRecords *r){
     KH_RECORD(r,legacy_notice);
     if(r->loading) atomic_store(&notice,0);
     KH_RECORD(r,art);
+    KH_RECORD(r,held_resources);
     KH_RECORD(r,idle);
     KH_RECORD(r,face_actor);
     KH_RECORD(r,face_instance);

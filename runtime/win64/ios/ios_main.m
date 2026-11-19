@@ -38,6 +38,8 @@
  * Bundle id beer.vyvanse.khnmc (tools/ios/make_project.py). */
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <CoreMotion/CoreMotion.h>
+#include "portrait.h"
 #import <AVFoundation/AVFoundation.h>
 #import <GameController/GameController.h>
 #include <math.h>
@@ -304,8 +306,20 @@ static void start_display_link(void){
 
 @interface KHGameViewController : UIViewController
 - (void)reportSize;
+- (void)flipForDevice;
+- (void)stopMotion;
 @end
-@implementation KHGameViewController { BOOL _started; }
+@implementation KHGameViewController {
+    BOOL _started;
+    int _upsideDown;
+    CMDeviceMotion *_sample;
+    CMMotionManager *_motion;
+    KHGameView *_picture;
+    id _orientationObserver;
+    UIInterfaceOrientation _lastInterface;
+    UIDeviceOrientation _lastDevice;
+    NSString *_orientationLog;
+}
 - (void)loadView {
     KHGameView *v=[[KHGameView alloc] initWithFrame:CGRectZero];
     v.opaque=YES; v.backgroundColor=[UIColor blackColor];
@@ -315,7 +329,9 @@ static void start_display_link(void){
     label.numberOfLines=0; label.textColor=[UIColor lightGrayColor]; label.textAlignment=NSTextAlignmentCenter;
     label.text=@"KHNMC test shell\n\nWhat runs is set by Documents/khnmc.conf.\nThe log and the status file named there are written into Documents.\nThe app closes when the run ends.";
     [v addSubview:label]; test_label=label;
-    self.view=v;
+    self.view=[[UIView alloc] initWithFrame:CGRectZero];
+    [self.view addSubview:v];
+    _picture=v;
 }
 - (BOOL)prefersStatusBarHidden { return YES; }
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
@@ -324,54 +340,73 @@ static void start_display_link(void){
 /* the drawable's size in pixels (bounds x nativeScale), 0 x 0 before the view has a screen */
 - (BOOL)pixelsW:(uint32_t *)w h:(uint32_t *)h {
     UIScreen *scr=self.view.window.windowScene.screen; if(!scr) return NO;
-    CGFloat s=scr.nativeScale; if(self.view.contentScaleFactor!=s) self.view.contentScaleFactor=s;
+    CGFloat s=scr.nativeScale; if(_picture.contentScaleFactor!=s) _picture.contentScaleFactor=s;
     CGSize b=self.view.bounds.size; *w=(uint32_t)lround(b.width*s); *h=(uint32_t)lround(b.height*s);
     return *w>0 && *h>0;
 }
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
+    _picture.bounds=self.view.bounds;
+    _picture.center=CGPointMake(CGRectGetMidX(self.view.bounds),CGRectGetMidY(self.view.bounds));
+    [self flipForDevice];
     test_label.frame=CGRectInset(self.view.bounds,24,24);
     uint32_t w=0,h=0; if(![self pixelsW:&w h:&h]) return;          /* wait for a layout with a screen and a size */
     if(!_started){
         _started=YES;
         if(w<h) fprintf(stderr,"kh: ios: the first layout is portrait (%ux%u px): the game's screen follows it\n",w,h);
         kh_present_note_drawable(w,h);                                 /* every app (review A41, verification): KHNMC_SCREEN=layer needs only the size */
-        if(kh_present_built()) kh_present_set_layer((__bridge void *)self.view.layer,w,h);   /* before the game reads its screen size */
-        fprintf(stderr,"kh: ios: game view %ux%u px (scale %.3f), layer %s; starting the game\n",w,h,self.view.contentScaleFactor,kh_present_built()?"handed to the runtime":"not used (no graphics backend in this app)");
+        if(kh_present_built()) kh_present_set_layer((__bridge void *)_picture.layer,w,h);   /* before the game reads its screen size */
+        fprintf(stderr,"kh: ios: game view %ux%u px (scale %.3f), layer %s; starting the game\n",w,h,_picture.contentScaleFactor,kh_present_built()?"handed to the runtime":"not used (no graphics backend in this app)");
         start_display_link();
         start_game_once();
     } else kh_present_set_size(w,h);
 }
 - (void)reportSize { uint32_t w=0,h=0; if(_started && [self pixelsW:&w h:&h]) kh_present_set_size(w,h); }
-/* Upside-down portrait (owner 2026-11-18, "portrait mode doesnt turn upside down"): iPhones without a Home button never turn an app's
- * interface upside down, whatever the app allows.  The game is played with a controller (no touch to remap), so the view turns its own
- * picture 180 degrees while the phone is held upside down in portrait: UIDevice reports the physical orientation even when the
- * interface does not follow.  Only portrait-with-the-phone-upside-down is turned; landscape left / right is the system's own rotation;
- * face up / face down / unknown keep the current state.  If a phone does turn the interface itself, io is PortraitUpsideDown and
- * nothing is turned twice. */
 - (void)viewDidLoad {
     [super viewDidLoad];
     [[UIDevice currentDevice] beginGeneratingDeviceOrientationNotifications];
     __weak KHGameViewController *ws=self;
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIDeviceOrientationDidChangeNotification object:nil queue:NSOperationQueue.mainQueue
-        usingBlock:^(NSNotification *n){ (void)n; [ws flipForDevice:YES]; }];
+    _orientationObserver=[[NSNotificationCenter defaultCenter] addObserverForName:UIDeviceOrientationDidChangeNotification object:nil queue:NSOperationQueue.mainQueue
+        usingBlock:^(NSNotification *n){ (void)n; [ws flipForDevice]; }];
+    _motion=[CMMotionManager new];
+    if(_motion.deviceMotionAvailable){
+        _motion.deviceMotionUpdateInterval=0.15;
+        [_motion startDeviceMotionUpdatesToQueue:NSOperationQueue.mainQueue withHandler:^(CMDeviceMotion *sample,NSError *error){
+            if(error){ fprintf(stderr,"kh: ios: orientation motion stopped: %s\n",error.localizedDescription.UTF8String); [ws stopMotion]; }
+            else if(sample){ KHGameViewController *vc=ws; if(vc){ vc->_sample=sample; [vc flipForDevice]; } }
+        }];
+    } else fprintf(stderr,"kh: ios: orientation motion unavailable\n");
 }
-- (void)flipForDevice:(BOOL)animated {
-    UIDeviceOrientation d=[UIDevice currentDevice].orientation;
-    if(d!=UIDeviceOrientationPortrait && d!=UIDeviceOrientationPortraitUpsideDown && d!=UIDeviceOrientationLandscapeLeft && d!=UIDeviceOrientationLandscapeRight) return;
+- (void)stopMotion { [_motion stopDeviceMotionUpdates]; _sample=nil; [self flipForDevice]; }
+- (void)dealloc {
+    [_motion stopDeviceMotionUpdates];
+    if(_orientationObserver) [[NSNotificationCenter defaultCenter] removeObserver:_orientationObserver];
+    [[UIDevice currentDevice] endGeneratingDeviceOrientationNotifications];
+}
+- (void)flipForDevice {
+    UIDeviceOrientation d=UIDevice.currentDevice.orientation;
     UIInterfaceOrientation io=self.view.window.windowScene.interfaceOrientation;
-    BOOL flip=(io==UIInterfaceOrientationPortrait && d==UIDeviceOrientationPortraitUpsideDown);
-    CGAffineTransform t=flip?CGAffineTransformMakeRotation((CGFloat)M_PI):CGAffineTransformIdentity;
-    if(CGAffineTransformEqualToTransform(self.view.transform,t)) return;
-    fprintf(stderr,"kh: ios: the phone is %s: the picture is %s\n",flip?"upside down in portrait":"upright or in landscape",flip?"turned 180 degrees":"upright");
-    if(animated) [UIView animateWithDuration:0.25 animations:^{ self.view.transform=t; }]; else self.view.transform=t;
-}
-/* a system rotation (landscape <-> portrait, left <-> right) starts from an upright view and re-checks the phone afterwards */
-- (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
-    self.view.transform=CGAffineTransformIdentity;
-    [super viewWillTransitionToSize:size withTransitionCoordinator:coordinator];
-    __weak KHGameViewController *ws=self;
-    [coordinator animateAlongsideTransition:nil completion:^(id<UIViewControllerTransitionCoordinatorContext> c){ (void)c; [ws reportSize]; [ws flipForDevice:NO]; }];
+    CMDeviceMotion *sample=_sample;
+    CMAcceleration gravity=sample ? sample.gravity : (CMAcceleration){0};
+    // Latch between thresholds so a flat device or a diagonal turn cannot oscillate.
+    int device=d==UIDeviceOrientationPortraitUpsideDown ? 1 : d==UIDeviceOrientationPortrait ? -1 : 0;
+    // An unchanged upright report is common on this device, even while gravity is inverted.
+    if(sample && d==_lastDevice) device=0;
+    _lastDevice=d;
+    BOOL flip=kh_portrait_flip(io==UIInterfaceOrientationPortrait,&_upsideDown,device,sample!=nil,gravity.x,gravity.y);
+    CGAffineTransform t=flip ? CGAffineTransformMakeRotation((CGFloat)M_PI) : CGAffineTransformIdentity;
+    if(!CGAffineTransformEqualToTransform(t,_picture.transform)) _picture.transform=t;
+    if(_started && io!=UIInterfaceOrientationUnknown && _lastInterface!=io && kh_present_built()){
+        uint32_t w,h;
+        if([self pixelsW:&w h:&h]) kh_present_set_layer((__bridge void *)_picture.layer,w,h);
+    }
+    _lastInterface=io;
+    NSString *state=[NSString stringWithFormat:@"device=%ld interface=%ld bounds=%@ transform=%@ motion=%d flip=%d",
+        (long)d,(long)io,NSStringFromCGRect(self.view.bounds),NSStringFromCGAffineTransform(_picture.transform),sample!=nil,flip];
+    if(![state isEqualToString:_orientationLog]){
+        _orientationLog=state;
+        fprintf(stderr,"kh: ios: orientation %s gravityY=%.3f\n",state.UTF8String,gravity.y);
+    }
 }
 @end
 
@@ -388,6 +423,10 @@ static void start_display_link(void){
     setup_controllers();
     setup_audio_interruptions();
     /* the game starts after the view's first layout (KHGameViewController viewDidLayoutSubviews) */
+}
+- (void)windowScene:(UIWindowScene *)scene didUpdateCoordinateSpace:(id<UICoordinateSpace>)oldSpace interfaceOrientation:(UIInterfaceOrientation)oldOrientation traitCollection:(UITraitCollection *)oldTraits {
+    (void)scene; (void)oldSpace; (void)oldOrientation; (void)oldTraits;
+    [(KHGameViewController *)self.window.rootViewController flipForDevice];
 }
 - (void)sceneWillResignActive:(UIScene *)scene {
     (void)scene; _left=YES;

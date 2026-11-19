@@ -50,6 +50,7 @@
  * +0x408/+0x40c the 16:9 fit createDevices stores (0x1246ae; used only to compare settings, plan section 3), +0x41c/+0x420 the
  * settings' window size, byte +0x416 the fullscreen setting (0x117fd0 takes the fullscreen branch when it is not zero). */
 #include "khnmc_rt.h"
+#include <math.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -129,7 +130,9 @@ void kh_aspect_hud_config(const char *cmd,const char *hpv);   /* task 53, below 
 void kh_aspect_title_config(const char *v);                   /* task 53, below */
 static void zoom_storage_init(void);
 static int test_event_bars;
-void kh_aspect_init(void){ kh_aspect_config(getenv("KHNMC_ASPECT"),getenv("KHNMC_ASPECT_LOG"),getenv("KHNMC_ASPECT_TEST_H1"));
+static void portrait_config(void);
+void kh_aspect_init(void){
+    portrait_config(); kh_aspect_config(getenv("KHNMC_ASPECT"),getenv("KHNMC_ASPECT_LOG"),getenv("KHNMC_ASPECT_TEST_H1"));
     const char *bars=getenv("KHNMC_ASPECT_TEST_EVENT_BARS");
     if(bars&&*bars){
         if(strcmp(bars,"1")||!asp_mode) kh_fatal(NULL,"aspect-test-event-bars: expected 1 with KHNMC_ASPECT=fill");
@@ -784,7 +787,7 @@ static const char *hud_env[HUD_N]={"KHNMC_HUD_SCALE_CMD","KHNMC_HUD_SCALE_HP"};
 static const char *hud_what[HUD_N]={"command menu (dk groups 1, 2)","player gauges (dk groups 3, 4, 5)"};
 static const float hud_px[HUD_N]={-70.0f,590.0f}, hud_py[HUD_N]={416.0f,405.0f};       /* the pivots, GS frame (measured: above) */
 /* a KHNMC_HUD_SCALE_* value: DIGITS[.DIGITS], at most 15 digits, nothing else.  0 = *v set, 1 = malformed, 2 = outside 0.5 .. 3.0 */
-int kh_hud_scale_parse(const char *s,double *v){
+static int decimal_range(const char *s,double *v,double lo,double hi){
     u64 n=0, den=1; int nd=0, ni=0, nf=0, dot=0;
     if(!s) return 1;
     for(const char *p=s;*p;p++){
@@ -794,8 +797,27 @@ int kh_hud_scale_parse(const char *s,double *v){
         n=n*10+(u64)(*p-'0'); if(dot){ den*=10; nf++; } else ni++; }
     if(!ni||(dot&&!nf)) return 1;
     double x=(double)n/(double)den;
-    if(!(x>=0.5&&x<=3.0)) return 2;
+    if(!(x>=lo&&x<=hi)) return 2;
     *v=x; return 0;
+}
+int kh_hud_scale_parse(const char *s,double *v){ return decimal_range(s,v,0.5,3.0); }
+static double style_scale=2,style_raise=0.25,enemy_scale=1.5,sub_scale=1.5,sub_lower=0.06;
+static int menu_band;
+static void portrait_number(const char *key,double *value,double lo,double hi){
+    const char *s=getenv(key);
+    if(!s || !*s) return;
+    int e=decimal_range(s,value,lo,hi);
+    if(e) kh_fatal(NULL,"portrait-value-%s: %s=%s (plain decimal %g..%g)",e==1?"malformed":"range",key,s,lo,hi);
+}
+static void portrait_config(void){
+    portrait_number("KHNMC_HUD_SCALE_STYLE",&style_scale,0.5,3);
+    portrait_number("KHNMC_HUD_STYLE_RAISE",&style_raise,0,0.5);
+    portrait_number("KHNMC_HUD_SCALE_ENEMY",&enemy_scale,0.5,3);
+    portrait_number("KHNMC_SUB_SCALE",&sub_scale,0.5,3);
+    portrait_number("KHNMC_SUB_LOWER",&sub_lower,0,0.5);
+    const char *s=getenv("KHNMC_MENU_LAYOUT");
+    menu_band=s && !strcmp(s,"band");
+    if(s && *s && !menu_band && strcmp(s,"portrait")) kh_fatal(NULL,"menu-layout-value: KHNMC_MENU_LAYOUT=%s (known: portrait, band)",s);
 }
 void kh_aspect_hud_config(const char *cmd,const char *hpv){
     const char *v[HUD_N]={cmd,hpv};
@@ -1188,6 +1210,15 @@ static void h3_apply(KCtx *g,u64 obj,int first){
     if(h3_hs[d]){ u32 *ms=h3_cur_ms[d]; int k=a==H3_BOTTOM?hud_kind(grp):-1;            /* task 53: the scaled widgets, the loop's MS.x / .y / .z for the rest */
         ms[0]=h3_ms[d][0]; ms[1]=h3_ms[d][1]; ms[2]=h3_ms[d][2]; ms[3]=fbits(v);
         if(k>=0&&h3_hsc[d][k]!=1.0){ hud_ms(ms,h3_hsc[d][k],hud_px[k],hud_py[k]); hud.objs[k]++; } else hud.back++;
+        if(a==H3_TOP && grp==6) hud_ms(ms,enemy_scale,590,26);
+        if(vt==GS_BASE+0x5b1df0ull && (style_scale!=1 || style_raise!=0)){
+            double W=rdf(g,GX+0x18),H=rdf(g,GX+0x1c);
+            double xs=bf(ms[0]);
+            // The complete rank animation spans GS x 384..683, y 61..362.
+            double scale=fmin(style_scale,(W-2)/(299*xs));
+            hud_ms(ms,scale,533.5f,208);
+            ms[3]=fbits((float)(bf(ms[3])-H*style_raise));
+        }
         for(int i=0;i<3;i++) wr32(g,GX+0xa0+4ull*(u64)i,ms[i]);
         v=bf(ms[3]); }
     wrf(g,GX+0xac,v); h3_cur_vt[d]=vt; h3_cur_a[d]=a; h3_cur_v[d]=v; h3_cur_obj[d]=obj;
@@ -1214,6 +1245,7 @@ static void h3a_post(KCtx *g){
     h3_on[d]=1; h3_wc[d]=wc; h3_o[d]=(float)o; h3_cur_vt[d]=0; h3_cur_a[d]=-1; h3_cur_obj[d]=0;
     for(int i=0;i<4;i++) h3_ms[d][i]=rd32(g,GX+0xa0+4ull*(u64)i);
     for(int k=0;k<HUD_N;k++){ h3_hsc[d][k]=kh_aspect_hud_scale(k,W,H); if(h3_hsc[d][k]!=1.0) h3_hs[d]=1; }   /* task 53: a screen taller than wide */
+    if(W>0 && H>W && (style_scale!=1 || style_raise || enemy_scale!=1)) h3_hs[d]=1;
     if(h3_hs[d]) hud.passes++;
     if(kh_aspect_log&&!atomic_exchange(&h3_logged,1))
         fprintf(stderr,"kh: aspect: H3: first anchored dk pass: screen %gx%g, o %g; MagicScale (GX+0xa0..0xac) %g %g %g %g; GS frame GX+0x38/0x3c %g/%g, GX+0x48/0x4c %g/%g; GX+0x28 %g; game frame %llu, present %llu, guest thread %u\n",
@@ -1351,13 +1383,13 @@ static void h3_report(FILE *f){
 #define H7_MAXQ (H7_MAXV/4)                /* so every quad of an examined batch has its box in h7_pre's tables */
 #define H7_E 0.125                         /* GS units: a rectangle's corners against its box, and "exactly on a band edge" (R3); GS coordinates are multiples of 1/16 */
 #define H7_R3_MIN 312.0                    /* R3: the rectangle is at least 3/4 of the band tall (GS rows) */
-enum { H7K_FULL=0, H7K_PIECE, H7K_STACK, H7K_ALREADY, H7K_SITE, H7K_SHAPE, H7K_EDGE, H7K_BATCH, H7K_TITLE, H7K_WIPE, H7K_N };
+enum { H7K_FULL=0, H7K_PIECE, H7K_STACK, H7K_ALREADY, H7K_SITE, H7K_SHAPE, H7K_EDGE, H7K_BATCH, H7K_TITLE, H7K_WIPE, H7K_CAMP, H7K_RANK, H7K_N };
 static const char *h7_kname[H7K_N]={"R1 stretched, full band width","R1 stretched, a band-height piece narrower than the band","R2 stretched, a quad of a batch whose wide stripes stack over the band height",
                                      "already covering the frame's height, left","a band-height rectangle or stripe stack from a draw routine that is not in H7's table, left",
                                      "the batch's box spans the band height but neither R1 nor R2 applies, left",
                                      "R3 moved to the frame's edge, a picture cut by a band edge",
                                      "a band-height rectangle whose batch covers the strips above and below it, left",
-                                     "a part of the title's layout moved to its portrait place (task 53)","map-change wipe, outer tiles extended"};
+                                     "a part of the title's layout moved to its portrait place (task 53)","map-change wipe, outer tiles extended","portrait camp panel","rank animation at screen edge"};
 /* the draw routines whose rectangles H7 may stretch, by the return address f_11a330 finds on the guest stack (it is entered by a jump
  * from f_11a2f0, so this is the address after `call 0x14011a2f0`).  Any other routine is left alone whatever it draws: the pppEi /
  * ppp effect routines (0x1404b3c85, 0x1404ade0d, 0x1404b8de6 ...) submit world-space quads through f_11a330 too, some with the same
@@ -1462,6 +1494,36 @@ static u64 h7_vbobj(KCtx *g){
     return GX+0x5790+0x58ull*(u64)rd32(g,GX+0x578c);
 }
 static void h7_quadlog(KCtx *g,u64 ra,u32 prim,int q,int nq,const float *bb,int kind,double s,double y0n,double y1n,u64 va,u32 stride);   /* M's draw log (below) */
+/* Camp's SEQD panels meet at x=157, header ends at y=34, footer begins
+ * at y=312. Use the whole submitted batch, including a text run's glyphs. */
+static __thread u32 batch_ms[4];
+static void camp_matrix(u32 ms[4],double b,const float box[4],u64 vt,int page){
+    double height=416+2*b, cx=(box[0]+box[1])/2, scale=1.2;
+    double px=256,py=208,tx=256,ty=208;
+    if(box[3]<=35 && vt!=GS_BASE+0x5bab18){
+        py=0; ty=20-b; scale=1.05;
+    }else if((box[2]>=311 || (box[0]>=150 && box[2]>=303)) && vt!=GS_BASE+0x5bab18){
+        py=405; ty=416+b-15; scale=1.05;
+    }else if(page==36 || page==20){
+        /* Config choices share rows with their labels. Party places a native 3D actor in its card. */
+        scale=1.18;
+        if(page==20) px=tx=75;
+    }else if(height>=900){
+        int left=vt==GS_BASE+0x5bab18 || vt==GS_BASE+0x5baba8 || cx<156;
+        if(page==0 && !left){
+            /* Keep the preview frame around the separate Tz::MenuObj camera. */
+            px=tx=332; py=ty=175; scale=1.22;
+        }else{
+            scale=page==0?1.18:fmin(1.5,(height-190)/560);
+            px=left?80:332; py=36;
+            ty=60-b+(left?0:280*scale+14);
+        }
+    }
+    double xs=bf(ms[0]),ys=bf(ms[1]);
+    hud_ms(ms,scale,px,py);
+    ms[2]=fbits((float)(bf(ms[2])+(tx-px)*xs));
+    ms[3]=fbits((float)(bf(ms[3])+(ty-py)*ys));
+}
 /* H7 (b) at the entry of f_11a330: returns the kind (H7K_*) of a classified batch, -1 otherwise */
 static int h7_pre(KCtx *g){
     h7.calls++;
@@ -1473,7 +1535,9 @@ static int h7_pre(KCtx *g){
     if(!rd32(g,GX+0xb4)||!rd32(g,GX+0xb8)){ h7.mode90++; return -1; }                 /* f_1121d0 stages MagicScale from GX+0x90 */
     float msx=rdf(g,GX+0xa0), msy=rdf(g,GX+0xa4), msz=rdf(g,GX+0xa8), msw=rdf(g,GX+0xac);
     double dw=(double)msw-o, dh=416.0*(double)msy-((double)H-2.0*o);
-    if(!(dw<=0.5&&dw>=-0.5&&dh<=0.5&&dh>=-0.5)||!(msx>0)){ h7.modeother++; return -1; }
+    int rank=H>W && h3_depth && h3_on[h3_depth-1] && h3_cur_vt[h3_depth-1]==GS_BASE+0x5b1df0 &&
+             (style_scale!=1 || style_raise!=0);
+    if((!rank && !(dw<=0.5&&dw>=-0.5&&dh<=0.5&&dh>=-0.5))||!(msx>0)){ h7.modeother++; return -1; }
     if(!rd8(g,GX+0x4c0)&&rd64(g,GX+0x4b0)){ h7.lazy++; return -1; }                   /* the body's lazy begin is pending: left to the exe */
     u64 B=h7_vbobj(g); if(!B||!GA_OK(B)||!GA_OK(B+0x57)){ h7.nobuf++; return -1; }
     u32 stride=rd32(g,B+0x8); u64 vp=rd64(g,B+0x48);
@@ -1487,6 +1551,21 @@ static int h7_pre(KCtx *g){
       if(!base||!vp||vp!=base+off||count>asked||(u64)off+(u64)count*stride>cap){ h7.nobuf++; return -1; } }
     h7.batches++;
     float ox=rdf(g,GX+0x138), oy=rdf(g,GX+0x13c);
+    if(rank){
+        /* The resting letter keeps its requested centre. Clamp only frames of the zoom animation that reach an edge. */
+        float left=W,right=0,top=H,bottom=0;
+        for(int i=0;i<count;i++){
+            float x=(rdf(g,vp+(u64)i*stride)-ox)*msx+msz;
+            float y=(rdf(g,vp+(u64)i*stride+4)-oy)*msy+msw;
+            left=fminf(left,x); right=fmaxf(right,x);
+            top=fminf(top,y); bottom=fmaxf(bottom,y);
+        }
+        if(left>=0 && right<=W && top>=0 && bottom<=H) return -1;
+        memcpy(batch_ms,hp(g,GX+0xa0),sizeof batch_ms);
+        batch_ms[2]=fbits(msz+fmaxf(0,-left)+fminf(0,W-right));
+        batch_ms[3]=fbits(msw+fmaxf(0,-top)+fminf(0,H-bottom));
+        return H7K_RANK;
+    }
     double r=kh_aspect_r(W,H), b=208.0*(r-1.0), xl=(0.0-(double)msz)/(double)msx, xr=((double)W-(double)msz)/(double)msx, s=1.0;
     u64 ra=rd64(g,KH_RSP(g)); int site=h7_site_index(ra), best=-1, wrote=0, k2=0, nq=((prim==8&&!(count&3))||count==4)?count/4:0;
     float ab[4]={1e30f,-1e30f,1e30f,-1e30f}, qb[H7_MAXQ][4]; u8 qr[H7_MAXQ], qon[H7_MAXQ]; signed char qk[H7_MAXQ];   /* the batch's box; per quad its box, rectangle flag, R2 mask, kind */
@@ -1495,6 +1574,24 @@ static int h7_pre(KCtx *g){
         for(int i=0;i<4;i++){ v[i][0]=rdf(g,a+(u64)i*stride)-ox; v[i][1]=rdf(g,a+(u64)i*stride+4)-oy; }
         qr[q]=(u8)h7_box(v,bb); h7.quads++;
         if(bb[0]<ab[0]) ab[0]=bb[0]; if(bb[1]>ab[1]) ab[1]=bb[1]; if(bb[2]<ab[2]) ab[2]=bb[2]; if(bb[3]>ab[3]) ab[3]=bb[3]; }
+    if(!menu_band && H>W && h3_depth && h3_on[h3_depth-1] &&
+       rd8(g,GS_BASE+0x9006b0) && rd32(g,GS_BASE+0x900724)==8 &&
+       (ra==GS_BASE+0x197033 || ra==GS_BASE+0x19701a || ra==GS_BASE+0x1977e3 || ra==GS_BASE+0x3aff0f)){
+        if(!nq){
+            for(int i=0;i<count;i++){
+                u64 p=vp+(u64)i*stride;
+                float x=rdf(g,p)-ox,y=rdf(g,p+4)-oy;
+                ab[0]=fminf(ab[0],x); ab[1]=fmaxf(ab[1],x);
+                ab[2]=fminf(ab[2],y); ab[3]=fmaxf(ab[3],y);
+            }
+        }
+        if(ab[3]-ab[2]<416){ /* full-height stripes, side trims and dims retain H7's backdrop layout */
+            memcpy(batch_ms,hp(g,GX+0xa0),sizeof batch_ms);
+            camp_matrix(batch_ms,b,ab,h3_cur_vt[h3_depth-1],rd32(g,GS_BASE+0xbee64c));
+            h7.kind[H7K_CAMP]++;
+            return H7K_CAMP;
+        }
+    }
     if(ra==GS_BASE+0x197033ull&&nq==5&&!h3_depth&&h7_wipe_caps(qb,qr,xl,xr,b)){
         for(int q=0;q<5;q++){
             const float *bb=qb[q]; u64 a=vp+(u64)q*4u*stride;
@@ -1561,12 +1658,49 @@ static int h7_pre(KCtx *g){
     if(wrote) h7.batch_ext++;
     return best;
 }
+/* f_3afd90 receives the complete laid-out page. Its alignment (text+0x80)
+ * and measured dimensions (+0x20/+0x28) precede the per-glyph draw loop. */
+void orig_f_3afd90(KCtx *);
+void f_3afd90(KCtx *g){
+    int d=h3_depth-1;
+    if(!asp_mode || d<0 || !h3_on[d] || h3_cur_vt[d]!=GS_BASE+0x5c5180){
+        orig_f_3afd90(g); return;
+    }
+    double W=rdf(g,GX+0x18),H=rdf(g,GX+0x1c);
+    u64 text=A0(g);
+    double width=rd64(g,text+0x20),height=rd64(g,text+0x28);
+    if(H<=W || W<=0 || !width || !height){ orig_f_3afd90(g); return; }
+    int align=rd32(g,text+0x80);
+    double x=(s32)A1(g),y=(s32)A2(g);
+    double left=x-(align==1?width:(align>=2 && align<=4)?floor(width/2):0);
+    double bottom=y+(align==4 || align==5?0:align==3?height-floor(height/2):height);
+    u32 save[4],ms[4]; memcpy(save,hp(g,GX+0xa0),sizeof save); memcpy(ms,save,sizeof ms);
+    double sx=bf(ms[0]),sy=bf(ms[1]);
+    if(sx<=0 || sy<=0){ orig_f_3afd90(g); return; }
+    /* Native widths count advances. The last 32-GS glyph quad can extend past its advance. */
+    double scale=fmin(sub_scale,fmin(W/(sx*(width+32)),H*(1-sub_lower)/(sy*(height+2))));
+    hud_ms(ms,scale,(float)(left+width/2),(float)bottom);
+    double dx=bf(ms[0]),dy=bf(ms[1]);
+    ms[2]=fbits((float)fmax(-left*dx,fmin(bf(ms[2]),W-(left+width+32)*dx)));
+    /* For event cues the measured baseline ends at GS 400, the last glyph quad at 402.
+     * A taller text object already contains all its wrapped rows. */
+    double rows=(align==4 && y>=385 && y<=400)?402-y:2;
+    ms[3]=fbits((float)fmax(-(bottom-height)*dy,H*(1-sub_lower)-(bottom+rows)*dy));
+    memcpy(hp(g,GX+0xa0),ms,sizeof ms);
+    orig_f_3afd90(g);
+    memcpy(hp(g,GX+0xa0),save,sizeof save);
+}
 void orig_f_11a330(KCtx *);
 void f_11a330(KCtx *g){
     if(__builtin_expect(!asp_mode,1)){ orig_f_11a330(g); return; }                    /* nothing set / pc: exactly the exe */
     int k=h7_pre(g);
     if(k<0){ orig_f_11a330(g); return; }
-    int sv=h7_in; h7_in=1+k; orig_f_11a330(g); h7_in=sv;
+    int sv=h7_in; h7_in=1+k;
+    u32 saved[4];
+    if(k==H7K_CAMP || k==H7K_RANK){ memcpy(saved,hp(g,GX+0xa0),sizeof saved); memcpy(hp(g,GX+0xa0),batch_ms,sizeof saved); }
+    orig_f_11a330(g);
+    if(k==H7K_CAMP || k==H7K_RANK) memcpy(hp(g,GX+0xa0),saved,sizeof saved);
+    h7_in=sv;
 }
 static void h7_report(FILE *f){
     fprintf(f,"kh: aspect report: H7 (task 46: no bars on any frame, backdrops stretched to the frame's height; 0x11a330): H1 rewrites on frames without the 3D view %llu; dk passes anchored on such frames %llu; "
@@ -2321,6 +2455,13 @@ static void h3_selftest(KCtx *g){
       u32 ms[14][4], ref[14][4], m0[4];
       /* the arithmetic: parse, the screens, the map keeps the pivot's pixel and scales distances by s */
       { double v=0; ACHECK(kh_hud_scale_parse("1.25",&v)==0&&v==1.25&&kh_hud_scale_parse("0.5",&v)==0&&v==0.5&&kh_hud_scale_parse("3.0",&v)==0&&v==3.0&&kh_hud_scale_parse("3",&v)==0&&v==3.0);
+        ACHECK(decimal_range("0.06",&v,0,0.5)==0 && v==0.06 && decimal_range("0.51",&v,0,0.5)==2);
+        ACHECK(decimal_range("0",&v,0,0.5)==0 && !v && decimal_range(".25",&v,0,0.5)==1);
+        /* The two halves of a Config row must receive exactly the same transform. */
+        u32 left[4]={fbits(1),fbits(1),0,0},right[4]; memcpy(right,left,sizeof left);
+        camp_matrix(left,300,(float[]){40,138,80,106},GS_BASE+0x5bab18,36);
+        camp_matrix(right,300,(float[]){178,493,80,106},0,36);
+        ACHECK(!memcmp(left,right,sizeof left) && bf(left[0])>1);
         ACHECK(kh_hud_scale_parse("0.49",&v)==2&&kh_hud_scale_parse("3.01",&v)==2&&kh_hud_scale_parse("0",&v)==2);
         ACHECK(kh_hud_scale_parse("1,25",&v)==1&&kh_hud_scale_parse("1.25x",&v)==1&&kh_hud_scale_parse("",&v)==1&&kh_hud_scale_parse(".5",&v)==1&&kh_hud_scale_parse("1.",&v)==1&&kh_hud_scale_parse("-1",&v)==1&&kh_hud_scale_parse("1e0",&v)==1&&kh_hud_scale_parse(NULL,&v)==1);
         hud_s[0]=1.25; hud_s[1]=1.5; asp_mode=1;
@@ -2344,6 +2485,14 @@ static void h3_selftest(KCtx *g){
       ACHECK(near(bf(ref[0][3]),o_,0.5)&&bf(ref[0][0])>0&&bf(ref[0][1])>0);                            /* the loop's MagicScale (f_1433a0) */
       const u32 *L=ref[0];
       asp_mode=1;
+      double es=enemy_scale,ss=style_scale,sr=style_raise;
+      enemy_scale=1.5; style_scale=2; style_raise=0.25;
+      ACHECK(h3t_pass4(g,ob,14,ms,m0) && near(bf(ms[9][0]),1.5*bf(L[0]),1e-5));
+      u64 rank=h3t_obj(g,GS_BASE+0x5b1df0ull,0);
+      ACHECK(h3t_pass4(g,&rank,1,ms,m0) && near(bf(ms[0][1]),2*bf(L[1]),1e-5));
+      ACHECK(near(bf(ms[0][3])+208*bf(ms[0][1]),2853*0.25,1.0));
+      ga_free(rank);
+      enemy_scale=style_scale=1; style_raise=0;
       for(int c=0;c<4;c++){                                                                               /* scales: defaults, 1 / 1, command 1 only, 2.0 / 0.5 */
           hud_s[0]=c==0?1.25:c==1?1.0:c==2?1.0:2.0; hud_s[1]=c==0?1.5:c==1?1.0:c==2?1.5:0.5;
           u64 p0=hud.passes, so0[2]={hud.objs[0],hud.objs[1]}, bk0=hud.back; int nk[2]={0,0}, nb=0;
@@ -2382,6 +2531,7 @@ static void h3_selftest(KCtx *g){
         memcpy(h3in,hin,sizeof hin); n_h3in=nhin; h3in_cut=hcut;
         ga_free(list); ga_free(out); ga_free(mode); ga_free(wm); ga_free(sv); ga_free(tmp); }
       for(int i=0;i<14;i++) ga_free(ob[i]);
+      enemy_scale=es; style_scale=ss; style_raise=sr;
       hud_s[0]=hs0[0]; hud_s[1]=hs0[1]; hud_set[0]=hset0[0]; hud_set[1]=hset0[1]; memcpy(&hud,&hsv,sizeof hsv); asp_mode=1; }
     #undef H3SCREEN
     for(int i=0;i<8;i++) ga_free(o[i]);

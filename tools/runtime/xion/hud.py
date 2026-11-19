@@ -41,11 +41,11 @@ def sheet(height):
         image.alpha_composite(Image.fromarray(rgba),(x-portrait.width//2,319-portrait.height))
     return image
 
-def patch_face(data,image):
-    _,_,_,off,size=next(e for e in directory(data) if e[0]==24 and e[2]==b'face')
+def patch_face(data,image,member=b'face'):
+    _,_,_,off,size=next(e for e in directory(data) if e[0]==24 and e[2]==member)
     buf,n,pal,pn=R('<4I',data,off+8)
     w,h=R('<HH',data,off+28)
-    assert n==w*h==32768 and pn==1024 and pal+pn<=size
+    assert n==w*h and pn==1024 and buf+n<=size and pal+pn<=size
     q=image.resize((w,h),Image.Resampling.LANCZOS).quantize(256,Image.Quantize.FASTOCTREE)
     idx=np.asarray(q)
     colors=np.array(q.getpalette('RGBA'),dtype=np.uint8).reshape(-1,4)

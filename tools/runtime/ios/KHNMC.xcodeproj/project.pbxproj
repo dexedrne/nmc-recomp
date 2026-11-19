@@ -191,6 +191,8 @@
 					GameController,
 					"-framework",
 					QuartzCore,
+					"-framework",
+					CoreMotion,
 					"$(KHNMC_GFX_LDFLAGS)",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = beer.vyvanse.khnmc;
@@ -238,6 +240,8 @@
 					GameController,
 					"-framework",
 					QuartzCore,
+					"-framework",
+					CoreMotion,
 					"$(KHNMC_GFX_LDFLAGS)",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = beer.vyvanse.khnmc;

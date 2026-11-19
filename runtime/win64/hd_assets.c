@@ -129,7 +129,10 @@ int kh_look_key(const char *rel){
     if(!scene && !xion) return 0;
     char key[2300];
     if(!canon_rel(rel,key,sizeof key)) return 0;
-    if(scene && kh_scene_key(key)) return KH_SCENE_MODEL;
+    if(scene && kh_scene_key(key)){
+        if(xion) return !strcasecmp(key,KH_SCENE_MDLX)?-1:0; /* X5 uses embedded textures. */
+        return KH_SCENE_MODEL;
+    }
     if(!xion) return 0;
     const char *base=!strncasecmp(key,"remastered/",11)?key+11:key;
     if(!strncasecmp(base,"menu/shopface/",14)){
@@ -408,6 +411,20 @@ static int mod_asset(const HdFile *f,HdEnt *e,HdTable *t,char *err,size_t cap){
     e->size=(int32_t)f->size; e->fsize=f->size; e->src=SRC_MOD; t->n_mod++; return 0;
 }
 
+#define TITLE_LAYOUT "menu/us/title.2ld"
+#define TITLE_IMAGE "remastered/" TITLE_LAYOUT "/-4.png"
+
+/* Only the HD table varies. The loose title layout and its other textures stay shared. */
+static int hd_look(const char *rel){
+    if(!strcasecmp(rel,TITLE_LAYOUT) && kh_look_enabled()){
+        char path[4096];
+        if(kh_look_available(TITLE_IMAGE,path,sizeof path)) return 5;
+        kh_warn("player-look-title: missing %s in the Xion pack; using original title",TITLE_IMAGE);
+        return 0;
+    }
+    return kh_look_key(rel);
+}
+
 /* Builds the table for `rel` (canonical tree path of the game file). Returns 0, or -1 with a message in err.  `root` is the tree; the
  * folder is <root>/remastered/<rel> (case-insensitive).  `bytes` are only read when the folder is scanned. */
 static int hd_build(const char *root,const char *rel,const unsigned char *bytes,int64_t n,HdTable **out,char *err,size_t cap){
@@ -417,7 +434,7 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
     t->game_mod=gmod; t->mod_files=nmod; t->pkg_n=pt?pt->n:0; t->offsets=-1;
     HdFile *files=NULL; int nf=0; int32_t *offs=NULL; char *served=NULL; int rc=-1;
     char sub[2700],dir[4300],full[3000]; struct stat st;
-    t->look=kh_look_key(rel);
+    t->look=hd_look(rel);
     if(t->look==KH_SCENE_MODEL && !strcasecmp(rel,KH_SCENE_MDLX)){
         int count=0,bad=0;
         if(!kh_rm_offsets(rel,bytes,n,&offs,&count,&bad) || bad || count!=KH_SCENE_TEXTURES){
@@ -505,9 +522,9 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
     if(t->look>0){
         int slot=t->look-1;
         char name[32],key[2600],path[4300];
-        snprintf(name,sizeof name,"-%d.dds",slot);
+        snprintf(name,sizeof name,"-%d.%s",slot,!strcasecmp(rel,TITLE_LAYOUT)?"png":"dds");
         if(slot>=t->n || strcasecmp(t->e[slot].name,name)){
-            snprintf(err,cap,"player-look-hd-slot: %s lacks face entry %s",rel,name); goto fail;
+            snprintf(err,cap,"player-look-hd-slot: %s lacks texture entry %s",rel,name); goto fail;
         }
         snprintf(key,sizeof key,"remastered/%s/%s",rel,name);
         kh_look_path(NULL,key,path,sizeof path);
@@ -533,7 +550,7 @@ HdTable *kh_hd_begin(KCtx *g,const char *root,const char *rel_in,const unsigned 
     char rel[2300]; if(!canon_rel(rel_in,rel,sizeof rel)||!*rel) kh_fatal(g,"hd assets: no usable tree path in \"%s\"",rel_in);
     pthread_mutex_lock(&hd_lock);
     unsigned b=ci_hash(rel)&1023; HdTable *t;
-    int look=kh_look_key(rel);
+    int look=hd_look(rel);
     for(t=buckets[b];t;t=t->next) if(t->look==look&&t->fsize==n&&key_eq(t->key,rel)) break;
     if(t&&t->gent){ st_cache_hit++; pthread_mutex_unlock(&hd_lock); cur_table=t; return prev; }
     if(!t){
@@ -791,6 +808,41 @@ int kh_hd_selftest(KCtx *g){
     unsigned char bar[0x1000]; char err[1500]; HdTable *t;
     cfg_loaded=1; prov_clear(); pkg_clear();                                           /* the tests set both lists themselves */
 
+    /* Exercise the real HD cache across a look change, including packs predating title art. */
+    {
+        const char *oldroot=getenv("KHNMC_LOOK_DIR"), *oldlook=getenv("KHNMC_PLAYER_LOOK");
+        char *savedroot=oldroot?strdup(oldroot):NULL, *savedlook=oldlook?strdup(oldlook):NULL;
+        char pack[KH_TMP_MAX+32]; snprintf(pack,sizeof pack,"%s/pack",dir); mkdir(pack,0700);
+        setenv("KHNMC_LOOK_DIR",pack,1); setenv("KHNMC_PLAYER_LOOK","roxas",1);
+        make_bar(bar,8,0);
+        TEST(prov_add(TITLE_LAYOUT));
+        for(int i=0;i<8;i++){
+            char key[128]; snprintf(key,sizeof key,"remastered/" TITLE_LAYOUT "/-%d.png",i);
+            TEST(prov_add(key) && put_file(dir,key,"stock",5));
+        }
+        HdTable *prev=kh_hd_begin(g,dir,TITLE_LAYOUT,bar,sizeof bar), *stock=cur_table;
+        TEST(stock && stock->n==8 && stock->look==0);
+        setenv("KHNMC_PLAYER_LOOK","xion",1);
+        TEST(!hd_look(TITLE_LAYOUT) && put_file(pack,TITLE_IMAGE,"variant",7));
+        kh_hd_begin(g,dir,TITLE_LAYOUT,bar,sizeof bar);
+        HdTable *variant=cur_table;
+        TEST(variant!=stock && variant->n==8 && variant->e[4].size==7 && stock->e[4].size==5);
+        if(variant->n==8 && stock->n==8) for(int i=0;i<8;i++){
+            TEST(variant->e[i].orig==stock->e[i].orig &&
+                 ((strcmp(variant->e[i].host,stock->e[i].host)!=0)==(i==4)));
+        }
+        setenv("KHNMC_PLAYER_LOOK","roxas",1);
+        kh_hd_begin(g,dir,TITLE_LAYOUT,bar,sizeof bar); TEST(cur_table==stock);
+        kh_hd_end(prev);
+        HdTable **bucket=&buckets[ci_hash(TITLE_LAYOUT)&1023];
+        while(*bucket){
+            HdTable *entry=*bucket; *bucket=entry->next;
+            ga_free(entry->gent); table_free(entry);
+        }
+        if(savedroot) setenv("KHNMC_LOOK_DIR",savedroot,1); else unsetenv("KHNMC_LOOK_DIR");
+        if(savedlook) setenv("KHNMC_PLAYER_LOOK",savedlook,1); else unsetenv("KHNMC_PLAYER_LOOK");
+        free(savedroot); free(savedlook); prov_clear();
+    }
     /* ---- helpers: canonical paths, the walker-against-package classes ---- */
     { char c[64]; TEST(canon_rel("./obj//X.mdlx/",c,sizeof c)&&!strcmp(c,"obj/X.mdlx")); TEST(canon_rel("a/./b",c,sizeof c)&&!strcmp(c,"a/b")); TEST(!canon_rel("0123456789",c,8)); }
     { TEST(st_pkg("w/a.bar\t3\t-0.dds:20000010:1\t-1.dds:20000020:1\t-2.dds:ffffffff:1")); const PkgTab *p=pkg_find("W/A.BAR"); TEST(p&&p->n==3);
