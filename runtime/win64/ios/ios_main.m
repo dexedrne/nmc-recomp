@@ -218,9 +218,10 @@ static void start_display_link(void){
 /* owner 2026-11-18: portrait too ("Fill the whole tall screen").  The game takes the drawable's size at start-up (KHNMC_SCREEN=layer), so
  * it fills the screen in the orientation it was STARTED in; a rotation while it runs only changes the presenter's swapchain (the
  * picture is fitted into the new shape) until live resize exists (task 47). */
-/* 18:40: back to landscape only: the first GPU pictures at 2007x2853 (lavapipe) were black; portrait returns when that is understood
- * (set KH_IOS_PORTRAIT to 1 here and add UIInterfaceOrientationPortrait to Info.plist). */
-#define KH_IOS_PORTRAIT 0
+/* Portrait (owner 2026-11-18, "Fill the whole tall screen"): the game takes the drawable's size at start-up, so it fills the screen in
+ * the orientation it is STARTED in (checked on lavapipe at 2007x2853: the 3D fills the tall frame, the HUD is at the edges; an earlier
+ * "black" result was only the loading transition).  A rotation while it runs only refits the picture until live resize exists. */
+#define KH_IOS_PORTRAIT 1
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return KH_IOS_PORTRAIT ? UIInterfaceOrientationMaskAllButUpsideDown : UIInterfaceOrientationMaskLandscape; }
 /* the drawable's size in pixels (bounds x nativeScale), 0 x 0 before the view has a screen */
 - (BOOL)pixelsW:(uint32_t *)w h:(uint32_t *)h {
