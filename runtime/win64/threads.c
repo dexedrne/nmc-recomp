@@ -490,12 +490,69 @@ static u32 thread_resume(u64 h){ int k; KWaitObj *w=h_get_ref(h,&k); if(!w||k!=H
     KThread *t=w->thread; pthread_mutex_lock(&t->m); int was=t->suspended; if(was>0) t->suspended=was-1;
     if(was==1){ atomic_store(&t->vc_state,0); vc_released(); }   /* runnable from here on: running for the quiescence test until it blocks, not idle until it has run (review of task 28) */
     pthread_cond_broadcast(&t->cv); pthread_mutex_unlock(&t->m); kh_wobj_unref(w); return (u32)was; }
+void kh_resume_fddde(KCtx *);
+static _Thread_local jmp_buf *stream_dispatch;
+static _Thread_local u64 stream_entry_sp;
+
+int kh_cut_on_stream(void){ return stream_dispatch!=NULL; }
+
+void kh_cut_stream_loop(KCtx *g){
+    KThread *t=cur_thread();
+    if(!t||t->start!=GS_BASE+0xfddd0||g!=t->g||stream_dispatch||
+       rd64(g,A0(g)+0x20)!=GS_BASE+0xfe930){
+        kh_dispatch(g,GS_BASE+0xfddd0);
+        return;
+    }
+    jmp_buf dispatch;
+    stream_entry_sp=KH_RSP(g);
+    stream_dispatch=&dispatch;
+    switch(setjmp(dispatch)){
+    case 0:
+        kh_dispatch(g,t->start);
+        break;
+    case 1:
+        /* thread_suspend transferred t->m to this dispatcher before parking. */
+        while(t->suspended>0) kh_cut_wait("stream-idle",&t->cv,&t->m);
+        atomic_store(&t->vc_state,0);
+        pthread_mutex_unlock(&t->m);
+        SET_RAX(g,0);
+        KH_RET(g);
+        kh_cut_stream_steps(g,0xfeade);
+        kh_resume_fddde(g);
+        break;
+    case 2:
+        kh_cut_poll("stream-loop-top",NULL);
+        kh_cut_stream_steps(g,0xfe990);
+        kh_resume_fddde(g);
+        break;
+    case 3:
+        kh_cut_poll("stream-next-request",NULL);
+        kh_cut_stream_steps(g,0xfea00);
+        kh_resume_fddde(g);
+    }
+    stream_dispatch=NULL;
+}
+
+static int stream_chain(KThread *t,KCtx *g,u64 offset){
+    u64 sp=KH_RSP(g);
+    return stream_dispatch&&g==t->g&&!kh_cut_callback_depth&&sp>=t->stack_lo&&
+        stream_entry_sp<t->stack_hi&&t->stack_hi-stream_entry_sp>=8&&
+        stream_entry_sp>=sp&&stream_entry_sp-sp==offset&&
+        rd64(g,stream_entry_sp-0x30)==GS_BASE+0xfddde&&
+        rd64(g,stream_entry_sp)==0x7ff7ffff0000ull;
+}
+void kh_cut_before_request(KCtx *g,int pc){
+    if(atomic_load(&kh_cut_requested)&&kh_cut_loader_safe()&&stream_chain(cur_thread(),g,0x88))
+        longjmp(*stream_dispatch,pc==0xfe990?2:3);
+}
 static u32 thread_suspend(KCtx *g,u64 h){
     KThread *me=cur_thread(), *t=me; KWaitObj *w=NULL; (void)g;
     if(h!=PSEUDO_THREAD){ int k; w=h_get_ref(h,&k); if(!w||k!=HK_THREAD){ if(w) kh_wobj_unref(w); kh_set_last_error(6); return (u32)-1; } t=w->thread; kh_wobj_unref(w); }
     if(t!=me){ atomic_fetch_add(&cnt_foreign_suspend,1); kh_warn("SuspendThread of ANOTHER thread (target %u, caller %u, handle %llx) is not implemented: the target keeps running, the call returns failure",t->tid,me->tid,(unsigned long long)h); kh_set_last_error(5); return (u32)-1; }
     atomic_fetch_add(&cnt_self_suspend,1);
-    pthread_mutex_lock(&t->m); int was=t->suspended; t->suspended=was+1; atomic_store(&t->vc_state,2); kh_vclock_idle(2); while(t->suspended>0) kh_cut_wait("self-suspend",&t->cv,&t->m); atomic_store(&t->vc_state,0); pthread_mutex_unlock(&t->m);
+    pthread_mutex_lock(&t->m); int was=t->suspended; t->suspended=was+1; atomic_store(&t->vc_state,2); kh_vclock_idle(2);
+    if(!was&&stream_chain(t,g,0x90)&&rd64(g,KH_RSP(g))==GS_BASE+0xfeade) longjmp(*stream_dispatch,1);
+    while(t->suspended>0) kh_cut_wait("self-suspend",&t->cv,&t->m); atomic_store(&t->vc_state,0); pthread_mutex_unlock(&t->m);
     return (u32)was;
 }
 IMP(K32,ResumeThread){ SET_RAX(g,thread_resume(A0(g))); }

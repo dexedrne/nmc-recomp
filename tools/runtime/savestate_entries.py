@@ -5,6 +5,8 @@ from pathlib import Path
 
 # Shard, containing function, successor, instruction that yielded/called.
 entries = (
+    (19, 'fddd0', 'fddde', 'kh_dispatch(g,t6);'),
+    (20, 'fe930', 'feade', 'f_fdd70(g);'),
     (27, '1548e0', '154a1b', 'f_105e10(g);'),
     (26, '14fd60', '14fdfe', 'kh_dispatch(g,t2);'),
     (26, '14eb70', '14ecde', 'f_14fc20(g);'),
@@ -32,4 +34,17 @@ for shard, func, label, instruction in entries:
     # value from the abandoned caller's C scope is needed after the jump.
     for callee in sorted(set(re.findall(r'\b((?:f_|rt_)[A-Za-z_0-9]+)\(g\);', body))):
         print(f'void {callee}(KCtx *g);')
-    print(f'void kh_resume_{label}(KCtx *g){{ goto L{label};' + body)
+    if func == 'fe930':
+        # Inspect the request list only after the cut has had a chance to park
+        # the worker. Each block has fresh temporaries in the generated lift.
+        print('void kh_cut_before_request(KCtx *,int);')
+        for site in ('fe990', 'fea00'):
+            boundary = f'L{site}:{{'
+            if body.count(boundary) != 1:
+                raise ValueError(f'missing stream request boundary {site}')
+            body = body.replace(boundary, boundary + f' kh_cut_before_request(g,0x{site});')
+        print('void kh_cut_stream_steps(KCtx *g,int pc){')
+        print('switch(pc){ case 0xfeade: goto Lfeade; case 0xfe990: goto Lfe990; case 0xfea00: goto Lfea00; }')
+        print(body)
+    else:
+        print(f'void kh_resume_{label}(KCtx *g){{ goto L{label};' + body)

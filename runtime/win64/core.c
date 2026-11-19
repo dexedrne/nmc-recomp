@@ -842,6 +842,10 @@ void kh_dispatch(KCtx *g,u64 target){
     KhFn f=kh_lookup(target);
     if(!f){ if(kh_native_try(g,target)) return; kh_fault(g,target,"dispatch: not a function start"); }
     g->aux[0]=target;
+    if(kh_cut_enabled&&target==GS_BASE+0xfe930&&kh_cut_on_stream()){
+        kh_cut_stream_steps(g,0xfe930);
+        return;
+    }
     if(__builtin_expect(KH_R64(g,KO_RIP)==GS_BASE+0x1666ab,0) && kh_hide_hud &&
        rd64(g,KH_RSP(g))==GS_BASE+0x1666ae){
         int previous=screenshot_draw;
@@ -874,7 +878,8 @@ u64 kh_call5(KCtx *g,u64 target,u64 a0,u64 a1,u64 a2,u64 a3,u64 a4){
     wr64(g,sp+0x20,a4);            /* 5th argument slot (after the 32-byte shadow space and return address) */
     sp-=8; wr64(g,sp,KH_SENTINEL_RET);
     KH_RSP(g)=sp; KH_RCX(g)=a0; KH_RDX(g)=a1; KH_R8(g)=a2; KH_R9(g)=a3;
-    kh_dispatch(g,target);
+    if(kh_cut_enabled&&target==GS_BASE+0xfddd0) kh_cut_stream_loop(g);
+    else kh_dispatch(g,target);
     u64 r=KH_RAX(g); KH_RSP(g)=save; KH_RCX(g)=sv_rcx; KH_RDX(g)=sv_rdx; KH_R8(g)=sv_r8; KH_R9(g)=sv_r9; return r;
 }
 u64 kh_call(KCtx *g,u64 t,u64 a0,u64 a1,u64 a2,u64 a3){ return kh_call5(g,t,a0,a1,a2,a3,0); }

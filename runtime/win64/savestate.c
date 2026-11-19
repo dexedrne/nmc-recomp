@@ -1,4 +1,5 @@
 #include "savestate.h"
+#include "settings.h"
 #include "gfx_present.h"
 #include "route_state.h"
 #include "autosave.h"
@@ -27,10 +28,43 @@ static struct Trigger {
 } *trigger_head;
 static pthread_mutex_t mutex=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t resume=PTHREAD_COND_INITIALIZER;
-static struct Park { struct Park *next; KThread *thread; const char *site; void *callers[64]; int depth; } *parks;
+static struct Park { struct Park *next; KThread *thread; const char *site; void *callers[64]; int depth,stream; } *parks;
 static unsigned generation, completed, missed;
 static FILE *oracle; /* CPU comparison evidence only; never accepted as a playable slot. */
 static int oracle_failed;
+/* UI thread submits one numbered slot. Only the game thread touches the trigger list. */
+static _Atomic int menu_request;
+static _Atomic(const char *) menu_status;
+static struct Trigger menu_trigger;
+static char menu_path[4096];
+static int scripted;
+
+const char *kh_cut_menu_status(void){ return atomic_exchange(&menu_status,NULL); }
+int kh_cut_menu_request(int load,int slot){
+    if(slot<1||slot>3) return -1;
+    if(!kh_cut_enabled||scripted) return -2;
+    int empty=0;
+    return atomic_compare_exchange_strong(&menu_request,&empty,load?slot+3:slot)?0:-1;
+}
+static void finish_menu(const char *message){
+    fprintf(stderr,"kh: savestate-menu: %s (%s)\n",message,menu_path);
+    trigger_head=NULL;
+    completed=missed=0;
+    atomic_store(&menu_status,message);
+    atomic_store(&menu_request,0);
+}
+static void take_menu_request(u64 frame){
+    int request=atomic_load(&menu_request);
+    if(!request) return;
+    const char *docs=getenv("KH_DOCS");
+    if(!docs||!*docs||snprintf(menu_path,sizeof menu_path,"%s/state-%d.slot",docs,(request-1)%3+1)>=(int)sizeof menu_path){
+        finish_menu("savestate-slot-path: Documents directory unavailable");
+        return;
+    }
+    menu_trigger=(struct Trigger){NULL,frame,request>3?LOAD:SAVE,menu_path};
+    trigger_head=&menu_trigger;
+}
+
 static void record_bytes(const void *data,size_t size){
     if(!oracle_failed&&fwrite(data,1,size,oracle)!=size) oracle_failed=1;
 }
@@ -56,6 +90,7 @@ void kh_cut_init(void){
         kh_fatal(NULL,"savestate-profile: external audio device active");
     kh_cut_reserve_boot_object();
     kh_cut_enabled=1;
+    scripted=trigger!=NULL;
     if(!trigger) return;
     char *storage=strdup(trigger), *spec=storage;
     if(!spec) kh_fatal(NULL,"savestate-trigger-memory");
@@ -101,6 +136,7 @@ void kh_cut_poll(const char *site,pthread_mutex_t *held){
     pthread_mutex_lock(&mutex);
     if(atomic_load(&kh_cut_requested)){
         struct Park p={parks,cur_thread(),site};
+        p.stream=kh_cut_on_stream();
         if(!completed) p.depth=backtrace(p.callers,64);
         parks=&p;
         unsigned epoch=generation;
@@ -197,6 +233,7 @@ static int game_chain_known(KCtx *g){
 void kh_cut_frame(KCtx *g,u64 frame){
     extern _Atomic u64 gfx_presents;
     extern size_t kh_phase_files_seen(void);
+    if(!trigger_head) take_menu_request(frame);
     int due=trigger_head&&frame>=trigger_head->frame;
     if(due&&!at_dispatch&&game_chain_known(g)) longjmp(*game_dispatch,1);
     unsigned char digest[32];
@@ -215,16 +252,18 @@ void kh_cut_frame(KCtx *g,u64 frame){
 
     if(trigger_head->op==LOAD){
         FILE *f=fopen(slot,"rb");
-        if(!f) kh_fatal(g,"savestate-load-open: %s: %s",slot,strerror(errno));
-        char header[8];
-        size_t size=fread(header,1,sizeof header,f);
-        int failed=ferror(f);
-        fclose(f);
-        if(failed) kh_fatal(g,"savestate-load-read: %s",slot);
-        if(size<sizeof header) kh_fatal(g,"savestate-load-truncated: %s",slot);
-        if(!memcmp(header,"KHCPU01\n",8))
-            kh_fatal(g,"savestate-load-cpu-only: %s has no host or execution continuations",slot);
-        kh_fatal(g,"savestate-load-format: unrecognized checkpoint %s",slot);
+        const char *error="savestate-load-open";
+        if(f){
+            char header[8];
+            size_t size=fread(header,1,sizeof header,f);
+            if(ferror(f)) error="savestate-load-read";
+            else if(size<sizeof header) error="savestate-load-truncated";
+            else if(!memcmp(header,"KHCPU01\n",8)) error="savestate-load-cpu-only";
+            else error="savestate-load-format";
+            fclose(f);
+        }
+        if(trigger_head==&menu_trigger){ finish_menu(error); return; }
+        kh_fatal(g,"%s: %s",error,slot);
     }
     KThread *threads[4096];
     u64 start=kh_host_ns(),epoch;
@@ -253,22 +292,34 @@ void kh_cut_frame(KCtx *g,u64 frame){
     unsigned blocker_tid=0;
     u64 blocker_start=0,blocker_return=0;
     const char *blocker_site=NULL;
-    int gate_ok=0;
+    int gate_ok=0,stream_busy=0;
     char *tmp=NULL;
     int fd=-1;
     if(!missing&&kh_cut_gate_begin(&epoch)){
         gate_ok=kh_gfx_gate_quiesce_bounded(4,10)==KH_GATE_QUIESCED;
         if(save&&gate_ok){
-            /* A suspended stream worker can stay here for the entire scene.
-             * Its import result and lifted caller are still on its old stack. */
+            /* The stream dispatcher owns only the guest successor and suspend predicate. */
             for(struct Park *p=parks;p;p=p->next){
+                if(p->stream){
+                    KThread *t=p->thread;
+                    if(!strcmp(p->site,"stream-loop-top")||!strcmp(p->site,"stream-next-request")) continue;
+                    int idle=0;
+                    if(!strcmp(p->site,"stream-idle")&&!pthread_mutex_trylock(&t->m)){
+                        idle=t->suspended==1&&rd32(g,GS_BASE+0x713390)==0;
+                        pthread_mutex_unlock(&t->m);
+                    }
+                    if(idle){
+                        fprintf(stderr,"kh: savestate-stream-idle tid=%u successor=feade\n",t->tid);
+                        continue;
+                    }
+                    stream_busy=1;
+                }
                 if(blocker_site&&strcmp(p->site,"self-suspend")) continue;
                 blocker_tid=p->thread->tid;
                 blocker_start=p->thread->start;
                 blocker_site=p->site;
                 KCtx *ctx=p->thread->g;
                 blocker_return=rd64(ctx,KH_RSP(ctx));
-                if(!strcmp(p->site,"self-suspend")) break;
             }
         }
         if(!save&&!completed&&gate_ok){
@@ -311,19 +362,38 @@ void kh_cut_frame(KCtx *g,u64 frame){
     }
     free(tmp);
     if(oracle_failed) kh_fatal(g,"savestate-census-io: could not publish CPU comparison file");
-    if(missing||!gate_ok){
-        if(++missed==4) kh_fatal(g,"savestate-cut-refused: four successive incomplete rendezvous; last frame %llu",(unsigned long long)frame);
-        kh_warn("savestate-cut-deferred: frame %llu, missing %d, gate %d",(unsigned long long)frame,missing,gate_ok);
+    if(stream_busy||missing||!gate_ok){
+        if(++missed==4){
+            const char *reason=stream_busy?"savestate-stream-drain-timeout":"savestate-cut-refused";
+            if(trigger_head==&menu_trigger){ finish_menu(reason); return; }
+            kh_fatal(g,"%s: four successive incomplete cuts; last frame %llu",reason,(unsigned long long)frame);
+        }
+        kh_warn("savestate-cut-deferred: frame %llu, missing %d, gate %d, stream-busy %d",
+                (unsigned long long)frame,missing,gate_ok,stream_busy);
         return;
     }
     completed++;
     missed=0;
     if(save){
-        if(!at_dispatch) kh_fatal(g,"savestate-game-continuation: unsupported frame caller %llx for %s",
-                (unsigned long long)rd64(g,KH_RSP(g)),slot);
-        if(blocker_site) kh_fatal(g,"savestate-worker-continuation: tid=%u start=%llx wait=%s guest-return=%llx slot=%s",
-                blocker_tid,(unsigned long long)blocker_start,blocker_site,(unsigned long long)blocker_return,slot);
-        kh_fatal(g,"savestate-host-state: runtime owners have no restore records for %s",slot);
+        const char *error;
+        char detail[256];
+        if(!at_dispatch){
+            error="savestate-game-continuation";
+            snprintf(detail,sizeof detail,"unsupported frame caller %llx",(unsigned long long)rd64(g,KH_RSP(g)));
+        }else if(blocker_site){
+            error="savestate-worker-continuation";
+            snprintf(detail,sizeof detail,"tid=%u start=%llx wait=%s guest-return=%llx",blocker_tid,
+                     (unsigned long long)blocker_start,blocker_site,(unsigned long long)blocker_return);
+        }else{
+            error="savestate-host-state";
+            snprintf(detail,sizeof detail,"runtime owners have no restore records");
+        }
+        if(trigger_head==&menu_trigger){
+            kh_warn("%s: %s slot=%s",error,detail,slot);
+            finish_menu(error);
+            return;
+        }
+        kh_fatal(g,"%s: %s slot=%s",error,detail,slot);
     }
     if(completed==(trigger_head->op==FREEZE?20:1)){
         struct Trigger *done=trigger_head;

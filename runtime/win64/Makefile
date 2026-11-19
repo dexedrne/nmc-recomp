@@ -467,7 +467,7 @@ endif
 all: $(O)/hook_link.ok
 $(O)/hook_link.ok: $(BIN) tools/check_hook_link.py
 	python3 tools/check_hook_link.py --bin $(BIN) --objs $(RTOBJ) $(LIFTOBJ) $(HOOK_OBJ) --hooks $(HOOKS_UNIQ) --wrap $(WRAP_FNS) $(if $(HOOK_OBJ),--forwarders $(HOOK_OBJ)) $(if $(filter 1,$(HOOK_STRICT)),--strict) && touch $@
-$(O)/savestate_entries.c: tools/savestate_entries.py $(addprefix $(SHARDS_DIR)/shard_,0022.c 0023.c 0024.c 0026.c 0027.c 0038.c 0058.c)
+$(O)/savestate_entries.c: tools/savestate_entries.py $(addprefix $(SHARDS_DIR)/shard_,0019.c 0020.c 0022.c 0023.c 0024.c 0026.c 0027.c 0038.c 0058.c)
 	@mkdir -p $(O)
 	python3 $< $(SHARDS_DIR) > $@.new && mv $@.new $@
 $(O)/savestate_entries.o: $(O)/savestate_entries.c

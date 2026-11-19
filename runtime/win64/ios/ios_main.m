@@ -120,7 +120,9 @@ static BOOL options_input(unsigned short buttons){
             [options_label removeFromSuperview]; options_label=nil; suppress_buttons=YES;
             kh_app_resume(KH_APP_RESUME_BOUND_MS);
         }else if((down&0x1000) && kh_setting_action(selected_option)){
-            if(kh_setting_set(kh_options[selected_option].name,option_value(selected_option).UTF8String)) show_options(@"A command is already queued");
+            int result=kh_setting_set(kh_options[selected_option].name,option_value(selected_option).UTF8String);
+            if(result==-2) show_options(@"Save states require an interactive null-graphics, frame-clock session.");
+            else if(result) show_options(@"A command is already queued");
             else show_options(@"Queued. Circle to resume.");
         }else if(down&3){
             selected_option=(selected_option+((down&1)?-1:1)+kh_setting_menu_count())%kh_setting_menu_count();
@@ -147,7 +149,8 @@ static BOOL options_input(unsigned short buttons){
         options_label.adjustsFontSizeToFitWidth=YES; options_label.minimumScaleFactor=0.7;
         [parent addSubview:options_label];
         if(!chosen_options) chosen_options=[NSMutableDictionary new];
-        show_options(nil);
+        const char *status=kh_cut_menu_status();
+        show_options(status?@(status):nil);
         return YES;
     }
     return NO;

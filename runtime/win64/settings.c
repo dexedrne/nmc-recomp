@@ -82,6 +82,7 @@ const struct kh_option kh_options[]={
     TWEAK_OPT("COMBAT_MENU_MEMORY","Menu memory (unused by DLL)","off"),
     TWEAK_OPT("COMBAT_REPOINT_AND_EXTEND_BTLOBJ_SHEET","Extend battle objects (unused by DLL)","on"),
     TWEAK_OPT("COMBAT_CHANGE_CUSTOM_MAGIC_MPDRIVE_STATUS","Magic MP/Drive status (unused by DLL)","off"),
+    NUMBER("SAVE_STATE","Save state","1",1,3,1), NUMBER("LOAD_STATE","Load state","1",1,3,1),
     BOOL_OPT("DEBUG_TURBO","Debug turbo","0"),
     BOOL_OPT("DEBUG_OHKO","Debug one-hit kills","0"),
     BOOL_OPT("DEBUG_INVINCIBLE","Debug party invincibility","0"),
@@ -91,13 +92,14 @@ const struct kh_option kh_options[]={
     BOOL_OPT("DEBUG_RESET","Return to title (discards progress)","0"),
 };
 const int kh_option_count=sizeof kh_options/sizeof *kh_options;
+enum { STATE_ACTIONS=2 };
 enum { TURBO, OHKO, INVINCIBLE, WARP, HIDE, SHOW, RESET, DEBUG_COUNT };
 static _Atomic int debug_enabled,allow_reset;
 static int debug_pending=-1,debug_arg[6],turbo;
 static float turbo_speed=7.5f;
 static unsigned long long mp_probe;
 static int test_log;
-int kh_setting_action(int i){return i>=kh_option_count-DEBUG_COUNT && i<kh_option_count;}
+int kh_setting_action(int i){return i>=kh_option_count-DEBUG_COUNT-STATE_ACTIONS && i<kh_option_count;}
 int kh_setting_menu_count(void){return kh_option_count-(debug_enabled?(allow_reset?0:1):DEBUG_COUNT);}
 static _Atomic double values[COUNT]={0,0,1,1};
 int kh_setting_live(int index){return index>=0 && index<COUNT;}
@@ -182,7 +184,7 @@ static void load_saved_options(void){
         char *v=strchr(p,'=');
         if(!v) continue;
         *v++=0;v[strcspn(v,"\r\n")]=0;
-        for(int i=0;i<kh_option_count-DEBUG_COUNT;i++)
+        for(int i=0;i<kh_option_count-DEBUG_COUNT-STATE_ACTIONS;i++)
             if(!strcmp(p,kh_options[i].name) && !getenv(p) && setenv(p,v,0)) kh_fatal(NULL,"settings-config-env: %s",p);
     }
     if(ferror(in)) kh_fatal(NULL,"settings-config-read: %s",path);
@@ -205,6 +207,10 @@ int kh_settings_selftest(void){
         fail|=strcmp(data,"# keep\narg --selftest\nenv KHNMC_EXP_MULT=2\n")!=0;
     }
     double v;
+    fail|=validate("KHNMC_SAVE_STATE","1",&v)<0 || v!=1;
+    fail|=validate("KHNMC_LOAD_STATE","3",&v)<0 || v!=3;
+    fail|=validate("KHNMC_LOAD_STATE","4",&v)>=0 || validate("KHNMC_SAVE_STATE","1.5",&v)>=0;
+    fail|=!kh_setting_action(validate("KHNMC_SAVE_STATE","2",&v));
     fail|=validate("KHNMC_TWEAK_WORLDS_SYMBOL_ZZ","12,1,2,3,256",&v)>=0;
     fail|=validate("KHNMC_TWEAK_FORMS_VALOR_GROWTH","1,2",&v)>=0;
     fail|=validate("KHNMC_TWEAK_DEBUG_TURBO_SPEED","7.5",&v)<0;
@@ -218,6 +224,8 @@ int kh_setting_set(const char *name,const char *value){
     double v; int i=validate(name,value,&v);
     if(i<0) return -1;
     if(kh_setting_action(i)){
+        int debug_start=kh_option_count-DEBUG_COUNT;
+        if(i<debug_start) return kh_cut_menu_request(i==debug_start-1,(int)v);
         if(i>=kh_setting_menu_count()) return -1;
         pthread_mutex_lock(&config_lock);
         if(debug_pending>=0){pthread_mutex_unlock(&config_lock);return -1;}
