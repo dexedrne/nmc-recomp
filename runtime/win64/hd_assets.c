@@ -63,6 +63,7 @@
 #include "khnmc_hd.h"
 #include "khnmc_remaster.h"
 #include "kh_look.h"
+#include "xion_swap.h"
 #include <dirent.h>
 #include <string.h>
 #include <strings.h>
@@ -134,6 +135,12 @@ int kh_look_key(const char *rel){
         return KH_SCENE_MODEL;
     }
     if(!xion) return 0;
+    if(kh_xion_enabled){
+        static const char *const story[]={"obj/P_EX110.mdlx","obj/P_EX110_NPC_PAJAMAS.mdlx",
+                                           "obj/H_EX510.mdlx","obj/H_EX510_PAJAMAS.mdlx"};
+        for(size_t i=0;i<sizeof story/sizeof *story;i++)
+            if(!strcasecmp(key,story[i])) return -1;
+    }
     const char *base=!strncasecmp(key,"remastered/",11)?key+11:key;
     if(!strncasecmp(base,"menu/shopface/",14)){
         static const char *const shops[]={"menu/shopface/p_ex100.bin","menu/shopface/p_ex101.bin","menu/shopface/p_ex100_wi.bin"};

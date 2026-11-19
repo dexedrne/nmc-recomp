@@ -70,9 +70,10 @@ static NSMutableDictionary<NSString *,NSString *> *chosen_options;
 static int selected_option,selected_component;
 static unsigned short previous_buttons;
 static BOOL suppress_buttons;
+static NSString *pending_character;
 static NSString *option_value(int index){
     const struct kh_option *o=&kh_options[index];
-    if(!strcmp(o->name,"KHNMC_PLAYER_LOOK")) return kh_settings_look()?@"xion":@"roxas";
+    if(!strcmp(o->name,"KHNMC_PLAYER_LOOK")) return pending_character ?: (kh_settings_look()?@"xion":@"roxas");
     NSString *chosen=chosen_options[@(o->name)];
     const char *configured=getenv(o->name);
     return chosen ?: @(configured ?: o->initial);
@@ -82,10 +83,10 @@ static void show_options(NSString *error){
     int first=MAX(0,MIN(selected_option-2,kh_setting_menu_count()-5));
     for(int i=first;i<MIN(first+5,kh_setting_menu_count());i++){
         const char *reason=kh_setting_unavailable(i);
-        [text appendFormat:@"%@%@   %@\n",i==selected_option?@"▶  ":@"     ",@(kh_options[i].label),reason?[NSString stringWithFormat:@"Unavailable (%s)",reason]:option_value(i)];
+        [text appendFormat:@"%@%@: %@\n",i==selected_option?@"▶  ":@"     ",@(kh_options[i].label),reason?[NSString stringWithFormat:@"Unavailable (%s)",reason]:i==0?option_value(i).capitalizedString:option_value(i)];
     }
     [text appendFormat:@"\n%@\nD-pad to select and change   •   Circle to close",
-     error ?: (kh_setting_action(selected_option)?@"Cross to execute when play resumes":kh_setting_live(selected_option)?@"Applies immediately":@"Applies on the next launch")];
+     error ?: (selected_option==0?@"Applies when you close Options":kh_setting_action(selected_option)?@"Cross to execute when play resumes":kh_setting_live(selected_option)?@"Applies immediately":@"Applies on the next launch")];
     if(strchr(kh_options[selected_option].initial,',')){
         [text appendFormat:@"\nL1/R1 to select value %d",selected_component+1];
     }
@@ -111,7 +112,8 @@ static void adjust_option(int direction){
         parts[selected_component]=part;
         value=[parts componentsJoinedByString:@","];
     }
-    if(!kh_setting_action(selected_option) && kh_setting_set(o->name,value.UTF8String)){show_options(@"Could not save this value");return;}
+    if(selected_option==0) pending_character=value;
+    else if(!kh_setting_action(selected_option) && kh_setting_set(o->name,value.UTF8String)){show_options(@"Could not save this value");return;}
     chosen_options[@(o->name)]=value;
     show_options(nil);
 }
@@ -122,6 +124,8 @@ static BOOL options_input(unsigned short buttons){
     if(UIApplication.sharedApplication.applicationState!=UIApplicationStateActive) return YES;
     if(options_label){
         if(down&0x2000){
+            if(pending_character && kh_setting_set(kh_options[0].name,pending_character.UTF8String)){show_options(@"Could not apply Character");return YES;}
+            pending_character=nil;
             [options_label removeFromSuperview]; options_label=nil; suppress_buttons=YES;
             kh_app_resume(KH_APP_RESUME_BOUND_MS);
         }else if((down&0x1000) && kh_setting_action(selected_option)){
@@ -154,6 +158,7 @@ static BOOL options_input(unsigned short buttons){
         options_label.adjustsFontSizeToFitWidth=YES; options_label.minimumScaleFactor=0.7;
         [parent addSubview:options_label];
         if(!chosen_options) chosen_options=[NSMutableDictionary new];
+        selected_option=selected_component=0; pending_character=nil;
         const char *status=kh_cut_menu_status();
         show_options(status?@(status):nil);
         return YES;

@@ -1,4 +1,4 @@
-"""Add the event-rigged H_EX500 to a local X5 look pack."""
+"""Build event models and shop faces in a local Xion look pack."""
 import argparse
 from pathlib import Path
 
@@ -77,3 +77,8 @@ if __name__ == '__main__':
     pack = parser.parse_args().look_pack
     build(pack)
     shop_faces(pack)
+    from models import build as rig, JOINTS
+    for stem in ('P_EX110','P_EX110_NPC_PAJAMAS','H_EX510','H_EX510_PAJAMAS'):
+        # The high Roxas rigs insert 70 face joints between head and second arm.
+        joints = np.where(JOINTS >= 137, JOINTS + 70, JOINTS) if stem.startswith('H_') else JOINTS
+        rig(stem, pack / 'obj', joints)

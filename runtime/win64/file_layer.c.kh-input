@@ -3,6 +3,7 @@
 #include "khnmc_hd.h"
 #include "kh_look.h"
 #include "settings.h"
+#include "xion_swap.h"
 #include "route_state.h"
 #include <string.h>
 #include <strings.h>
@@ -156,7 +157,8 @@ static pthread_mutex_t names_lock=PTHREAD_MUTEX_INITIALIZER;
 void kh_look_set(KCtx *g,int selected){
     pthread_mutex_lock(&files_lock);
     pthread_mutex_lock(&names_lock);
-    player_look=!!selected;
+    player_look=selected;
+    selected=kh_look_enabled();
     for(u64 e=name_overlays;e;e=rd64(g,e)){
         char *text=hp(g,e+16+rd32(g,e+12));
         int old=*text==*xion?4:5, len=selected?4:5;
@@ -232,7 +234,14 @@ void kh_look_path(KCtx *g,const char *rel,char *host,size_t cap){
     if(!kh_look_available(rel,host,cap)) kh_fatal(g,"player-look-asset: missing or invalid %s",rel);
 }
 
+void kh_xkb_set_mode(KCtx *g,int enabled){
+    if(kh_xion_enabled==enabled) return;
+    kh_xion_enabled=enabled;
+    kh_look_set(g,player_look);
+}
+
 int kh_look_enabled(void){
+    if(kh_xion_enabled) return 1;
     int selected=player_look;
     if(selected>=0) return selected;
     const char *env=getenv("KHNMC_PLAYER_LOOK");
@@ -440,7 +449,12 @@ int kh_file_selftest(KCtx *g){
         TEST(!strcmp(gstr(g,cached),(i&1)?xion:roxas));
         TEST(kh_look_name(g,0x51f,label)==cached);
     }
-    kh_look_set(g,0); ga_free(label); ga_free(journal);
+    kh_look_set(g,0);
+    kh_xkb_set_mode(g,1);
+    TEST(!strcmp(gstr(g,cached),xion) && kh_look_key("obj/H_EX510_PAJAMAS.mdlx")==-1);
+    kh_xkb_set_mode(g,0);
+    TEST(!strcmp(gstr(g,cached),roxas) && !kh_look_key("obj/H_EX510_PAJAMAS.mdlx"));
+    ga_free(label); ga_free(journal);
     TEST(!kh_look_key("obj/P_EX100.mdlx"));
     const char *pack_env=getenv("KHNMC_SCENE_ROXAS_DIR");
     char *initial_pack=pack_env?strdup(pack_env):NULL;

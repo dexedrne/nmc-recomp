@@ -5,3 +5,4 @@ void kh_autosave_load(KCtx *g);
 u16 kh_input_buttons(void);
 const char *kh_autosave_documents(void);
 int kh_autosave_indicator(void);
+u32 kh_save_crc(const u8 *payload);

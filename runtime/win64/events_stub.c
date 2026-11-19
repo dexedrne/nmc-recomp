@@ -152,7 +152,9 @@ u64 kh_input_game_frames(void);
  * the event table: f_2d04e0 uses the original ID to find the ANB directory. */
 enum { ACTOR_SORA = 571, NMC_ROXAS = 84, EVENT_OBJECT = 1u << 30,
        DONALD_WEAPON = 575, GOOFY_WEAPON = 576, MAGES_STAFF = 108, KNIGHTS_SHIELD = 109 };
+#include "xion_swap.h"
 static int scene_roxas(KCtx *g){
+    if(kh_xion_enabled) return 1;
     const char *v=getenv("KHNMC_SCENE_ROXAS");
     if(!v || !*v || !strcmp(v,"0")) return 0;
     if(!strcmp(v,"1")) return 1;

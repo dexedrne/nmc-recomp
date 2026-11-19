@@ -1,5 +1,6 @@
 #include "khnmc_rt.h"
 #include "settings.h"
+#include "xion_swap.h"
 #include "kh_look.h"
 #include "mod_config.h"
 #include "route_state.h"
@@ -10,15 +11,15 @@
 #include <pthread.h>
 
 extern int kh_run_is_selftest;
-enum { HP, MP, EXP, DROP, HUD_COMBO, LOOK, COUNT };
+enum { LOOK, HP, MP, EXP, DROP, HUD_COMBO, COUNT };
 #define BOOL_OPT(name,label,initial) {"KHNMC_" name,label,initial,"0|1",0,1,1}
 #define TWEAK_OPT(name,label,initial) {"KHNMC_TWEAK_" name,label,initial,"off|on",0,1,1}
 #define NUMBER(name,label,initial,min,max,step) {"KHNMC_" name,label,initial,NULL,min,max,step}
 const struct kh_option kh_options[]={
+    {"KHNMC_PLAYER_LOOK","Character","roxas","roxas|xion",0,0,0},
     BOOL_OPT("CHEAT_INF_HP","Infinite HP","0"), BOOL_OPT("CHEAT_INF_MP","Infinite MP","0"),
     NUMBER("EXP_MULT","EXP multiplier","1",0.5,10,0.5), NUMBER("DROP_MULT","Item drop multiplier","1",0.5,10,0.5),
     BOOL_OPT("HUD_HIDE_COMBO","Hold L3 + R3 to hide HUD","0"),
-    {"KHNMC_PLAYER_LOOK","Player appearance","roxas","roxas|xion",0,0,0},
     TWEAK_OPT("DEBUG_DEBUG_ON","Enable debug commands","off"),
     TWEAK_OPT("DEBUG_SOFT_RESET","Allow debug reset to title","off"),
     NUMBER("TWEAK_DEBUG_TURBO_SPEED","Debug turbo speed","7.5",0.1,100,0.1),
@@ -109,7 +110,7 @@ const char *kh_setting_unavailable(int i){
     return unavailable[i];
 }
 int kh_setting_menu_count(void){return kh_option_count-(debug_enabled?(allow_reset?0:1):DEBUG_COUNT);}
-static _Atomic double values[COUNT]={0,0,1,1};
+static _Atomic double values[COUNT]={[EXP]=1,[DROP]=1};
 double kh_live_setting_value(int i){ return atomic_load(&values[i]); }
 int kh_setting_live(int index){return index>=0 && index<COUNT;}
 
@@ -235,6 +236,7 @@ int kh_settings_selftest(KCtx *g){
     fail|=kh_stick_step(&state,&start,0xc0,900000000)!=CHORD_PRESS;
     fail|=kh_stick_step(&state,&start,0xc0,1500000000)!=CHORD_HOLD;
     fail|=kh_stick_step(&state,&start,0,1500000001)!=CHORD_IDLE;
+    fail|=LOOK!=0;
     fail|=validate("KHNMC_PLAYER_LOOK","xion",&v)!=LOOK || v!=1;
     fail|=notice_selftest(g);
     unlink(path);rmdir(dir);
@@ -283,7 +285,9 @@ static int kh_save_live_option(const char *name,const char *value,int i,double v
 struct change { unsigned long long frame; char *name,*value; struct change *next; };
 static struct change *pending;
 static char *schedule_storage;
+static void init_notice_text(void);
 void kh_settings_init(void){
+    init_notice_text();
 #if !KH_IOS_PATHS
     load_saved_options();
 #endif
@@ -388,14 +392,20 @@ void kh_settings_init(void){
 _Atomic int kh_hide_hud;
 /* f_18deb0 replaces the active INFORMATION line. Keep transient feedback off
  * that widget so mission scripts retain their own message and timing. */
-static const u8 look_text[][18]={
-    {0x45,0xa2,0xa8,0xa7},                         /* Xion */
-    {0x3f,0xa8,0xb1,0x9a,0xac},                    /* Roxas */
-    {0x30,0x9a,0xa7,0x57,0xad,1,0xac,0xb0,0xa2,0xad,0x9c,0xa1,1,0xa7,0xa8,0xb0}
-};
-static _Atomic u64 notice; /* expiry in host ns, with message index in low two bits */
+enum { NOTICE_XION, NOTICE_ROXAS, NOTICE_FIELD, NOTICE_BUSY, NOTICE_ACTOR, NOTICE_PACK, NOTICE_XKB, NOTICE_COUNT };
+static const char *const notice_lines[]={"Xion","Roxas","Can't switch now: outside field","Can't switch now: busy",
+    "Can't switch now: player unavailable","Can't switch now: missing art","Can't switch now: XKB"};
+static u8 look_text[NOTICE_COUNT][40];
+static _Atomic u64 notice;
 u8 kh_look_font[65536];
-static const char *const notice_lines[]={"Xion","Roxas","Can't switch now"};
+static void init_notice_text(void){
+    for(int i=0;i<NOTICE_COUNT;i++){
+        for(size_t j=0;notice_lines[i][j];j++){
+            char c=notice_lines[i][j];
+            look_text[i][j]=c==' '?1:c=='\''?0x57:c==':'?0x52:c>='a'?0x9a+c-'a':0x2e + c-'A';
+        }
+    }
+}
 static _Atomic int font_ready; /* zero while loading, negative for an unsupported atlas */
 void kh_look_font_loaded(const char *path,const u8 *bar,size_t n){
     /* Called under files_lock for both loose and packaged data. f_3e2470
@@ -415,7 +425,7 @@ invalid:
     atomic_store(&font_ready,-1);
 }
 static const u8 *visible_notice(u64 state,u64 now){
-    return now<(state & ~3ull)?look_text[state & 3]:NULL;
+    return now<(state & ~7ull)?look_text[state & 7]:NULL;
 }
 const u8 *kh_look_notice(void){
     u64 state=atomic_load(&notice);
@@ -427,9 +437,9 @@ const u8 *kh_look_notice(void){
         return NULL;
     }
     u64 now=kh_host_ns();
-    /* A stick click during boot may arrive before the game loads its font. */
-    if(state<=3){
-        u64 active=((now+2000000000ull) & ~3ull) | (state-1);
+    /* Start the notice timer when the font is ready. */
+    if(state<=NOTICE_COUNT){
+        u64 active=((now+2000000000ull) & ~7ull) | (state-1);
         if(!atomic_compare_exchange_strong(&notice,&state,active)) return NULL;
         state=active;
     }
@@ -441,7 +451,8 @@ static int notice_selftest(KCtx *g){
     u64 p=ga_alloc(sizeof look_text[0],16);
     if(!p) return 1;
     int bad=0;
-    for(unsigned i=0;i<3;i++){
+    init_notice_text();
+    for(unsigned i=0;i<NOTICE_COUNT;i++){
         char decoded[40];
         memcpy(hp(g,p),look_text[i],sizeof look_text[i]);
         kh_route_message_text(g,p,decoded,sizeof decoded);
@@ -627,41 +638,43 @@ static void look_frame(KCtx *g,int target,u64 frame){
     char stem[40],path[64];
     u64 cmds; int windows,waiting;
     kh_route_field_parts(g,&cmds,&windows,&waiting);
-    const char *line="Can't switch now";
-    int notice_index=2;
-    if(!cmds || windows || rd8(g,GS_BASE+0x9ba8d1) || rd8(g,GS_BASE+0x2a11428) || rd8(g,GS_BASE+0x9006b0) || rd64(g,GS_BASE+0x2a11478) ||
+    int notice_index=NOTICE_FIELD;
+    if(kh_xion_enabled && !refresh){notice_index=NOTICE_XKB; goto feedback;}
+    if(!cmds) goto feedback;
+    notice_index=NOTICE_BUSY;
+    if(windows || rd8(g,GS_BASE+0x9ba8d1) || rd8(g,GS_BASE+0x2a11428) || rd8(g,GS_BASE+0x9006b0) || rd64(g,GS_BASE+0x2a11478) ||
        rd64(g,GS_BASE+0x2ae9fa8) || rd64(g,GS_BASE+0x2a11268) || /* Roxas parked during XKB ownership */
        rd32(g,GS_BASE+0x2a10504) || rd64(g,GS_BASE+0x9ba928) ||
-       (!refresh && last_switch && frame>=last_switch && frame-last_switch<60) ||
-       !kh_route_player_sheet(g,&player) || player.hp<=0 ||
+       (!refresh && last_switch && frame>=last_switch && frame-last_switch<60)) goto feedback;
+    notice_index=NOTICE_ACTOR;
+    if(!kh_route_player_sheet(g,&player) || player.hp<=0 ||
        !kh_route_object_name(g,player.obj,stem,sizeof stem)) goto feedback;
     snprintf(path,sizeof path,"obj/%s.mdlx",stem);
     if(kh_player_asset_key(path)!=-1) goto feedback;
     if(target){
         char face[96],host[4096];
-        if(!kh_look_available(path,host,sizeof host)) {line="Xion model missing"; goto feedback;}
+        if(!kh_look_available(path,host,sizeof host)) {notice_index=NOTICE_PACK; goto feedback;}
         snprintf(path,sizeof path,"obj/%s.a.us",stem);
         snprintf(face,sizeof face,"remastered/%s/-%d.dds",path,kh_player_asset_key(path)-1);
         if(!kh_look_available(path,host,sizeof host) || !kh_look_available(face,host,sizeof host)){
-            line="Xion portrait missing"; goto feedback;
+            notice_index=NOTICE_PACK; goto feedback;
         }
     }
     KCtx ctx=*g;
-    kh_look_set(&ctx,target);
+    if(!refresh) kh_look_set(&ctx,target);
     if(!bind_look(&ctx,player,stem,target)){
         if(!refresh) kh_look_set(&ctx,!target);
-        line="Appearance resources unavailable";
+        notice_index=NOTICE_PACK;
         goto feedback;
     }
     if(refresh) return;
-    line=target?"Xion":"Roxas";
     notice_index=target?0:1;
     if(kh_save_live_option("KHNMC_PLAYER_LOOK",target?"xion":"roxas",LOOK,target))
         kh_warn("appearance changed for this session: unable to save setting");
     last_switch=frame;
 feedback:
     if(refresh) return;
-    kh_warn("player appearance: %s (frame %llu)",line,(unsigned long long)frame);
+    kh_warn("player appearance: %s (frame %llu)",notice_lines[notice_index],(unsigned long long)frame);
     show_look_notice(notice_index,frame);
 }
 void kh_settings_frame(KCtx *g,uint64_t frame){
@@ -675,7 +688,6 @@ void kh_settings_frame(KCtx *g,uint64_t frame){
     int action=kh_stick_action(frame);
     atomic_store(&kh_hide_hud,action==CHORD_HOLD && values[HUD_COMBO]!=0);
     int target=atomic_exchange(&look_request,-1);
-    if(action==CHORD_CLICK && !unavailable[LOOK]) target=!kh_look_enabled();
     if(g && (target>=0 || last_switch)) look_frame(g,target,frame);
     if(mp_probe && frame==mp_probe){
         KhPlayerSheet p;

@@ -4,6 +4,7 @@
  */
 #include "khnmc_rt.h"
 #include "xion_swap.h"
+#include "route_state.h"
 #include <math.h>
 
 static const struct { const char *name; u32 flags, dll_rva; } entries[] = {
@@ -256,7 +257,39 @@ void kh_mod_syscalls_dump(void){
     fprintf(stderr,"; Task 23 additions: 0 Set_Action=%u, 8 MapJump=%u, 47 GetGrowthTable=%u, 55 SetCameraMode=%u, 93 PartyJump=%u; 1f9a80 (DLL 0x2d110) resets=%llu\n",
             atomic_load(&hits[0]),atomic_load(&hits[8]),atomic_load(&hits[47]),atomic_load(&hits[55]),atomic_load(&hits[93]),(unsigned long long)atomic_load(&reset_calls));
 }
+/* N_EX940_BTL installs ENMP 130 through table 2 trap 9. Change only this
+ * spawned sheet, after native initialization and before its AI resumes. */
+static void tutorial_set_sheet(KCtx *g){
+    u64 args=A0(g);
+    int battle;
+    if(rd32(g,args+8)!=130 || kh_route_world(g)!=18 || kh_route_area(g)!=3 ||
+       !kh_route_programs(g,NULL,NULL,&battle,NULL) || battle!=0x1301){
+        kh_dispatch(g,GS_BASE+0x431a70);
+        return;
+    }
+    KCtx ctx=*g;
+    u64 object_ref=decode(&ctx,rd32(g,args));
+    u64 actor=decode(&ctx,rd32(g,object_ref+4));
+    kh_dispatch(g,GS_BASE+0x431a70);
+    u64 sheet=rd64(g,actor+0x5c0);
+    u64 enemy=call(&ctx,0x3ebf30,130,0), seifer=call(&ctx,0x3ebf30,135,0);
+    u64 level=call(&ctx,0x3ee8c0,0,0);
+    if(!sheet || !enemy || !seifer || !level || rd16(g,enemy)!=130 || rd16(g,seifer)!=135)
+        kh_fatal(g,"tutorial-fight-sheet: missing enemy or battle level");
+    u32 original=rd32(g,sheet+4);
+    u32 pool=((u32)rd16(g,seifer+4)*rd16(g,level)+99)/100;
+    if(!pool) kh_fatal(g,"tutorial-fight-sheet: empty Struggle HP pool");
+    wr32(g,sheet+4,pool);
+    wr32(g,sheet,pool);
+    kh_warn("tutorial-fight: EH03_INTRO2 ENMP 130 HP %u -> %u/%u",original,pool,pool);
+}
 void kh_mod_syscalls_init(KCtx *g){
+    const char *tutorial=getenv("KHNMC_TUTORIAL_FIGHT");
+    if(!tutorial || !strcmp(tutorial,"real")){
+        u64 trap=rd64(g,GS_BASE+0x7534a0)+9*16;
+        if(rd64(g,trap)!=GS_BASE+0x431a70) kh_fatal(g,"tutorial-fight-trap");
+        wr64(g,trap,kh_host_fn("tutorial-set-sheet",tutorial_set_sheet));
+    }else if(strcmp(tutorial,"mod")) kh_fatal(g,"tutorial-fight-mode: expected real or mod");
     if(table) kh_fatal(g,"mod syscall table initialized twice");
     if(rd64(g,GS_BASE+0x7534a8)) kh_fatal(g,"expected empty vanilla syscall table 3");
     table=ga_calloc(114,16); drive_multiplier=ga_alloc(4,16); sstm_name=ga_strdup("sstm");

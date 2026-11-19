@@ -16,7 +16,7 @@ JOINTS=np.array([4,0,65,66,67,75,78,79,79,82,85,88,91,92,94,95,96,98,99,100,
                  180,183,184,186,187,188,190,191,192,194,195,196,198,199,200,178,
                  202,2,11,12,15,18,40,41,44,47])
 
-def build(stem):
+def build(stem, output=OUT, joints=JOINTS):
     shell,ally=load(stem),load('N_PO010_BTL')
     body=shell.members[4]
     donor=Model(ally.members[4])
@@ -32,7 +32,7 @@ def build(stem):
     P('<I',raw,h+12,0)
     anchors=[2,3,4,5,6,7,10,*range(11,26),28,29,30,31,32,35,*range(36,51),54,55,56,57,58,59,60,61]
     source=donor.rest[anchors,:3,3]
-    delta=rest[JOINTS[anchors],:3,3]-source
+    delta=rest[joints[anchors],:3,3]-source
     inverse=np.linalg.inv(rest)
     shift=len(bones)-len(donor.bones)
     for i,(mat,packets) in enumerate(donor.groups):
@@ -48,10 +48,10 @@ def build(stem):
             near=np.argsort(dist,axis=1)[:,:6]
             weights=1/np.maximum(np.take_along_axis(dist,near,axis=1),1e-8)**1.5
             xyz[:,:3]+=np.einsum('nk,nkj->nj',weights/weights.sum(axis=1)[:,None],delta[near])
-            local=np.einsum('nij,nj->ni',inverse[JOINTS[p.joints]],xyz)
+            local=np.einsum('nij,nj->ni',inverse[joints[p.joints]],xyz)
             raw[p.xyz_offset:p.xyz_offset+12*len(local)]=local[:,:3].astype('<f4').tobytes()
             for tag,listing in p.edits:
-                target=JOINTS[R('<I',raw,listing)[0]]
+                target=joints[R('<I',raw,listing)[0]]
                 for pos in (tag,listing): P('<I',raw,pos,target)
             P('<I',raw,p.first+4,R('<I',raw,p.first+4)[0]+shift)
     raw[h+donor.aux:h+donor.bo]=shell.members[4][h+aux:h+bo]
@@ -67,13 +67,13 @@ def build(stem):
     bounds[0,:3]=np.minimum(bounds[0,:3],points.min(0))
     bounds[1,:3]=np.maximum(bounds[1,:3],points.max(0))
     shell.members.update({4:bytes(raw),7:ally.members[7]})
-    out=OUT/(stem+'.mdlx')
+    out=output/(stem+'.mdlx')
     out.write_bytes(shell.write())
     reread=Model(Archive(out.read_bytes()).members[4])
     assert reread.bones==bones and len(reread.groups)==len(donor.groups)
     for (_,ps),(_,qs) in zip(donor.groups,reread.groups):
         for p,q in zip(ps,qs):
-            assert np.array_equal(p.nodes,q.nodes) and np.array_equal(JOINTS[p.joints],q.joints)
+            assert np.array_equal(p.nodes,q.nodes) and np.array_equal(joints[p.joints],q.joints)
     original=load(stem)
     packed=Archive(out.read_bytes())
     assert all(v==packed.members[k] for k,v in original.members.items() if k not in (4,7))

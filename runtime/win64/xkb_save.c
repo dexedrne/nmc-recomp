@@ -1,5 +1,6 @@
 #include "xion_swap.h"
 #include "rewind.h"
+#include "autosave.h"
 #include "slot_hash.h"
 #include <arpa/inet.h>
 #include <errno.h>
@@ -116,6 +117,13 @@ static void manager_path(KCtx *g,u64 manager,char path[2048]){
     char win[512]; snprintf(win,sizeof win,"%s%s",gstr(g,manager+0x40),gstr(g,manager+0x144));
     kh_winpath(win,path,2048);
 }
+/* Save and Load share save.2ld. Sequence group 7 selects the Xion eye strip.
+ * f_2ee350 and f_2ee4a0 copy the zero-based portrait byte to slot row +0x23. */
+void kh_xion_save_portrait(KCtx *g,u64 buf){
+    if(rd8(g,buf+0x419c)==6) return;
+    wr8(g,buf+0x419c,6);
+    wr32(g,buf+8,kh_save_crc(GUEST_PTR(buf)));
+}
 void orig_f_100ef0(KCtx *);
 void f_100ef0(KCtx *g){
     u64 manager=A0(g),buf=A1(g),name=A2(g); u32 size=A3(g);
@@ -124,13 +132,17 @@ void f_100ef0(KCtx *g){
     pthread_mutex_lock(&lock);
     char path[2048]; Chunk c; manager_path(g,manager,path);
     source_tag=record(&source,gstr(g,name),GUEST_PTR(buf),size)&&read_chunk(path,&c)&&contains(&c,&source);
+    if(source_tag && rd8(g,buf+0x419c)!=6 && rd32(g,buf+8)==kh_save_crc(GUEST_PTR(buf))){
+        kh_xion_save_portrait(g,buf);
+        digest(&source,GUEST_PTR(buf),size); /* track the returned copy for load and copy-slot */
+    }
     if(kh_xkb_menu) kh_warn("xkb-card-read: %s %u XKB %d",source.name,size,source_tag);
     pthread_mutex_unlock(&lock);
 }
 void kh_xkb_load(KCtx *g){
     pthread_mutex_lock(&lock);
     Record live=source; digest(&live,GUEST_PTR(GS_BASE+0x9a98b0),SAVE_SIZE);
-    kh_xion_enabled=source_tag&&!memcmp(&live,&source,sizeof live)&&rd32(g,GS_BASE+0x9abd48)==1;
+    kh_xkb_set_mode(g,source_tag&&!memcmp(&live,&source,sizeof live)&&rd32(g,GS_BASE+0x9abd48)==1);
     pthread_mutex_unlock(&lock);
 }
 void kh_xkb_serialized(void){
@@ -181,6 +193,7 @@ int kh_xkb_save_selftest(KCtx *g){
     u64 slots=ga_alloc(3*SAVE_SIZE,16), buf=ga_alloc(SAVE_SIZE,16), names=ga_alloc(32,16);
     memset(GUEST_PTR(card),0,0x200); memset(GUEST_PTR(directory),0,3*0x158);
     memset(GUEST_PTR(buf),0,SAVE_SIZE);
+    wr32(g,buf+8,kh_save_crc(GUEST_PTR(buf)));
     memcpy(GUEST_PTR(names),"card/slotA",11); memcpy(GUEST_PTR(names+16),"card/slotB",11);
     strcpy(GUEST_PTR(card+0x40),path);
     wr64(g,card+0x18,directory); wr64(g,card+0x20,slots); wr32(g,card+0x28,3); wr64(g,card+0x30,SAVE_SIZE);
@@ -191,8 +204,9 @@ int kh_xkb_save_selftest(KCtx *g){
     kh_xion_enabled=0;
     kh_call(&ctx,GS_BASE+0x101590,card,buf,names+16,SAVE_SIZE);
     fail+=!test_publish(path,card);
-    kh_call(&ctx,GS_BASE+0x100ef0,card,buf,names+16,SAVE_SIZE); fail+=source_tag!=0;
-    kh_call(&ctx,GS_BASE+0x100ef0,card,buf,names,SAVE_SIZE); fail+=source_tag!=1;
+    kh_call(&ctx,GS_BASE+0x100ef0,card,buf,names+16,SAVE_SIZE); fail+=source_tag!=0 || rd8(g,buf+0x419c)!=0;
+    kh_call(&ctx,GS_BASE+0x100ef0,card,buf,names,SAVE_SIZE);
+    fail+=source_tag!=1 || rd8(g,buf+0x419c)!=6 || rd32(g,buf+8)!=kh_save_crc(GUEST_PTR(buf));
     /* Copy A's read payload over B while the current campaign is Standard. */
     kh_call(&ctx,GS_BASE+0x101590,card,buf,names+16,SAVE_SIZE); fail+=!test_publish(path,card);
     kh_call(&ctx,GS_BASE+0x1004d0,card,names,0,0); fail+=!test_publish(path,card);

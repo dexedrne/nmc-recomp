@@ -1,6 +1,7 @@
 #include <math.h>
 #include "xion_swap.h"
 #include "autosave.h"
+#include "kh_look.h"
 #include "rewind.h"
 #include "route_state.h"
 
@@ -10,7 +11,8 @@
 #define FC VA(0x2a10620)
 #define MICKEY VA(0x7523b8)
 
-int kh_xion_enabled,kh_xkb_menu;
+_Atomic int kh_xion_enabled;
+int kh_xkb_menu;
 static u64 messages[6];
 static const char *const lines[]={
     "Standard","Critical","Xion Knows Best","Play as Xion.\nRoxas steps in when needed.",
@@ -53,7 +55,7 @@ void f_2b88c0(KCtx *g){
     if(!kh_xkb_menu){orig_f_2b88c0(g);return;}
     u32 index=rd32(g,VA(0xb1d810));
     if(index>=4) kh_fatal(g,"xkb-menu-choice: %u",index);
-    kh_xion_enabled=index==3;
+    kh_xkb_set_mode(g,index==3);
     wr32(g,VA(0xb1d810),index==3?1:index+1);
     orig_f_2b88c0(g);
     wr32(g,VA(0xb1d810),index);
@@ -72,7 +74,9 @@ void kh_rewind_xion(KhRecords *r){
     extern void kh_rewind_xkb_save(KhRecords *);
     kh_rewind_xkb_save(r);
     KH_RECORD(r,declined);
-    KH_VALUE(r,kh_xion_enabled);
+    int enabled=kh_xion_enabled;
+    KH_VALUE(r,enabled);
+    if(r->loading) kh_xion_enabled=enabled;
     KH_RECORD(r,messages);
     KH_RECORD(r,save_interaction);
     KH_RECORD(r,death_pending);
@@ -141,6 +145,12 @@ static s32 return_gauge(KCtx *g,u64 live,u64 parked,s32 entry){
 }
 static u64 call(KCtx *g,u32 r,u64 a,u64 b){ return kh_call(g,VA(r),a,b,0,0); }
 
+/* f_180900 follows HUD slot zero to actor+0x5c0 on its next update. */
+static void gauge_owner(KCtx *g,u64 actor){
+    call(g,0x168850,0,actor);
+    if(call(g,0x1689a0,0,0)!=actor) kh_fatal(g,"xion-swap-hud-owner");
+}
+
 static void actor_method(KCtx *g,u64 actor,u32 slot){
     u64 desc=call(g,0x4ad270,rd32(g,actor),0);
     kh_call(g,rd64(g,rd64(g,desc)+slot),desc,actor,0,0);
@@ -177,6 +187,7 @@ static void handback(KCtx *g,const char *reason){
     retiring=xion;
     call(g,0x3a8140,0,0);
     call(g,0x3bd2e0,xion,roxas);
+    gauge_owner(g,roxas);
     wr32(g,rs,hp); wr32(g,rs+0x180,mp);
     call(g,0x3c2120,rs,0);
     if(rd64(g,ACTIVE)!=roxas||rd64(g,PARKED)||rd64(g,FC+0xae0)!=roxas)
@@ -230,6 +241,7 @@ static void enter(KCtx *g,const KhPlayerSheet *p){
     wr32(g,sheet,entry_hp); wr32(g,sheet+0x180,entry_mp);
     wr32(g,sheet+8,0); // permit genuine KO, the zero-result callback is MICKEY vfn22
     call(g,0x3bd2e0,roxas,actor);
+    gauge_owner(g,actor);
     xion=actor;
     if(messages[5]) call(g,0x17b710,messages[5],0);
     kh_warn("xion-swap: Xion object 792, HP %d/%d MP %d/%d",entry_hp,rd32(g,sheet+4),entry_mp,rd32(g,sheet+0x184));
@@ -284,10 +296,13 @@ BOUNDARY(152990,"area departure",0)
 void orig_f_2ed110(KCtx *);
 void f_2ed110(KCtx *g){
     if(kh_xion_enabled){ KCtx ctx=*g; handback(&ctx,"save"); }
-    orig_f_2ed110(g); kh_xkb_serialized();
+    u64 dst=A0(g)?A0(g):rd64(g,VA(0xbee360));
+    orig_f_2ed110(g);
+    if(kh_look_enabled()) kh_xion_save_portrait(g,dst);
+    kh_xkb_serialized();
 }
 void kh_xion_reset(KCtx *g){
-    KCtx ctx=*g; handback(&ctx,"session reset"); kh_xion_enabled=declined=save_interaction=0;
+    KCtx ctx=*g; handback(&ctx,"session reset"); kh_xkb_set_mode(g,0); declined=save_interaction=0;
 }
 void orig_f_2ed0e0(KCtx *);
 void f_2ed0e0(KCtx *g){

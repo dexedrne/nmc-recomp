@@ -57,7 +57,7 @@ static void init_crc(void){
         crc_table[i]=c;
     }
 }
-static u32 checkpoint_crc(const u8 *p){
+u32 kh_save_crc(const u8 *p){
     pthread_once(&crc_once,init_crc);
     u32 c=~0u;
     for(size_t i=0;i<SAVE_SIZE;i++){
@@ -138,7 +138,7 @@ void f_3a0660(KCtx *g){
        rd64(g,GS_BASE+0x2a0ff68) || kh_route_mission(g)){
         kh_warn("autosave-skip: checkpoint world %u room %u",p[12],p[13]); return;
     }
-    wr32(g,CONTINUE+8,checkpoint_crc(p));
+    wr32(g,CONTINUE+8,kh_save_crc(p));
     int dir=open_directory(1);
     if(dir<0){ kh_warn("autosave-write: %s: %s",kh_slot_autosave_documents(),strerror(errno)); return; }
     int last=newest(dir);
@@ -174,7 +174,7 @@ void kh_autosave_load(KCtx *g){
             u8 trailer[sizeof mode_trailer];
             if(ok && tagged) ok=fread(trailer,sizeof trailer,1,f)==1 && !memcmp(trailer,mode_trailer,sizeof trailer) && rd32(g,candidate+0x2498)==1;
             if(ok){
-                kh_xion_enabled=kh_xkb_menu && tagged;
+                kh_xkb_set_mode(g,kh_xkb_menu && tagged);
                 memcpy(GUEST_PTR(SAVE),data,SAVE_SIZE);
                 kh_warn("autosave-load: %s %.2s%02u",name,kh_warp_world_names[data[12]],data[13]);
             }
@@ -195,7 +195,7 @@ int kh_autosave_selftest(KCtx *g){
     u8 *p=GUEST_PTR(buf);
     for(size_t i=0;i<SAVE_SIZE;i++) p[i]=(u8)(i*37u);
     memcpy(p,"KH2J\x3a\0\0\0",8); p[12]=2; p[13]=2;
-    wr32(g,buf+8,checkpoint_crc(p));
+    wr32(g,buf+8,kh_save_crc(p));
     int fails=kh_retry_rewind_selftest();
     fails+=!header_ok(p) || !native_valid(g,buf);
     fails+=indicator_visible(0,0) || !indicator_visible(1499999999,1500000000) || indicator_visible(1500000000,1500000000);

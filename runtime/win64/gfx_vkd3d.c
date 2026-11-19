@@ -1587,7 +1587,7 @@ static void draw_look_notice(KCtx *g,Swap *s,u32 idx,u64 n,const u8 *text){
     if(scale>4) scale=4;
     unsigned h=32*scale;
     if(text!=s->notice_text || scale!=s->notice_scale){
-        unsigned w=16, advance[18];
+        unsigned w=16, advance[40];
         for(unsigned i=0;text[i];i++){
             unsigned ink=0;
             if(text[i]!=1) for(unsigned x=0;x<18;x++) for(unsigned y=0;y<24;y++)
