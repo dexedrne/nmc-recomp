@@ -195,6 +195,7 @@ typedef struct KThread {
     int   prio;
     u64   last_error;
     int   lasterr;
+    _Atomic int cut_boot_wait;
 } KThread;
 KThread *cur_thread(void);
 void kh_thread_init_main(void);

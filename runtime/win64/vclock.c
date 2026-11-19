@@ -1,3 +1,4 @@
+#include "savestate.h"
 /* vclock.c : KHNMC_CLOCK=frames, the guest's clocks follow a virtual 60 Hz display instead of the host (TASK18).
  *
  * Why.  The CPU Vulkan driver renders the field at a fraction of real time.  The game's own time is the display's: its timing thread
@@ -219,7 +220,7 @@ void kh_vclock_wait_until_raw(u64 t){
     for(;;){
         if(!atomic_load(&stepped)){ u64 h=kh_host_ns(); if(h>=t) return; host_sleep_until(t-h>50000000ull?h+50000000ull:t); continue; }   /* re-check every 50 ms: stepping may begin */
         pthread_mutex_lock(&vm);
-        while(atomic_load(&stepped)&&atomic_load(&v_now)<t) pthread_cond_wait(&vcv,&vm);
+        while(atomic_load(&stepped)&&atomic_load(&v_now)<t) kh_cut_wait("clock-deadline",&vcv,&vm);
         int done=atomic_load(&stepped)&&atomic_load(&v_now)>=t; pthread_mutex_unlock(&vm);
         if(done) return;
     }
@@ -251,6 +252,7 @@ static void client_wait_raw(int id,u64 t){
         if(!atomic_load(&stepped)){ u64 h=kh_host_ns(); if(h>=t) return; host_sleep_until(t-h>50000000ull?h+50000000ull:t); continue; }
         pthread_mutex_lock(&vm);
         for(;;){
+            if(atomic_load(&kh_cut_requested)) kh_cut_poll("clock-client",&vm);
             if(!atomic_load(&stepped)) break;
             int ahead=0; if(atomic_load(&v_now)>=t){ int my=cprio(id); for(int i=0;i<MAXCLIENTS;i++) if(i!=id&&clients[i].used&&clients[i].due<=t&&cprio(i)<my){ ahead=1; break; } }
             if(atomic_load(&v_now)>=t&&!ahead){ if(!kh_vclock_sync) break;                     /* sync=all: and nothing else of the guest is still running at t */
@@ -259,7 +261,7 @@ static void client_wait_raw(int id,u64 t){
                 u64 h=kh_host_ns(); if(h-clients[id].quiet_since>=quiet_guard_ns){ client_let_go(id,h-clients[id].quiet_since,who,t); break; }
                 struct timespec d2; abs_in(&d2,200000ull); kh_cond_wait_until(&vcv,&vm,&d2); continue; }
             client_quiet_mark(id,0);
-            pthread_cond_wait(&vcv,&vm);
+            kh_cut_wait("clock-client",&vcv,&vm);
         }
         client_quiet_mark(id,0);                                                               /* runs its work now: charged from here on */
         int done=atomic_load(&stepped); pthread_mutex_unlock(&vm);
@@ -299,6 +301,7 @@ static void advance_locked(KCtx *g,u64 target){
         if(kh_vclock_sync){                                                             /* nothing may still be running at `now` */
             u64 q0=0; char who[64]="";
             while(!kh_threads_quiet(who,sizeof who)){
+                if(atomic_load(&kh_cut_requested)) kh_cut_poll("clock-advance",&vm);
                 u64 h=kh_host_ns(); if(!q0){ q0=h; n_quiet_waits++; }
                 if(h-q0>=quiet_guard_ns){ n_quiet_guard++; if(n_quiet_guard_logged++<8) fprintf(stderr,"kh: vclock: quiescence guard: thread %s still running %.1f s of host time after virtual %llu ns; the clock goes on\n",who,(h-q0)/1e9,(unsigned long long)now); break; }
                 struct timespec d2; abs_in(&d2,200000ull); kh_cond_wait_until(&vcv,&vm,&d2);
@@ -333,6 +336,7 @@ void kh_vclock_vblank_raw(KCtx *g,u64 dev){
     atomic_store(&frame_sem_h[0],sem_handle(g,FRAME_SEM_VA)); if(dev) atomic_store(&frame_sem_h[1],sem_handle(g,dev+DEV_SEM_OFF));
     int how, w=0, released=0; u64 p=0, gf=0, q_since=0; long q_diff=0;
     for(;;){
+        if(atomic_load(&kh_cut_requested)) kh_cut_poll("vblank-handoff",NULL);
         u64 now=kh_host_ns(); frame_calibrate(now,&q_since,&q_diff); released=gate_releases()!=ticks_seen; w=gate_waiting(g,dev); p=gate_presents(); gf=gate_frames();
         if(released){ if(w&&gf==frames_seen){ how=4; break; } if(w&&p>presents_seen){ how=0; break; }
             if(kh_vclock_sync){ if(kh_threads_quiet(NULL,0)){ how=5; break; } if(now-t_enter>=VC_QUIET_GUARD_NS){ how=3; break; } }

@@ -1,3 +1,4 @@
+#include "savestate.h"
 /* app_life.c : the app's life cycle (TASK41; IOS-GRAPHICS-PLAN.md section 4 step 11, docs/IOS-SHELL.md "Suspend and resume").  The API
  * and what each call does are in khnmc_app.h.  This file holds:
  *   1. the focus flag the window seam reads (null_window.c GetForegroundWindow);
@@ -61,6 +62,22 @@ static LifeReq lq[LQ]; static int lqn, l_started, l_busy; static u64 l_seq, l_do
 static _Atomic u64 l_epoch;
 static _Atomic int l_state;                       /* ST_*: what the shell said last, in the order of its calls (set under lm) */
 static _Atomic int l_suspended;                   /* under lm: from kh_app_suspend to the resume that clears the gate (the null Present parks only then) */
+static u64 cut_life_seq; /* guarded by lm; one field cut owns the gate */
+int kh_cut_gate_begin(u64 *epoch){
+    pthread_mutex_lock(&lm);
+    int ok=!l_busy&&!lqn&&atomic_load(&l_state)==ST_ACTIVE&&kh_app_window_active()&&!kh_gfx_gate_is_set();
+    if(ok){ cut_life_seq=l_seq; *epoch=atomic_load(&l_epoch); kh_gfx_gate_set(); }
+    pthread_mutex_unlock(&lm);
+    return ok;
+}
+int kh_cut_gate_end(u64 epoch){
+    pthread_mutex_lock(&lm);
+    int ok=atomic_load(&l_epoch)==epoch;
+    if(ok) kh_gfx_gate_clear(); /* resign/suspend take ownership by incrementing l_epoch */
+    ok=ok&&cut_life_seq==l_seq;
+    pthread_mutex_unlock(&lm);
+    return ok;
+}
 static int (*au_start)(void)=kh_audio_out_start; static void (*au_stop)(void)=kh_audio_out_stop; static int (*au_running)(void)=kh_audio_ring_started;
 /* worker only.  au_pending: the device was running when a suspend or an audio-session interruption stopped it, and it has not been started
  * again since (review A41, verification: it is only ever SET by a stop and cleared by a start that worked, so a second suspend before

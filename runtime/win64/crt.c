@@ -1,6 +1,7 @@
 /* crt.c : UCRT / vcruntime140 / msvcp140 imports as host implementations (heap, string, stdio, printf engine, convert, time,
  * utility, startup, C++ throw thunks = terminate-on-throw).  Order of treatment follows IMPORT-CENSUS call-site counts. */
 #include "khnmc_rt.h"
+#include "savestate.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
@@ -127,12 +128,12 @@ IMP(CRTU,srand){ holdrand=(u32)A0(g); }
 /* time */
 static u64 tm_block(KCtx *g){ static __thread u64 b; if(!b) b=ga_alloc(64,16); return b; }
 static void put_tm(KCtx *g,u64 b,const struct tm *t){ wr32(g,b,t->tm_sec); wr32(g,b+4,t->tm_min); wr32(g,b+8,t->tm_hour); wr32(g,b+12,t->tm_mday); wr32(g,b+16,t->tm_mon); wr32(g,b+20,t->tm_year); wr32(g,b+24,t->tm_wday); wr32(g,b+28,t->tm_yday); wr32(g,b+32,t->tm_isdst>0?1:0); }
-IMP(CRTI,_time64){ time_t t=time(0); if(A0(g)) wr64(g,A0(g),(u64)t); SET_RAX(g,(u64)t); }
+IMP(CRTI,_time64){ time_t t=kh_cut_enabled?(time_t)(kh_cut_unix_ns()/1000000000ull):time(0); if(A0(g)) wr64(g,A0(g),(u64)t); SET_RAX(g,(u64)t); }
 IMP(CRTI,_localtime64){ time_t t=(time_t)rd64(g,A0(g)); struct tm r; localtime_r(&t,&r); u64 b=tm_block(g); put_tm(g,b,&r); SET_RAX(g,b); }
 IMP(CRTI,_gmtime64){ time_t t=(time_t)rd64(g,A0(g)); struct tm r; gmtime_r(&t,&r); u64 b=tm_block(g); put_tm(g,b,&r); SET_RAX(g,b); }
 IMP(CRTI,_mktime64){ u64 b=A0(g); struct tm r; memset(&r,0,sizeof r); r.tm_sec=(int)rd32(g,b); r.tm_min=(int)rd32(g,b+4); r.tm_hour=(int)rd32(g,b+8); r.tm_mday=(int)rd32(g,b+12); r.tm_mon=(int)rd32(g,b+16); r.tm_year=(int)rd32(g,b+20); r.tm_isdst=(int)rd32(g,b+32); SET_RAX(g,(u64)mktime(&r)); }
 IMP(CRTI,_difftime64){ ret_d(g,(double)((s64)A0(g)-(s64)A1(g))); }
-IMP(CRTI,clock){ static u64 t0; u64 n=kh_now_ns()/1000000ull; if(!t0) t0=n; SET_RAX(g,n-t0); }
+IMP(CRTI,clock){ if(kh_cut_enabled){ SET_RAX(g,kh_cut_elapsed_ns()/1000000); return; } static u64 t0; u64 n=kh_now_ns()/1000000ull; if(!t0) t0=n; SET_RAX(g,n-t0); }
 IMP(CRTM,__setusermatherr){ }
 IMP(CRTL,_configthreadlocale){ SET_RAX(g,0); }
 IMP(CRTF,_mkdir){ char p[2048]; kh_winpath(gstr(g,A0(g)),p,sizeof p); if(ga_deterministic){ SET_RAX(g,0); return; } int r=mkdir(p,0755); if(r){ kh_set_errno(g,errno); kh_set_last_error(errno==EEXIST?183:3); } SET_RAX(g,(u32)r); }

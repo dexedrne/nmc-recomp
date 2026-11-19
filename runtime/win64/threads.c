@@ -1,3 +1,4 @@
+#include "savestate.h"
 /* threads.c : guest threads (pthreads), TEB/TLS blocks, wait objects, critical sections, fibers (stackful coroutines with an
  * x86-64 and an arm64 context switch), kernel32 thread/sync/fiber imports and the msvcp140 _Mtx_* imports. */
 #include "khnmc_rt.h"
@@ -78,6 +79,21 @@ static pthread_mutex_t tlist_m=PTHREAD_MUTEX_INITIALIZER;
  * thread-registry-full.  tlist_created / tlist_ended count over the process's life (map reports, the sync report). */
 #define TLIST_MAX 4096
 static KThread *tlist[TLIST_MAX]; static u32 ntlist, tlist_cap=TLIST_MAX; static u64 tlist_created, tlist_ended; static _Atomic u32 next_tid=1000;
+int kh_cut_threads(KThread **parked,unsigned count,int report){
+    int missing=0;
+    pthread_mutex_lock(&tlist_m);
+    for(u32 i=0;i<ntlist;i++){
+        KThread *t=tlist[i];
+        if(t==cur_thread()) continue;
+        unsigned k=0;
+        while(k<count&&parked[k]!=t) k++;
+        if(k<count) continue;
+        missing++;
+        if(report) fprintf(stderr,"kh: savestate-missing tid=%u start=%llx clock-state=%d\n",t->tid,(unsigned long long)t->start,atomic_load(&t->vc_state));
+    }
+    pthread_mutex_unlock(&tlist_m);
+    return missing;
+}
 static int tlist_add_locked(KThread *t){ if(ntlist>=tlist_cap) return 0; tlist[ntlist++]=t; tlist_created++; return 1; }      /* caller holds tlist_m */
 static void tlist_remove(KThread *t){
     pthread_mutex_lock(&tlist_m);
@@ -161,8 +177,21 @@ static int wobj_ready(KWaitObj *w,int k,KThread *t,u64 gen0,int blocked){
     return 1;
 }
 static _Atomic u64 vc_vwaits;
+/* Order input and sound initialization against subsequent parent allocations.
+ * Sound handlers can allocate a timer thread and stack before their first wait. */
+static void cut_boot_ready(KCtx *g){
+    KThread *t=cur_thread();
+    if(!t||!atomic_load(&t->cut_boot_wait)) return;
+    u64 site=rd64(g,KH_RSP(g))-GS_BASE;
+    if(site!=0x44f710&&site!=0x44d960&&site!=0x97d4f&&site!=0xfb0e0) return;
+    pthread_mutex_lock(&t->m);
+    atomic_store(&t->cut_boot_wait,0);
+    pthread_cond_broadcast(&t->cv);
+    pthread_mutex_unlock(&t->m);
+}
 u32 kh_wait(KCtx *g,u64 h,u32 ms){
     KThread *me=cur_thread(); SYNC_CHAOS();
+    if(kh_cut_enabled) cut_boot_ready(g);
     if(h==PSEUDO_THREAD||h==PSEUDO_PROCESS) return 0x102;
     int k=0; KWaitObj *w=h_get_ref(h,&k); if(!w){ kh_set_last_error(6); return 0xFFFFFFFFu; }
     int vsync=kh_vclock_sync&&me, vcl=-1; u64 vdl=0;                                  /* the idle mark from the start; virtual time-outs once the clock steps */
@@ -173,6 +202,7 @@ u32 kh_wait(KCtx *g,u64 h,u32 ms){
     pthread_mutex_lock(m);
     u32 res=0; u64 waited=0, gen0=w->gen; int blocked=0;
     for(;;){
+        if(atomic_load(&kh_cut_requested)) kh_cut_poll("handle-wait",m);
         if(th?th->done:wobj_try(w,k,me,gen0,blocked)) break;
         if(ms==0){ res=0x102; break; }
         if(!blocked){ blocked=1; if(!th){ w->waiters++; if(kh_vclock_on) pthread_cond_broadcast(cv); }     /* frames clock: a timer client may wait for a consumer to be back (kh_wobj_settle) */
@@ -185,6 +215,7 @@ u32 kh_wait(KCtx *g,u64 h,u32 ms){
             if(kh_vclock_now_ns()>=vdl){ pthread_mutex_unlock(m); int due=kh_vclock_deadline_due(vcl,vdl); pthread_mutex_lock(m);
                 if(due){ if(!(th?th->done:wobj_try(w,k,me,gen0,blocked))) res=0x102; break; } }
             struct timespec d2; abs_deadline(&d2,1); kh_cond_wait_until(cv,m,&d2); continue; }
+        if(ms==0xFFFFFFFFu&&kh_cut_enabled){ kh_cut_wait("handle-wait",cv,m); continue; }
         if(ms==0xFFFFFFFFu){ struct timespec d2; abs_deadline(&d2,10000); rc=kh_cond_wait_until(cv,m,&d2);
             if(rc==ETIMEDOUT){ waited+=10; if(kh_verbose||(waited%60==0)) fprintf(stderr,"kh: thread %u ('%s') waiting %llus on handle %llx kind %d (site rva %llx)\n",me->tid,me->name,(unsigned long long)waited,(unsigned long long)h,k,(unsigned long long)(rd64(g,KH_RSP(g))-GS_BASE)); } }
         else { rc=kh_cond_wait_until(cv,m,&dl); if(rc==ETIMEDOUT){ if(!(th?th->done:wobj_try(w,k,me,gen0,blocked))) res=0x102; break; } }
@@ -288,9 +319,16 @@ IMP(MSVCP,_Mtx_unlock){ cs_leave(g,A0(g)); SET_RAX(g,0); }
 /* _Thrd_sleep(const xtime*): xtime { __time64_t sec; long nsec } is an ABSOLUTE wall-clock time (std::this_thread::sleep_until builds it
  * from _Xtime_get_ticks); sleep until then. */
 IMP(MSVCP,_Thrd_sleep){ u64 xt=A0(g); struct timespec ts; ts.tv_sec=(time_t)(s64)rd64(g,xt); ts.tv_nsec=(long)(s32)rd32(g,xt+8); if(ts.tv_nsec<0) ts.tv_nsec=0; if(ts.tv_nsec>=1000000000L) ts.tv_nsec=999999999L;
-    struct timespec now; clock_gettime(CLOCK_REALTIME,&now); s64 d=((s64)ts.tv_sec-now.tv_sec)*1000000000ll+((s64)ts.tv_nsec-now.tv_nsec);
+    struct timespec now;
+    if(kh_cut_enabled){ u64 ns=kh_cut_unix_ns(); now.tv_sec=ns/1000000000; now.tv_nsec=ns%1000000000; }
+    else clock_gettime(CLOCK_REALTIME,&now);
+    s64 d=((s64)ts.tv_sec-now.tv_sec)*1000000000ll+((s64)ts.tv_nsec-now.tv_nsec);
+    if(kh_cut_enabled&&d>0){
+        s64 bounded=d>60000000000ll?60000000000ll:d;
+        if(kh_vclock_vsleep((u32)((bounded+999999)/1000000))) return;
+    }
     if(d>0){ if(d>60ll*1000000000ll){ kh_warn("_Thrd_sleep: absolute target %llds in the future, clamping to 60 s",(long long)(d/1000000000ll)); ts.tv_sec=now.tv_sec+60; ts.tv_nsec=now.tv_nsec; } { struct timespec rel={(time_t)(d/1000000000ll),(long)(d%1000000000ll)}; if(d>60ll*1000000000ll){ rel.tv_sec=60; rel.tv_nsec=0; } nanosleep(&rel,0); } } }
-IMP(MSVCP,_Xtime_get_ticks){ struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts); SET_RAX(g,(u64)ts.tv_sec*10000000ull+(u64)ts.tv_nsec/100); }
+IMP(MSVCP,_Xtime_get_ticks){ if(kh_cut_enabled){ SET_RAX(g,kh_cut_unix_ns()/100); return; } struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts); SET_RAX(g,(u64)ts.tv_sec*10000000ull+(u64)ts.tv_nsec/100); }
 
 /* ---- events / semaphores / mutexes ------------------------------------------------------------------------------------ */
 static u64 mk_event(int manual,int initial){ KWaitObj *w=wobj_new(HK_EVENT); w->manual=manual; w->signaled=initial; return h_new(HK_EVENT,w); }
@@ -319,6 +357,11 @@ static void vc_after_wake(u64 h,int had_waiters,u64 sat0){
     int k; KWaitObj *w=h_get_ref(h,&k); if(!w) return;
     u64 t0=0; struct timespec ts={0,20000}; KThread *tk=NULL;
     for(;;){
+        if(atomic_load(&kh_cut_requested)){
+            u64 pause=kh_host_ns();
+            kh_cut_poll("wake-handoff",NULL);
+            if(t0) t0+=kh_host_ns()-pause;
+        }
         pthread_mutex_lock(&w->m); u64 sat=w->satisfied; tk=w->last_taker; int left=w->waiters; pthread_mutex_unlock(&w->m);
         if(sat>sat0&&tk&&tk!=me&&(tk->done||atomic_load(&tk->vc_state)==1||vc_idle_now(tk,atomic_load(&tk->vc_state)))) break;     /* taken, and the taker waits again (or ended) */
         if(sat==sat0&&left==0) break;                                                  /* nobody blocked any more and nobody took it */
@@ -361,7 +404,7 @@ IMP(K32,WaitForSingleObject){ u64 h=A0(g); int fw=kh_vclock_on&&kh_vclock_frame_
 IMP(K32,WaitForSingleObjectEx){ SET_RAX(g,kh_wait(g,A0(g),(u32)A1(g))); }
 IMP(K32,CloseHandle){ u64 h=A0(g); if(h==PSEUDO_THREAD||h==PSEUDO_PROCESS){ SET_RAX(g,1); return; } int ok=h_close(h); if(!ok) kh_set_last_error(6); SET_RAX(g,ok); }
 static void host_sleep_ms(u32 ms){ struct timespec ts={ms/1000,(long)(ms%1000)*1000000L}; if(kh_vclock_sync) kh_vclock_idle(1); nanosleep(&ts,0); if(kh_vclock_sync) kh_vclock_idle(0); }
-IMP(K32,Sleep){ u32 ms=(u32)A0(g); if(ms==0) sched_yield(); else if(!kh_vclock_vsleep(ms)) host_sleep_ms(ms); }
+IMP(K32,Sleep){ if(kh_cut_enabled) cut_boot_ready(g); u32 ms=(u32)A0(g); if(ms==0) sched_yield(); else if(!kh_vclock_vsleep(ms)) host_sleep_ms(ms); }
 IMP(K32,SleepEx){ u32 ms=(u32)A0(g); if(ms==0) sched_yield(); else if(!kh_vclock_vsleep(ms)) host_sleep_ms(ms); SET_RAX(g,0); }
 /* task 44: with KHNMC_CLOCK=frames and its default KHNMC_CLOCK_SYNC=all the virtual clock moves only while every guest thread waits, and a
  * thread that spins on SwitchToThread never does: the movie player's sound thread (exe 0x13ec00) yields in a loop until the game thread
@@ -398,7 +441,7 @@ static void *thread_main(void *arg){
     jmp_buf jb; tl_exit_jb=&jb;
     if(setjmp(jb)==0){
         kh_run_tls_callbacks(g,2);
-        pthread_mutex_lock(&t->m); if(t->suspended) atomic_store(&t->vc_state,2); while(t->suspended) pthread_cond_wait(&t->cv,&t->m); atomic_store(&t->vc_state,0); pthread_mutex_unlock(&t->m);
+        pthread_mutex_lock(&t->m); if(t->suspended) atomic_store(&t->vc_state,2); while(t->suspended) kh_cut_wait("thread-start",&t->cv,&t->m); atomic_store(&t->vc_state,0); pthread_mutex_unlock(&t->m);
         t->exit_code=(u32)kh_call(g,t->start,t->param,0,0,0);
     }
     kh_run_tls_callbacks(g,3);
@@ -417,8 +460,22 @@ static u64 thread_create(KCtx *g,u64 stack_size,u64 start,u64 param,int suspende
      * pthread that is never joined keeps its 48 MiB host stack mapping for good (review 2026-11-16: address space and VMA count grew with
      * every worker the engine ended).  t->pt is therefore only valid while !t->done (nothing uses it after creation). */
     pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at,48ull<<20); pthread_attr_setdetachstate(&at,PTHREAD_CREATE_DETACHED);
+    int ordered_boot=kh_cut_enabled&&!suspended&&(start==GS_BASE+0x44ea80||start==GS_BASE+0x44d850||start==GS_BASE+0xfab10);
+    if(ordered_boot) atomic_store(&t->cut_boot_wait,1);
     int rc=pthread_create(&t->pt,&at,thread_main,t); pthread_attr_destroy(&at);
     if(rc){ kh_warn("pthread_create failed: %d",rc); h_close(t->handle); tlist_remove(t); return 0; }
+    if(ordered_boot){
+        struct timespec deadline;
+        kh_mono_deadline_ms(&deadline,3000);
+        pthread_mutex_lock(&t->m);
+        while(atomic_load(&t->cut_boot_wait)){
+            if(kh_cond_wait_until(&t->cv,&t->m,&deadline)==ETIMEDOUT&&atomic_load(&t->cut_boot_wait)){
+                pthread_mutex_unlock(&t->m);
+                kh_fatal(g,"savestate-worker-start: worker %llx did not reach its first idle import",(unsigned long long)start);
+            }
+        }
+        pthread_mutex_unlock(&t->m);
+    }
     t->started=1; if(tid_out) *tid_out=t->tid; (void)g;
     return t->handle;
 }
@@ -438,7 +495,7 @@ static u32 thread_suspend(KCtx *g,u64 h){
     if(h!=PSEUDO_THREAD){ int k; w=h_get_ref(h,&k); if(!w||k!=HK_THREAD){ if(w) kh_wobj_unref(w); kh_set_last_error(6); return (u32)-1; } t=w->thread; kh_wobj_unref(w); }
     if(t!=me){ atomic_fetch_add(&cnt_foreign_suspend,1); kh_warn("SuspendThread of ANOTHER thread (target %u, caller %u, handle %llx) is not implemented: the target keeps running, the call returns failure",t->tid,me->tid,(unsigned long long)h); kh_set_last_error(5); return (u32)-1; }
     atomic_fetch_add(&cnt_self_suspend,1);
-    pthread_mutex_lock(&t->m); int was=t->suspended; t->suspended=was+1; atomic_store(&t->vc_state,2); kh_vclock_idle(2); while(t->suspended>0) pthread_cond_wait(&t->cv,&t->m); atomic_store(&t->vc_state,0); pthread_mutex_unlock(&t->m);
+    pthread_mutex_lock(&t->m); int was=t->suspended; t->suspended=was+1; atomic_store(&t->vc_state,2); kh_vclock_idle(2); while(t->suspended>0) kh_cut_wait("self-suspend",&t->cv,&t->m); atomic_store(&t->vc_state,0); pthread_mutex_unlock(&t->m);
     return (u32)was;
 }
 IMP(K32,ResumeThread){ SET_RAX(g,thread_resume(A0(g))); }
@@ -446,7 +503,7 @@ IMP(K32,SuspendThread){ SET_RAX(g,thread_suspend(g,A0(g))); }
 IMP(K32,GetCurrentThreadId){ SET_RAX(g,cur_thread()->tid); }
 IMP(K32,GetCurrentThread){ SET_RAX(g,PSEUDO_THREAD); }
 IMP(K32,GetCurrentProcess){ SET_RAX(g,PSEUDO_PROCESS); }
-IMP(K32,GetCurrentProcessId){ SET_RAX(g,ga_deterministic?4242u:(u32)getpid()); }
+IMP(K32,GetCurrentProcessId){ SET_RAX(g,(ga_deterministic||kh_cut_enabled)?4242u:(u32)getpid()); }
 /* the MSVC SetThreadName convention (RaiseException 0x406D1388, k32.c): the guest's own thread names ("CDevSd MSECHandler", "Stream
  * Thread", ...) replace "thrN" in reports and logs (TASK28: the audio log names the thread of every call).  tid -1 = the caller. */
 void kh_thread_set_name(u32 tid,const char *name){
@@ -487,7 +544,7 @@ IMPN(K32,ExitProcess){ extern void kh_exit_process(int); kh_exit_process((int)A0
 
 /* ---- fibers ---------------------------------------------------------------------------------------------------------- */
 u64 kh_fiber_host_stack=2ull<<20;            /* host stack of a fiber (lazily committed); the vkd3d backend raises it because native graphics code runs on it */
-struct KFiber { KCtx *g; void *hstack; size_t hsize; void *sp; u64 start, param, handle, gstack_lo, gstack_sz; KThread *owner; int is_thread_fiber, finished; };
+struct KFiber { KFiber *cut_next; KCtx *g; void *hstack; size_t hsize; void *sp; u64 start, param, handle, gstack_lo, gstack_sz; KThread *owner; int is_thread_fiber, finished; };
 #define FIBER_MAGIC 0x46494245ull
 static int fiber_teb_swap=1;                          /* 0 only inside the selftest's demonstration of the hazard */
 /* guest stacks by address, for reports (ga_describe): threads from the thread list, fibers from this small table */
@@ -508,8 +565,52 @@ int kh_describe_stack(u64 a,char *out,size_t cap){
         pthread_mutex_unlock(&fstk_m); }
     return hit;
 }
-static KFiber *fiber_of(KCtx *g,u64 h){ if(!GA_OK(h)||rd64(g,h+8)!=FIBER_MAGIC){ kh_fatal(g,"bad fiber handle %llx",(unsigned long long)h); } return (KFiber*)rd64(g,h); }
-static u64 fiber_handle(KCtx *g,KFiber *f){ u64 h=ga_alloc(64,16); wr64(g,h,(u64)(uintptr_t)f); wr64(g,h+8,FIBER_MAGIC); f->handle=h; return h; }
+/* The opaque guest handle doubles as its stable key. Native bindings stay in this
+ * process and inactive fibers remain enumerable after their owner switches away. */
+static KFiber *cut_fibers;
+static pthread_mutex_t cut_fiber_m=PTHREAD_MUTEX_INITIALIZER;
+static KFiber *fiber_of(KCtx *g,u64 h){
+    if(!GA_OK(h)||rd64(g,h+8)!=FIBER_MAGIC) kh_fatal(g,"bad fiber handle %llx",(unsigned long long)h);
+    if(!kh_cut_enabled) return (KFiber*)rd64(g,h);
+    pthread_mutex_lock(&cut_fiber_m);
+    KFiber *f=cut_fibers;
+    while(f&&f->handle!=h) f=f->cut_next;
+    pthread_mutex_unlock(&cut_fiber_m);
+    if(!f||rd64(g,h)!=h) kh_fatal(g,"savestate-fiber-binding: unknown handle %llx",(unsigned long long)h);
+    return f;
+}
+static u64 fiber_handle(KCtx *g,KFiber *f){
+    u64 h=ga_alloc(64,16);
+    f->handle=h;
+    if(kh_cut_enabled){
+        pthread_mutex_lock(&cut_fiber_m);
+        f->cut_next=cut_fibers;
+        cut_fibers=f;
+        pthread_mutex_unlock(&cut_fiber_m);
+    }
+    wr64(g,h,kh_cut_enabled?h:(u64)(uintptr_t)f);
+    wr64(g,h+8,FIBER_MAGIC);
+    return h;
+}
+static void cut_forget_fiber(KFiber *f){
+    if(!kh_cut_enabled) return;
+    pthread_mutex_lock(&cut_fiber_m);
+    KFiber **p=&cut_fibers;
+    while(*p&&*p!=f) p=&(*p)->cut_next;
+    if(!*p) kh_fatal(NULL,"savestate-fiber-registry: missing live fiber");
+    *p=f->cut_next;
+    pthread_mutex_unlock(&cut_fiber_m);
+}
+void kh_cut_fiber_report(void){
+    pthread_mutex_lock(&cut_fiber_m);
+    for(KFiber *f=cut_fibers;f;f=f->cut_next){
+        u64 sp=KH_RSP(f->g);
+        fprintf(stderr,"kh: savestate-fiber handle=%llx owner=%u start=%llx rsp=%llx return=%llx\n",
+                (unsigned long long)f->handle,f->owner?f->owner->tid:0,(unsigned long long)f->start,
+                (unsigned long long)sp,(unsigned long long)(GA_OK(sp)?rd64(f->g,sp):0));
+    }
+    pthread_mutex_unlock(&cut_fiber_m);
+}
 void kh_fiber_main(KFiber *f){
     KCtx *g=f->g; (void)kh_call(g,f->start,f->param,0,0,0);
     kh_fatal(g,"fiber start routine 0x%llx returned (Windows would ExitThread)",(unsigned long long)f->start);
@@ -550,12 +651,14 @@ void kh_fiber_delete(KCtx *g,u64 h){
     KFiber *f=fiber_of(g,h); KThread *t=cur_thread();
     if(f==t->cur_fiber && !f->is_thread_fiber) kh_fatal(g,"DeleteFiber of the running fiber (ExitThread semantics) not supported");
     if(f->is_thread_fiber){ kh_warn("DeleteFiber on a thread fiber"); return; }
+    cut_forget_fiber(f);
     if(f->hstack) munmap(f->hstack,f->hsize);
     fiber_stack_note(f->gstack_lo,0,0); ga_pages_free_src(f->gstack_lo,f->gstack_sz,GA_SRC_STACK); wr64(g,h+8,0); ga_free(h); free(f->g); free(f);
 }
 int kh_fiber_convert_to_thread(KCtx *g){
     KThread *t=cur_thread(); KFiber *f=t->thread_fiber; if(!f) return 0; if(t->cur_fiber!=f){ kh_fatal(g,"ConvertFiberToThread while a non-thread fiber is running"); }
     wr64(g,t->teb+0x08,t->stack_hi); wr64(g,t->teb+0x10,t->stack_lo);
+    cut_forget_fiber(f);
     wr64(g,f->handle+8,0); ga_free(f->handle); free(f); t->thread_fiber=NULL; t->cur_fiber=NULL; return 1;
 }
 IMP(K32,ConvertThreadToFiber){ SET_RAX(g,kh_fiber_convert(g,A0(g))); }

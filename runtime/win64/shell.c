@@ -8,6 +8,7 @@
  * (or the optional KH_RUN_SECONDS time limit of a headless run expires).  EndMessageClose and MouseEnable are no-ops.
  * These four symbols replace the generated abort stubs (tools/gen_nep.sh removes them from nep_stubs.c). */
 #include "khnmc_rt.h"
+#include "savestate.h"
 #include <time.h>
 #include <unistd.h>
 
@@ -110,6 +111,11 @@ static void shell_run(KCtx *g,int req){
         shell_restore_resize(g,reason);                    /* then OnResize's GXDevice.resize(ClientSize) */
     } else kh_fatal(g,"shell-request-unknown: lifecycle request %d",req);
 }
+void kh_cut_wake_shell(void){
+    pthread_mutex_lock(&sm);
+    pthread_cond_broadcast(&scv);
+    pthread_mutex_unlock(&sm);
+}
 void f_579bf0(KCtx *g){                                  /* ManageRun(app) */
     u64 app=KH_RCX(g);
     if(getenv("KH_STATE_DUMP")) state_dump(g,getenv("KH_STATE_DUMP"));
@@ -123,6 +129,7 @@ void f_579bf0(KCtx *g){                                  /* ManageRun(app) */
     kh_vclock_idle(1);                                     /* TASK28: parked, idle for the frames clock's quiescence test */
     pthread_mutex_lock(&sm); shell_in_loop=1;
     while(!exit_requested){
+        if(atomic_load(&kh_cut_requested)){ kh_cut_poll("shell-loop",&sm); continue; }
         if(shell_qn){ int req=shell_q[0]; for(int i=1;i<shell_qn;i++) shell_q[i-1]=shell_q[i]; shell_qn--;   /* TASK41: in order */
             pthread_mutex_unlock(&sm); kh_vclock_idle(0); shell_run(g,req); kh_vclock_idle(1); pthread_mutex_lock(&sm); continue; }
         if(pending_size&&!shell_suspend_flg){

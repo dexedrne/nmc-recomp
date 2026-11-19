@@ -1,6 +1,7 @@
 /* k32.c : kernel32 (loader, memory, time, strings, files, find, mapping, diagnostics), winmm, advapi32 registry, shell32, ole32,
  * oleaut32, imagehlp, dbghelp.  Thread/sync/fiber parts of kernel32 live in threads.c. */
 #include "khnmc_rt.h"
+#include "savestate.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
@@ -56,7 +57,7 @@ IMP(K32,GetDiskFreeSpaceExA){ if(A1(g)) wr64(g,A1(g),200ull<<30); if(A2(g)) wr64
 IMP(K32,QueryPerformanceCounter){ wr64(g,A0(g),kh_qpc()); SET_RAX(g,1); }
 IMP(K32,QueryPerformanceFrequency){ wr64(g,A0(g),10000000ull); SET_RAX(g,1); }
 #define EPOCH_DIFF 116444736000000000ull
-IMP(K32,GetSystemTimeAsFileTime){ extern u64 kh_det_tick(void); if(ga_deterministic){ wr64(g,A0(g),0x01DBA00000000000ull+kh_det_tick()*10000ull); return; } struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts); wr64(g,A0(g),(u64)ts.tv_sec*10000000ull+(u64)ts.tv_nsec/100+EPOCH_DIFF); }
+IMP(K32,GetSystemTimeAsFileTime){ extern u64 kh_det_tick(void); if(kh_cut_enabled){ wr64(g,A0(g),EPOCH_DIFF+kh_cut_unix_ns()/100); return; } if(ga_deterministic){ wr64(g,A0(g),0x01DBA00000000000ull+kh_det_tick()*10000ull); return; } struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts); wr64(g,A0(g),(u64)ts.tv_sec*10000000ull+(u64)ts.tv_nsec/100+EPOCH_DIFF); }
 IMP(K32,FileTimeToLocalFileTime){ wr64(g,A1(g),rd64(g,A0(g))); SET_RAX(g,1); }
 IMP(K32,FileTimeToSystemTime){ u64 ft=rd64(g,A0(g)); time_t t=(time_t)((ft-EPOCH_DIFF)/10000000ull); struct tm r; gmtime_r(&t,&r); u64 d=A1(g);
     wr16(g,d,(u16)(r.tm_year+1900)); wr16(g,d+2,(u16)(r.tm_mon+1)); wr16(g,d+4,(u16)r.tm_wday); wr16(g,d+6,(u16)r.tm_mday); wr16(g,d+8,(u16)r.tm_hour); wr16(g,d+10,(u16)r.tm_min); wr16(g,d+12,(u16)r.tm_sec); wr16(g,d+14,(u16)(((ft-EPOCH_DIFF)/10000ull)%1000)); SET_RAX(g,1); }
@@ -138,7 +139,7 @@ IMP(K32,OpenProcess){ SET_RAX(g,0); kh_set_last_error(5); }
 IMP(winmm,timeBeginPeriod){ SET_RAX(g,0); }
 IMP(winmm,timeEndPeriod){ SET_RAX(g,0); }
 IMP(winmm,timeGetDevCaps){ if(A0(g)){ wr32(g,A0(g),1); wr32(g,A0(g)+4,1000000); } SET_RAX(g,0); }
-static u64 t0ms; IMP(winmm,timeGetTime){ u64 n=kh_now_ns()/1000000; if(!t0ms) t0ms=n; SET_RAX(g,(u32)(n-t0ms+1000)); }
+static u64 t0ms; IMP(winmm,timeGetTime){ if(kh_cut_enabled){ SET_RAX(g,(u32)(1000+kh_cut_elapsed_ns()/1000000)); return; } u64 n=kh_now_ns()/1000000; if(!t0ms) t0ms=n; SET_RAX(g,(u32)(n-t0ms+1000)); }
 typedef struct Timer { u32 id; u32 delay; u64 cb, user; u32 flags; volatile int killed; struct Timer *next;
     u64 fires, settled, no_consumer, guard_hits; u64 seth[4]; u64 setsat[4]; int setwait[4]; int nset; KThread *owner; int owner_seq; int anchor; } Timer;   /* anchor: review of task 28, 1 = created before the first vblank and anchored there, -1 = not anchored (guard) */   /* frames clock: consumer tracking, same-instant order (TASK28) */
 static Timer *timers; static u32 next_timer=1; static pthread_mutex_t tmm=PTHREAD_MUTEX_INITIALIZER;
@@ -148,7 +149,11 @@ static Timer *timers; static u32 next_timer=1; static pthread_mutex_t tmm=PTHREA
 static void timer_fire(KCtx *g,Timer *t){
     if(t->flags&0x20){ if(!kh_event_pulse(t->cb)) kh_warn("winmm timer %u: pulse of a closed or invalid event handle %llx",t->id,(unsigned long long)t->cb); }
     else if(t->flags&0x10){ if(!kh_event_set(t->cb)) kh_warn("winmm timer %u: set of a closed or invalid event handle %llx",t->id,(unsigned long long)t->cb); }
-    else kh_call5(g,t->cb,t->id,0,t->user,0,0);
+    else {
+        if(kh_cut_enabled) kh_cut_callback_depth++;
+        kh_call5(g,t->cb,t->id,0,t->user,0,0);
+        if(kh_cut_enabled) kh_cut_callback_depth--;
+    }
 }
 /* KHNMC_CLOCK=frames: the timer's grid is on the virtual clock.
  * Before TASK28 the timer thread woke whenever the clock passed its next grid instant and fired ONCE (missed periods dropped), while the
@@ -213,7 +218,16 @@ void kh_timer_frames_report(FILE *f){
     for(int i=0;i<tm_nframes;i++){ Timer *t=tm_list_frames[i]; fprintf(f," timer %u (%u ms, flags %x): %llu ticks / %llu settled / %llu no consumer / %llu guard%s%s",t->id,t->delay,t->flags,(unsigned long long)t->fires,(unsigned long long)t->settled,(unsigned long long)t->no_consumer,(unsigned long long)t->guard_hits,t->anchor==1?" (created before the first vblank, anchored at it)":t->anchor<0?" (NOT anchored)":"",i+1<tm_nframes?";":""); }
     fputc('\n',f);
 }
-static void timer_proc(KCtx *g){ Timer *t=(Timer*)(uintptr_t)A0(g);
+static void timer_proc(KCtx *g){
+    Timer *t;
+    if(kh_cut_enabled){
+        /* The thread parameter survives in guest registers across callbacks. */
+        u64 id=A0(g);
+        pthread_mutex_lock(&tmm);
+        for(t=timers;t&&t->id!=id;t=t->next){}
+        pthread_mutex_unlock(&tmm);
+        if(!t) kh_fatal(g,"savestate-timer-binding: unknown id %llu",(unsigned long long)id);
+    }else t=(Timer*)(uintptr_t)A0(g);
     if(kh_vclock_on&&!ga_deterministic){ timer_proc_virtual(g,t); KH_RET(g); return; }
     struct timespec next; clock_gettime(CLOCK_MONOTONIC,&next);
     for(;;){
@@ -228,7 +242,7 @@ static void timer_proc(KCtx *g){ Timer *t=(Timer*)(uintptr_t)A0(g);
         if(!(t->flags&1)) break; }
     KH_RET(g); }
 IMP(winmm,timeSetEvent){ Timer *t=calloc(1,sizeof *t); t->owner=cur_thread(); t->owner_seq=t->owner?t->owner->vc_ntimers++:0; t->delay=(u32)A0(g)?(u32)A0(g):1; t->cb=A2(g); t->user=A3(g); t->flags=(u32)ARG(g,4); pthread_mutex_lock(&tmm); t->id=next_timer++; t->next=timers; timers=t; pthread_mutex_unlock(&tmm);
-    kh_spawn_hostfn_thread(g,"winmm_timer",timer_proc,(u64)(uintptr_t)t); SET_RAX(g,t->id); }
+    kh_spawn_hostfn_thread(g,"winmm_timer",timer_proc,kh_cut_enabled?t->id:(u64)(uintptr_t)t); SET_RAX(g,t->id); }
 IMP(winmm,timeKillEvent){ u32 id=(u32)A0(g); int ok=1; pthread_mutex_lock(&tmm); for(Timer *t=timers;t;t=t->next) if(t->id==id){ t->killed=1; ok=0; } pthread_mutex_unlock(&tmm); SET_RAX(g,ok?0xffffffffu:0); }
 
 /* ---- advapi32 registry: in-memory key/value store (documented stub; HKCU\Software\SQUARE\KHProj) --------------------------- */

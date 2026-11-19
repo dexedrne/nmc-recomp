@@ -18,6 +18,7 @@
  * Not implemented, named fatals: operation sets (deferred calls), voice and output filters, xWMA and other compressed tags,
  * default down-mix matrices, a mastering voice at another rate than 48 kHz, a non-stereo mastering output. */
 #include "khnmc_rt.h"
+#include "savestate.h"
 #include "khnmc_mix.h"
 #include "khnmc_audio_out.h"
 #include <time.h>
@@ -107,8 +108,20 @@ int kh_audio_cocreate(KCtx *g){
 typedef struct { u64 object; u32 enabled, channels, size; void *params; } Effect;
 typedef struct Matrix { u64 dest; u32 src, dst; void *values; struct Matrix *next; } Matrix;
 struct SoftVoice;
-typedef struct { u32 flags, count; Effect *effects; u32 channels[64]; Matrix *matrices; struct SoftVoice *soft; } Voice;
-static Voice *voice_state(KCtx *g,u64 o){ return (Voice*)(uintptr_t)rd64(g,o+48); }
+typedef struct Voice {
+    u32 flags, count; Effect *effects; u32 channels[64]; Matrix *matrices; struct SoftVoice *soft;
+    u64 object; struct Voice *next;
+} Voice;
+static pthread_mutex_t voice_bind_lock=PTHREAD_MUTEX_INITIALIZER;
+static Voice *bound_voices;
+static Voice *voice_state(KCtx *g,u64 o){
+    if(!kh_cut_enabled) return (Voice*)(uintptr_t)rd64(g,o+48);
+    pthread_mutex_lock(&voice_bind_lock);
+    Voice *v=bound_voices;
+    while(v && v->object!=o) v=v->next;
+    pthread_mutex_unlock(&voice_bind_lock);
+    return v;
+}
 static void clear_effects(Voice *v){
     for(u32 i=0;i<v->count;i++) free(v->effects[i].params);
     free(v->effects); v->effects=NULL; v->count=0;
@@ -324,6 +337,14 @@ static void soft_link(SoftEngine *e,SoftVoice *sv){ pthread_mutex_lock(&soft_m);
 static void soft_unlink(SoftVoice *sv){ pthread_mutex_lock(&soft_m); if(sv->prevp){ *sv->prevp=sv->next; if(sv->next) sv->next->prevp=sv->prevp; sv->prevp=NULL; sv->next=NULL; } pthread_mutex_unlock(&soft_m); }
 static void voice_state_free(KCtx *g,u64 o,Voice *v){
     clear_effects(v); while(v->matrices){ Matrix *m=v->matrices; v->matrices=m->next; free(m->values); free(m); }
+    if(kh_cut_enabled){
+        pthread_mutex_lock(&voice_bind_lock);
+        Voice **entry=&bound_voices;
+        while(*entry && *entry!=v) entry=&(*entry)->next;
+        if(!*entry) kh_fatal(g,"savestate: missing audio voice binding");
+        *entry=v->next;
+        pthread_mutex_unlock(&voice_bind_lock);
+    }
     free(v); wr64(g,o+48,0);
 }
 static void soft_destroy_voice(KCtx *g,Voice *st){
@@ -359,7 +380,14 @@ static u32 soft_create_voice(KCtx *g,SoftEngine *e,int s,u64 vobj,Voice *st,u64 
     kmx_voice_publish(sv->mv);                     /* complete: from the next pass on (deferred mode: the first pass after this instant) */
     st_created[s-5]++; return 0;
 }
-static SoftEngine *soft_engine_of(KCtx *g,u64 o){ return (SoftEngine*)(uintptr_t)rd64(g,o+32); }
+static SoftEngine *soft_engine_of(KCtx *g,u64 o){
+    if(!kh_cut_enabled) return (SoftEngine*)(uintptr_t)rd64(g,o+32);
+    pthread_mutex_lock(&soft_m);
+    SoftEngine *e=engines;
+    while(e && e->obj!=o) e=e->next;
+    pthread_mutex_unlock(&soft_m);
+    return e;
+}
 /* where a pass goes (soft_quantum): the WAV path only, or the ring of the pull device (pushed / discarded because no device is started /
  * dropped because the device stopped consuming) */
 enum { SINK_WAV=0, SINK_RING=1, SINK_RING_STOPPED=2, SINK_RING_OVERRUN=3 };
@@ -471,6 +499,7 @@ static void mix_thread(KCtx *g){
 static const char *peak_name(void *vu){ static char b[96]; SoftVoice *sv=vu; if(!sv){ b[0]=0; return b; }
     if(sv->fmt>=0) snprintf(b,sizeof b,"voice=%llx %s %u ch %u Hz",ULL(sv->obj),fmt_tag_name(fmts[sv->fmt].tag),fmts[sv->fmt].ch,fmts[sv->fmt].rate); else snprintf(b,sizeof b,"voice=%llx",ULL(sv->obj)); return b; }
 static void soft_quantum(KCtx *g,u64 instant,int sink){
+    if(kh_cut_enabled) kh_cut_callback_depth++;
     float acc[960]; int have=0; SoftEngine *list[16]; int n=0;
     pthread_mutex_lock(&soft_m);
     for(SoftEngine *e=engines;e&&n<16;e=e->next) if(!e->manual){ e->inuse++; list[n++]=e; }
@@ -499,6 +528,7 @@ static void soft_quantum(KCtx *g,u64 instant,int sink){
     }
     pthread_mutex_unlock(&wav_m);
     st_quanta++;
+    if(kh_cut_enabled) kh_cut_callback_depth--;
 }
 static void soft_engine_new(KCtx *g,u64 obj){
     SoftEngine *e=calloc(1,sizeof *e); if(!e) kh_fatal(g,"audio: engine allocation failed");
@@ -506,7 +536,7 @@ static void soft_engine_new(KCtx *g,u64 obj){
     if(kh_vclock_on&&!apply_mode) kmx_engine_set_deferred(e->mx,1);              /* frames clock: calls apply at the first pass after their virtual instant */
     if(peak_f) kmx_engine_set_peaks(e->mx,1);
     kmx_engine_start(e->mx);                                                        /* XAudio2 engines are created started */
-    wr64(g,obj+32,(uintptr_t)e);
+    wr64(g,obj+32,kh_cut_enabled?obj:(uintptr_t)e);
     pthread_mutex_lock(&soft_m); e->next=engines; engines=e; int start=!e->manual&&!clock_started; if(start) clock_started=1; pthread_mutex_unlock(&soft_m);
     if(start){
         pthread_mutex_lock(&wav_m);
@@ -587,7 +617,12 @@ static int h_xa2(KCtx *g,u64 o,int s,const char *c){
         Voice *state=calloc(1,sizeof(*state)); if(!state) kh_fatal(g,"null audio: voice allocation failed");
         state->flags=s==5?(u32)A3(g):(u32)A4(g);
         for(u32 i=0;i<rd32(g,v+32);i++) state->channels[i]=0x3f800000;
-        wr64(g,v+48,(uintptr_t)state);
+        if(kh_cut_enabled){
+            pthread_mutex_lock(&voice_bind_lock);
+            state->object=v; state->next=bound_voices; bound_voices=state;
+            pthread_mutex_unlock(&voice_bind_lock);
+        }
+        wr64(g,v+48,kh_cut_enabled?v:(uintptr_t)state);
         u64 chain=ARG(g,s==7?6:7);
         if(s==5){ u64 f=A2(g); alog("CreateSourceVoice voice=%llx tag=%x ch=%u rate=%u align=%u bits=%u cbSize=%u flags=%x maxratio=%g callback=%llx site=%llx",ULL(v),rd16(g,f),rd16(g,f+2),rd32(g,f+4),rd16(g,f+12),rd16(g,f+14),rd16(g,f+16),(u32)A3(g),(double)*(float*)hp(g,KH_RSP(g)+8+32),ULL(ARG(g,5)),RVA(guest_return_addr(g)));
             if(rd16(g,f)==2) alog("  adpcm samplesPerBlock=%u numCoef=%u",rd16(g,f+18),rd16(g,f+20));
@@ -598,7 +633,7 @@ static int h_xa2(KCtx *g,u64 o,int s,const char *c){
         log_chain(g,"create",v,chain);
         if(se){
             u32 hr=soft_create_voice(g,se,s,v,state,s==5?A2(g):0,s==5?ARG(g,5):0,s==7?0:ARG(g,6),chain);
-            if(hr){ alog("  creation failed %08x",hr); free(state); wr64(g,v+48,0); wr64(g,A1(g),0); SET_RAX(g,hr); return 1; }
+            if(hr){ alog("  creation failed %08x",hr); voice_state_free(g,v,state); wr64(g,A1(g),0); SET_RAX(g,hr); return 1; }
         } else {
             if(!effect_chain(g,state,chain)) kh_fatal(g,"null audio: invalid creation effect chain");
             if(s==5) fmt_stat(rd16(g,A2(g)),rd16(g,A2(g)+2),rd32(g,A2(g)+4),rd16(g,A2(g)+14),rd16(g,A2(g)+12));
@@ -758,8 +793,7 @@ static int h_voice(KCtx *g,u64 o,int s,const char *c){
         break;
     }
     case 18:
-        clear_effects(v); while(v->matrices){ Matrix *m=v->matrices; v->matrices=m->next; free(m->values); free(m); }
-        free(v); wr64(g,o+48,0); break;
+        voice_state_free(g,o,v); break;
     case 21: if(A1(g)){ st_null_buffers++; st_null_bytes+=rd32(g,A1(g)+4); } break; /* null device: the buffer is dropped, counted for the report */
     case 19: case 20: case 22: case 23: case 24: break; /* documented drained null source */
     case 12: wr32(g,o+40,*(u32*)&KH_XMM(g,1)); break;

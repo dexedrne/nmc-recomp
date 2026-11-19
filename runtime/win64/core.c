@@ -1,6 +1,7 @@
 /* core.c : guest arena allocator, tracing, fatal/fault reporting, dispatch (guest address -> function), host-fn registry,
  * handle table, guest-to-host calls, time, Windows path mapping.  Replaces the lifter's khrt_dispatch.c (see README, ABI notes). */
 #include "khnmc_rt.h"
+#include "savestate.h"
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -315,6 +316,14 @@ u64 ga_strdup_src(const char *s,int src){ size_t n=strlen(s)+1; u64 p=ga_alloc_s
 void ga_stats(u64 *lb,u64 *ac){ u64 l=0; pthread_mutex_lock(&gm); for(int i=0;i<nzones;i++) l+=zones[i].live; pthread_mutex_unlock(&gm); *lb=l; *ac=alloc_count; }
 u64 ga_bump_ptr(void){ return zones[ZONE_ID].bump; }
 u64 ga_arena_lo(void){ return arena_lo; }
+/* Called at a worker rendezvous. Read only ranges the allocator committed.
+ * In the spread layout adjacent segment numbers can be entire windows apart. */
+void kh_cut_arena_census(KCtx *g,void (*report)(KCtx *,u64,u64)){
+    report(g,GS_BASE,arena_lo-GS_BASE);
+    for(int i=0;i<nzones;i++) report(g,zones[i].lo,zones[i].commit-zones[i].lo);
+    for(u64 k=0;k<sp_count;k++)
+        report(g,sp_lo+(k%sp_wins)*GA_WIN+(k/sp_wins)*ga_spread_seg,ga_spread_seg);
+}
 int ga_zone_get(int zi,u64 *lo,u64 *hi,u64 *bump,u64 *commit,u64 *live){
     if(zi<0||zi>=nzones) return 0; pthread_mutex_lock(&gm); Zone *z=&zones[zi]; if(lo)*lo=z->lo; if(hi)*hi=z->hi; if(bump)*bump=z->bump; if(commit)*commit=z->commit; if(live)*live=z->live; pthread_mutex_unlock(&gm); return 1;
 }
@@ -592,7 +601,7 @@ static _Atomic u64 det_tick;
 /* oracle mode (KH_DET=1): every clock read returns the next value of a counter, so a run is reproducible and the Unicorn oracle can mirror it */
 u64 kh_det_tick(void){ return atomic_fetch_add(&det_tick,1)+1; }
 u64 kh_now_ns(void){ if(ga_deterministic) return 1000000000ull+kh_det_tick()*100000ull; if(kh_vclock_on) return kh_vclock_now_ns(); struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (u64)ts.tv_sec*1000000000ull+(u64)ts.tv_nsec; }
-u64 kh_qpc(void){ return kh_now_ns()/100; }
+u64 kh_qpc(void){ if(kh_cut_enabled) return 10000000ull+kh_cut_elapsed_ns()/100; return kh_now_ns()/100; }
 
 /* ======================================================================================================================
  * trace

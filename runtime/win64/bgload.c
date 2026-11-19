@@ -1,3 +1,4 @@
+#include "savestate.h"
 /* bgload.c : the engine's background file-load request list: serialisation (port hardening), stress knob, fault diagnostics, selftest.
  *
  * What the original does (kh2fm.exe, read from its disassembly; nothing here is taken from lifted C):
@@ -88,10 +89,12 @@ static void (*scan_step_fn)(KCtx *g,u64 node);        /* called after every walk
 static int scan_hook_on;                               /* 4ad270 takes its slow path only when this is set */
 
 /* a call made from the loader loop that blocks or runs long: without the lock */
+static __thread int loader_idle;
+int kh_cut_loader_safe(void){ return !bg_tls()->depth && (!bg_tls()->is_loader || loader_idle); }
 static void released(KCtx *g,KhFn orig,u64 site){
     BgTls *t=bg_tls();
     if(bg_lock_on && t->is_loader && t->depth==1 && rd64(g,KH_RSP(g))==site){
-        atomic_fetch_add(&c_released,1); bg_unlock(g); orig(g); bg_lock(g);
+        atomic_fetch_add(&c_released,1); bg_unlock(g); loader_idle=(site==RA_IDLE); orig(g); loader_idle=0; bg_lock(g);
     } else orig(g);
 }
 static void locked(KCtx *g,KhFn orig){ bg_lock(g); orig(g); bg_unlock(g); }
