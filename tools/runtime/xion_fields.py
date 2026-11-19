@@ -234,8 +234,8 @@ def main():
             if a and not tree.find('map/'+a.name+'.map'): bad.add('missing room map')
             if w=='al' and n==5: bad.add('Above Agrabah carpet traversal')
             if w=='wm': bad.add('world map/gummi')
-            if {'M_EX570', 'M_EX580'} <= names:
-                bad.add('paired encounter fault at f_402d20 with Xion')
+            if (w,n,ps) == ('mu',9,(0,10,0)):
+                bad.add('P_EX220 ptya table 28 lacks key 1 required by f_402d20')
             if 'PLAYER' not in names: bad.add('no field player spawn')
             if w=='hb' and 21 <= n <= 25: bad.add('Cavern of Remembrance traversal')
             legacy = (w,n,*ps) in LEGACY

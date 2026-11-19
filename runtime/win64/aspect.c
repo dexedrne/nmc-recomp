@@ -1,3 +1,4 @@
+#include "route_state.h"
 /* aspect.c : task 37, the first steps of the "fill" mode (NATIVE-FILL-PLAN.md sections 3, 4.3, 6 and 7; plan steps 0 to 3).
  *
  * The owner plays on a 1.42:1 screen (iPhone Duo inner screen, 2670x1878).  The exe already has a Vert+ projection for screens
@@ -868,6 +869,17 @@ int kh_aspect_title_elem(const float *bb){
     if(y1-y0<=420.0&&cy>=30.0&&cy<=290.0&&cx>=-600.0&&cx<=360.0) return TT_LOGO;       /* the logo block, its credits and sweep line (sliding out to the left in the exit animation, x -413) and its exit flash; not the backdrops (479 tall) nor the fade-in flashes (511 / 639) */
     return -1;
 }
+/* f_1969a0 submits the credit rows separately and its underline as two joined quads.
+ * The exit animation slides them left independently of the rest of the logo. */
+static double title_logo_pivot(const float b[4]){
+    float w=b[1]-b[0], h=b[3]-b[2];
+    if(b[2]>=253 && b[3]<=293){
+        if((w==160 && h==12) || (w==170 && h==15)) return (b[0]+b[1])*0.5;
+        if(h==2 && w==95) return b[0]+11.5; /* 72 pixels precede this piece */
+        if(h==2 && w==72) return b[0]+83.5;
+    }
+    return tt_px[TT_LOGO];
+}
 typedef struct { _Atomic u64 batches, q[TT_N], left, other, tooshort; Ivs fr[TT_N]; } TtStat;
 static TtStat ttl;
 static _Atomic int ttl_logged;
@@ -1070,6 +1082,27 @@ static const H3Cls h3cls[]={
     {GS_BASE+0x5b1a40ull,"dk::SpriteImage",H3_GENERIC,"generic (first in the HUD pass, group 0: centre)"},
     {GS_BASE+0x5b1aa0ull,"dk::SpriteMessage",H3_GENERIC,"generic text (menus: group 0)"}};
 #define H3_NCLS ((int)(sizeof h3cls/sizeof *h3cls))
+/* Slot 2 of a dk draw object, reached only at the draw call in f_166640. */
+static int hud_draw_owner(u64 vt,u32 group){
+    for(int i=0;i<H3_NCLS;i++) if(h3cls[i].vt==vt){
+        if(h3cls[i].anchor==H3_GENERIC) return group>=1 && group<=17 && group!=7;
+        if(vt==GS_BASE+0x5b2400 || vt==GS_BASE+0x5b2430) return 0; /* INFORMATION text box */
+        if(h3cls[i].anchor!=H3_CENTRE) return 1;
+        switch(vt-GS_BASE){
+        case 0x5b1df0: /* style rank */
+        case 0x5b24f8: case 0x5b2540: case 0x5b24c0: /* lock-on, EXP and 3D sprites */
+        case 0x5b2638: case 0x5b1b90: case 0x5b1ee0: return 1; /* field notices */
+        default: return 0; /* menus and windows */
+        }
+    }
+    return 0;
+}
+
+int kh_hide_dk_draw(KCtx *g){
+    if(kh_phase_title_alive() || kh_route_cond_eval(g,KR_MENU_OPEN,0,0,NULL)) return 0;
+    u64 obj=KH_RCX(g);
+    return hud_draw_owner(rd64(g,obj),rd32(g,obj+0x14));
+}
 typedef struct { u32 grp; int anchor; const char *owner; } H3Grp;
 static const H3Grp h3grp[]={
     {1,H3_BOTTOM,"the command menu (dk::COMMAND_DRAW and its children)"},{2,H3_BOTTOM,"dk::COMMAND_ONE"},
@@ -1466,8 +1499,9 @@ static int h7_pre(KCtx *g){
                                                             W,H,L.s[TT_PIC],L.ty[TT_PIC],L.s[TT_LOGO],L.ty[TT_LOGO],L.ty[TT_MENU],L.ty[TT_SET]);
                 for(int q=0;q<nq;q++){ int e=tsite?kh_aspect_title_elem(qb[q]):-1; if(e<0){ ttl.left++; continue; }
                     u64 a=vp+(u64)q*4u*stride; double sc=L.s[e], y0n=L.ty[e]+sc*((double)qb[q][2]-tt_py[e]), y1n=L.ty[e]+sc*((double)qb[q][3]-tt_py[e]);
+                    double pivot=e==TT_LOGO ? title_logo_pivot(qb[q]) : tt_px[e];
                     for(int i=0;i<4;i++){ u64 p=a+(u64)i*stride;
-                        if(e==TT_PIC||e==TT_LOGO) wrf(g,p,(float)(L.tx[e]+sc*((double)(rdf(g,p)-ox)-tt_px[e]))+ox);      /* the menu rows keep x */
+                        if(e==TT_PIC||e==TT_LOGO) wrf(g,p,(float)(L.tx[e]+sc*((double)(rdf(g,p)-ox)-pivot))+ox);      /* the menu rows keep x */
                         wrf(g,p+4,(float)(L.ty[e]+sc*((double)(rdf(g,p+4)-oy)-tt_py[e]))+oy); }
                     if(__builtin_expect(kh_aspect_m,0)) h7_quadlog(g,ra,prim,q,nq,qb[q],H7K_TITLE,sc,y0n,y1n,a,stride);
                     qt[q]=1; wrote=1; ttl.q[e]++;
@@ -2136,6 +2170,9 @@ static void h3_selftest(KCtx *g){
     u8 gxsave[0x100]; memcpy(gxsave,hp(g,GX),0x100); u32 guard=rd32(g,GX_GUARD);                  /* GX's first 0x100 bytes: sizes, mode, MS, scissor */ wr32(g,GX_GUARD,0x80000000u);
     u8 tsave[0x204]; memcpy(tsave,hp(g,ID_TAB),0x204); int tlive=rd32(g,ID_TAB+0x200)!=0;
     if(!tlive){ for(int i=0;i<64;i++) wr64(g,ID_TAB+8ull*i,~0ull); wr32(g,ID_TAB+0x200,0x80000000u); }   /* as 0x4ad2c0 leaves it */
+    ACHECK(hud_draw_owner(GS_BASE+0x5b1df0,0) && hud_draw_owner(GS_BASE+0x5b2340,0));
+    ACHECK(hud_draw_owner(GS_BASE+0x5b1a70,3) && !hud_draw_owner(GS_BASE+0x5b1aa0,0));
+    ACHECK(!hud_draw_owner(GS_BASE+0x5b1dc0,0) && !hud_draw_owner(GS_BASE+0x5c5180,0));
     int sm=asp_mode, su=asp_h1_uncond, so=asp_off_h3, sdk=kh_aspect_dk, sml=kh_aspect_m; u64 s3=atomic_load(&last3d_plus1); H3Stat sh; memcpy(&sh,&h3,sizeof sh);
     kh_aspect_m=0; kh_aspect_dk=1; asp_h1_uncond=0; asp_off_h3=0; h3.warned=1; h3.warned_inner=1;   /* no WARNING lines from the test cases */
     /* f_1433a0 (0x1433a0..0x14355f, this = GX+8) reads the screen GX+0x18 / +0x1c, GX+0x10 / +0x14, the scales GX+0x20 / +0x24 / +0x28 and
@@ -2704,6 +2741,10 @@ static void h7_selftest(KCtx *g){
         TTSUB(H7T_LAY,195,595,0,400); ACHECK(k&&near(xs[0],256.0-200.0*sP,2e-3)&&near(xs[1],256.0+200.0*sP,2e-3)&&near(ys[0],yT,2e-3)&&near(ys[2],yT+400.0*sP,2e-3)&&ttl.batches==b0+1&&ttl.q[TT_PIC]==p0+1);
         ACHECK(near(xs[0],xs[2],0)&&near(ys[0],ys[1],0));                                             /* still an axis-aligned rectangle */
         TTSUB(H7T_LAYB,-77,298,83,194); ACHECK(near(xs[0],256.0+1.1*(-77.0-110.5),2e-3)&&near(xs[1],256.0+1.1*(298.0-110.5),2e-3)&&near(ys[0],lt+1.1*(83.0-37.0),2e-3)&&near(ys[2],lt+1.1*(194.0-37.0),2e-3));
+        TTSUB(H7T_LAY,-188,-28,262,274); ACHECK(near((xs[0]+xs[1])/2,256,2e-3));
+        TTSUB(H7T_LAY,-181,-11,278,293); ACHECK(near((xs[0]+xs[1])/2,256,2e-3));
+        TTSUB(H7T_LAY,-212,-140,275,277); float seam=xs[1];
+        TTSUB(H7T_LAY,-140,-45,275,277); ACHECK(near(xs[0],seam,2e-3)&&near(xs[1],256+83.5*1.1,2e-3));
         TTSUB(H7T_LAY,344,597,14,36); ACHECK(xs[0]==344.0f&&xs[1]==597.0f&&near(ys[0],st,2e-3)&&near(ys[2],st+22.0,2e-3));   /* GAME SETTINGS: x as it was */
         TTSUB(H7T_LAY,-47,522,305,330); ACHECK(xs[0]==-47.0f&&xs[1]==522.0f&&near(ys[0],mt+10.0,2e-3)&&near(ys[2],mt+35.0,2e-3));   /* the menu row drawn by the title layout (the exit animation) */
         u64 r10=h7.kind[H7K_FULL];

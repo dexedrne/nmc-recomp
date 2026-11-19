@@ -521,13 +521,14 @@ void kh_present_shell_report(FILE *f){ char buf[512]; if(kh_present_shell_line(b
 #ifdef KH_GFX_VKD3D
 /* ==== 3. the Vulkan presenter ================================================================================================== */
 #include "gfx_vkd3d_int.h"
+#include "autosave.h"
 static pthread_mutex_t pm_g=PTHREAD_MUTEX_INITIALIZER;
 /* ---- Vulkan functions per device (core: also for the own back buffers of gfx_vkd3d.c; WSI: only when presenting) ---- */
 #define VK_INST_FNS(X) X(GetPhysicalDeviceMemoryProperties) X(GetPhysicalDeviceFormatProperties) X(GetDeviceProcAddr) X(EnumerateDeviceExtensionProperties)
 #define VK_INST_WSI(X) X(GetPhysicalDeviceSurfaceSupportKHR) X(GetPhysicalDeviceSurfaceCapabilitiesKHR) X(GetPhysicalDeviceSurfaceFormatsKHR) X(GetPhysicalDeviceSurfacePresentModesKHR) X(DestroySurfaceKHR)
 #define VK_DEV_FNS(X) X(CreateImage) X(DestroyImage) X(GetImageMemoryRequirements) X(AllocateMemory) X(FreeMemory) X(BindImageMemory) X(CreateBuffer) X(DestroyBuffer) \
     X(GetBufferMemoryRequirements) X(BindBufferMemory) X(MapMemory) X(UnmapMemory) X(CreateCommandPool) X(DestroyCommandPool) X(AllocateCommandBuffers) X(BeginCommandBuffer) \
-    X(EndCommandBuffer) X(ResetCommandBuffer) X(CmdPipelineBarrier) X(CmdBlitImage) X(CmdClearColorImage) X(CmdCopyImageToBuffer) X(CreateSemaphore) X(DestroySemaphore) \
+    X(EndCommandBuffer) X(ResetCommandBuffer) X(CmdPipelineBarrier) X(CmdBlitImage) X(CmdClearColorImage) X(CmdCopyImageToBuffer) X(CmdCopyBufferToImage) X(CreateSemaphore) X(DestroySemaphore) \
     X(CreateFence) X(DestroyFence) X(WaitForFences) X(ResetFences) X(GetFenceStatus) X(QueueSubmit) X(QueueWaitIdle)
 #define VK_DEV_WSI(X) X(CreateSwapchainKHR) X(DestroySwapchainKHR) X(GetSwapchainImagesKHR) X(AcquireNextImageKHR) X(QueuePresentKHR)
 #define VK_FIELD(n) PFN_vk##n n;
@@ -626,7 +627,7 @@ typedef struct { VkCommandBuffer cb; VkFence fence; VkSemaphore acq; int pending
 struct KhPresenter { pthread_mutex_t m; const KhVk *vk; ID3D12Device *dev; ID3D12CommandQueue *queue; ID3D12Fence *fence; u64 fence_val; u32 family;
     int mode, fit, check, general; u32 gen; VkSurfaceKHR surface; VkSwapchainKHR sc; VkExtent2D ext; u32 nimg; VkImage simg[PMAXIMG]; VkSemaphore rsem[PMAXIMG];
     int stale, stale_reason, sc_src_ok, linear_ok; VkCommandPool pool; PSlot slot[PSLOTS]; u64 frames; KhPresentBuffers bb; VkFormat fmt;
-    VkBuffer hb[2]; VkDeviceMemory hm[2]; u8 *hp[2]; u64 hsz[2]; int counted_timeouts; int busy;
+    VkBuffer hb[3]; VkDeviceMemory hm[3]; u8 *hp[3]; u64 hsz[3]; int counted_timeouts; int busy;
     int made;                                       /* a swapchain was made once: later builds are counted as rebuilds by their reason */
     int in_marker;                                  /* a Present is in its marker wait (d), WITHOUT p->m (review Y39 n=1) */
     int chk_pending, chk_slot; u64 chk_n; u32 chk[8];   /* a check present waiting for its reference (kh_present_check): sw sh dx dy dw dh bw bh */
@@ -694,7 +695,7 @@ static void slot_wait(KhPresenter *p,PSlot *s,const char *why){
 static void hostbuf(KhPresenter *p,int k,u64 size){
     const KhVk *v=p->vk; if(p->hsz[k]>=size) return;
     if(p->hb[k]){ v->UnmapMemory(v->dev,p->hm[k]); v->DestroyBuffer(v->dev,p->hb[k],NULL); kh_vko_note(VKO_BUF,0); v->FreeMemory(v->dev,p->hm[k],NULL); kh_vko_note(VKO_MEM,0); p->hb[k]=VK_NULL_HANDLE; p->hsz[k]=0; }
-    VkBufferCreateInfo bi; memset(&bi,0,sizeof bi); bi.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO; bi.size=size; bi.usage=VK_BUFFER_USAGE_TRANSFER_DST_BIT; bi.sharingMode=VK_SHARING_MODE_EXCLUSIVE;
+    VkBufferCreateInfo bi; memset(&bi,0,sizeof bi); bi.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO; bi.size=size; bi.usage=k==2 ? VK_BUFFER_USAGE_TRANSFER_SRC_BIT : VK_BUFFER_USAGE_TRANSFER_DST_BIT; bi.sharingMode=VK_SHARING_MODE_EXCLUSIVE;
     VKC(v->CreateBuffer(v->dev,&bi,NULL,&p->hb[k]),"vkCreateBuffer(check copy)"); kh_vko_note(VKO_BUF,1);
     VkMemoryRequirements mr; v->GetBufferMemoryRequirements(v->dev,p->hb[k],&mr);
     int t=kh_vk_memtype(v,mr.memoryTypeBits,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT); if(t<0) kh_fatal(NULL,"gfx-present-vk: no host-visible coherent memory type for the check copy");
@@ -972,6 +973,25 @@ int kh_present_frame(KCtx *g,KhPresenter *p,u32 idx,u64 n){
             VkMemoryBarrier hb; memset(&hb,0,sizeof hb); hb.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER; hb.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; hb.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
             v->CmdPipelineBarrier(s->cb,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&hb,0,NULL,0,NULL);
             last=VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; lasta=VK_ACCESS_TRANSFER_READ_BIT; }
+        extern _Atomic int kh_hide_hud;
+        if(dw>=64 && dh>=64 && kh_autosave_indicator() && !kh_hide_hud){
+            /* Immutable 32px disk icon. Draw after the check copies, inside the fitted picture. */
+            if(!p->hb[2]){
+                static const u8 disk[8]={0x00,0x7c,0x54,0x7e,0x42,0x5a,0x7e,0x00};
+                hostbuf(p,2,32*32*4);
+                for(unsigned y=0;y<32;y++) for(unsigned x=0;x<32;x++){
+                    u32 color=(disk[y/4] & (0x80>>(x/4))) ? 0xffffffffu : 0xff203040u;
+                    memcpy(p->hp[2]+4*(32*y+x),&color,4);
+                }
+            }
+            barrier1(v,s->cb,si,last,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,lasta,VK_ACCESS_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT);
+            last=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; lasta=VK_ACCESS_TRANSFER_WRITE_BIT;
+            VkBufferImageCopy region={0};
+            region.imageSubresource=(VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};
+            region.imageOffset=(VkOffset3D){(int32_t)(dx+dw-48),(int32_t)(dy+16),0};
+            region.imageExtent=(VkExtent3D){32,32,1};
+            v->CmdCopyBufferToImage(s->cb,p->hb[2],si,last,1,&region);
+        }
         if(p->general) barrier1(v,s->cb,bbi,VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_GENERAL,VK_ACCESS_TRANSFER_READ_BIT,VK_ACCESS_HOST_READ_BIT|VK_ACCESS_HOST_WRITE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT);
         barrier1(v,s->cb,si,last,VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,lasta,0,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
         VKC(v->EndCommandBuffer(s->cb),"vkEndCommandBuffer");
@@ -1077,7 +1097,7 @@ void kh_present_teardown(KhPresenter *p){
     queue_idle(p); swapchain_destroy(p,p->sc,p->nimg,p->rsem); p->sc=VK_NULL_HANDLE;
     for(int i=0;i<PSLOTS;i++){ del_sem(v,&p->slot[i].acq); v->DestroyFence(v->dev,p->slot[i].fence,NULL); kh_vko_note(VKO_FENCE,0); }
     v->DestroyCommandPool(v->dev,p->pool,NULL); kh_vko_note(VKO_POOL,0);
-    for(int k=0;k<2;k++) if(p->hb[k]){ v->UnmapMemory(v->dev,p->hm[k]); v->DestroyBuffer(v->dev,p->hb[k],NULL); kh_vko_note(VKO_BUF,0); v->FreeMemory(v->dev,p->hm[k],NULL); kh_vko_note(VKO_MEM,0); }
+    for(int k=0;k<3;k++) if(p->hb[k]){ v->UnmapMemory(v->dev,p->hm[k]); v->DestroyBuffer(v->dev,p->hb[k],NULL); kh_vko_note(VKO_BUF,0); v->FreeMemory(v->dev,p->hm[k],NULL); kh_vko_note(VKO_MEM,0); }
     if(p->surface){ v->DestroySurfaceKHR(v->inst,p->surface,NULL); kh_vko_note(VKO_SURFACE,0); }
     ID3D12Fence_Release(p->fence); ID3D12CommandQueue_Release(p->queue); ID3D12Device_Release(p->dev);
     pthread_mutex_unlock(&p->m); pthread_mutex_destroy(&p->m); free(p);

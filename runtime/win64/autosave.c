@@ -12,14 +12,23 @@
 #define CONTINUE (GS_BASE+0x29fb580)
 #define SAVE (GS_BASE+0x9a98b0)
 enum { SAVE_SIZE=0x10fc0 };
-static int slots;
+static int slots,indicator;
+static _Atomic u64 indicator_until;
+static int indicator_visible(u64 now,u64 until){ return now<until; }
+int kh_autosave_indicator(void){
+    u64 until=atomic_load(&indicator_until);
+    return until && indicator_visible(kh_host_ns(),until);
+}
 static char directory[PATH_MAX];
 
 void kh_autosave_init(void){
-    slots=0;
+    slots=0; indicator=0; atomic_store(&indicator_until,0);
     const char *e=getenv("KHNMC_AUTOSAVE");
     if(!e || !*e || !strcmp(e,"0")) return;
     if(strcmp(e,"1")) kh_fatal(NULL,"autosave-mode: expected 0 or 1");
+    e=getenv("KHNMC_AUTOSAVE_INDICATOR");
+    if(e && strcmp(e,"0") && strcmp(e,"1")) kh_fatal(NULL,"autosave-indicator: expected 0 or 1");
+    indicator=!e || !strcmp(e,"1");
     e=getenv("KHNMC_AUTOSAVE_SLOTS");
     char *end;
     long count=e ? strtol(e,&end,10) : 3;
@@ -128,7 +137,10 @@ void f_3a0660(KCtx *g){
     int last=newest(dir);
     int n=last<0 ? 1 : last%slots+1;
     if((last<0 && errno!=ENOENT) || !publish(dir,n,p)) kh_warn("autosave-write: %s: %s",directory,strerror(errno));
-    else kh_warn("autosave-write: KH2autosave-%d.dat %.2s%02u",n,kh_warp_world_names[p[12]],p[13]);
+    else {
+        if(indicator) atomic_store(&indicator_until,kh_host_ns()+1500000000ull);
+        kh_warn("autosave-write: KH2autosave-%d.dat %.2s%02u",n,kh_warp_world_names[p[12]],p[13]);
+    }
     close(dir);
 }
 
@@ -174,6 +186,7 @@ int kh_autosave_selftest(KCtx *g){
     memcpy(p,"KH2J\x3a\0\0\0",8); p[12]=2; p[13]=2;
     wr32(g,buf+8,checkpoint_crc(p));
     int fails=!header_ok(p) || !native_valid(g,buf);
+    fails+=indicator_visible(0,0) || !indicator_visible(1499999999,1500000000) || indicator_visible(1500000000,1500000000);
     p[SAVE_SIZE-1]^=1;
     fails+=native_valid(g,buf)!=0;
     fails+=allowed(1,1)||allowed(5,5)||allowed(18,21)||allowed(8,13)||allowed(16,26)||

@@ -152,6 +152,10 @@ static void state_snapshot(KCtx *g,const char *stage){
     u64 mission=rd64(g,GS_BASE+0x2a0ff68);
     u64 header=mission?rd64(g,mission+8):0;
     fprintf(live_log,"boundary menu %d mission %d\n",menu,header?(int)rd16(g,header+2):-1);
+    /* Project-name exit flags and the 0x16 layer mask live outside GAME_SAVE. */
+    fprintf(live_log,"event flags %016llx layers %016llx\n",
+            (unsigned long long)rd64(g,GS_BASE+0x79cac0),
+            (unsigned long long)rd64(g,GS_BASE+0xabcbd8));
     fputs(stage,live_log);
     for(int i=0;i<10;i++) fprintf(live_log," %u",rd8(g,PLACE_W+i));
     for(int i=0;i<2;i++){ u64 slot=GS_BASE+0xabad40+16*i;
@@ -165,7 +169,7 @@ static void state_snapshot(KCtx *g,const char *stage){
     for(unsigned i=0;o;i++){
         if(i>=4096 || !GA_OK(o) || !GA_OK(o+0xa93)) kh_fatal(g,"cutscenes-savedump: invalid field object list");
         char model[40]; kh_route_object_name(g,o,model,sizeof model);
-        fprintf(live_log,"object %s %#x\n",model,rd32(g,o+0x124));
+        fprintf(live_log,"object %s %#x flags120 %#x\n",model,rd32(g,o+0x124),rd32(g,o+0x120));
         u32 id=rd32(g,o+0xa90);
         o=id?(rd64(g,GS_BASE+0x2b0d720+8ull*((id&0x7fffffffu)>>25))|(id&0x1ffffffu)):0;
     }

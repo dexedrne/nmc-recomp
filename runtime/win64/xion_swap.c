@@ -33,10 +33,14 @@ static int field_supported(int world,int area,int map,int btl,int evt){
     return 0;
 }
 
-static int supported(KCtx *g){
+static int supported(KCtx *g,int loading){
     int map,btl,evt;
-    return kh_route_programs(g,NULL,&map,&btl,&evt)&&
-           field_supported(kh_route_world(g),kh_route_area(g),map,btl,evt);
+    if(!kh_route_programs(g,NULL,&map,&btl,&evt)) return 0;
+    int world=kh_route_world(g),area=kh_route_area(g);
+    int allowed=field_supported(world,area,map,btl,evt);
+    if(!allowed&&loading&&chosen&&world==8&&area==9&&map==0&&btl==10&&evt==0)
+        kh_warn("xion-swap-declined: mu09 0/10/0 retains Roxas: P_EX220 ptya table 28 lacks key 1");
+    return allowed;
 }
 
 void kh_xion_command_done(KCtx *g,u64 controller,u64 actor){
@@ -182,7 +186,7 @@ void kh_xion_frame(KCtx *g,u16 buttons){
             if(!chosen){ handback(&ctx,"save point"); return; }
         }
     }
-    if(chosen&&!xion&&!retiring&&!rd64(g,VA(0x9ba928))&&!rd8(g,VA(0x9ba8d1))&&supported(g)&&!rd16(g,VA(0x9acdd4))){
+    if(chosen&&!xion&&!retiring&&!rd64(g,VA(0x9ba928))&&!rd8(g,VA(0x9ba8d1))&&supported(g,0)&&!rd16(g,VA(0x9acdd4))){
         if(kh_route_mission(g)){
             KhObjective o;
             if(kh_route_world(g)!=2||kh_route_area(g)!=7||!kh_route_objective(g,&o)||o.id!=0xa7) return;
@@ -195,7 +199,7 @@ void kh_xion_frame(KCtx *g,u16 buttons){
 void orig_f_3e2eb0(KCtx *);
 void f_3e2eb0(KCtx *g){
     orig_f_3e2eb0(g);
-    if(kh_xion_enabled&&supported(g)){
+    if(kh_xion_enabled&&supported(g,1)){
         KCtx ctx=*g;
         kh_call(&ctx,VA(0x3e0460),792,3000,7,0); // normal area cache lifetime, without flushing Drive group 5000
     }
@@ -279,7 +283,7 @@ int kh_xion_selftest(void){
     fields+=!field_supported(16,1,5,1,0);
     fields+=field_supported(16,1,5,1,0xffff)||field_supported(15,0,0,0,0);
     fields+=field_supported(2,7,95,95,96);
-    fields+=field_supported(8,9,0,10,0);  // observed native battle fault
+    fields+=field_supported(8,9,0,10,0);  // P_EX220 lacks the ptya row used in this battle
     fields+=field_supported(5,7,0,0,0);   // chest interaction
     fields+=field_supported(7,5,0,0,0);   // carpet traversal
     fields+=field_supported(1,0,0,0,0);   // ending transit

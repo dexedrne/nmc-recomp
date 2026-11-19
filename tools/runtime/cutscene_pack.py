@@ -11,7 +11,7 @@ ard/us folder (the 289 area files the mod replaces or keeps).  VANILLA objentry 
 mod's own files (SillyBillyMod1): only its map/ folder is read, for the rooms it rebuilt.
 Output is analysis of the owner's own data (the table) and the owner's own data (the pack): never commit either.
 
-Only the PC frame/load handlers reviewed in implementation notes may be admitted. Version 2
+Only the PC command forms reviewed in implementation notes and implementation notes may be admitted. Version 2
 pins the entire pack including its sorted inventory, asset alternatives and exact stub templates.
 """
 import hashlib, argparse, collections, os, struct, sys
@@ -57,31 +57,49 @@ def stub_like(data):
 # These records only supply the event end/start, camera key/interval or separator.
 # No ReadAssets subtypes have been approved. Only its empty list is allowed.
 # (decode/relocate, load, frame dispatch RVAs, exact payload length).
-# None means the opcode is outside that dispatcher's index range.
+# None in a dispatch column means outside its index range; a None length is validated below.
 PRESENTATION = {
     0x00: (0x2c9025, None, None, 20),          # exact NMC project only
+    0x03: (0x2c914e, 0x2cc2b8, 0x2cbbed, 6), # same-room map descriptor
     0x06: (0x2cb0c5, 0x2cc2b8, 0x2cb781, 8), # camera interval, 2d2660
     0x08: (0x2cb0c5, 0x2cc232, 0x2cbbed, 4), # timeline end, 2d8dd0
     0x0f: (0x2cb0c5, 0x2cc239, 0x2cbbed, 0), # NMC setup, 2d8fe0
     0x10: (0x2cb0c5, 0x2cc243, 0x2cbbed, 4), # timeline start, 2d9020
     0x12: (0x2cb0c5, 0x2cc2b8, 0x2cb7ee, 6), # fade, 2da730
+    0x13: (0x2c9575, 0x2cc24d, 0x2cbbed, None), # camera track, eight channels of 16-byte keys
     0x14: (0x2cb0c5, 0x2cc2b8, 0x2cbbed, 2), # advances all three cursors
+    0x22: (0x2cb0c5, 0x2cc2b8, 0x2cba1c, 4), # render-layer fade, 2dab00
     0x24: (0x2cb0b8, 0x2cc277, 0x2cbbed, 8), # empty read-assets record
 }
 
 def reviewed_command(t, pl):
-    if t not in PRESENTATION or len(pl) != PRESENTATION[t][3]:
+    if t not in PRESENTATION or (PRESENTATION[t][3] is not None and len(pl) != PRESENTATION[t][3]):
         return False
+    if t == 0x13:
+        if len(pl) < 36 or (len(pl) - 36) % 16:
+            return False
+        slot, *channels, pad = struct.unpack_from('<18H', pl)
+        keys = (len(pl) - 36) // 16
+        return slot < 128 and pad == 0 and all(
+            count > 0 and offset + count <= keys
+            for offset, count in zip(channels[::2], channels[1::2]))
     if t == 0x00:
         # The name and project parameters select other player paths.
         return hashlib.sha256(pl).hexdigest() == '16a128eeacd36960d853aededfca52edf714c7650862a2c143f236d3a4f406ab'
+    if t == 0x03:
+        room, world, pad = struct.unpack('<H2sH', pl)
+        return room < 100 and world.isalpha() and world.islower() and pad == 0
+    if t == 0x22:
+        frame, mode = struct.unpack('<HH', pl)
+        return frame <= 0x7fff and mode in (0, 1)
     if t == 0x24:
         return pl == bytes.fromhex('0000008000000000')
     if t == 0x12:
-        return int.from_bytes(pl[4:], 'little') in (1, 4)
+        frame, duration, mode = struct.unpack('<3H', pl)
+        return mode in (1, 4) or (frame <= 0x7fff and duration <= 0x7fff and mode < 8)
     if t == 0x06:
         camera, start, stop, pad = struct.unpack('<4H', pl)
-        return camera == pad == 0 and start <= stop <= 0x7fff
+        return camera < 128 and pad == 0 and start <= stop <= 0x7fff
     return True
 
 
@@ -114,6 +132,16 @@ def classify(ev_v, changed_rows, exists, replaced_rooms=frozenset()):
     if rooms & set(replaced_rooms): return 'KEEP-STUB', 'room-replaced ' + ','.join(sorted(rooms & set(replaced_rooms)))
     odd = sorted({t for t, pl in ev_v.cmds if not reviewed_command(t, pl)})
     if odd: return 'KEEP-STUB', 'unproven-command ' + ','.join('%#04x' % t for t in odd)
+    camera_slots = {struct.unpack_from('<H', pl)[0] for t, pl in ev_v.cmds if t == 0x13}
+    for t, pl in ev_v.cmds:
+        if t == 0x03:
+            room, world, _ = struct.unpack('<H2sH', pl)
+            if ev_v.area != '%s%02d' % (world.decode('ascii'), room):
+                return 'KEEP-STUB', 'different-event-map'
+        if t == 0x06:
+            slot = struct.unpack_from('<H', pl)[0]
+            if (slot or camera_slots) and slot not in camera_slots:
+                return 'KEEP-STUB', 'undefined-camera %d' % slot
     ch = [oid for oid in actor_ids(ev_v) if oid in changed_rows]
     if ch: return 'KEEP-STUB', 'actor-changed ' + ','.join(str(x) for x in ch)
     miss = [group for group in asset_groups(ev_v) if not any('/' in path and exists(path) for path in group.split('|'))]
@@ -234,6 +262,19 @@ def selftest():
         if t not in PRESENTATION:
             assert not reviewed_command(t, bytes(8))
             tests += 1
+    for frame, mode, allowed in ((0, 0, True), (32767, 1, True), (32768, 0, False), (0, 2, False)):
+        assert reviewed_command(0x22, struct.pack('<HH', frame, mode)) == allowed
+    for mode in range(8):
+        assert reviewed_command(0x12, struct.pack('<3H', 1, 30, mode))
+    assert not reviewed_command(0x12, struct.pack('<3H', 0x8000, 30, 7))
+    assert not reviewed_command(0x12, struct.pack('<3H', 1, 0x8000, 7))
+    for mode in (8, 0xffff):
+        assert not reviewed_command(0x12, struct.pack('<3H', 1, 30, mode))
+    camera = struct.pack('<18H', 127, *([0, 1] * 8), 0) + bytes(16)
+    assert reviewed_command(0x13, camera)
+    assert not reviewed_command(0x13, camera[:-1])
+    assert not reviewed_command(0x13, b'\x80\0' + camera[2:])
+    assert not reviewed_command(0x13, camera[:2] + b'\x01\0' + camera[4:])
     for arg in (100, 101):
         assert not reviewed_command(0x51, struct.pack('<HHI', 0, 0, arg))
     empty = bytes.fromhex('0000008000000000')
@@ -253,6 +294,23 @@ def selftest():
     def result():
         return classify(fixture, set(), lambda path: True)[0]
     assert result() == 'SAFE'
+    # H50C observed exit-table bits survive both completion and skip for these project names.
+    for name in (b'he_event_301', b'he_event_302'):
+        fixture.cmds = [(0x00, struct.pack('<6x14s', name))]
+        assert result() == 'KEEP-STUB', name
+    fixture.cmds = [(0x03, struct.pack('<H2sH', 0, b'aa', 0))]
+    assert result() == 'SAFE'
+    fixture.cmds.append((0x03, struct.pack('<H2sH', 1, b'aa', 0)))
+    assert result() == 'KEEP-STUB'
+    assert not reviewed_command(0x03, struct.pack('<H2sH', 0, b'aa', 1))
+    interval = struct.pack('<4H', 127, 0, 30, 0)
+    fixture.cmds = [(0x06, interval)]
+    assert result() == 'KEEP-STUB'
+    fixture.cmds.append((0x13, camera))
+    assert result() == 'SAFE'
+    fixture.cmds[0] = (0x06, struct.pack('<4H', 0, 0, 30, 0))
+    assert result() == 'KEEP-STUB'
+    assert not reviewed_command(0x06, struct.pack('<4H', 128, 0, 30, 0))
     for t in (0x33, 0x51, 0x4d, 0x2e, 0x2f, 0x30, 0xffff):
         fixture.cmds = [(t, bytes(8))]
         assert result() == 'KEEP-STUB', hex(t)

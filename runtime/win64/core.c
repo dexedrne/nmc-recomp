@@ -818,10 +818,28 @@ KhFn kh_lookup(u64 target){
     return 0;
 }
 int kh_native_try(KCtx *g,u64 target);                 /* native_call.c: registered native Windows-ABI ranges (vkd3d), else 0 */
+/* The dk object's draw method still advances animations and releases resources.
+ * Suppress only its D3D12 Draw[Indexed]Instanced emissions, on this thread. */
+static _Thread_local int screenshot_draw;
 void kh_dispatch(KCtx *g,u64 target){
+    extern _Atomic int kh_hide_hud;
+    extern int kh_hide_dk_draw(KCtx *);
+    if(__builtin_expect(screenshot_draw,0)){
+        u64 ra=rd64(g,KH_RSP(g));
+        if(ra==GS_BASE+0x11a2ac || ra==GS_BASE+0x11a2c5){
+            KH_RET(g); return;
+        }
+    }
     KhFn f=kh_lookup(target);
     if(!f){ if(kh_native_try(g,target)) return; kh_fault(g,target,"dispatch: not a function start"); }
-    g->aux[0]=target; f(g);
+    g->aux[0]=target;
+    if(__builtin_expect(KH_R64(g,KO_RIP)==GS_BASE+0x1666ab,0) && kh_hide_hud &&
+       rd64(g,KH_RSP(g))==GS_BASE+0x1666ae){
+        int previous=screenshot_draw;
+        screenshot_draw=kh_hide_dk_draw(g);
+        f(g);
+        screenshot_draw=previous;
+    } else f(g);
 }
 void kh_fault(KCtx *g,u64 va,const char *kind){
     fprintf(stderr,"\nkh_fault: %s at guest 0x%llx (rva 0x%llx)\n",kind,(unsigned long long)va,(unsigned long long)(va-GS_BASE));

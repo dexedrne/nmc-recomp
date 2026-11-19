@@ -9,13 +9,14 @@
 #include <pthread.h>
 
 extern int kh_run_is_selftest;
-enum { HP, MP, EXP, DROP, COUNT };
+enum { HP, MP, EXP, DROP, HUD_COMBO, COUNT };
 #define BOOL_OPT(name,label,initial) {"KHNMC_" name,label,initial,"0|1",0,1,1}
 #define TWEAK_OPT(name,label,initial) {"KHNMC_TWEAK_" name,label,initial,"off|on",0,1,1}
 #define NUMBER(name,label,initial,min,max,step) {"KHNMC_" name,label,initial,NULL,min,max,step}
 const struct kh_option kh_options[]={
     BOOL_OPT("CHEAT_INF_HP","Infinite HP","0"), BOOL_OPT("CHEAT_INF_MP","Infinite MP","0"),
     NUMBER("EXP_MULT","EXP multiplier","1",0.5,10,0.5), NUMBER("DROP_MULT","Item drop multiplier","1",0.5,10,0.5),
+    BOOL_OPT("HUD_HIDE_COMBO","Hold L3 + R3 to hide HUD (not at save points)","0"),
     TWEAK_OPT("DEBUG_DEBUG_ON","Enable debug commands","off"),
     TWEAK_OPT("DEBUG_SOFT_RESET","Allow debug reset to title","off"),
     NUMBER("TWEAK_DEBUG_TURBO_SPEED","Debug turbo speed","7.5",0.1,100,0.1),
@@ -188,6 +189,7 @@ static void load_saved_options(void){
     free(line);fclose(in);
 }
 #endif
+static int hide_combo(int,unsigned);
 int kh_settings_selftest(void){
     char dir[KH_TMP_MAX],path[KH_TMP_MAX+16],data[200];
     kh_tmp_path(dir,sizeof dir,"khnmc-settings-XXXXXX");
@@ -206,6 +208,7 @@ int kh_settings_selftest(void){
     fail|=validate("KHNMC_TWEAK_WORLDS_SYMBOL_ZZ","12,1,2,3,256",&v)>=0;
     fail|=validate("KHNMC_TWEAK_FORMS_VALOR_GROWTH","1,2",&v)>=0;
     fail|=validate("KHNMC_TWEAK_DEBUG_TURBO_SPEED","7.5",&v)<0;
+    fail|=validate("KHNMC_HUD_HIDE_COMBO","1",&v)!=HUD_COMBO || !hide_combo(1,0xc0) || hide_combo(0,0xc0) || hide_combo(1,0x40) || hide_combo(1,0x80);
     unlink(path);rmdir(dir);
     fprintf(stderr,"kh: settings persistence and vector validation: %d failures\n",fail);
     return fail;
@@ -304,6 +307,8 @@ void kh_settings_init(void){
         *c=(struct change){frame,key,val,*p}; *p=c;
     }
 }
+_Atomic int kh_hide_hud;
+static int hide_combo(int enabled,unsigned buttons){ return enabled && (buttons&0xc0)==0xc0; }
 void kh_settings_frame(KCtx *g,uint64_t frame){
     while(pending && pending->frame<=frame){
         struct change *c=pending; pending=c->next;
@@ -312,6 +317,12 @@ void kh_settings_frame(KCtx *g,uint64_t frame){
         free(c);
     }
     if(schedule_storage && !pending){free(schedule_storage);schedule_storage=NULL;}
+    extern u16 kh_input_buttons(void);
+    int enabled=atomic_load(&values[HUD_COMBO])!=0;
+    /* 11/19 (main session): L3 + R3 is also the Xion swap's chord at a save point (task 54): no HUD hiding while standing at one */
+    extern int kh_xion_enabled; extern int kh_route_at_save_point(KCtx *);
+    int at_swap_point=enabled && kh_xion_enabled && g && kh_route_at_save_point(g);
+    atomic_store(&kh_hide_hud,enabled && !at_swap_point && hide_combo(enabled,kh_input_buttons()));
     if(mp_probe && frame==mp_probe){
         KhPlayerSheet p;
         if(!kh_route_player_sheet(g,&p) || p.mp<2) kh_fatal(g,"settings-mp-probe: no active player with MP");
