@@ -1,4 +1,6 @@
 #include "mod_config.h"
+#include "rewind.h"
+#include "xion_swap.h"
 #include "mod_static_table.h"
 #include <strings.h>
 
@@ -6,6 +8,31 @@ int kh_retry,kh_savepoint,kh_gummiskip;
 static int shortcuts;
 static int keep_inventory,keep_party,restore_party;
 static unsigned char checkpoint[0x10fc0];
+void kh_rewind_retry(KhRecords *r){
+    if(!kh_retry) return;
+    KH_VALUE(r,checkpoint);
+    KH_VALUE(r,keep_inventory);
+    KH_VALUE(r,keep_party);
+    KH_VALUE(r,restore_party);
+}
+
+int kh_retry_rewind_selftest(void){
+    KhRecords original={0}, cut={0};
+    int enabled=kh_retry;
+    kh_retry=1;
+    kh_records_begin(&original,0); kh_rewind_retry(&original);
+    memset(checkpoint,0x53,sizeof checkpoint);
+    keep_inventory=1; keep_party=0; restore_party=1;
+    kh_records_begin(&cut,0); kh_rewind_retry(&cut);
+    memset(checkpoint,0xa7,sizeof checkpoint);
+    keep_inventory=0; keep_party=1; restore_party=0;
+    kh_records_begin(&cut,1); kh_rewind_retry(&cut); kh_records_end(&cut);
+    int fail=keep_inventory!=1 || keep_party || restore_party!=1;
+    for(size_t i=0;i<sizeof checkpoint;i++) fail|=checkpoint[i]!=0x53;
+    kh_records_begin(&original,1); kh_rewind_retry(&original); kh_records_end(&original);
+    kh_records_free(&original); kh_records_free(&cut); kh_retry=enabled;
+    return fail;
+}
 #define EX(rva) (GS_BASE+(rva))
 #define call(rva,a,b,c,d) kh_call(g,EX(rva),a,b,c,d)
 #define RETRY_BACKUP EX(0x29fb580)
@@ -28,6 +55,7 @@ void f_418f30(KCtx *g){
         if(!member) continue;
         u64 s=call(0x3c04c0,member,UINT32_MAX,0,0);
         if(!s) kh_fatal(g,"savepoint-party-sheet: member %u",member);
+        s=kh_xion_recovery_sheet(g,s);
         if(rd32(g,s+0x268)){
             float recharge; memcpy(&recharge,hp(g,s+0x1c0),4);
             if((s32)rd32(g,s)<(s32)rd32(g,s+4) || recharge>0 ||

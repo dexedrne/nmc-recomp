@@ -53,6 +53,7 @@ extern "C" {
 #define KH_APP_NOT_SUSPENDED   0x20u   /* resume without a suspend or a resign before it (counted; the gate is cleared anyway) */
 #define KH_APP_CALLER_GONE     0x40u   /* suspend: it reached the drain after its caller's bound had passed: drain steps skipped (no Signal) */
 
+int kh_app_game_presented(void);
 void kh_app_will_resign_active(void);
 int  kh_app_suspend(unsigned bound_ms);
 int  kh_app_resume(unsigned bound_ms);

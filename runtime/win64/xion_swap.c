@@ -65,7 +65,7 @@ static u64 xion,roxas,command_actor,command_place;
 static u16 command_evt;
 static u64 retiring;
 static s32 sheet_gauges[5];
-static s32 original_hp,original_mp,entry_hp,entry_mp;
+static s32 entry_hp,entry_mp;
 
 /* Guest actor addresses and gauge backups belong to the same cut as the player sheets. */
 void kh_rewind_xion(KhRecords *r){
@@ -83,8 +83,6 @@ void kh_rewind_xion(KhRecords *r){
     KH_RECORD(r,command_evt);
     KH_RECORD(r,retiring);
     KH_RECORD(r,sheet_gauges);
-    KH_RECORD(r,original_hp);
-    KH_RECORD(r,original_mp);
     KH_RECORD(r,entry_hp);
     KH_RECORD(r,entry_mp);
 }
@@ -132,6 +130,15 @@ static s32 fraction(s32 value,s32 maximum,s32 destmax){
 static s32 carry_back(s32 value,s32 entry,s32 original,s32 maximum,s32 destmax){
     return value==entry?original:fraction(value,maximum,destmax);
 }
+/* Save-point recovery addresses the canonical party. Heal the playable sheet
+ * so damage and recovery are ordered on the same gauge throughout the swap. */
+u64 kh_xion_recovery_sheet(KCtx *g,u64 sheet){
+    if(xion && sheet==rd64(g,roxas+0x5c0)) return rd64(g,xion+0x5c0);
+    return sheet;
+}
+static s32 return_gauge(KCtx *g,u64 live,u64 parked,s32 entry){
+    return carry_back(rd32(g,live),entry,rd32(g,parked),rd32(g,live+4),rd32(g,parked+4));
+}
 static u64 call(KCtx *g,u32 r,u64 a,u64 b){ return kh_call(g,VA(r),a,b,0,0); }
 
 static void actor_method(KCtx *g,u64 actor,u32 slot){
@@ -146,9 +153,8 @@ static void handback(KCtx *g,const char *reason){
     if(rd64(g,ACTIVE)!=xion||rd64(g,PARKED)!=roxas)
         kh_fatal(g,"xion-swap-ownership: player changed before %s",reason);
     u64 xs=rd64(g,xion+0x5c0),rs=rd64(g,roxas+0x5c0);
-    s32 hp=rd32(g,xs),mp=rd32(g,xs+0x180);
-    hp=carry_back(hp,entry_hp,original_hp,rd32(g,xs+4),rd32(g,rs+4));
-    mp=carry_back(mp,entry_mp,original_mp,rd32(g,xs+0x184),rd32(g,rs+0x184));
+    s32 hp=return_gauge(g,xs,rs,entry_hp);
+    s32 mp=return_gauge(g,xs+0x180,rs+0x180,entry_mp);
     u64 pos=call(g,0x3b5b40,xion,0);
     call(g,0x3b64d0,roxas,pos);
     KH_XMM(g,1)=VZ; u32 yaw=rd32(g,xion+0x68c); memcpy(&KH_XMM(g,1),&yaw,4);
@@ -220,7 +226,6 @@ static void enter(KCtx *g,const KhPlayerSheet *p){
     sheet_gauges[3]=rd32(g,sheet+0x180); sheet_gauges[4]=rd32(g,sheet+0x184);
     if(!sheet_gauges[1]) wr32(g,sheet+4,p->hp_max);
     if(!sheet_gauges[4]) wr32(g,sheet+0x184,p->mp_max);
-    original_hp=p->hp; original_mp=p->mp;
     entry_hp=fraction(p->hp,p->hp_max,rd32(g,sheet+4)); entry_mp=fraction(p->mp,p->mp_max,rd32(g,sheet+0x184));
     wr32(g,sheet,entry_hp); wr32(g,sheet+0x180,entry_mp);
     wr32(g,sheet+8,0); // permit genuine KO, the zero-result callback is MICKEY vfn22
@@ -343,6 +348,20 @@ void f_414dd0(KCtx *g){
 
 int kh_xion_selftest(KCtx *g){
     int failures=0;
+    u64 live=ga_alloc(8,8), parked=ga_alloc(8,8);
+    wr32(g,live,2); wr32(g,live+4,20); wr32(g,parked,7); wr32(g,parked+4,60);
+    failures+=return_gauge(g,live,parked,2)!=7;
+    wr32(g,parked,60); /* save point healed the canonical sheet */
+    failures+=return_gauge(g,live,parked,2)!=60;
+    u64 saved_xion=xion,saved_roxas=roxas;
+    xion=ga_alloc(0x5c8,8); roxas=ga_alloc(0x5c8,8);
+    wr64(g,xion+0x5c0,live); wr64(g,roxas+0x5c0,parked);
+    wr32(g,parked,7); wr32(g,live,1); /* Xion took damage since the swap */
+    u64 healed=kh_xion_recovery_sheet(g,parked);
+    wr32(g,healed,rd32(g,healed+4));
+    failures+=return_gauge(g,live,parked,2)!=60;
+    ga_free(roxas); ga_free(xion); xion=saved_xion; roxas=saved_roxas;
+    ga_free(parked); ga_free(live);
     failures+=fraction(0,20,60)!=0;
     failures+=fraction(7,20,60)!=21;
     failures+=fraction(1,60,20)!=1;
@@ -351,7 +370,7 @@ int kh_xion_selftest(KCtx *g){
     failures+=carry_back(2,2,7,20,60)!=7;
     failures+=carry_back(1,2,7,20,60)!=3;
     failures+=carry_back(0,2,7,20,60)!=0;
-    fprintf(stderr,"kh: xion-swap fraction selftest: 8 checks, %d failures\n",failures);
+    fprintf(stderr,"kh: xion-swap fraction selftest: 11 checks, %d failures\n",failures);
     int fields=0;
     fields+=!field_supported(2,2,1,0,0)||!field_supported(4,8,0,1,0)||!field_supported(2,7,95,95,95);
     fields+=!field_supported(16,1,5,1,0);

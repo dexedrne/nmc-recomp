@@ -13,6 +13,7 @@ typedef struct { u8 *data; size_t size,capacity; } KhBootDocs;
 const char *kh_slot_docs_capture(KhBootDocs *);
 const char *kh_slot_docs_begin(const KhBootDocs *);
 void kh_slot_docs_finish(void);
+const char *kh_slot_autosave_documents(void);
 const char *kh_slot_documents(void);
 typedef struct { u64 poll; u8 pad[12]; u32 reserved; } KhPadChange;
 typedef struct { KhPadChange *changes; size_t count; u64 polls; } KhPadHistory;

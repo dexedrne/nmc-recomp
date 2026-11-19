@@ -20,7 +20,7 @@ void kh_cut_wait(const char *site,pthread_cond_t *cv,pthread_mutex_t *m);
 int kh_cut_threads(KThread **parked,unsigned count,int report,unsigned *cs_waiter);
 int kh_cut_gate_begin(u64 *epoch);
 int kh_cut_gate_commit(u64 epoch);
-void kh_cut_gate_committed_end(void);
+void kh_cut_gate_committed_end(u64 epoch);
 int kh_cut_gate_end(u64 epoch);
 int kh_cut_loader_safe(void);
 

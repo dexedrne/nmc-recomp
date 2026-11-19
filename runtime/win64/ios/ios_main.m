@@ -134,7 +134,7 @@ static BOOL options_input(unsigned short buttons){
         return YES;
     }
     /* Hold L3 first, then press the DualSense Options button (GC buttonMenu). */
-    if((buttons&0x40) && (down&0x10) && test_label.superview && kh_present_presented()>0){
+    if((buttons&0x40) && (down&0x10) && test_label.superview && kh_app_game_presented()){
         const char *life=getenv("KHNMC_APP_LIFE");
         if(life && !strcmp(life,"off")) return NO;
         kh_input_host_pad_set(0,0,0,0,0,0,0);
@@ -156,13 +156,17 @@ static BOOL options_input(unsigned short buttons){
     return NO;
 }
 
-static void pad_send(GCExtendedGamepad *p){
+static unsigned short pad_buttons(GCExtendedGamepad *p){
     unsigned short b=0;
     if(p.dpad.up.pressed) b|=0x0001; if(p.dpad.down.pressed) b|=0x0002; if(p.dpad.left.pressed) b|=0x0004; if(p.dpad.right.pressed) b|=0x0008;
     if(p.buttonMenu.pressed) b|=0x0010; if(p.buttonOptions.pressed) b|=0x0020;
     if(p.leftThumbstickButton.pressed) b|=0x0040; if(p.rightThumbstickButton.pressed) b|=0x0080;
     if(p.leftShoulder.pressed) b|=0x0100; if(p.rightShoulder.pressed) b|=0x0200;
     if(p.buttonA.pressed) b|=0x1000; if(p.buttonB.pressed) b|=0x2000; if(p.buttonX.pressed) b|=0x4000; if(p.buttonY.pressed) b|=0x8000;
+    return b;
+}
+static void pad_send(GCExtendedGamepad *p){
+    unsigned short b=pad_buttons(p);
     if(options_input(b)) return;
     kh_input_host_pad_set(b,pad_trigger(p.leftTrigger.value),pad_trigger(p.rightTrigger.value),
                           pad_axis(p.leftThumbstick.xAxis.value),pad_axis(p.leftThumbstick.yAxis.value),
@@ -178,7 +182,8 @@ static int pad_attach(GCController *c){
     if(pad_active && pad_active!=c){ fprintf(stderr,"kh: ios: controller '%s' connected: not used (another controller is pad 0)\n",c.vendorName.UTF8String?:"?"); return 0; }
     pad_active=c;
     c.handlerQueue=dispatch_get_main_queue();
-    p.valueChangedHandler=^(GCExtendedGamepad *gp,GCControllerElement *el){ (void)el; pad_send(gp); };
+    p.valueChangedHandler=^(GCExtendedGamepad *gp,GCControllerElement *el){ (void)el; if(gp==pad_active.extendedGamepad) pad_send(gp); };
+    previous_buttons=pad_buttons(p);
     pad_send(p);
     fprintf(stderr,"kh: ios: controller connected: %s (pad 0)\n",c.vendorName.UTF8String?:"?");
     return 1;
@@ -395,7 +400,8 @@ static void start_display_link(void){
     (void)scene;
     if(!_left) return;                                         /* the first activation at launch: nothing was suspended */
     _left=NO;
-    if(options_label){previous_buttons=0;return;}
+    previous_buttons=pad_buttons(pad_active.extendedGamepad);
+    if(options_label) return;
     [(KHGameViewController *)self.window.rootViewController reportSize];   /* the layer's size before our swapchain is rebuilt */
     kh_app_resume(KH_APP_RESUME_BOUND_MS);                     /* bounded: stale swapchain, the PC's restore, audio (also after an interruption), focus, gate cleared */
     pad_resync();                                              /* every controller's CURRENT state */

@@ -127,6 +127,7 @@ void kh_aspect_drawlog_config(const char *v);
 void kh_aspect_zoom_config(const char *v);          /* task 49, below */
 void kh_aspect_hud_config(const char *cmd,const char *hpv);   /* task 53, below */
 void kh_aspect_title_config(const char *v);                   /* task 53, below */
+static void zoom_storage_init(void);
 static int test_event_bars;
 void kh_aspect_init(void){ kh_aspect_config(getenv("KHNMC_ASPECT"),getenv("KHNMC_ASPECT_LOG"),getenv("KHNMC_ASPECT_TEST_H1"));
     const char *bars=getenv("KHNMC_ASPECT_TEST_EVENT_BARS");
@@ -135,6 +136,7 @@ void kh_aspect_init(void){ kh_aspect_config(getenv("KHNMC_ASPECT"),getenv("KHNMC
         test_event_bars=1;
         fprintf(stderr,"kh: aspect: TEST AID: draw inactive cinematic bars during events\n");
     }
+    zoom_storage_init();
     kh_aspect_zoom_config(getenv("KHNMC_FOV_ZOOM"));
     kh_aspect_hud_config(getenv("KHNMC_HUD_SCALE_CMD"),getenv("KHNMC_HUD_SCALE_HP"));
     kh_aspect_title_config(getenv("KHNMC_TITLE_LAYOUT"));
@@ -581,19 +583,28 @@ static ZoomStat zs;
 typedef struct { u8 pc_vp[0x40], pc_pr[0x40], z_vp[0x40], z_pr[0x40]; int valid; } ZoomEnt;
 static ZoomEnt zent[ZOOM_NCAM][2];
 /* per D site: the copy handed out (0x184 bytes, host memory given to the game by its guest address) */
-static u8 zshadow[ZOOM_NDRAW][0x190] __attribute__((aligned(64)));
+#include "rewind.h"
+static u8 local_shadow[ZOOM_NDRAW][0x190] __attribute__((aligned(64)));
+static u8 (*zshadow)[0x190]=local_shadow;
+static void zoom_storage_init(void){
+    if(!kh_cut_enabled || !asp_mode || zshadow!=local_shadow) return;
+    /* f_19cfc0 leaves interior pointers to the draw copy in guest memory. */
+    u64 address=ga_alloc(sizeof local_shadow,64);
+    if(!address) kh_fatal(NULL,"savestate-zoom-shadow-allocation");
+    zshadow=(void *)(uintptr_t)(address+gs_bias);
+    memset(zshadow,0,sizeof local_shadow);
+}
 #define ZOOM_GADDR(p) ((u64)((uintptr_t)(p)-gs_bias))
 int kh_aspect_zoom_shadow(u64 a){                                                     /* a lies in a copy of zshadow (H2c, GA_OK's stand-in) */
-    u64 lo=ZOOM_GADDR(zshadow[0]); return a>=lo&&a<lo+sizeof zshadow;
+    u64 lo=ZOOM_GADDR(zshadow[0]); return a>=lo&&a<lo+sizeof local_shadow;
 }
 /* the M sites: the game frame of the last call; the zoom is 1 in that frame and the next */
 static _Atomic u64 zsup_frame; static _Atomic int zsup_have;
-#include "rewind.h"
 /* The guest may still hold a draw-camera pointer into zshadow at a cut. */
 void kh_rewind_aspect(KhRecords *r){
     if(!asp_mode) return;
     KH_RECORD(r,zent);
-    KH_RECORD(r,zshadow);
+    kh_record(r,zshadow,sizeof local_shadow);
     KH_RECORD(r,zsup_frame);
     KH_RECORD(r,zsup_have);
     KH_RECORD(r,last3d_plus1);
@@ -2963,7 +2974,7 @@ static void zoom_selftest(KCtx *g){
         ACHECK(kh_aspect_zoom_shadow(r)&&!memcmp(hp(g,r),Sref2,0x40)&&!memcmp((u8*)hp(g,r)+CAM_PROJ,Sref2+CAM_PROJ,0x40)&&!memcmp((u8*)hp(g,r)+0x40,Spc2+0x40,0xc4));
         { KhRecords cut={0};
           kh_records_begin(&cut,0); kh_rewind_aspect(&cut); kh_records_end(&cut);
-          memset(zent,0,sizeof zent); memset(zshadow,0,sizeof zshadow); zsup_have=1; zsup_frame=kh_game_frames();
+          memset(zent,0,sizeof zent); memset(zshadow,0,sizeof local_shadow); zsup_have=1; zsup_frame=kh_game_frames();
           kh_records_begin(&cut,1); kh_rewind_aspect(&cut); kh_records_end(&cut); kh_records_free(&cut);
           ACHECK(!memcmp(hp(g,r),Sref2,0x40) && zt_get(g,1,0x2bd4ec)==r); }
         wr8(g,CAM_SEL,1); ACHECK(zt_get(g,0,0x18ef29)!=cam&&kh_aspect_zoom_shadow(zt_get(g,0,0x18ef29)));   /* byte 0x140ac183c set: cl = 0 gives the current camera */

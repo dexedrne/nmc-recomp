@@ -87,7 +87,31 @@ static struct SessionSlot **slot_at(const char *path){
     while(*p&&strcmp((*p)->path,path)) p=&(*p)->next;
     return p;
 }
-static const char *open_slot(const char *path,struct SessionSlot **out,KhSlotHeader *h,KhRecords *arena,KhPadHistory *pad,KhBootDocs *docs,FILE **file){
+static const char *check_identity(const KhSlotHeader *h){
+    KhSlotHeader local={0};
+    const char *err=kh_slot_identity(&local);
+    if(!err){
+        if(memcmp(local.build,h->build,32)) err="savestate-load-build";
+        else if(memcmp(local.game,h->game,32)) err="savestate-load-game";
+        else if(memcmp(local.data,h->data,32)) err="savestate-load-data-tree";
+        else if(memcmp(local.settings,h->settings,32)) err="savestate-load-switches";
+    }
+    return err;
+}
+/* A resident slot can be large enough that reading it before parking the
+ * timing thread lets that thread leave its restorable release handoff. */
+static const char *read_resident(struct SessionSlot *s){
+    const char *err=check_identity(&disk_header);
+    if(err) return err;
+    if(memcmp(&s->header,&disk_header,sizeof disk_header)) return "savestate-load-checksum";
+    KhPadHistory check={0}; KhBootDocs initial={0};
+    err=kh_slot_read(bootstrap,&disk_header,NULL,&check,&initial,NULL);
+    free(check.changes); free(initial.data);
+    if(!err && fseeko(bootstrap,sizeof disk_header,SEEK_SET)) err="savestate-load-seek";
+    if(!err) err=kh_slot_read(bootstrap,&disk_header,&disk_arena,&disk_pad,&disk_docs,NULL);
+    return err;
+}
+static const char *open_slot(const char *path,struct SessionSlot **out,KhSlotHeader *h,KhPadHistory *pad,KhBootDocs *docs,FILE **file){
     FILE *f=fopen(path,"rb");
     if(!f) return "savestate-load-open";
     const char *err=NULL;
@@ -96,30 +120,14 @@ static const char *open_slot(const char *path,struct SessionSlot **out,KhSlotHea
     else if(!memcmp(h->magic,"KHSES01\n",8)) err="savestate-load-session";
     else if(memcmp(h->magic,"KHSS003\n",8)) err="savestate-load-format";
     else if(fread((u8 *)h+8,1,sizeof *h-8,f)!=sizeof *h-8) err="savestate-load-truncated";
-    KhSlotHeader local={0};
-    if(!err) err=kh_slot_identity(&local);
-    if(!err){
-        if(memcmp(local.build,h->build,32)) err="savestate-load-build";
-        else if(memcmp(local.game,h->game,32)) err="savestate-load-game";
-        else if(memcmp(local.data,h->data,32)) err="savestate-load-data-tree";
-        else if(memcmp(local.settings,h->settings,32)) err="savestate-load-switches";
-    }
     struct SessionSlot *s=*slot_at(path);
     if(!err && s && !memcmp(s->header.key,h->key,sizeof h->key)){
-        if(memcmp(s->header.checksum,h->checksum,32)) err="savestate-load-checksum";
-        else *out=s;
+        *out=s; *file=f;
+        return NULL;
     }
-    if(!err && *out){
-        if(memcmp(&s->header,h,sizeof *h)) err="savestate-load-checksum";
-        else{
-            KhPadHistory check={0}; KhBootDocs initial={0};
-            err=kh_slot_read(f,h,NULL,&check,&initial,NULL);
-            free(check.changes); free(initial.data);
-            if(!err && fseeko(f,sizeof *h,SEEK_SET)) err="savestate-load-seek";
-        }
-    }
-    if(!err) err=kh_slot_read(f,h,*out?arena:NULL,pad,docs,NULL);
-    if(!err&&!*out) *file=f;
+    if(!err) err=check_identity(h);
+    if(!err) err=kh_slot_read(f,h,NULL,pad,docs,NULL);
+    if(!err) *file=f;
     else fclose(f);
     return err;
 }
@@ -206,7 +214,7 @@ static void disk_cpu(struct SessionSlot *s,KhRecords *r){
     kh_rewind_arena(r);
     kh_rewind_fibers(r); kh_rewind_handles(r); kh_rewind_crt(r);
     kh_rewind_gfx(r); kh_rewind_aspect(r); kh_rewind_input(r); kh_rewind_shell(r); kh_rewind_route(r); kh_rewind_phase(r);
-    kh_rewind_warp(r); kh_rewind_xion(r); kh_rewind_hd(r); kh_rewind_mod(r); kh_rewind_maps(r);
+    kh_rewind_warp(r); kh_rewind_xion(r); kh_rewind_retry(r); kh_rewind_hd(r); kh_rewind_mod(r); kh_rewind_maps(r);
     kh_rewind_ids(r); kh_rewind_files(r); kh_rewind_cutscenes(r);
 }
 static void disk_owners(struct SessionSlot *s,KhRecords *r){
@@ -289,7 +297,7 @@ void kh_cut_init(void){
         if(!trigger_head) kh_fatal(NULL,"savestate-boot-slot-path");
         struct SessionSlot *resident=NULL;
         load_started=kh_host_ns();
-        const char *err=open_slot(menu_path,&resident,&disk_header,&disk_arena,&disk_pad,&disk_docs,&bootstrap);
+        const char *err=open_slot(menu_path,&resident,&disk_header,&disk_pad,&disk_docs,&bootstrap);
         if(!err) err=kh_slot_docs_begin(&disk_docs);
         if(err) kh_fatal(NULL,"%s: %s",err,menu_path);
         if(!kh_pad_bootstrap(&disk_pad)) kh_fatal(NULL,"savestate-cold-input-prefix");
@@ -482,7 +490,7 @@ void kh_cut_frame(KCtx *g,u64 frame){
         const char *err=NULL;
         if(!opened){
             load_started=kh_host_ns();
-            err=open_slot(slot,&session,&disk_header,&disk_arena,&disk_pad,&disk_docs,&bootstrap);
+            err=open_slot(slot,&session,&disk_header,&disk_pad,&disk_docs,&bootstrap);
             if(!err && !session){
                 if(kh_gfx_vkd3d_on) err="savestate-cold-gpu-objects";
                 else if(disk_docs.size!=startup_docs.size ||
@@ -600,7 +608,8 @@ void kh_cut_frame(KCtx *g,u64 frame){
                        !(candidate->path=strdup(slot))) kh_fatal(g,"savestate-slot-memory");
                     candidate->nthreads=n+1; candidate->header.frame=frame; session=candidate;
                 }
-                sync_error=session_check(session,load&&!cold,n);
+                if(load&&!cold) sync_error=read_resident(session);
+                if(!sync_error) sync_error=session_check(session,load&&!cold,n);
                 if(!sync_error&&(!load||cold)) qsort(session->points,session->nthreads,sizeof *session->points,point_order);
                 if(!sync_error&&(load||kh_gfx_vkd3d_on)){
                     committing=kh_cut_gate_commit(epoch);
@@ -695,7 +704,7 @@ void kh_cut_frame(KCtx *g,u64 frame){
             kh_route_map_report(g,stderr,"savestate candidate");
         }
         if(gate_ok&&!save&&trigger_head->op!=HASH) kh_cut_rebuild_fibers();
-        if(committing) kh_cut_gate_committed_end();
+        if(committing) kh_cut_gate_committed_end(epoch);
         else gate_ok=kh_cut_gate_end(epoch)&&gate_ok;
     }
     atomic_store(&kh_cut_requested,0);

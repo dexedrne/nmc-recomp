@@ -91,9 +91,16 @@ static const char *const scene_files[]={
     "remastered/" KH_SCENE_MDLX "/-1.dds", "remastered/" KH_SCENE_MDLX "/-2.dds"
 };
 
-int kh_scene_path(const char *rel,char *host,size_t cap){
+const char *kh_scene_root(void){
     const char *root=getenv("KHNMC_SCENE_ROXAS_DIR");
-    if(!root) root="private/scene-roxas";
+    return root?root:"private/scene-roxas";
+}
+const char *kh_look_root(void){
+    const char *root=getenv("KHNMC_LOOK_DIR");
+    return root?root:"private/looks/xion";
+}
+int kh_scene_path(const char *rel,char *host,size_t cap){
+    const char *root=kh_scene_root();
     struct stat st;
     return *root && strlen(root)+strlen(rel)+2<=cap && kh_resolve_ci(root,rel,host,cap) &&
            !stat(host,&st) && S_ISREG(st.st_mode) && st.st_size>0 && st.st_size<=INT_MAX && !access(host,R_OK);
@@ -137,8 +144,7 @@ void kh_look_set(int xion){
 }
 
 void kh_look_path(KCtx *g,const char *rel,char *host,size_t cap){
-    const char *root=getenv("KHNMC_LOOK_DIR");
-    if(!root) root="private/looks/xion";
+    const char *root=kh_look_root();
     struct stat st;
     if(strlen(root)+strlen(rel)+2>cap || !kh_resolve_ci(root,rel,host,cap) ||
        stat(host,&st) || !S_ISREG(st.st_mode) || st.st_size<=0 || st.st_size>INT_MAX)

@@ -1,6 +1,7 @@
 #include "slot_disk.h"
 #include "slot_hash.h"
 #include "settings.h"
+#include "kh_look.h"
 
 extern const char *kh_game_image_path(void);
 #include <errno.h>
@@ -57,6 +58,21 @@ static int tree_hash(SlotHash *hash,const char *path){
     }
     return fts_close(tree)==0 && ok;
 }
+static int appearance_hash(SlotHash *hash){
+    const char *scene=getenv("KHNMC_SCENE_ROXAS");
+    const char *roots[]={kh_look_enabled()?kh_look_root():NULL,
+                         scene&&!strcmp(scene,"1")?kh_scene_root():NULL};
+    for(unsigned i=0;i<2;i++){
+        const char *root=roots[i];
+        struct stat st;
+        if(root && stat(root,&st)){
+            if(errno!=ENOENT && errno!=ENOTDIR) return 0;
+            root=NULL;
+        }
+        if(!tree_hash(hash,root)) return 0;
+    }
+    return 1;
+}
 static int string_order(const void *a,const void *b){
     return strcmp(*(const char *const *)a,*(const char *const *)b);
 }
@@ -87,6 +103,7 @@ const char *kh_slot_identity(KhSlotHeader *h){
     SlotHash hash; slot_hash_init(&hash);
     const char *data=getenv("KHNMC_DATA");
     if(!tree_hash(&hash,data?data:"data")||!tree_hash(&hash,getenv("KHNMC_PKGDIR"))) return "savestate-data-tree-read";
+    if(!appearance_hash(&hash)) return "savestate-appearance-tree-read";
     slot_hash_end(h->data,&hash);
 #ifdef __APPLE__
     char **env=*_NSGetEnviron();

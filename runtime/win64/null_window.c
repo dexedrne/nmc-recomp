@@ -63,11 +63,12 @@ void kh_screen_config(const char *screen,const char *khwin){
     fprintf(stderr,"kh: screen: KHNMC_SCREEN=%dx%d: the monitor, the one display mode, the client rectangle and the DXGI output are %dx%d; the window is maximized (IsZoomed=1) from the first call; what the game builds is checked at every present (WARNING screen-not-applied when it is another size)\n",w,h,w,h);
 }
 static const char *resize_schedule;
+static u64 resize_offset; /* UINT64_MAX after the final entry */
 static u64 resize_frame;
 static int resize_w, resize_h;
 static void next_resize(void){
-    const char *p=resize_schedule;
-    if(!p){ resize_frame=0; return; }
+    if(resize_offset==UINT64_MAX||!resize_schedule){ resize_frame=0; return; }
+    const char *p=resize_schedule+resize_offset;
     char *end;
     if(strncmp(p,"frame:",6)||p[6]<'0'||p[6]>'9') goto bad;
     errno=0;
@@ -78,7 +79,7 @@ static void next_resize(void){
     if(len>=sizeof size) goto bad;
     memcpy(size,p,len); size[len]=0;
     if(kh_screen_parse(size,&resize_w,&resize_h)) goto bad;
-    resize_frame=frame; resize_schedule=p[len]?p+len+1:NULL;
+    resize_frame=frame; resize_offset=p[len]?(u64)(p+len+1-resize_schedule):UINT64_MAX;
     return;
 bad:
     kh_fatal(NULL,"resize-schedule-invalid: expected increasing frame:N:WxH entries; got %s",resize_schedule);
@@ -96,7 +97,10 @@ void kh_rewind_window(KhRecords *r,u64 *pending_size){
     kh_present_layer_size(&w,&h);
     KH_RECORD(r,pixels);
     if(scripted_resize){
-        KH_RECORD(r,resize_schedule);
+        KH_RECORD(r,resize_offset);
+        if(resize_offset!=UINT64_MAX && (resize_offset>strlen(resize_schedule)||
+           (resize_offset && resize_schedule[resize_offset-1]!=',')))
+            kh_fatal(NULL,"savestate-resize-offset");
         KH_RECORD(r,resize_frame);
         KH_RECORD(r,resize_w);
         KH_RECORD(r,resize_h);
@@ -124,6 +128,7 @@ void kh_seam_window_init(void){
     const char *screen=getenv("KHNMC_SCREEN");
     resize_schedule=getenv("KHNMC_TEST_RESIZE");
     scripted_resize=resize_schedule&&*resize_schedule;
+    resize_offset=resize_frame=0;
     if(scripted_resize) next_resize();
     live_resize=scripted_resize||(screen&&!strcmp(screen,"layer"));
     kh_screen_config(scripted_resize&&(!screen||!*screen)?"1280x720":screen,e);
@@ -176,6 +181,20 @@ int kh_window_resize_selftest(void){
     failures+=kh_window_apply_size(pending>>32,(u32)pending)!=1;
     kh_records_free(&cut);
     kh_present_test_layer_size(old_w,old_h);
+    const char *old_schedule=resize_schedule;
+    u64 old_offset=resize_offset,old_frame=resize_frame;
+    int old_rw=resize_w,old_rh=resize_h;
+    char first[]="frame:1:1280x720,frame:2:1920x1350,frame:3:1280x720";
+    char second[sizeof first]; memcpy(second,first,sizeof first);
+    scripted_resize=1; resize_schedule=first; resize_frame=resize_offset=0; next_resize();
+    kh_records_begin(&cut,0); kh_rewind_window(&cut,&pending); kh_records_end(&cut);
+    resize_schedule=second; next_resize();
+    kh_records_begin(&cut,1); kh_rewind_window(&cut,&pending); kh_records_end(&cut);
+    failures+=resize_schedule!=second;
+    next_resize(); failures+=resize_frame!=2 || resize_w!=1920;
+    kh_records_free(&cut);
+    resize_schedule=old_schedule; resize_offset=old_offset; resize_frame=old_frame;
+    resize_w=old_rw; resize_h=old_rh;
     scripted_resize=was_scripted;
     kh_screen_test_state(old,NULL); live_resize=was_live;
     return failures;

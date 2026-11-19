@@ -37,6 +37,7 @@
 extern int kh_gfx_vkd3d_on;
 extern int kh_run_is_selftest;
 extern _Atomic u64 gfx_presents;
+int kh_app_game_presented(void){ return atomic_load(&gfx_presents)>0; }
 uint64_t kh_app_host_ns(void){ return kh_host_ns(); }
 
 /* ---- 1. focus ---- */
@@ -62,6 +63,7 @@ static LifeReq lq[LQ]; static int lqn, l_started, l_busy; static u64 l_seq, l_do
 static _Atomic u64 l_epoch;
 static _Atomic int l_state;                       /* ST_*: what the shell said last, in the order of its calls (set under lm) */
 static _Atomic int l_suspended;                   /* under lm: from kh_app_suspend to the resume that clears the gate (the null Present parks only then) */
+static int cut_committing;
 static u64 cut_life_seq; /* guarded by lm; one field cut owns the gate */
 int kh_cut_gate_begin(u64 *epoch){
     pthread_mutex_lock(&lm);
@@ -73,12 +75,16 @@ int kh_cut_gate_begin(u64 *epoch){
 /* Keep a lifecycle transition from invalidating a load after it mutates guest RAM. */
 int kh_cut_gate_commit(u64 epoch){
     pthread_mutex_lock(&lm);
-    if(atomic_load(&l_epoch)==epoch&&cut_life_seq==l_seq) return 1;
+    int ok=atomic_load(&l_epoch)==epoch&&cut_life_seq==l_seq&&!cut_committing;
+    if(ok) cut_committing=1;
     pthread_mutex_unlock(&lm);
-    return 0;
+    return ok;
 }
-void kh_cut_gate_committed_end(void){
-    kh_gfx_gate_clear();
+void kh_cut_gate_committed_end(u64 epoch){
+    pthread_mutex_lock(&lm);
+    cut_committing=0;
+    if(epoch==atomic_load(&l_epoch)&&atomic_load(&l_state)==ST_ACTIVE) kh_gfx_gate_clear();
+    if(l_started) pthread_cond_broadcast(&l_cv);
     pthread_mutex_unlock(&lm);
 }
 int kh_cut_gate_end(u64 epoch){
@@ -228,7 +234,7 @@ static void do_audio_interruption(int began){
 static void *life_worker(void *a){
     (void)a; pthread_mutex_lock(&lm);
     for(;;){
-        while(!lqn) pthread_cond_wait(&l_cv,&lm);
+        while(!lqn||cut_committing) pthread_cond_wait(&l_cv,&lm);
         LifeReq rq=lq[0]; for(int i=1;i<lqn;i++) lq[i-1]=lq[i]; lqn--; l_busy=1;
         pthread_mutex_unlock(&lm);
         u64 t0=kh_host_ns(); int r=0;
@@ -627,6 +633,20 @@ int kh_app_life_selftest(void){
     /* 9d. KHNMC_CLOCK=frames: the PC's minimise is not delivered (it would stop the virtual clock for good), counted */
     { u64 k0=atomic_load(&c_min_skipped); st_frames_clock=1; kh_app_will_resign_active(); TA(SUSP_OK(kh_app_suspend(2000)));
       st_frames_clock=-1; TA(kh_shell_test_take()==0 && atomic_load(&c_min_skipped)==k0+1); TA(kh_app_resume(2000)==0 && kh_shell_test_take()==0 && !kh_gfx_gate_is_set()); }
+    /* A claimed cut permits the UI to post a suspend but defers the worker drain. */
+    { u64 epoch, drains=atomic_load(&c_drains);
+      TA(kh_cut_gate_begin(&epoch)); TA(kh_cut_gate_commit(epoch));
+      int locked=pthread_mutex_trylock(&lm)==0;
+      TA(locked);
+      if(locked){
+          pthread_mutex_unlock(&lm);
+          kh_app_will_resign_active();
+          TA(kh_app_suspend(50)==KH_APP_BOUND_EXPIRED);
+          TA(atomic_load(&c_drains)==drains);
+      }
+      kh_cut_gate_committed_end(epoch);
+      if(locked){ TA(kh_gfx_gate_is_set()); TA(st_wait_idle(3000)); TA(kh_app_resume(2000)==0); }
+    }
     /* 9. the test trigger's value */
     { u64 a=0; unsigned b=0; TA(test_parse("frame:120:35000",&a,&b)==0 && a==120 && b==35000); TA(test_parse("frame:0:5",&a,&b)==2 && test_parse("frame:5",&a,&b)==1 && test_parse("frames:1:2",&a,&b)==1 && test_parse("frame:1:2x",&a,&b)==1); }
     TA(st_wait_idle(3000)); au_pending=0; au_interrupted=0;                 /* the worker is idle: its audio state back to none */

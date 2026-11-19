@@ -27,6 +27,8 @@ void kh_rewind_warp(KhRecords *);
 void kh_rewind_window(KhRecords *,u64 *pending_size);
 void kh_rewind_shell(KhRecords *);
 void kh_rewind_xion(KhRecords *);
+void kh_rewind_retry(KhRecords *);
+int kh_retry_rewind_selftest(void);
 void kh_rewind_mod(KhRecords *);
 void kh_rewind_maps(KhRecords *);
 void kh_rewind_ids(KhRecords *);

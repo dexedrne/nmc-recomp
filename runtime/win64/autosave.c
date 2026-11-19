@@ -1,6 +1,7 @@
 /* Native port of equations19's auto-save, based on Denhonator's KHPCSpeedrunTools. */
 #include "autosave.h"
 #include "xion_swap.h"
+#include "slot_disk.h"
 #include "route_state.h"
 #include "warp.h"
 #include <errno.h>
@@ -20,7 +21,7 @@ int kh_autosave_indicator(void){
     u64 until=atomic_load(&indicator_until);
     return until && indicator_visible(kh_host_ns(),until);
 }
-static char directory[PATH_MAX];
+
 
 void kh_autosave_init(void){
     slots=0; indicator=0; atomic_store(&indicator_until,0);
@@ -36,8 +37,7 @@ void kh_autosave_init(void){
     if((e && (*end || end==e)) || count<1 || count>INT_MAX)
         kh_fatal(NULL,"autosave-slots: expected a positive slot count");
     slots=(int)count;
-    if(snprintf(directory,sizeof directory,"%s/autosave",kh_autosave_documents())>=(int)sizeof directory)
-        kh_fatal(NULL,"autosave-directory: path too long");
+
 }
 
 static int allowed(unsigned w,unsigned r){
@@ -81,6 +81,9 @@ static int header_ok(const u8 *p){
 }
 
 static int open_directory(int writing){
+    char directory[PATH_MAX];
+    if(snprintf(directory,sizeof directory,"%s/autosave",kh_slot_autosave_documents())>=(int)sizeof directory)
+        kh_fatal(NULL,"autosave-directory: path too long");
     if(writing && mkdir(directory,0700) && errno!=EEXIST) return -1;
     int fd=open(directory,O_RDONLY|O_DIRECTORY);
     if(fd>=0 && flock(fd,writing ? LOCK_EX : LOCK_SH)){ close(fd); return -1; }
@@ -137,10 +140,10 @@ void f_3a0660(KCtx *g){
     }
     wr32(g,CONTINUE+8,checkpoint_crc(p));
     int dir=open_directory(1);
-    if(dir<0){ kh_warn("autosave-write: %s: %s",directory,strerror(errno)); return; }
+    if(dir<0){ kh_warn("autosave-write: %s: %s",kh_slot_autosave_documents(),strerror(errno)); return; }
     int last=newest(dir);
     int n=last<0 ? 1 : last%slots+1;
-    if((last<0 && errno!=ENOENT) || !publish(dir,n,p)) kh_warn("autosave-write: %s: %s",directory,strerror(errno));
+    if((last<0 && errno!=ENOENT) || !publish(dir,n,p)) kh_warn("autosave-write: %s: %s",kh_slot_autosave_documents(),strerror(errno));
     else {
         if(indicator) atomic_store(&indicator_until,kh_host_ns()+1500000000ull);
         kh_warn("autosave-write: KH2autosave-%d.dat %.2s%02u",n,kh_warp_world_names[p[12]],p[13]);
@@ -193,7 +196,8 @@ int kh_autosave_selftest(KCtx *g){
     for(size_t i=0;i<SAVE_SIZE;i++) p[i]=(u8)(i*37u);
     memcpy(p,"KH2J\x3a\0\0\0",8); p[12]=2; p[13]=2;
     wr32(g,buf+8,checkpoint_crc(p));
-    int fails=!header_ok(p) || !native_valid(g,buf);
+    int fails=kh_retry_rewind_selftest();
+    fails+=!header_ok(p) || !native_valid(g,buf);
     fails+=indicator_visible(0,0) || !indicator_visible(1499999999,1500000000) || indicator_visible(1500000000,1500000000);
     p[SAVE_SIZE-1]^=1;
     fails+=native_valid(g,buf)!=0;
