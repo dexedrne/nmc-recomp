@@ -95,6 +95,7 @@ static void hold_check(KCtx *g,u64 present);                          /* task 31
 void orig_f_105e10(KCtx *g);
 void f_105e10(KCtx *g){
     u64 n=atomic_fetch_add(&game_frames,1)+1;
+    extern void kh_test_resize_frame(u64); kh_test_resize_frame(n);
     { extern void kh_idtable_game_frame(u64); kh_idtable_game_frame(n); extern void kh_moose_game_frame(KCtx *); kh_moose_game_frame(g); }
     if(kh_xion_enabled){
         pthread_mutex_lock(&input_lock); u16 buttons=last_pad.buttons; pthread_mutex_unlock(&input_lock);

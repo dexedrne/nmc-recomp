@@ -14,12 +14,19 @@
  * otherwise, in the exit report below). */
 #include "khnmc_rt.h"
 #include "khnmc_app.h"
+#include "gfx_present.h"
+#include <errno.h>
 
 #define HWND_MAIN 0xAB0001ull
 #define HMON_MAIN 0xAB0100ull
 static int win_w=1280, win_h=720, win_x=100, win_y=100, win_zoomed=0, win_visible=0;
 static u64 wndproc_ga, winlong[32];
-static int scr_w=1920, scr_h=1080;
+/* One snapshot for both axes, including readers on the timing thread. */
+static _Atomic u32 screen_pixels=(1080u<<16)|1920u;
+static int live_resize;
+int kh_screen_size(int *w,int *h);
+void kh_window_client_size(int *w,int *h);
+static void store_screen(int w,int h){ atomic_store(&screen_pixels,((u32)h<<16)|(u32)w); }
 static int scr_set;                                   /* task 37: 1 = KHNMC_SCREEN gave the screen */
 static _Atomic u64 scr_req_create, scr_req_setpos;    /* window-size requests the screen seam did not apply (counted, reported) */
 void kh_aspect_init(void);
@@ -51,20 +58,60 @@ void kh_screen_config(const char *screen,const char *khwin){
     if(r==1) kh_fatal(NULL,"screen-value-malformed: KHNMC_SCREEN=%s: expected WxH, two decimal numbers joined by a lower-case x (e.g. 1920x1350)",screen);
     if(r) kh_fatal(NULL,"screen-value-range: KHNMC_SCREEN=%s: each side must be 16..16384 pixels",screen);
     if(khwin&&*khwin) kh_fatal(NULL,"screen-and-kh-win: KHNMC_SCREEN=%s and KH_WIN=%s are both set: the screen seam reports a maximized window whose client rectangle is the screen, KH_WIN would be ignored",screen,khwin);
-    scr_w=w; scr_h=h; scr_set=1; win_w=w; win_h=h; win_x=0; win_y=0; win_zoomed=1;
+    store_screen(w,h); scr_set=1; win_w=w; win_h=h; win_x=0; win_y=0; win_zoomed=1;
     fprintf(stderr,"kh: screen: KHNMC_SCREEN=%dx%d: the monitor, the one display mode, the client rectangle and the DXGI output are %dx%d; the window is maximized (IsZoomed=1) from the first call; what the game builds is checked at every present (WARNING screen-not-applied when it is another size)\n",w,h,w,h);
+}
+static const char *resize_schedule;
+static u64 resize_frame;
+static int resize_w, resize_h;
+static void next_resize(void){
+    const char *p=resize_schedule;
+    if(!p){ resize_frame=0; return; }
+    char *end;
+    if(strncmp(p,"frame:",6)||p[6]<'0'||p[6]>'9') goto bad;
+    errno=0;
+    unsigned long long frame=strtoull(p+6,&end,10);
+    if(errno||frame<=resize_frame||*end!=':') goto bad;
+    p=end+1;
+    size_t len=strcspn(p,","); char size[16];
+    if(len>=sizeof size) goto bad;
+    memcpy(size,p,len); size[len]=0;
+    if(kh_screen_parse(size,&resize_w,&resize_h)) goto bad;
+    resize_frame=frame; resize_schedule=p[len]?p+len+1:NULL;
+    return;
+bad:
+    kh_fatal(NULL,"resize-schedule-invalid: expected increasing frame:N:WxH entries; got %s",resize_schedule);
+}
+void kh_test_resize_frame(u64 frame){
+    if(frame!=resize_frame) return;
+    kh_warn("test resize: game frame %llu drawable %dx%d",(unsigned long long)frame,resize_w,resize_h);
+    kh_present_set_size(resize_w,resize_h);
+    next_resize();
+}
+int kh_window_apply_size(u32 w,u32 h){
+    if(!live_resize) return 0;
+    if(w<16||h<16||w>16384||h>16384) kh_fatal(NULL,"drawable-size-range: %ux%u",w,h);
+    if((h<<16|w)==atomic_load(&screen_pixels)) return 0;
+    store_screen(w,h);
+    return 1;
 }
 void kh_seam_window_init(void){
     const char *e=getenv("KH_WIN"); if(e) sscanf(e,"%dx%d",&win_w,&win_h);
-    kh_screen_config(getenv("KHNMC_SCREEN"),e);
+    const char *screen=getenv("KHNMC_SCREEN");
+    resize_schedule=getenv("KHNMC_TEST_RESIZE");
+    int test=resize_schedule&&*resize_schedule;
+    if(test) next_resize();
+    live_resize=test||(screen&&!strcmp(screen,"layer"));
+    kh_screen_config(test&&(!screen||!*screen)?"1280x720":screen,e);
     kh_aspect_init();                                 /* task 37: KHNMC_ASPECT / KHNMC_ASPECT_LOG (runtime/aspect.c), read with the screen */
 }
 /* the screen the seam reports (1920x1080 unless KHNMC_SCREEN); returns 1 when KHNMC_SCREEN set it */
-int kh_screen_size(int *w,int *h){ if(w) *w=scr_w; if(h) *h=scr_h; return scr_set; }
-void kh_window_client_size(int *w,int *h){ *w=win_w; *h=win_h; }      /* review A41 (verification): the form's ClientSize (GetClientRect's answer) for the PC's restore */
+int kh_screen_size(int *w,int *h){ u32 size=atomic_load(&screen_pixels); if(w) *w=size&65535; if(h) *h=size>>16; return scr_set; }
+void kh_window_client_size(int *w,int *h){ if(scr_set){ kh_screen_size(w,h); return; } *w=win_w; *h=win_h; }      /* review A41 (verification): the form's ClientSize (GetClientRect's answer) for the PC's restore */
 void kh_screen_check_counts(u64 *presents,u64 *bad);   /* runtime/aspect.c: the built size against the screen at each present */
 void kh_screen_report(FILE *f){
     if(!scr_set) return;
+    int scr_w,scr_h; kh_screen_size(&scr_w,&scr_h);
     u64 np=0,nb=0; kh_screen_check_counts(&np,&nb);
     fprintf(f,"kh: screen: KHNMC_SCREEN=%dx%d; window-size requests not applied (the window stays maximized at the screen size): CreateWindowExA %llu, SetWindowPos %llu; "
               "the built size checked at %llu presents (swap chain, GX+0x8, GX+0x18): not %dx%d at %llu\n",
@@ -74,8 +121,24 @@ void kh_screen_report(FILE *f){
 }
 /* selftest only (runtime/aspect.c): put the seam into a known state and back.  Returns the state it replaced through *old (8 ints). */
 void kh_screen_test_state(const int *set,int *old){
-    if(old){ old[0]=scr_set; old[1]=scr_w; old[2]=scr_h; old[3]=win_w; old[4]=win_h; old[5]=win_x; old[6]=win_y; old[7]=win_zoomed; }
-    if(set){ scr_set=set[0]; scr_w=set[1]; scr_h=set[2]; win_w=set[3]; win_h=set[4]; win_x=set[5]; win_y=set[6]; win_zoomed=set[7]; }
+    if(old){ old[0]=scr_set; kh_screen_size(old+1,old+2); old[3]=win_w; old[4]=win_h; old[5]=win_x; old[6]=win_y; old[7]=win_zoomed; }
+    if(set){ scr_set=set[0]; store_screen(set[1],set[2]); win_w=set[3]; win_h=set[4]; win_x=set[5]; win_y=set[6]; win_zoomed=set[7]; }
+}
+/* Drive the live seam in both directions without an iOS layer. */
+int kh_window_resize_selftest(void){
+    int old[8], was_live=live_resize, failures=0;
+    kh_screen_test_state(NULL,old);
+    scr_set=live_resize=1;
+    store_screen(2853,2007);
+    int sizes[][2]={{2007,2853},{2853,2007}};
+    for(int i=0;i<2;i++){
+        int w=sizes[i][0],h=sizes[i][1],cw,ch;
+        failures+=kh_window_apply_size(w,h)!=1;
+        kh_window_client_size(&cw,&ch); failures+=cw!=w||ch!=h;
+        failures+=kh_window_apply_size(w,h)!=0;
+    }
+    kh_screen_test_state(old,NULL); live_resize=was_live;
+    return failures;
 }
 void kh_screen_test_counts(u64 *create,u64 *setpos){ if(create) *create=scr_req_create; if(setpos) *setpos=scr_req_setpos; }
 
@@ -83,30 +146,30 @@ IMP(U32,RegisterClassExA){ kh_cnt_window_calls++; u64 wc=A0(g); wndproc_ga=rd64(
 IMP(U32,UnregisterClassA){ SET_RAX(g,1); }
 IMP(U32,CreateWindowExA){ kh_cnt_window_calls++; /* (exstyle, class, title, style, x, y, w, h, parent, menu, inst, param) */
     int w=(int)(s32)ARG(g,6),h=(int)(s32)ARG(g,7);
-    if(scr_set){ if(w!=scr_w||h!=scr_h) scr_req_create++; SET_RAX(g,HWND_MAIN); return; }      /* maximized at the screen size */
+    if(scr_set){ int scr_w,scr_h; kh_screen_size(&scr_w,&scr_h); if(w!=scr_w||h!=scr_h) scr_req_create++; SET_RAX(g,HWND_MAIN); return; }      /* maximized at the screen size */
     if(w>0&&w<16384) win_w=w; if(h>0&&h<16384) win_h=h; SET_RAX(g,HWND_MAIN); }
 IMP(U32,DestroyWindow){ kh_cnt_window_calls++; SET_RAX(g,1); }
 IMP(U32,ShowWindow){ kh_cnt_window_calls++; win_visible=(int)A1(g)!=0; SET_RAX(g,0); }
 IMP(U32,SetWindowPos){ kh_cnt_window_calls++; /* (hwnd, after, x, y, cx, cy, flags) */ u32 fl=(u32)ARG(g,6);
-    if(scr_set){ if(!(fl&1)&&((int)(s32)ARG(g,4)!=scr_w||(int)(s32)ARG(g,5)!=scr_h)) scr_req_setpos++; SET_RAX(g,1); return; }   /* SWP_NOSIZE = 1 */
+    if(scr_set){ int scr_w,scr_h; kh_screen_size(&scr_w,&scr_h); if(!(fl&1)&&((int)(s32)ARG(g,4)!=scr_w||(int)(s32)ARG(g,5)!=scr_h)) scr_req_setpos++; SET_RAX(g,1); return; }   /* SWP_NOSIZE = 1 */
     if(!(fl&2)){ win_x=(int)(s32)A2(g); win_y=(int)(s32)A3(g); } if(!(fl&1)){ win_w=(int)(s32)ARG(g,4); win_h=(int)(s32)ARG(g,5); } SET_RAX(g,1); }
-IMP(U32,GetClientRect){ kh_cnt_window_calls++; u64 r=A1(g); wr32(g,r,0); wr32(g,r+4,0); wr32(g,r+8,(u32)win_w); wr32(g,r+12,(u32)win_h); SET_RAX(g,1); }
+IMP(U32,GetClientRect){ kh_cnt_window_calls++; int win_w,win_h; kh_window_client_size(&win_w,&win_h); u64 r=A1(g); wr32(g,r,0); wr32(g,r+4,0); wr32(g,r+8,(u32)win_w); wr32(g,r+12,(u32)win_h); SET_RAX(g,1); }
 IMP(U32,AdjustWindowRect){ kh_cnt_window_calls++; u64 r=A0(g); (void)r; SET_RAX(g,1); }      /* no frame in the headless window: client == window */
 IMP(U32,ScreenToClient){ SET_RAX(g,1); }
-IMP(U32,GetCursorPos){ u64 p=A0(g); wr32(g,p,(u32)(scr_w/2)); wr32(g,p+4,(u32)(scr_h/2)); SET_RAX(g,1); }
+IMP(U32,GetCursorPos){ int scr_w,scr_h; kh_screen_size(&scr_w,&scr_h); u64 p=A0(g); wr32(g,p,(u32)(scr_w/2)); wr32(g,p+4,(u32)(scr_h/2)); SET_RAX(g,1); }
 /* the window "has focus" (the pad poll is gated on it).  TASK41: while the app is not active (runtime/app_life.c: from the shell's
  * sceneWillResignActive to its sceneDidBecomeActive, or a KHNMC_TEST_SUSPEND run) the foreground window is another one (0), as on the PC
  * when the game's window loses focus: the game's own input update 0x105810 resets each PADDATA to neutral every frame and 0x134ff0 reads
  * the pad only when GetForegroundWindow() is the game's window (0x13501c-0x135022), so the game sees neutral pads, exactly as on the PC */
 IMP(U32,GetForegroundWindow){ kh_cnt_window_calls++; if(__builtin_expect(!kh_app_window_active(),0)){ kh_app_note_foreground_query(); SET_RAX(g,0); return; } SET_RAX(g,HWND_MAIN); }
 IMP(U32,IsZoomed){ SET_RAX(g,win_zoomed); }
-IMP(U32,GetSystemMetrics){ int i=(int)A0(g); SET_RAX(g,(u32)(i==0?scr_w:i==1?scr_h:0)); }
+IMP(U32,GetSystemMetrics){ int scr_w,scr_h; kh_screen_size(&scr_w,&scr_h); int i=(int)A0(g); SET_RAX(g,(u32)(i==0?scr_w:i==1?scr_h:0)); }
 IMP(U32,MonitorFromWindow){ SET_RAX(g,HMON_MAIN); }
-IMP(U32,GetMonitorInfoA){ u64 p=A1(g); u32 cb=rd32(g,p); wr32(g,p+4,0); wr32(g,p+8,0); wr32(g,p+12,(u32)scr_w); wr32(g,p+16,(u32)scr_h); wr32(g,p+20,0); wr32(g,p+24,0); wr32(g,p+28,(u32)scr_w); wr32(g,p+32,(u32)scr_h); wr32(g,p+36,1);
+IMP(U32,GetMonitorInfoA){ int scr_w,scr_h; kh_screen_size(&scr_w,&scr_h); u64 p=A1(g); u32 cb=rd32(g,p); wr32(g,p+4,0); wr32(g,p+8,0); wr32(g,p+12,(u32)scr_w); wr32(g,p+16,(u32)scr_h); wr32(g,p+20,0); wr32(g,p+24,0); wr32(g,p+28,(u32)scr_w); wr32(g,p+32,(u32)scr_h); wr32(g,p+36,1);
     if(cb>=0x48) strcpy((char*)hp(g,p+40),"\\\\.\\DISPLAY1"); SET_RAX(g,1); }
 /* without KHNMC_SCREEN: modes 0 and 1 and ENUM_CURRENT_SETTINGS (-1) all report 1920x1080 (as before task 37); with it: mode 0 and
  * ENUM_CURRENT_SETTINGS report W x H and every other index ends the list (one mode) */
-IMP(U32,EnumDisplaySettingsA){ u32 mode=(u32)A1(g); u64 d=A2(g);
+IMP(U32,EnumDisplaySettingsA){ int scr_w,scr_h; kh_screen_size(&scr_w,&scr_h); u32 mode=(u32)A1(g); u64 d=A2(g);
     if(scr_set?(mode!=0&&mode!=0xFFFFFFFFu):(mode>1&&mode!=0xFFFFFFFFu)){ SET_RAX(g,0); return; }
     wr16(g,d+0x44,0x9c); wr32(g,d+0x48,0x5c0000|0x400000|0x80000|0x100000|0x20000); wr32(g,d+0x68,32); wr32(g,d+0x6c,(u32)scr_w); wr32(g,d+0x70,(u32)scr_h); wr32(g,d+0x78,60); SET_RAX(g,1); }
 IMP(U32,GetWindowLongPtrA){ int i=(int)(s32)A1(g); u64 v=0; if(i==-4) v=wndproc_ga; else if(i==-6) v=GS_BASE; else if(i==-16) v=0x10CF0000; else if(i==-20) v=0; else if(i>=0&&i<32*8) v=winlong[i/8]; SET_RAX(g,v); }

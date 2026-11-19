@@ -396,6 +396,7 @@ int kh_gfx_frameline_selftest(void){
 #undef TF
     return f;
 }
+static void res_release(KCtx *g,u64 o);
 static int h_swap(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)c;
     switch(s){
     case 8: case 22: gfx_presents++;
@@ -419,7 +420,22 @@ static int h_swap(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1
     case 13: if(__builtin_expect(kh_aspect_log,0)) kh_aspect_note_swapchain(g,"ResizeBuffers (asked)",0,(u32)A2(g),(u32)A3(g));   /* task 37: 0 = keep that side */
              if(kh_gfx_vkd3d_on){ u32 nw=(u32)A2(g)?(u32)A2(g):rd32(g,o+32), nh=(u32)A3(g)?(u32)A3(g):rd32(g,o+36); kh_vkd3d_swap_resize(g,o,nw,nh);
                  if(!(u32)KH_RAX(g)){ wr32(g,o+32,nw); wr32(g,o+36,nh); wr32(g,o+40,0); } return 1; }       /* real buffers: new size, back-buffer index restarts at 0 */
-             wr32(g,o+32,(u32)A2(g)?(u32)A2(g):rd32(g,o+32)); wr32(g,o+36,(u32)A3(g)?(u32)A3(g):rd32(g,o+36)); SET_RAX(g,0); return 1;     /* ResizeBuffers(count,w,h,fmt,flags) */
+             { u32 w=A2(g)?(u32)A2(g):rd32(g,o+32), h=A3(g)?(u32)A3(g):rd32(g,o+36);
+               if(w!=rd32(g,o+32)||h!=rd32(g,o+36)){
+                   for(int i=0;i<3;i++){
+                       u64 buffer=rd64(g,o+56+8*i);
+                       if(buffer&&rd64(g,buffer+16)!=1){
+                           kh_warn("ResizeBuffers(%ux%u): back buffer %d still referenced",w,h,i);
+                           SET_RAX(g,0x887a0001u); return 1;
+                       }
+                   }
+                   for(int i=0;i<3;i++){
+                       u64 slot=o+56+8*i,buffer=rd64(g,slot);
+                       if(buffer){ wr64(g,slot,0); res_release(g,buffer); }
+                   }
+                   wr32(g,o+32,w); wr32(g,o+36,h); wr32(g,o+40,0);
+               }
+               SET_RAX(g,0); return 1; }
     case 15: out_obj(g,A1(g),o_output); SET_RAX(g,0); return 1;                                             /* GetContainingOutput */
     case 18: { u64 d=A1(g); memset(hp(g,d),0,0x30); wr32(g,d,rd32(g,o+32)); wr32(g,d+4,rd32(g,o+36)); wr32(g,d+8,0x57); wr32(g,d+16,1); wr32(g,d+24,0x30); wr32(g,d+28,3); wr32(g,d+36,3); wr32(g,d+44,0x42); SET_RAX(g,0); return 1; }   /* GetDesc1 */
     case 19: { u64 d=A1(g); memset(hp(g,d),0,20); wr32(g,d+16,1); SET_RAX(g,0); return 1; }            /* GetFullscreenDesc: Windowed=TRUE */
@@ -682,7 +698,11 @@ static int release_selftest(KCtx *g){
       wr64(g,pp,0); RCHECK(st_call8(g,sc,9,1,0,pp,0,0,0,0)==0); u64 b=rd64(g,pp); RCHECK(b && rd64(g,sc+56+8)==b && rd64(g,b+16)==2);
       if(b){ u64 vt=rd64(g,b); RCHECK(st_call8(g,b,2,0,0,0,0,0,0,0)==1 && rd64(g,b)==vt && gfx_res_freed==f1);
              wr64(g,pp,0); RCHECK(st_call8(g,sc,9,1,0,pp,0,0,0,0)==0 && rd64(g,pp)==b && rd64(g,b+16)==2);    /* the same buffer again, alive */
-             RCHECK(st_call8(g,b,2,0,0,0,0,0,0,0)==1 && kh_com_cls_of(g,b)==C_res); } }
+             RCHECK(st_call8(g,sc,13,3,32,64,0,0,0,0)==0x887a0001u && rd32(g,sc+32)==64);
+             RCHECK(st_call8(g,b,2,0,0,0,0,0,0,0)==1 && kh_com_cls_of(g,b)==C_res);
+             RCHECK(st_call8(g,sc,13,3,32,64,0,0,0,0)==0 && rd64(g,sc+64)==0 && gfx_res_freed==f1+1);
+             RCHECK(st_call8(g,sc,9,1,0,pp,0,0,0,0)==0);
+             u64 next=rd64(g,pp); RCHECK(next && rd64(g,next+R_DESC+16)==32 && rd32(g,next+R_DESC+24)==64); } }
     ga_free(m); ga_free(dev);
     fprintf(stderr,"kh: gfx release selftest: %d checks, %d failures\n",checks,fails);
 #undef RCHECK

@@ -46,6 +46,14 @@ static void state_dump(KCtx *g,const char *path){
 #include "khnmc_app.h"
 #define SHELL_QMAX 16
 static int shell_q[SHELL_QMAX], shell_qn, shell_in_loop, shell_suspend_flg; static u64 shell_posted, shell_minimised, shell_restored, shell_dropped;
+/* A layout may arrive before ManageRun parks or while minimised. Keep the latest pair until the form can consume it. */
+static u64 pending_size;
+void kh_shell_drawable_size(u32 w,u32 h){
+    pthread_mutex_lock(&sm);
+    pending_size=((u64)w<<32)|h;
+    pthread_cond_signal(&scv);
+    pthread_mutex_unlock(&sm);
+}
 void kh_shell_post(int req){
     pthread_mutex_lock(&sm); shell_posted++;
     if(shell_qn<SHELL_QMAX){ shell_q[shell_qn++]=req; pthread_cond_broadcast(&scv); } else shell_dropped++;
@@ -117,6 +125,18 @@ void f_579bf0(KCtx *g){                                  /* ManageRun(app) */
     while(!exit_requested){
         if(shell_qn){ int req=shell_q[0]; for(int i=1;i<shell_qn;i++) shell_q[i-1]=shell_q[i]; shell_qn--;   /* TASK41: in order */
             pthread_mutex_unlock(&sm); kh_vclock_idle(0); shell_run(g,req); kh_vclock_idle(1); pthread_mutex_lock(&sm); continue; }
+        if(pending_size&&!shell_suspend_flg){
+            u64 size=pending_size; u32 w=size>>32,h=(u32)size; pending_size=0;
+            pthread_mutex_unlock(&sm);
+            extern int kh_window_apply_size(u32,u32);
+            if(kh_window_apply_size(w,h)){
+                kh_vclock_idle(0);
+                kh_warn("shell: WM_SIZE SIZE_MAXIMIZED %ux%u",w,h);
+                kh_call(g,GS_BASE+0x10eb40,HWND_MAIN,5,2,h<<16|w);  /* packed client rectangle, as delivered to the PC child */
+                kh_vclock_idle(1);
+            }
+            pthread_mutex_lock(&sm); continue;
+        }
         if(secs){ if(pthread_cond_timedwait(&scv,&sm,&dl)!=0){ pthread_mutex_unlock(&sm); kh_warn("shell: KH_RUN_SECONDS=%ld elapsed, ending the run",secs); kh_exit_process(0); } } else pthread_cond_wait(&scv,&sm); }
     shell_in_loop=0; pthread_mutex_unlock(&sm); kh_vclock_idle(0);
     kh_warn("shell: ExitApplication requested; ManageRun returns");

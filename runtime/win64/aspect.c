@@ -126,7 +126,14 @@ void kh_aspect_drawlog_config(const char *v);
 void kh_aspect_zoom_config(const char *v);          /* task 49, below */
 void kh_aspect_hud_config(const char *cmd,const char *hpv);   /* task 53, below */
 void kh_aspect_title_config(const char *v);                   /* task 53, below */
+static int test_event_bars;
 void kh_aspect_init(void){ kh_aspect_config(getenv("KHNMC_ASPECT"),getenv("KHNMC_ASPECT_LOG"),getenv("KHNMC_ASPECT_TEST_H1"));
+    const char *bars=getenv("KHNMC_ASPECT_TEST_EVENT_BARS");
+    if(bars&&*bars){
+        if(strcmp(bars,"1")||!asp_mode) kh_fatal(NULL,"aspect-test-event-bars: expected 1 with KHNMC_ASPECT=fill");
+        test_event_bars=1;
+        fprintf(stderr,"kh: aspect: TEST AID: draw inactive cinematic bars during events\n");
+    }
     kh_aspect_zoom_config(getenv("KHNMC_FOV_ZOOM"));
     kh_aspect_hud_config(getenv("KHNMC_HUD_SCALE_CMD"),getenv("KHNMC_HUD_SCALE_HP"));
     kh_aspect_title_config(getenv("KHNMC_TITLE_LAYOUT"));
@@ -295,8 +302,8 @@ void kh_screen_check_counts(u64 *presents,u64 *bad){ if(presents) *presents=scr_
  *   frame late and be overwritten.  H4a therefore sits at the entry of f_156f10 and acts on those three objects only when they hold
  *   the exe's rect (y = -1, h = 0x1a2): y = -1 - B, h = 0x1a2 + 2B.  The event letterbox bars: f_156e20 only SETS four objects (top
  *   0x140abb170 and 0x140abb600: y = -1, h = 0x24; bottom 0x140abb050 and 0x140abb4e0: y = 0x17d, h = 0x24; its last setter is a
- *   tail call, so no return address names it) and draws nothing; H4b runs after it: top bars y = -1 - B, h = 0x24 + B (inner edge
- *   unchanged), bottom bars h = 0x24 + B (y unchanged).  H4a also applies the bar rewrite at their draw (f_156f10), in case another
+ *   tail call, so no return address names it) and draws nothing; H4b runs after it: move each bar to its frame edge, keeping its PC height.
+ *   H4a also applies the bar rewrite at their draw (f_156f10), in case another
  *   path set the exe's rect again.  An object found with another rect is left alone and counted.
  * H5 (plan section 5 "scissored 2D", f_126fd0): f_472b20 calls f_126fd0(x0, y0, w = x1 - x0 + 1, h = y1 - y0 + 1) from the GS rect
  *   table at 0x14075e7a0 (+0x58 x0, +0x5a x1, +0x5c y0, +0x5e y1, shard_0095.c L472ba9); f_126fd0 stores them at GX+0xf4 / +0xf8 /
@@ -890,7 +897,9 @@ static const H4Obj h4o[7]={
 static int h4_index(u64 o){ for(int i=0;i<7;i++) if(h4o[i].obj==o) return i; return -1; }
 /* the rect at B extra GS rows on each side for the exe's rect of object kind `kind` */
 static void h4_target(int kind,int B,s16 y0,s16 h0,s16 *y,s16 *h){
-    if(kind==2){ *y=(s16)(y0-B); *h=(s16)(h0+2*B); } else if(kind==1){ *y=(s16)(y0-B); *h=(s16)(h0+B); } else { *y=y0; *h=(s16)(h0+B); } }
+    *y=(s16)(kind==0 ? y0+B : y0-B);
+    *h=(s16)(kind==2 ? h0+2*B : h0);
+}
 typedef struct { _Atomic u64 draws, rewritten, already, other, setter_rewritten, setter_other; s16 oy[4],oh[4]; int no; } H4Stat;
 static H4Stat h4s[7]; static _Atomic u64 h4_e20_calls, h4_off, h4_identity;
 /* 0 = B is 0 (nothing written), 1 = rewritten, 2 = already the extended rect, 3 = another rect (left) */
@@ -912,6 +921,19 @@ void f_156f10(KCtx *g){
             pthread_mutex_lock(&mm); H4Stat *s=&h4s[i]; int k; for(k=0;k<s->no;k++) if(s->oy[k]==y&&s->oh[k]==h) break; if(k==s->no&&s->no<4){ s->oy[k]=y; s->oh[k]=h; s->no++; } pthread_mutex_unlock(&mm); }
         if(asp_mode){ if(asp_off_h4) h4_off++;
             else { int k=h4_apply(g,i,gx_B(g)); if(k==0) h4_identity++; else if(k==1) h4s[i].rewritten++; else if(k==2) h4s[i].already++; else h4s[i].other++; } } }
+    /* In the picture fixture, draw the dormant primary pair through the same virtual sprite draw as L15701f.
+     * The event starter f_3ac350 publishes its task at 0x142a11478. Leave the fade timers and state words alone. */
+    if(test_event_bars&&(i==3||i==5)&&gx_B(g)&&rd64(g,GS_BASE+0x2a11478ull)){
+        u64 obj=h4o[i].obj;
+        if(!rd32(g,obj+0x108)||rd32(g,obj+0x114)){
+            u32 color=rd32(g,obj+0x14);
+            u64 flags=rd64(g,obj+0x90);
+            wr32(g,obj+0x14,0x80000000);
+            wr64(g,obj+0x90,0x44);  /* f_156d00 selects this mode for a black rectangle. */
+            kh_call(g,rd64(g,rd64(g,obj)+8),obj,0,0,0);
+            wr64(g,obj+0x90,flags); wr32(g,obj+0x14,color);
+        }
+    }
     orig_f_156f10(g);
 }
 void f_156e20(KCtx *g){
@@ -1024,6 +1046,7 @@ static const H3Cls h3cls[]={
     {GS_BASE+0x5b2430ull,"dk::INFORMATION_WINDOW",H3_TOP,"container of the INFORMATION bar (no draws), group 7"},
     {GS_BASE+0x5b2400ull,"dk::ScisSpriteMessage",H3_TOP,"INFORMATION text, GS y 14..58, scissored, group 7"},
     {GS_BASE+0x5b1df0ull,"dk::Layout",H3_CENTRE,"the mod's style rank (battle), group 0: measured, it rests at the band's vertical centre (its draws' GS y mid-points 192..224 in both routes, 2,935 of 3,602 in 192..208; band centre 208; GS y 61.7..361.7 is its zoom-in): no edge is nearer, so centred"},
+    {GS_BASE+0x5b23a0ull,"dk::MISSION_GAUGE",H3_TOP,"Shan-Yu gate gauge, group 10; children GS y 17..141.625"},
     {GS_BASE+0x5b2370ull,"dk::COUNTER",H3_TOP,"the mission counter's container (no draws), group 8; its dk::Sprite children: GS y -13.7..96.4 (camp route M)"},
     {GS_BASE+0x5b2460ull,"dk::NEXT_EXP",H3_TOP,"camp route M: GS y 37..54 at the left edge (x -61..-27), group 7 (the INFORMATION widget's EXP line)"},
     {GS_BASE+0x5b2490ull,"dk::GET_MUNNY",H3_TOP,"camp route M: GS y 37..92 at the left edge (x -57..-10), group 7 (the munny line)"},
@@ -1061,6 +1084,7 @@ static const H3Grp h3grp[]={
      * 0x140181da8), so a generic child of the party gauges takes the bottom with them */
     {4,H3_BOTTOM,"the party gauges (dk::GAUGE_FRIEND built by f_181d20 with r8d = 0: f_17ed50 group r8d + r9d + 3 = 4) and their children"},
     {5,H3_BOTTOM,"the party gauges (dk::GAUGE_FRIEND built by f_181d20 with r8d = 1: group 5) and their children"},
+    {10,H3_TOP,"mission gauge children (f_18caa3..f_18cb72, group 10 passed to f_16a900)"},
     {6,H3_TOP,"the enemy gauge (dk::GAUGE_ENEMY)"},
     {8,H3_TOP,"the mission counter (dk::COUNTER and its children: f_18be20 registers them with group 8, 0x14018be6c / 0x14018bf2b; camp route M: GS y -13.7..96.4)"},{7,H3_TOP,"the INFORMATION bar (dk::INFORMATION_WINDOW, ScisSpriteMessage)"},
     {0x11,H3_CENTRE,"the lock-on (dk::LockOn)"},
@@ -1273,13 +1297,13 @@ static void h3_report(FILE *f){
 #define H7_MAXQ (H7_MAXV/4)                /* so every quad of an examined batch has its box in h7_pre's tables */
 #define H7_E 0.125                         /* GS units: a rectangle's corners against its box, and "exactly on a band edge" (R3); GS coordinates are multiples of 1/16 */
 #define H7_R3_MIN 312.0                    /* R3: the rectangle is at least 3/4 of the band tall (GS rows) */
-enum { H7K_FULL=0, H7K_PIECE, H7K_STACK, H7K_ALREADY, H7K_SITE, H7K_SHAPE, H7K_EDGE, H7K_BATCH, H7K_TITLE, H7K_N };
+enum { H7K_FULL=0, H7K_PIECE, H7K_STACK, H7K_ALREADY, H7K_SITE, H7K_SHAPE, H7K_EDGE, H7K_BATCH, H7K_TITLE, H7K_WIPE, H7K_N };
 static const char *h7_kname[H7K_N]={"R1 stretched, full band width","R1 stretched, a band-height piece narrower than the band","R2 stretched, a quad of a batch whose wide stripes stack over the band height",
                                      "already covering the frame's height, left","a band-height rectangle or stripe stack from a draw routine that is not in H7's table, left",
                                      "the batch's box spans the band height but neither R1 nor R2 applies, left",
                                      "R3 moved to the frame's edge, a picture cut by a band edge",
                                      "a band-height rectangle whose batch covers the strips above and below it, left",
-                                     "a part of the title's layout moved to its portrait place (task 53)"};
+                                     "a part of the title's layout moved to its portrait place (task 53)","map-change wipe, outer tiles extended"};
 /* the draw routines whose rectangles H7 may stretch, by the return address f_11a330 finds on the guest stack (it is entered by a jump
  * from f_11a2f0, so this is the address after `call 0x14011a2f0`).  Any other routine is left alone whatever it draws: the pppEi /
  * ppp effect routines (0x1404b3c85, 0x1404ade0d, 0x1404b8de6 ...) submit world-space quads through f_11a330 too, some with the same
@@ -1332,6 +1356,15 @@ static int h7_batch_covers(const float (*bb)[4],const u8 *rect,int n,int q,doubl
             if((double)bb[i][2]<y0&&(double)bb[i][3]>=y0-H7_GAP&&(double)bb[i][3]<=y0+H7_GAP){ y0=bb[i][2]; ch=1; }
             if((double)bb[i][3]>y1&&(double)bb[i][2]<=y1+H7_GAP&&(double)bb[i][2]>=y1-H7_GAP){ y1=bb[i][3]; ch=1; } } }
     return h7_cover(y0,y1,b)<=1.0;
+}
+/* mapj's five tiles in submission order: picture, bottom, top, right, left. Only the caps' outer edges may move. */
+static int h7_wipe_caps(const float bb[][4],const u8 *rect,double xl,double xr,double b){
+    const float *c=bb[0], *lo=bb[1], *hi=bb[2], *r=bb[3], *l=bb[4];
+    for(int i=0;i<5;i++) if(!rect[i]) return 0;
+    return lo[0]==hi[0]&&lo[1]==hi[1]&&lo[0]==l[0]&&lo[1]==r[1]&&lo[0]<=xl&&lo[1]>=xr
+        &&l[1]==c[0]&&r[0]==c[1]&&lo[2]==c[3]&&hi[3]==c[2]
+        &&l[2]==c[2]&&r[2]==c[2]&&l[3]==c[3]&&r[3]==c[3]
+        &&hi[2]<=0&&lo[3]>=416&&(hi[2]>-b||lo[3]<416+b);
 }
 /* R2 for a batch of n quads (boxes bb[i], rect[i]): 0 = its wide rectangles (as wide as the frame xl..xr less 2 T, anywhere in x) do
  * not stack over the band height; 1 = they do and cover the frame already; 2 = they do, *s = the stack's factor.  on[i] = 1 for the
@@ -1408,6 +1441,20 @@ static int h7_pre(KCtx *g){
         for(int i=0;i<4;i++){ v[i][0]=rdf(g,a+(u64)i*stride)-ox; v[i][1]=rdf(g,a+(u64)i*stride+4)-oy; }
         qr[q]=(u8)h7_box(v,bb); h7.quads++;
         if(bb[0]<ab[0]) ab[0]=bb[0]; if(bb[1]>ab[1]) ab[1]=bb[1]; if(bb[2]<ab[2]) ab[2]=bb[2]; if(bb[3]>ab[3]) ab[3]=bb[3]; }
+    if(ra==GS_BASE+0x197033ull&&nq==5&&!h3_depth&&h7_wipe_caps(qb,qr,xl,xr,b)){
+        for(int q=0;q<5;q++){
+            const float *bb=qb[q]; u64 a=vp+(u64)q*4u*stride;
+            float top=q==2&&bb[2]>-b?(float)-b:bb[2];
+            float bottom=q==1&&bb[3]<416+b?(float)(416+b):bb[3];
+            if(top!=bb[2]||bottom!=bb[3]){
+                for(int i=0;i<4;i++){ u64 y=a+(u64)i*stride+4;
+                    wrf(g,y,oy+(rdf(g,y)-oy==bb[2]?top:bottom)); }
+                h7.kind[H7K_WIPE]++; h7_note(g,ra,H7K_WIPE,prim,(u32)count,bb,1.0);
+            }
+            if(__builtin_expect(kh_aspect_m,0)) h7_quadlog(g,ra,prim,q,nq,bb,H7K_WIPE,1.0,top,bottom,a,stride);
+        }
+        h7.batch_ext++; return H7K_WIPE;
+    }
     /* task 53 item 2: the parts of the title's two layout objects (the current dk object is [0x140b1d5d0] or [0x140b1d5d8] while the
      * title task runs) to their portrait places, on a screen taller than wide; R1 / R2 / R3 do not touch them */
     u8 qt[H7_MAXQ]; memset(qt,0,(size_t)(nq>0?nq:0));
@@ -2080,6 +2127,8 @@ static void h3_selftest(KCtx *g){
       ACHECK(kh_aspect_h3_anchor(GS_BASE+0x5b1234ull,3,&w)==H3_CENTRE&&w==H3W_UNLISTED&&kh_aspect_h3_anchor(GS_BASE+0x5b1234ull,6,&w)==H3_CENTRE&&w==H3W_UNLISTED);
       ACHECK(kh_aspect_h3_anchor(GS_BASE+0x5b1234ull,0x11,&w)==H3_CENTRE&&w==H3W_UNLISTED&&kh_aspect_h3_anchor(GS_BASE+0x5b1234ull,9,&w)==H3_CENTRE&&w==H3W_UNCLASSIFIED);
       ACHECK(kh_aspect_h3_anchor(GS_BASE+0x5b1a70ull,8,&w)==H3_TOP&&w==H3W_GROUP&&kh_aspect_h3_anchor(GS_BASE+0x5b2370ull,8,&w)==H3_TOP&&w==H3W_CLASS);   /* the counter */
+      ACHECK(kh_aspect_h3_anchor(GS_BASE+0x5b23a0ull,10,&w)==H3_TOP&&w==H3W_CLASS);
+      for(int i=0;i<3;i++) ACHECK(kh_aspect_h3_anchor(gen[i],10,&w)==H3_TOP&&w==H3W_GROUP);
       ACHECK(kh_aspect_h3_anchor(0,99,&w)==H3_CENTRE&&w==H3W_UNCLASSIFIED);
       ACHECK(h3_value(135.0f,135.0f,H3_TOP)==0.0f&&h3_value(135.0f,135.0f,H3_BOTTOM)==270.0f&&h3_value(135.0f,135.0f,H3_CENTRE)==135.0f);
       ACHECK(h3_value(188.0625f,188.0625f,H3_TOP)==0.0f&&h3_value(188.0625f,188.0625f,H3_BOTTOM)==376.125f); }
@@ -2324,6 +2373,11 @@ static void h7t_screen(KCtx *g,float W,float H){
 }
 static int h7t_all(const float *out,const float (*v)[2],int nv,int raw){ for(int i=0;i<nv;i++) if(fbits(out[i])!=fbits(raw?h7t_raw(v[i][1]):0)) return 0; return 1; }
 static void h7_selftest(KCtx *g){
+    { float bb[5][4]={{43,492,11,461},{-480,1015,461,682},{-480,1015,-213,11},{492,1015,11,461},{-480,43,11,461}};
+      const u8 rect[5]={1,1,1,1,1};
+      ACHECK(h7_wipe_caps(bb,rect,-85.333,597.333,317.65));
+      ACHECK(!h7_wipe_caps(bb,rect,-85.333,597.333,52));
+      bb[3][0]++; ACHECK(!h7_wipe_caps(bb,rect,-85.333,597.333,317.65)); }
     /* the arithmetic */
     ACHECK(h7_cover(0,416,52)==1.25&&h7_cover(-53,469,52)==1.0&&h7_cover(-52,468,52)==1.0&&h7_cover(-1000,2000,52)==1.0);
     ACHECK(h7_cover(-31,448,52)==260.0/239.0&&h7_cover(-30,449,52)==260.0/238.0&&h7_cover(-16,436,52)==260.0/224.0&&h7_cover(-51,461,52)==260.0/253.0&&h7_cover(-8,423,52)==260.0/215.0);
@@ -2498,6 +2552,14 @@ static void h7_selftest(KCtx *g){
           { static const float w6[5][4]={{82,449,47,414},{-346,877,414,595},{-346,877,-137,47},{449,877,47,414},{-346,82,47,414}};
             for(int q=0;q<5;q++) h7t_quad(v+4*q,w6[q][0],w6[q][1],w6[q][2],w6[q][3]);
             H7SUB(H7T_LAY,8,20); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,20,1)&&h7.kind[H7K_BATCH]==c0+3&&h7.kind[H7K_SHAPE]==h0+1); }
+          h7t_screen(g,2007,2853);
+          H7SUB(H7T_LAY,8,20); ACHECK(k&&same);
+          for(int i=0;i<20;i++){
+              double margin=kh_aspect_b(2007,2853);
+              float y=(i==6||i==7)?(float)(416+margin):(i==8||i==9)?(float)-margin:v[i][1];
+              ACHECK(near(out[i],H7T_OY+y,0.001));
+          }
+          h7t_screen(g,W,H);
           /* the camp menu's two side strips in one batch (present 21652) and the save menu's rectangle with its side piece (present
            * 20562) are still stretched: no piece of their batch lies above or below them */
           { double sp=h7_cover(-16,432,b); p0=h7.kind[H7K_PIECE]; f0=h7.kind[H7K_FULL]; h7t_quad(v,-88,8,-16,432); h7t_quad(v+4,504,600,-16,432);
@@ -2898,6 +2960,7 @@ int kh_aspect_selftest(KCtx *g){
     static const double phone_o[4]={188.0625,156.71875,125.375,94.03125};
     for(int i=0;i<4;i++){ double W=phone[i][0],H=phone[i][1];
         ACHECK(near(kh_aspect_r(W,H),1.250437,5e-7)&&kh_aspect_o(W,H)==phone_o[i]&&near(kh_aspect_b(W,H),52.0909,5e-5)); }
+    { extern int kh_window_resize_selftest(void); ACHECK(kh_window_resize_selftest()==0); }
     /* -- KHNMC_SCREEN values -- */
     { int w=0,h=0;
       ACHECK(kh_screen_parse("1920x1350",&w,&h)==0&&w==1920&&h==1350); ACHECK(kh_screen_parse("2670x1878",&w,&h)==0&&w==2670&&h==1878);
@@ -3015,8 +3078,8 @@ int kh_aspect_selftest(KCtx *g){
         KH_RSP(g)=st; u64 ra[2]={0,0}; int nr=m_chain(g,ra,2); KH_RSP(g)=sp0; ACHECK(nr==2&&ra[0]==GS_BASE+0x1704a1&&ra[1]==DK_RA_MODE);
         ga_free(st); ga_free(b); if(!ts){ text_state=0; text_lo=text_hi=0; } }
       /* H4: the rect targets, then the seven objects, then the hooks on the lifted f_156e20 and f_156f10 */
-      { s16 y,h; h4_target(2,52,-1,0x1a2,&y,&h); ACHECK(y==-53&&h==522); h4_target(1,52,-1,0x24,&y,&h); ACHECK(y==-53&&h==88);
-        h4_target(0,52,0x17d,0x24,&y,&h); ACHECK(y==0x17d&&h==88); h4_target(2,53,-1,0x1a2,&y,&h); ACHECK(y==-54&&h==524);
+      { s16 y,h; h4_target(2,52,-1,0x1a2,&y,&h); ACHECK(y==-53&&h==522); h4_target(1,52,-1,0x24,&y,&h); ACHECK(y==-53&&h==36);
+        h4_target(0,52,0x17d,0x24,&y,&h); ACHECK(y==0x17d+52&&h==36); h4_target(2,53,-1,0x1a2,&y,&h); ACHECK(y==-54&&h==524);
         for(int k=0;k<3;k++){ h4_target(k,0,k?-1:0x17d,0x24,&y,&h); ACHECK(y==(k?-1:0x17d)&&h==0x24); }
         u8 osave[7][0x120]; for(int i=0;i<7;i++) memcpy(osave[i],hp(g,h4o[i].obj),0x120);
         for(int i=0;i<7;i++){ const H4Obj *o=&h4o[i]; wr16(g,o->obj+0xe,(u16)o->y0); wr16(g,o->obj+0xa,(u16)o->h0);
@@ -3028,23 +3091,36 @@ int kh_aspect_selftest(KCtx *g){
         for(int i=0;i<7;i++){ memcpy(hp(g,h4o[i].obj),osave[i],0x120); h4s[i].no=0; }
         /* the lifted f_156e20 (it only sets the four bar objects): x and w are the exe's in every mode, y and h per screen and mode */
         s16 px[4],pw[4];
-        static const int scr[3][2]={{1920,1080},{1920,1350},{2670,1878}};
-        for(int sc=0;sc<3;sc++) for(int mode=0;mode<2;mode++){ SCREEN(scr[sc][0],scr[sc][1]); asp_mode=mode; int B=kh_aspect_B(scr[sc][0],scr[sc][1]);
+        static const int scr[][2]={{1920,1080},{1920,1350},{2670,1878},{2007,2853},{2560,1080}};
+        for(int sc=0;sc<5;sc++) for(int mode=0;mode<2;mode++){ SCREEN(scr[sc][0],scr[sc][1]); asp_mode=mode; int B=kh_aspect_B(scr[sc][0],scr[sc][1]);
             for(int i=3;i<7;i++){ wr16(g,h4o[i].obj+0xe,0x5555); wr16(g,h4o[i].obj+0xa,0x5555); }
             int ok=0; st_call(g,f_156e20,NULL,0,&ok); ACHECK(ok);
-            for(int i=3;i<7;i++){ const H4Obj *o=&h4o[i]; s16 ty=o->y0,th=o->h0; if(mode) h4_target(o->kind,B,o->y0,o->h0,&ty,&th);
+            for(int i=3;i<7;i++){ const H4Obj *o=&h4o[i]; s16 ty=o->y0,th=o->h0; if(mode) ty+=(o->kind==1 ? -B : B);
                 ACHECK((s16)rd16(g,o->obj+0xe)==ty&&(s16)rd16(g,o->obj+0xa)==th);
                 if(sc==0&&mode==0){ px[i-3]=(s16)rd16(g,o->obj+0xc); pw[i-3]=(s16)rd16(g,o->obj+0x8); }
                 else ACHECK((s16)rd16(g,o->obj+0xc)==px[i-3]&&(s16)rd16(g,o->obj+0x8)==pw[i-3]); }
-            if(sc==1&&mode==1) ACHECK((s16)rd16(g,h4o[3].obj+0xe)==-53&&(s16)rd16(g,h4o[3].obj+0xa)==88&&(s16)rd16(g,h4o[5].obj+0xe)==381&&(s16)rd16(g,h4o[5].obj+0xa)==88); }
+            if(sc==1&&mode==1) ACHECK((s16)rd16(g,h4o[3].obj+0xe)==-53&&(s16)rd16(g,h4o[3].obj+0xa)==36&&(s16)rd16(g,h4o[5].obj+0xe)==433&&(s16)rd16(g,h4o[5].obj+0xa)==36); }
         ACHECK(pw[0]==2*((s16)~px[0]+0x101)&&pw[1]==pw[0]&&px[1]==px[0]);                                          /* x = ~m, w = 2 (m + 0x101) for the exe's margin m (here from the selftest's GX) */
         for(int i=3;i<7;i++) memcpy(hp(g,h4o[i].obj),osave[i],0x120);
         /* the lifted f_156f10 with the object's state word +0x108 = 0 (it returns before drawing): the fade rect at its entry */
-        for(int i=0;i<3;i++) for(int sc=0;sc<3;sc++) for(int mode=0;mode<2;mode++){ const H4Obj *o=&h4o[i]; SCREEN(scr[sc][0],scr[sc][1]); asp_mode=mode;
+        for(int i=0;i<7;i++) for(int sc=0;sc<5;sc++) for(int mode=0;mode<2;mode++){ const H4Obj *o=&h4o[i]; SCREEN(scr[sc][0],scr[sc][1]); asp_mode=mode;
             wr32(g,o->obj+0x108,0); wr16(g,o->obj+0xe,(u16)o->y0); wr16(g,o->obj+0xa,(u16)o->h0); int ok=0; st_call(g,f_156f10,(u64[]){o->obj},1,&ok);
-            s16 ty=o->y0,th=o->h0; if(mode) h4_target(2,kh_aspect_B(scr[sc][0],scr[sc][1]),o->y0,o->h0,&ty,&th);
+            s16 ty=o->y0,th=o->h0; if(mode){ int B=kh_aspect_B(scr[sc][0],scr[sc][1]); ty+=o->kind==0 ? B : -B; if(o->kind==2) th+=2*B; }
             ACHECK(ok&&(s16)rd16(g,o->obj+0xe)==ty&&(s16)rd16(g,o->obj+0xa)==th);
-            if(sc==1&&mode==1) ACHECK(ty==-53&&th==522); }
+            if(i<3&&sc==1&&mode==1) ACHECK(ty==-53&&th==522); }
+        /* Substitute the game's position setter for the virtual draw: x becomes zero exactly on a forced draw. */
+        u64 event_slot=GS_BASE+0x2a11478ull, saved_event=rd64(g,event_slot), vt=ga_calloc(1,16);
+        wr64(g,vt+8,GS_BASE+0x160cd0ull);
+        for(int pass=0;pass<5;pass++) for(int i=0;i<7;i++){
+            const u64 obj=h4o[i].obj;
+            SCREEN(1920,pass==4?1080:1350); asp_mode=1; test_event_bars=pass!=0;
+            wr64(g,event_slot,pass==2?0:obj); wr64(g,obj,vt); wr32(g,obj+0x108,0);
+            wr32(g,obj+0x114,pass==3); wr16(g,obj+0xc,123); wr32(g,obj+0x14,0x12345678);
+            int ok=0; st_call(g,f_156f10,(u64[]){obj},1,&ok);
+            ACHECK(ok&&rd16(g,obj+0xc)==(((pass==1||pass==3)&&(i==3||i==5))?0:123));
+            ACHECK(rd32(g,obj+0x14)==0x12345678&&rd32(g,obj+0x108)==0);
+        }
+        test_event_bars=0; wr64(g,event_slot,saved_event); ga_free(vt);
         for(int i=0;i<7;i++){ memcpy(hp(g,h4o[i].obj),osave[i],0x120); h4s[i].draws=h4s[i].rewritten=h4s[i].already=h4s[i].other=h4s[i].setter_rewritten=h4s[i].setter_other=0; h4s[i].no=0; }
         h4_e20_calls=h4_identity=0; }
       /* H5: the targets, then the lifted f_126fd0 (it stores x, y, w, h at GX+0xf4 / +0xf8 / +0xfc / +0x100) */

@@ -69,15 +69,20 @@ extern int kh_gfx_vkd3d_on;
 static _Atomic u64 sh_layer_calls, sh_size_calls, sh_size_zero; static _Atomic int sh_presenter_layer; static const char *sh_env_mode="off (unset)";
 /* TASK41: the layer's drawable size the shell handed over (KHNMC_SCREEN=layer sizes the game's screen from it: null_window.c), and
  * whether display ticks are wanted (the shell's display link calls kh_vsync_tick only then: the null app keeps its pacing) */
-static _Atomic u32 sh_layer_w, sh_layer_h; static _Atomic int sh_tick_mode=-1;
-int kh_present_layer_size(uint32_t *w,uint32_t *h){ u32 a=atomic_load(&sh_layer_w), b=atomic_load(&sh_layer_h); if(w) *w=a; if(h) *h=b; return a&&b; }
-static void sh_note_layer(uint32_t w,uint32_t h){ if(w&&h){ atomic_store(&sh_layer_w,w); atomic_store(&sh_layer_h,h); } }
+static _Atomic u64 sh_layer_size; static _Atomic int sh_tick_mode=-1;
+int kh_present_layer_size(uint32_t *w,uint32_t *h){ u64 size=atomic_load(&sh_layer_size); u32 a=size>>32,b=(u32)size; if(w) *w=a; if(h) *h=b; return a&&b; }
+static void sh_note_layer(uint32_t w,uint32_t h){ if(w&&h){ atomic_store(&sh_layer_size,((u64)w<<32)|h); } }
 /* review A41 (verification): the shell hands the drawable size over in EVERY app, also one without the graphics backend (then it has no layer
  * to hand over, and KHNMC_SCREEN=layer still sizes the game's screen from it).  No lock, no counter, no line */
 void kh_present_note_drawable(uint32_t w,uint32_t h){ sh_note_layer(w,h); }
+static void sh_resize(uint32_t w,uint32_t h){
+    extern void kh_shell_drawable_size(u32,u32);
+    u64 size=((u64)w<<32)|h;
+    if(atomic_exchange(&sh_layer_size,size)!=size) kh_shell_drawable_size(w,h);
+}
 static _Atomic u64 sh_resume_calls, sh_size_same;          /* review A41: kh_present_resume_all calls (every build); size calls that changed nothing */
 uint64_t kh_present_resume_calls(void){ return atomic_load(&sh_resume_calls); }
-void kh_present_test_layer_size(uint32_t w,uint32_t h){ atomic_store(&sh_layer_w,w); atomic_store(&sh_layer_h,h); }   /* selftest: no counter moves */
+void kh_present_test_layer_size(uint32_t w,uint32_t h){ atomic_store(&sh_layer_size,((u64)w<<32)|h); }   /* selftest: no counter moves */
 int kh_present_built(void){
 #ifdef KH_GFX_VKD3D
     return 1;
@@ -609,6 +614,7 @@ void kh_present_set_layer(void *layer,uint32_t w,uint32_t h){ atomic_fetch_add(&
 /* review A41 (verification): the shell calls this at every layout pass and every activation; the swapchain is made stale only when the size
  * really changed (an unchanged size is counted, nothing else) */
 void kh_present_set_size(uint32_t w,uint32_t h){ atomic_fetch_add(&sh_size_calls,1); if(!w||!h){ atomic_fetch_add(&sh_size_zero,1); return; }
+    sh_resize(w,h);
     pthread_mutex_lock(&pm_g); if(w!=pr_w||h!=pr_h){ pr_w=w; pr_h=h; atomic_fetch_add(&pr_gen,1); } else atomic_fetch_add(&sh_size_same,1); pthread_mutex_unlock(&pm_g); }
 
 /* ---- the presenter object ---- */
@@ -1492,8 +1498,8 @@ void kh_present_set_layer(void *l,uint32_t w,uint32_t h){
     sh_note_layer(w,h);
     if(!atomic_fetch_add(&sh_layer_calls,1)) fprintf(stderr,"kh: gfx present: kh_present_set_layer(%p, %ux%u) DROPPED: this build has no graphics backend (GFX_VKD3D=0): no picture (counted, reported at exit)\n",l,w,h); }
 void kh_present_set_size(uint32_t w,uint32_t h){
-    if(!w||!h) atomic_fetch_add(&sh_size_zero,1);
-    if(!atomic_fetch_add(&sh_size_calls,1)) fprintf(stderr,"kh: gfx present: kh_present_set_size(%ux%u) DROPPED: this build has no graphics backend (GFX_VKD3D=0) (counted, reported at exit)\n",w,h); }
+    if(!w||!h) atomic_fetch_add(&sh_size_zero,1); else sh_resize(w,h);
+    if(!atomic_fetch_add(&sh_size_calls,1)) fprintf(stderr,"kh: gfx present: kh_present_set_size(%ux%u): no presenter in this build (GFX_VKD3D=0)\n",w,h); }
 /* TASK41: no presenter exists without the backend */
 void kh_present_resume_all(void){ atomic_fetch_add(&sh_resume_calls,1); }
 uint64_t kh_present_parked_after_acquire(void){ return 0; }

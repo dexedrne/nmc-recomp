@@ -215,12 +215,6 @@ static void start_display_link(void){
 }
 - (BOOL)prefersStatusBarHidden { return YES; }
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
-/* owner 2026-11-18: portrait too ("Fill the whole tall screen").  The game takes the drawable's size at start-up (KHNMC_SCREEN=layer), so
- * it fills the screen in the orientation it was STARTED in; a rotation while it runs only changes the presenter's swapchain (the
- * picture is fitted into the new shape) until live resize exists (task 47). */
-/* Portrait (owner 2026-11-18, "Fill the whole tall screen"): the game takes the drawable's size at start-up, so it fills the screen in
- * the orientation it is STARTED in (checked on lavapipe at 2007x2853: the 3D fills the tall frame, the HUD is at the edges; an earlier
- * "black" result was only the loading transition).  A rotation while it runs only refits the picture until live resize exists. */
 #define KH_IOS_PORTRAIT 1
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations { return KH_IOS_PORTRAIT ? UIInterfaceOrientationMaskAll : UIInterfaceOrientationMaskLandscape;   /* owner 11/18: upside-down portrait too */ }
 /* the drawable's size in pixels (bounds x nativeScale), 0 x 0 before the view has a screen */
@@ -242,9 +236,39 @@ static void start_display_link(void){
         fprintf(stderr,"kh: ios: game view %ux%u px (scale %.3f), layer %s; starting the game\n",w,h,self.view.contentScaleFactor,kh_present_built()?"handed to the runtime":"not used (no graphics backend in this app)");
         start_display_link();
         start_game_once();
-    } else if(kh_present_built()) kh_present_set_size(w,h);
+    } else kh_present_set_size(w,h);
 }
-- (void)reportSize { uint32_t w=0,h=0; if(_started && kh_present_built() && [self pixelsW:&w h:&h]) kh_present_set_size(w,h); }
+- (void)reportSize { uint32_t w=0,h=0; if(_started && [self pixelsW:&w h:&h]) kh_present_set_size(w,h); }
+/* Upside-down portrait (owner 2026-11-18, "portrait mode doesnt turn upside down"): iPhones without a Home button never turn an app's
+ * interface upside down, whatever the app allows.  The game is played with a controller (no touch to remap), so the view turns its own
+ * picture 180 degrees while the phone is held upside down in portrait: UIDevice reports the physical orientation even when the
+ * interface does not follow.  Only portrait-with-the-phone-upside-down is turned; landscape left / right is the system's own rotation;
+ * face up / face down / unknown keep the current state.  If a phone does turn the interface itself, io is PortraitUpsideDown and
+ * nothing is turned twice. */
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    [[UIDevice currentDevice] beginGeneratingDeviceOrientationNotifications];
+    __weak KHGameViewController *ws=self;
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIDeviceOrientationDidChangeNotification object:nil queue:NSOperationQueue.mainQueue
+        usingBlock:^(NSNotification *n){ (void)n; [ws flipForDevice:YES]; }];
+}
+- (void)flipForDevice:(BOOL)animated {
+    UIDeviceOrientation d=[UIDevice currentDevice].orientation;
+    if(d!=UIDeviceOrientationPortrait && d!=UIDeviceOrientationPortraitUpsideDown && d!=UIDeviceOrientationLandscapeLeft && d!=UIDeviceOrientationLandscapeRight) return;
+    UIInterfaceOrientation io=self.view.window.windowScene.interfaceOrientation;
+    BOOL flip=(io==UIInterfaceOrientationPortrait && d==UIDeviceOrientationPortraitUpsideDown);
+    CGAffineTransform t=flip?CGAffineTransformMakeRotation((CGFloat)M_PI):CGAffineTransformIdentity;
+    if(CGAffineTransformEqualToTransform(self.view.transform,t)) return;
+    fprintf(stderr,"kh: ios: the phone is %s: the picture is %s\n",flip?"upside down in portrait":"upright or in landscape",flip?"turned 180 degrees":"upright");
+    if(animated) [UIView animateWithDuration:0.25 animations:^{ self.view.transform=t; }]; else self.view.transform=t;
+}
+/* a system rotation (landscape <-> portrait, left <-> right) starts from an upright view and re-checks the phone afterwards */
+- (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
+    self.view.transform=CGAffineTransformIdentity;
+    [super viewWillTransitionToSize:size withTransitionCoordinator:coordinator];
+    __weak KHGameViewController *ws=self;
+    [coordinator animateAlongsideTransition:nil completion:^(id<UIViewControllerTransitionCoordinatorContext> c){ (void)c; [ws reportSize]; [ws flipForDevice:NO]; }];
+}
 @end
 
 @interface KHSceneDelegate : UIResponder <UIWindowSceneDelegate>
