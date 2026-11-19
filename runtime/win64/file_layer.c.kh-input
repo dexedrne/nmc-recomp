@@ -2,6 +2,8 @@
 #include "khnmc_rt.h"
 #include "khnmc_hd.h"
 #include "kh_look.h"
+#include "settings.h"
+#include "route_state.h"
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
@@ -143,12 +145,57 @@ void kh_look_set(int xion){
     pthread_mutex_unlock(&files_lock);
 }
 
-void kh_look_path(KCtx *g,const char *rel,char *host,size_t cap){
+/* Return an immutable guest string. Duplicate message texts may share a BAR offset. */
+static u64 name_overlays;
+static pthread_mutex_t names_lock=PTHREAD_MUTEX_INITIALIZER;
+u64 kh_look_name(KCtx *g,int id,u64 original){
+    if(!original || !kh_look_enabled()) return original;
+    static const char roxas[]="@KHINPUT(slash,data/msg/us/he.bar,15561,5,6371a57675507ca2b56b55306572693e0b838cda8d98eeecb9ec54a9dd62947b)@",xion[]="@KHINPUT(slash,data/msg/us/po.bar,13217,4,3841ba554755fe34fbbe96d4378902dcb824fa5bb69ca360c5ceb31d86e155f6)@";
+    if(strncmp(gstr(g,original),roxas,5)) return original;
+    id&=0x7fff;
+    int suffix=rd8(g,original+5);
+    if(suffix!=0x52){ /* A leading name and colon is the speaker label in 240 NMC system lines. */
+        switch(id){
+        case 0x51f: case 0x52d: case 0x534a:
+        case 0x2ce8: case 0x2d0c: case 0x2e9a:
+            if(suffix) return original;
+            break;
+        case 0x50e5: case 0x511d: case 0x533f: /* possessive save summary titles */
+            if(suffix!=0xee) return original;
+            break;
+        default: return original;
+        }
+    }
+    size_t end=5;
+    while(end<4096){
+        u8 c=rd8(g,original+end++);
+        if(!c) break;
+        if(c<32) end+=kh_route_message_ctl_args(c);
+    }
+    if(end>=4096) kh_fatal(g,"look-name-message-length: %#x",id);
+    size_t tail=end-5;
+    pthread_mutex_lock(&names_lock);
+    u64 e=name_overlays;
+    while(e && (rd32(g,e+8)!=tail || memcmp(hp(g,e+16),hp(g,original+5),tail))) e=rd64(g,e);
+    if(!e){
+        e=ga_alloc(16+tail,16);
+        if(!e) kh_fatal(g,"look-name-allocation");
+        wr64(g,e,name_overlays); wr32(g,e+8,tail);
+        memcpy(hp(g,e+12),xion,4); memcpy(hp(g,e+16),hp(g,original+5),tail);
+        name_overlays=e;
+    }
+    pthread_mutex_unlock(&names_lock);
+    return e+12;
+}
+
+int kh_look_available(const char *rel,char *host,size_t cap){
     const char *root=kh_look_root();
     struct stat st;
-    if(strlen(root)+strlen(rel)+2>cap || !kh_resolve_ci(root,rel,host,cap) ||
-       stat(host,&st) || !S_ISREG(st.st_mode) || st.st_size<=0 || st.st_size>INT_MAX)
-        kh_fatal(g,"player-look-asset: missing or invalid %s/%s",root,rel);
+    return *root && strlen(root)+strlen(rel)+2<=cap && kh_resolve_ci(root,rel,host,cap) &&
+           !stat(host,&st) && S_ISREG(st.st_mode) && st.st_size>0 && st.st_size<=INT_MAX && !access(host,R_OK);
+}
+void kh_look_path(KCtx *g,const char *rel,char *host,size_t cap){
+    if(!kh_look_available(rel,host,cap)) kh_fatal(g,"player-look-asset: missing or invalid %s",rel);
 }
 
 int kh_look_enabled(void){
@@ -298,6 +345,8 @@ static void load(KCtx *g,int bounded,int allocate){
             if(allocate) orig_f_106870(g); else if(bounded) orig_f_106790(g); else orig_f_106700(g);
             int size=allocate?(s32)rd32(g,sizeptr):(s32)KH_RAX(g);
             int hit=allocate?(KH_RAX(g)!=0||(oldsize==-1&&size>=0)):(size>0);
+            u64 data=allocate?KH_RAX(g):dst;
+            if(hit && data && size>0) kh_look_font_loaded(gstr(g,path),hp(g,data),size);
             file_log(g,gstr(g,path),hit?"PACKAGE":NULL,size);
             pthread_mutex_unlock(&files_lock); return;
         }
@@ -310,6 +359,7 @@ static void load(KCtx *g,int bounded,int allocate){
         if(allocate){ ga_free(dst); wr32(g,sizeptr,-2); } else result=-2;
         goto close;
     }
+    kh_look_font_loaded(gstr(g,path),hp(g,dst),n);
     result=allocate?dst:n;
     if(allocate) live_note(dst,n,gstr(g,path));
     if(hd&&n&&!register_resource(g,path,n,dst,fallback)){ if(allocate) ga_free(dst); result=0; }
@@ -339,7 +389,16 @@ int kh_file_selftest(KCtx *g){
     TEST(kh_look_key("./OBJ//p_ex100.MDLX")==-1 && kh_look_key("obj/P_EX100_WI_KH1F.a.us")==40);
     TEST(kh_look_key("remastered/obj/P_EX100.a.us/-36.dds")==37 && !kh_look_key("remastered/obj/P_EX100.a.us/-37.dds"));
     TEST(!kh_look_key("obj/P_EX100.mset") && !kh_look_key("obj/P_EX1000.mdlx"));
-    kh_look_set(0); TEST(!kh_look_key("obj/P_EX100.mdlx"));
+    u64 label=ga_strdup("@KHINPUT(slash,data/msg/us/he.bar,15561,5,6371a57675507ca2b56b55306572693e0b838cda8d98eeecb9ec54a9dd62947b)@");
+    TEST(label && !memcmp(hp(g,kh_look_name(g,0x851f,label)),"@KHINPUT(slash,data/msg/us/po.bar,13217,4,3841ba554755fe34fbbe96d4378902dcb824fa5bb69ca360c5ceb31d86e155f6)@",5));
+    TEST(kh_look_name(g,0x4023,label)==label);
+    u64 speaker=ga_alloc(16,16);
+    memcpy(hp(g,speaker),"@KHINPUT(slash,data/msg/us/he.bar,15561,5,6371a57675507ca2b56b55306572693e0b838cda8d98eeecb9ec54a9dd62947b)@\x52\x01\x07\x00\x44\x00\x00\x48",14);
+    u64 line=kh_look_name(g,0x27a,speaker);
+    TEST(line!=speaker && !memcmp(hp(g,line+4),hp(g,speaker+5),9));
+    TEST(kh_look_name(g,0x27a,speaker)==line); ga_free(speaker);
+    kh_look_set(0); TEST(kh_look_name(g,0x51f,label)==label); ga_free(label);
+    TEST(!kh_look_key("obj/P_EX100.mdlx"));
     player_look=initial_look;
     const char *pack_env=getenv("KHNMC_SCENE_ROXAS_DIR");
     char *initial_pack=pack_env?strdup(pack_env):NULL;
@@ -449,4 +508,7 @@ int kh_file_selftest(KCtx *g){
 void kh_rewind_files(KhRecords *r){
     KH_RECORD(r,real_packages);
     KH_RECORD(r,scene_pack);
+    KH_RECORD(r,name_overlays);
+    KH_RECORD(r,player_look);
+    kh_rewind_look(r);
 }

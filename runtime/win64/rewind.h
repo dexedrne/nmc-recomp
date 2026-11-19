@@ -32,6 +32,7 @@ int kh_retry_rewind_selftest(void);
 void kh_rewind_mod(KhRecords *);
 void kh_rewind_maps(KhRecords *);
 void kh_rewind_ids(KhRecords *);
+void kh_rewind_look(KhRecords *);
 void kh_rewind_files(KhRecords *);
 void kh_rewind_hd(KhRecords *);
 void kh_rewind_cutscenes(KhRecords *);

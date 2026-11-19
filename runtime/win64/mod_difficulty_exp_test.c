@@ -63,8 +63,8 @@ int kh_mod_exp_selftest(KCtx *g){
     wr32(g,GS_BASE+0x9abd48,3); wr32(g,sheet,50); wr8(g,sheet+0x203,3);
     wr32(g,args+8,4); wr32(g,GS_BASE+0x9acf90,0); kh_call(g,target,args,0,0,0); ET(rd32(g,GS_BASE+0x9acf90)==9);
     wr32(g,GS_BASE+0x9acf90,9999998); kh_call(g,target,args,0,0,0); ET(rd32(g,GS_BASE+0x9acf90)==9999999);
-    extern int kh_settings_selftest(void);
-    ET(kh_settings_selftest()==0);
+    extern int kh_settings_selftest(KCtx *);
+    ET(kh_settings_selftest(g)==0);
     /* Compare the same award, player sheet delta, and MP cast through the actual guest entries. */
     ET(kh_setting_set("KHNMC_EXP_MULT","nan")==-1);
     ET(kh_setting_set("KHNMC_EXP_MULT","10.1")==-1);

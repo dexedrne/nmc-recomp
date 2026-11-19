@@ -44,6 +44,7 @@
  *                    `enemies-at-most` walks ([0x142a171c8], next = the id at +0xa90); position at +0x670. */
 #include "route_state.h"
 #include "xion_swap.h"
+#include "kh_look.h"
 #include <math.h>
 u64 kh_input_game_frames(void);
 #define NOW_WORLD   (GS_BASE+0x717008ull)
@@ -312,7 +313,10 @@ void f_3ad9a0(KCtx *g){
     int id=(s32)A0(g);
     u64 overlay=kh_xkb_message(id);
     if(overlay){ SET_RAX(g,overlay); KH_RET(g); }
-    else orig_f_3ad9a0(g);
+    else {
+        orig_f_3ad9a0(g);
+        KH_RAX(g)=kh_look_name(g,id,KH_RAX(g));
+    }
     kh_route_message_lookup_note(id,KH_RAX(g));
     kh_route_menu_text_note(g,id,KH_RAX(g));
 }

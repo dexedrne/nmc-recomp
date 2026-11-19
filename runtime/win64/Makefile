@@ -187,7 +187,7 @@ INPUT_HOOKS += $(PLACE_HOOKS)
 # and 0x3ad9a0 (message id -> text) is noted while a system menu runs: the camp menu's labels (`kh: menu text:`)
 INFO_HOOKS = 17b710 3ad9a0
 INPUT_HOOKS += $(INFO_HOOKS)
-FILE_HOOKS = 1f9a80 3a9cf0 131ef0 106000 1063d0 106700 106790 106870 $(HD_HOOKS) $(PHASE_HOOKS) $(DIFFICULTY_HOOKS) $(MOD_A_HOOKS) $(MOD_B_HOOKS) $(MOD_PARAMS_HOOKS) $(STREAM_HOOKS) $(BGLOAD_HOOKS) $(INPUT_HOOKS)
+FILE_HOOKS = 3b43c0 3b4ec0 3b57b0 1f9a80 3a9cf0 131ef0 106000 1063d0 106700 106790 106870 $(HD_HOOKS) $(PHASE_HOOKS) $(DIFFICULTY_HOOKS) $(MOD_A_HOOKS) $(MOD_B_HOOKS) $(MOD_PARAMS_HOOKS) $(STREAM_HOOKS) $(BGLOAD_HOOKS) $(INPUT_HOOKS)
 # object-id table guard (runtime/idtable.c): 0x4ad390 registers a 32 MiB window in the game's 64-slot id table and encodes the pointer
 IDTABLE_HOOKS = 4ad390
 FILE_HOOKS += $(IDTABLE_HOOKS)

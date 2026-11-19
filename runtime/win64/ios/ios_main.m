@@ -70,6 +70,7 @@ static unsigned short previous_buttons;
 static BOOL suppress_buttons;
 static NSString *option_value(int index){
     const struct kh_option *o=&kh_options[index];
+    if(!strcmp(o->name,"KHNMC_PLAYER_LOOK")) return kh_settings_look()?@"xion":@"roxas";
     NSString *chosen=chosen_options[@(o->name)];
     const char *configured=getenv(o->name);
     return chosen ?: @(configured ?: o->initial);

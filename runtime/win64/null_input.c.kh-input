@@ -39,12 +39,26 @@ static pthread_mutex_t input_lock=PTHREAD_MUTEX_INITIALIZER;
  * with kh_input_host_pad_set from its own thread.  Unlike a script, it drives the right stick (the camera) too. */
 static int host_pad_on; static ScriptPad host_pad; static u64 host_pad_changes, host_pad_logged;
 static u16 host_latched;   /* review r9: buttons pressed since the last poll stay pressed for that poll (a tap shorter than a frame) */
+static int host_chord,host_click,script_chord,consume_sticks;
+static u64 host_pressed,script_pressed;
+int kh_stick_step(int *state,u64 *start,unsigned buttons,u64 now){
+    if((buttons&0xc0)==0xc0){
+        if(!*state){*state=CHORD_PRESS; *start=now;}
+        if(now-*start>=600000000ull) *state=CHORD_HOLD;
+        return *state;
+    }
+    int click=*state==CHORD_PRESS && now-*start<600000000ull;
+    *state=CHORD_IDLE;
+    return click?CHORD_CLICK:CHORD_IDLE;
+}
 static int pad_source(void){ return scripted||host_pad_on; }
 void kh_input_host_pad_set(u16 buttons,u8 lt,u8 rt,s16 lx,s16 ly,s16 rx,s16 ry){
     ScriptPad p={buttons,lt,rt,lx,ly,rx,ry}; u16 was;
     pthread_mutex_lock(&input_lock); was=host_pad.buttons;
     if(memcmp(&p,&host_pad,sizeof p)){ host_pad=p; host_pad_changes++; }
     host_latched|=(u16)(buttons&~was);
+    if(((buttons^was)&0xc0) && host_pad_on && !scripted &&
+       kh_stick_step(&host_chord,&host_pressed,buttons,kh_host_ns())==CHORD_CLICK) host_click=1;
     int logit=was!=buttons && host_pad_logged<200; if(logit) host_pad_logged++;
     pthread_mutex_unlock(&input_lock);
     if(logit) fprintf(stderr,"kh: input: host pad buttons 0x%04x (lt %u rt %u, left %d,%d right %d,%d)\n",buttons,lt,rt,lx,ly,rx,ry);
@@ -63,7 +77,7 @@ int kh_input_host_test(int on){ int was=host_pad_on; host_pad_on=on; pthread_mut
  * just before the lock must not fire after the resume).  Returns the buttons that were held or latched, | 0x10000 when a stick or trigger was off centre (0 = it was neutral already). */
 unsigned kh_input_host_pad_neutral(void){
     pthread_mutex_lock(&input_lock); u16 was=(u16)(host_pad.buttons|host_latched); int moved=host_pad.lt||host_pad.rt||host_pad.lx||host_pad.ly||host_pad.rx||host_pad.ry;
-    if(was||moved) host_pad_changes++; memset(&host_pad,0,sizeof host_pad); host_latched=0; pthread_mutex_unlock(&input_lock);
+    if(was||moved) host_pad_changes++; memset(&host_pad,0,sizeof host_pad); host_latched=0; host_chord=host_click=0; pthread_mutex_unlock(&input_lock);
     if(was||moved) fprintf(stderr,"kh: input: host pad set neutral (buttons 0x%04x were held or latched%s)\n",was,moved?", a stick or trigger was off centre":"");
     return (unsigned)was|(moved?0x10000u:0u); }
 void kh_input_host_pad_get(u16 *buttons,u16 *latched,s16 *lx){ pthread_mutex_lock(&input_lock); if(buttons) *buttons=host_pad.buttons; if(latched) *latched=host_latched; if(lx) *lx=host_pad.lx; pthread_mutex_unlock(&input_lock); }   /* selftest */
@@ -709,6 +723,20 @@ invalid: kh_fatal(g,"scripted XInput: invalid %s line %u%s%s",path,lineno,*why?"
 static KhPadHistory history;
 static size_t history_capacity, replay_index;
 static const KhPadHistory *replay;
+/* Route durations are in game frames. A physical click uses the controller
+ * event timestamps even when both edges fall between rendered frames. */
+int kh_stick_action(u64 frame){
+    pthread_mutex_lock(&input_lock);
+    int action=CHORD_IDLE;
+    if(host_pad_on && !scripted && !replay){
+        if(host_click){ action=CHORD_CLICK; host_click=0; }
+        else if(host_chord) action=kh_stick_step(&host_chord,&host_pressed,host_pad.buttons,kh_host_ns());
+    }else if(script_chord || (last_pad.buttons&0xc0)==0xc0){
+        action=kh_stick_step(&script_chord,&script_pressed,last_pad.buttons,frame*1000000000ull/60);
+    }
+    pthread_mutex_unlock(&input_lock);
+    return action;
+}
 static void resize_history(size_t n){
     if(n<=history_capacity) return;
     size_t cap=n+128;
@@ -777,7 +805,11 @@ u32 kh_input_state(KCtx *g,u32 slot,u64 out,u64 frame){
     else { pad=host_pad; pad.buttons|=host_latched; host_latched=0; }   /* the shell's controller (KHNMC_INPUT=host); a tap shorter than a frame is seen once */
     if(kh_cut_enabled) cut_pad_sample(&pad);
     if(!packet || memcmp(&last_pad,&pad,sizeof pad)){ packet++; last_pad=pad; }
-    wr32(g,out,packet); wr16(g,out+4,pad.buttons); wr8(g,out+6,pad.lt); wr8(g,out+7,pad.rt);
+    /* R3 recenters the native camera. Consume the appearance gesture through
+     * the release of both sticks, keeping single-stick presses available. */
+    if((pad.buttons&0xc0)==0xc0) consume_sticks=1;
+    else if(!(pad.buttons&0xc0)) consume_sticks=0;
+    wr32(g,out,packet); wr16(g,out+4,consume_sticks?pad.buttons&~0xc0:pad.buttons); wr8(g,out+6,pad.lt); wr8(g,out+7,pad.rt);
     wr16(g,out+8,(u16)pad.lx); wr16(g,out+10,(u16)pad.ly); wr16(g,out+12,(u16)pad.rx); wr16(g,out+14,(u16)pad.ry);   /* scripts leave rx/ry 0 */
     pthread_mutex_unlock(&input_lock); return 0;
 }
@@ -2038,6 +2070,10 @@ int kh_input_route33_selftest(KCtx *g){
 #include "rewind.h"
 void kh_rewind_input(KhRecords *r){
     KH_RECORD(r,game_frames);
+    KH_RECORD(r,script_chord);
+    KH_RECORD(r,script_pressed);
+    KH_RECORD(r,consume_sticks);
+    if(r->loading) host_chord=host_click=0;
     KH_RECORD(r,last_pad);
     KH_RECORD(r,packet);
     KH_RECORD(r,route_pad);

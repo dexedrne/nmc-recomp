@@ -1,6 +1,7 @@
 /* selftest.c : runtime self-tests that need no game data beyond the mapped image: allocator, qsort/bsearch, printf engine, wait objects,
  * critical sections across threads, fibers (switch, resume on another thread), the two yield hooks.  `khnmc --selftest`. */
 #include "khnmc_rt.h"
+#include "settings.h"
 #include <unistd.h>
 
 void rt_hook_fiber_yield_150060(KCtx *g); void rt_hook_fiber_yield_150080(KCtx *g);
@@ -200,7 +201,7 @@ static void input_selftest(KCtx *g){
     kh_input_state(g,0,out,10);
     packet=rd32(g,out); kh_input_state(g,0,out,12); CHECK(rd32(g,out)==packet);
     kh_input_state(g,0,out,13); CHECK(rd32(g,out)==packet+1 && rd64(g,out+4)==0 && rd32(g,out+12)==0);
-    kh_input_state(g,0,out,20); CHECK(rd16(g,out+4)==0xe3ef);
+    kh_input_state(g,0,out,20); CHECK(rd16(g,out+4)==(0xe3ef & ~0xc0)); /* both sticks belong to appearance */
     kh_input_state(g,0,out,30); CHECK(rd32(g,out+4)==0 && rd16(g,out+8)==1 && rd16(g,out+10)==0xffff);
     kh_input_state(g,0,out,3001); CHECK(rd64(g,out+4)==0);
     extern void kh_input_attach(KCtx *);
@@ -227,6 +228,20 @@ static void input_selftest(KCtx *g){
       CHECK(kh_input_state(g,0,out,4)==0 && rd16(g,out+4)==0x1000 && rd32(g,out)==p0+2);                 /* seen once ... */
       CHECK(kh_input_state(g,0,out,5)==0 && rd16(g,out+4)==0 && rd32(g,out)==p0+3);                      /* ... then released */
       CHECK(kh_input_state(g,1,out,3)==1167);                                                   /* pad 0 only */
+      kh_input_host_pad_set(0xc0,0,0,0,0,0,0);
+      kh_input_host_pad_set(0,0,0,0,0,0,0);
+      CHECK(kh_stick_action(1000)==CHORD_CLICK && kh_stick_action(1001)==CHORD_IDLE);
+      kh_input_host_pad_set(0x40,0,0,0,0,0,0);
+      kh_input_host_pad_set(0x80,0,0,0,0,0,0);
+      CHECK(kh_stick_action(1002)==CHORD_IDLE);
+      kh_input_host_pad_set(0xc0,0,0,0,0,0,0);
+      CHECK(kh_input_state(g,0,out,6)==0 && !(rd16(g,out+4)&0xc0));
+      kh_input_host_pad_set(0x40,0,0,0,0,0,0);
+      CHECK(kh_input_state(g,0,out,7)==0 && !(rd16(g,out+4)&0xc0));
+      kh_input_host_pad_set(0,0,0,0,0,0,0);
+      kh_input_state(g,0,out,8);
+      kh_input_host_pad_set(0x80,0,0,0,0,0,0);
+      CHECK(kh_input_state(g,0,out,9)==0 && (rd16(g,out+4)&0xc0)==0x80);
       kh_input_host_test(0); CHECK(kh_input_state(g,0,out,4)==1167);
       kh_input_host_test(was); }
     kh_input_load(g,getenv("KHNMC_INPUT_SCRIPT")); ga_free(out);

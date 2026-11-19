@@ -127,16 +127,31 @@ static int canon_rel(const char *in,char *out,size_t cap){
 int kh_look_key(const char *rel){
     int scene=kh_scene_pack_active(), xion=kh_look_enabled();
     if(!scene && !xion) return 0;
+    char key[2300];
+    if(!canon_rel(rel,key,sizeof key)) return 0;
+    if(scene && kh_scene_key(key)) return KH_SCENE_MODEL;
+    if(!xion) return 0;
+    const char *base=!strncasecmp(key,"remastered/",11)?key+11:key;
+    if(!strncasecmp(base,"menu/shopface/",14)){
+        static const char *const shops[]={"menu/shopface/p_ex100.bin","menu/shopface/p_ex101.bin","menu/shopface/p_ex100_wi.bin"};
+        for(size_t i=0;i<sizeof shops/sizeof *shops;i++){
+            char dds[80],host[4096];
+            snprintf(dds,sizeof dds,"remastered/%s/-0.dds",shops[i]);
+            if(!strcasecmp(key,shops[i]) || !strcasecmp(key,dds))
+                return kh_look_available(shops[i],host,sizeof host) && kh_look_available(dds,host,sizeof host);
+        }
+        return 0;
+    }
+    return kh_player_asset_key(key);
+}
+
+int kh_player_asset_key(const char *key){
     static const struct { const char *stem; int face; } keys[]={
         {"P_EX100",36},{"P_EX100_BTLF",47},{"P_EX100_MAGF",38},{"P_EX100_KH1F",47},
         {"P_EX100_TRIF",5},{"P_EX100_ULTF",41},{"P_EX100_HTLF",3},{"P_EX101",36},
         {"P_EX101_BTLF",47},{"P_EX110_BTLF",0},{"P_EX121",36},{"P_EX100_WI",36},
         {"P_EX100_WI_MAGF",38},{"P_EX100_WI_KH1F",39},{"P_EX100_WI_ULTF",41}
     };
-    char key[2300];
-    if(!canon_rel(rel,key,sizeof key)) return 0;
-    if(scene && kh_scene_key(key)) return KH_SCENE_MODEL;
-    if(!xion) return 0;
     int hd=!strncasecmp(key,"remastered/",11);
     const char *obj=key+(hd?11:0);
     if(strncasecmp(obj,"obj/",4)) return 0;

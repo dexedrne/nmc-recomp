@@ -1,5 +1,6 @@
 #include "khnmc_rt.h"
 #include "settings.h"
+#include "kh_look.h"
 #include "mod_config.h"
 #include "route_state.h"
 #include <math.h>
@@ -9,7 +10,7 @@
 #include <pthread.h>
 
 extern int kh_run_is_selftest;
-enum { HP, MP, EXP, DROP, HUD_COMBO, COUNT };
+enum { HP, MP, EXP, DROP, HUD_COMBO, LOOK, COUNT };
 #define BOOL_OPT(name,label,initial) {"KHNMC_" name,label,initial,"0|1",0,1,1}
 #define TWEAK_OPT(name,label,initial) {"KHNMC_TWEAK_" name,label,initial,"off|on",0,1,1}
 #define NUMBER(name,label,initial,min,max,step) {"KHNMC_" name,label,initial,NULL,min,max,step}
@@ -17,6 +18,7 @@ const struct kh_option kh_options[]={
     BOOL_OPT("CHEAT_INF_HP","Infinite HP","0"), BOOL_OPT("CHEAT_INF_MP","Infinite MP","0"),
     NUMBER("EXP_MULT","EXP multiplier","1",0.5,10,0.5), NUMBER("DROP_MULT","Item drop multiplier","1",0.5,10,0.5),
     BOOL_OPT("HUD_HIDE_COMBO","Hold L3 + R3 to hide HUD","0"),
+    {"KHNMC_PLAYER_LOOK","Player appearance","roxas","roxas|xion",0,0,0},
     TWEAK_OPT("DEBUG_DEBUG_ON","Enable debug commands","off"),
     TWEAK_OPT("DEBUG_SOFT_RESET","Allow debug reset to title","off"),
     NUMBER("TWEAK_DEBUG_TURBO_SPEED","Debug turbo speed","7.5",0.1,100,0.1),
@@ -24,7 +26,6 @@ const struct kh_option kh_options[]={
 #define KH_GROUP(key,env,label) TWEAK_OPT(#env,label,"on"),
 #include "tweak_groups.h"
 #undef KH_GROUP
-    {"KHNMC_PLAYER_LOOK","Player appearance","roxas","roxas|xion",0,0,0},
     BOOL_OPT("XKB_MENU","Xion Knows Best difficulty menu","0"), BOOL_OPT("SCENE_ROXAS","Scene Roxas","0"),
     NUMBER("FOV_ZOOM","Portrait camera zoom","1.3",1,1.89,0.05),
     NUMBER("HUD_SCALE_CMD","Portrait command menu","1.25",0.5,3,0.05),
@@ -113,7 +114,7 @@ static int validate(const char *name,const char *value,double *number){
             const char *p=o->choices;
             while(*p){
                 size_t n=strcspn(p,"|");
-                if(strlen(value)==n && !strncmp(p,value,n)){*number=!strcmp(value,"1");return i;}
+                if(strlen(value)==n && !strncmp(p,value,n)){*number=i==LOOK?!strcmp(value,"xion"):!strcmp(value,"1");return i;}
                 p+=n; if(*p) p++;
             }
             return -1;
@@ -192,8 +193,13 @@ static void load_saved_options(void){
     free(line);fclose(in);
 }
 #endif
-static int hide_combo(int,unsigned);
-int kh_settings_selftest(void){
+static _Atomic int look_request=-1;
+int kh_settings_look(void){
+    int request=atomic_load(&look_request);
+    return request>=0?request:kh_look_enabled();
+}
+static int notice_selftest(KCtx *g);
+int kh_settings_selftest(KCtx *g){
     char dir[KH_TMP_MAX],path[KH_TMP_MAX+16],data[200];
     kh_tmp_path(dir,sizeof dir,"khnmc-settings-XXXXXX");
     if(!mkdtemp(dir)) return 1;
@@ -215,12 +221,21 @@ int kh_settings_selftest(void){
     fail|=validate("KHNMC_TWEAK_WORLDS_SYMBOL_ZZ","12,1,2,3,256",&v)>=0;
     fail|=validate("KHNMC_TWEAK_FORMS_VALOR_GROWTH","1,2",&v)>=0;
     fail|=validate("KHNMC_TWEAK_DEBUG_TURBO_SPEED","7.5",&v)<0;
-    fail|=validate("KHNMC_HUD_HIDE_COMBO","1",&v)!=HUD_COMBO || !hide_combo(1,0xc0) || hide_combo(0,0xc0) || hide_combo(1,0x40) || hide_combo(1,0x80);
+    int state=0; u64 start=0;
+    fail|=kh_stick_step(&state,&start,0x40,1)!=CHORD_IDLE;
+    fail|=kh_stick_step(&state,&start,0xc0,2)!=CHORD_PRESS;
+    fail|=kh_stick_step(&state,&start,0x80,600000001)!=CHORD_CLICK;
+    fail|=kh_stick_step(&state,&start,0xc0,900000000)!=CHORD_PRESS;
+    fail|=kh_stick_step(&state,&start,0xc0,1500000000)!=CHORD_HOLD;
+    fail|=kh_stick_step(&state,&start,0,1500000001)!=CHORD_IDLE;
+    fail|=validate("KHNMC_PLAYER_LOOK","xion",&v)!=LOOK || v!=1;
+    fail|=notice_selftest(g);
     unlink(path);rmdir(dir);
     fprintf(stderr,"kh: settings persistence and vector validation: %d failures\n",fail);
     return fail;
 }
 static pthread_mutex_t config_lock=PTHREAD_MUTEX_INITIALIZER;
+static int kh_save_live_option(const char *,const char *,int,double);
 int kh_setting_set(const char *name,const char *value){
     double v; int i=validate(name,value,&v);
     if(i<0) return -1;
@@ -238,6 +253,10 @@ int kh_setting_set(const char *name,const char *value){
         debug_pending=i-(kh_option_count-DEBUG_COUNT);
         pthread_mutex_unlock(&config_lock);return 0;
     }
+    if(i==LOOK){atomic_store(&look_request,(int)v); return 0;}
+    return kh_save_live_option(name,value,i,v);
+}
+static int kh_save_live_option(const char *name,const char *value,int i,double v){
     const char *dir=getenv("KH_DOCS"); char docs[4096];
 #if KH_IOS_PATHS
     const char *app=getenv("KH_APP_HOME");
@@ -317,7 +336,231 @@ void kh_settings_init(void){
     }
 }
 _Atomic int kh_hide_hud;
-static int hide_combo(int enabled,unsigned buttons){ return enabled && (buttons&0xc0)==0xc0; }
+/* f_18deb0 replaces the active INFORMATION line. Keep transient feedback off
+ * that widget so mission scripts retain their own message and timing. */
+static const u8 look_text[][18]={
+    {0x45,0xa2,0xa8,0xa7},                         /* Xion */
+    {0x3f,0xa8,0xb1,0x9a,0xac},                    /* Roxas */
+    {0x30,0x9a,0xa7,0x57,0xad,1,0xac,0xb0,0xa2,0xad,0x9c,0xa1,1,0xa7,0xa8,0xb0}
+};
+static _Atomic u64 notice; /* expiry in host ns, with message index in low two bits */
+u8 kh_look_font[65536];
+static const char *const notice_lines[]={"Xion","Roxas","Can't switch now"};
+static _Atomic int font_ready; /* zero while loading, negative for an unsupported atlas */
+void kh_look_font_loaded(const char *path,const u8 *bar,size_t n){
+    /* Called under files_lock for both loose and packaged data. f_3e2470
+     * uploads the first sys member as a 512-wide 4-bit system font. */
+    if(atomic_load(&font_ready)) return;
+    size_t len=strlen(path);
+    const char suffix[]="fontimage.bar";
+    if(len<sizeof suffix-1 || strcasecmp(path+len-(sizeof suffix-1),suffix)) return;
+    if(n<32 || memcmp(bar,"BAR\1",4) || memcmp(bar+16,"\x24\0\0\0sys",8)) goto invalid;
+    u32 offset,size;
+    memcpy(&offset,bar+24,4); memcpy(&size,bar+28,4);
+    if(offset>n || size>n-offset || size<sizeof kh_look_font) goto invalid;
+    memcpy(kh_look_font,bar+offset,sizeof kh_look_font);
+    atomic_store(&font_ready,1);
+    return;
+invalid:
+    atomic_store(&font_ready,-1);
+}
+static const u8 *visible_notice(u64 state,u64 now){
+    return now<(state & ~3ull)?look_text[state & 3]:NULL;
+}
+const u8 *kh_look_notice(void){
+    u64 state=atomic_load(&notice);
+    if(!state) return NULL;
+    int ready=atomic_load(&font_ready);
+    if(!ready) return NULL;
+    if(ready<0) kh_fatal(NULL,"look-notice-system-font-unavailable");
+    u64 now=kh_host_ns();
+    /* A stick click during boot may arrive before the game loads its font. */
+    if(state<=3){
+        u64 active=((now+2000000000ull) & ~3ull) | (state-1);
+        if(!atomic_compare_exchange_strong(&notice,&state,active)) return NULL;
+        state=active;
+    }
+    const u8 *text=visible_notice(state,now);
+    if(!text) atomic_compare_exchange_strong(&notice,&state,0);
+    return text;
+}
+static int notice_selftest(KCtx *g){
+    u64 p=ga_alloc(sizeof look_text[0],16);
+    if(!p) return 1;
+    int bad=0;
+    for(unsigned i=0;i<3;i++){
+        char decoded[40];
+        memcpy(hp(g,p),look_text[i],sizeof look_text[i]);
+        kh_route_message_text(g,p,decoded,sizeof decoded);
+        bad|=strcmp(decoded,notice_lines[i])!=0 ||
+             visible_notice(2000000000ull|i,1999999999ull)!=look_text[i] ||
+             visible_notice(2000000000ull|i,2000000000ull)!=NULL;
+    }
+    ga_free(p);
+    return bad || visible_notice(0,0)!=NULL;
+}
+static void show_look_notice(int index,u64 frame){
+    atomic_store(&notice,index+1);
+    fprintf(stderr,"kh: appearance notice: game frame %llu: \"%s\"\n",(unsigned long long)frame,notice_lines[index]);
+}
+/* A Drive change destroys the actor and its weapons. Use its model and material
+ * binding operations on the live render instance, retaining the pose and sheet. */
+struct look_art { char stem[40]; int mode; u64 body,face; };
+static struct look_art art[30];
+static u64 face_actor,face_instance,face_model,face_bar;
+static u64 last_switch;
+/* A frame already submitted may still reference the old instance. Retire it
+ * with the actor, at the same native teardown boundary as the active one. */
+static struct idle_render { u64 owner,instance; } idle[80]; /* native sheet pool */
+static void free_render(KCtx *g,u64 inst){
+    u64 model=rd64(g,inst+0x20),allocator=kh_call(g,GS_BASE+0x152590,0,0,0,0);
+    kh_call(g,rd64(g,rd64(g,model)+0x48),model,allocator,inst,0);
+}
+static void end_look_actor(KCtx *g){
+    if(!last_switch) return;
+    if(A0(g)==face_actor) face_actor=face_instance=face_model=face_bar=0;
+    for(size_t i=0;i<80;i++) if(idle[i].owner==A0(g)){
+        KCtx ctx=*g;
+        free_render(&ctx,idle[i].instance);
+        idle[i]=(struct idle_render){0};
+        break;
+    }
+}
+void orig_f_3b43c0(KCtx *); void f_3b43c0(KCtx *g){ end_look_actor(g); orig_f_3b43c0(g); }
+void orig_f_3b4ec0(KCtx *); void f_3b4ec0(KCtx *g){ end_look_actor(g); orig_f_3b4ec0(g); }
+void orig_f_3b57b0(KCtx *);
+void f_3b57b0(KCtx *g){
+    u64 actor=A0(g);
+    if(!face_bar || actor!=face_actor || rd64(g,actor+0x7b0)!=face_instance || rd64(g,actor+0xa88)!=face_model){
+        orig_f_3b57b0(g); return;
+    }
+    u64 native=rd64(g,actor+0x928);
+    wr64(g,actor+0x928,face_bar);
+    orig_f_3b57b0(g);
+    wr64(g,actor+0x928,native);
+}
+static u64 look_bar(KCtx *g,const char *stem,const char *ext,u64 native){
+    char name[72];
+    int n=snprintf(name,sizeof name,"obj/%s.%s",stem,ext);
+    if(n<0 || (size_t)n>=sizeof name) return 0;
+    u64 path=ga_strdup(name);
+    int size=(s32)kh_call(g,GS_BASE+0x3a09b0,path,0,0,0);
+    u64 bar=size>=16?ga_alloc(size,128):0;
+    if(bar && (s32)kh_call(g,GS_BASE+0x3f9850,path,bar,0,0)!=size){
+        ga_free(bar); bar=0;
+    }
+    ga_free(path);
+    if(bar){
+        wr8(g,bar+3,(rd8(g,bar+3)&63)|(rd8(g,native+3)&192));
+        kh_call(g,GS_BASE+0x3a64f0,bar,0,0,0);
+        kh_call(g,GS_BASE+0x3a6840,bar,0,0,0);
+    }
+    return bar;
+}
+static int bind_look(KCtx *g,KhPlayerSheet p,const char *stem,int target){
+    u64 obj=p.obj,inst=rd64(g,obj+0x7b0);
+    if(!inst || !rd64(g,obj+0xa88) || !rd64(g,obj+0x920) || !rd64(g,obj+0x928) ||
+        rd64(g,inst+0x20)!=rd64(g,obj+0xa88)) return 0;
+    struct look_art *a=art;
+    while(a<art+30 && a->stem[0] && (a->mode!=target || strcmp(a->stem,stem))) ++a;
+    if(a==art+30) return 0;
+    snprintf(a->stem,sizeof a->stem,"%s",stem); a->mode=target;
+    if(!a->body) a->body=look_bar(g,stem,"mdlx",rd64(g,obj+0x920));
+    if(!a->face) a->face=look_bar(g,stem,"a.us",rd64(g,obj+0x928));
+    if(!a->body || !a->face) return 0;
+    u64 native=rd64(g,obj+0x920),face=a->face;
+    u64 original=kh_call(g,GS_BASE+0x3a6420,native,4,0,0);
+    u64 wanted=kh_call(g,GS_BASE+0x3a6420,a->body,4,0,0);
+    if(!original || !wanted) return 0;
+    /* All 15 X5 model members differ in length from their Roxas recipient.
+     * Keep the native instance on a room/form load that already selected it. */
+    if(rd32(g,original+12)==rd32(g,wanted+12)) face=rd64(g,obj+0x928);
+    else wr64(g,obj+0x920,a->body);
+    u64 model=kh_call(g,GS_BASE+0x3e62e0,obj+0x910,0,0,0);
+    u64 tex=kh_call(g,GS_BASE+0x3e6310,obj+0x910,0,0,0);
+    wr64(g,obj+0x920,native);
+    if(!model || !tex || rd64(g,model)!=rd64(g,rd64(g,obj+0xa88))) return 0;
+    int changed=rd64(g,obj+0xa88)!=model;
+    if(changed){
+        size_t slot=(p.sheet-(GS_BASE+0x2a17290))/0x278;
+        if(slot>=80 || (idle[slot].owner && idle[slot].owner!=obj)) return 0;
+        u64 other=idle[slot].instance;
+        if(!other || rd64(g,other+0x20)!=model){
+            u64 allocator=kh_call(g,GS_BASE+0x152590,0,0,0,0);
+            u64 next=kh_call(g,rd64(g,rd64(g,model)+0x40),model,allocator,0,0);
+            if(!next) return 0;
+            kh_call(g,GS_BASE+0x1a4bb0,next,tex,0,0);
+            kh_call(g,GS_BASE+0x1a4e30,next,0,0,0);
+            if(other) free_render(g,other);
+            other=next;
+        }
+        idle[slot]=(struct idle_render){obj,inst};
+        inst=other;
+        wr64(g,obj+0xa88,model);
+        wr64(g,obj+0x7b0,inst);
+        wr64(g,obj+0x7e0,tex);
+    }
+    face_bar=face; face_actor=obj; face_instance=inst; face_model=model;
+    if(!changed) return 1;
+    /* f_180900 refreshes dk::FACE separately from gauge visibility (f_16c250). */
+    u64 gauge=rd64(g,GS_BASE+0xabd248);
+    if(gauge && rd64(g,gauge+0x40)==obj){
+        u64 widget=gauge+0x50;
+        kh_call(g,GS_BASE+0x17eb30,widget,obj,rd32(g,gauge+0x20),0);
+        if(!rd8(g,widget+0x304)) kh_fatal(g,"look-gauge-face-bind: %s",stem);
+    }
+    return 1;
+}
+static void look_frame(KCtx *g,int target,u64 frame){
+    int refresh=target<0;
+    if(refresh){
+        KhPlayerSheet active;
+        if(!kh_route_player_sheet(g,&active) ||
+           (active.obj==face_actor && rd64(g,active.obj+0x7b0)==face_instance &&
+            rd64(g,active.obj+0xa88)==face_model)) return;
+        target=kh_look_enabled();
+    }else if(target==kh_look_enabled()) return;
+    KhPlayerSheet player;
+    char stem[40],path[64];
+    u64 cmds; int windows,waiting;
+    kh_route_field_parts(g,&cmds,&windows,&waiting);
+    const char *line="Can't switch now";
+    int notice_index=2;
+    if(!cmds || windows || rd8(g,GS_BASE+0x9ba8d1) || rd8(g,GS_BASE+0x2a11428) || rd8(g,GS_BASE+0x9006b0) || rd64(g,GS_BASE+0x2a11478) ||
+       rd64(g,GS_BASE+0x2ae9fa8) || rd64(g,GS_BASE+0x2a11268) || /* Roxas parked during XKB ownership */
+       rd32(g,GS_BASE+0x2a10504) || rd64(g,GS_BASE+0x9ba928) ||
+       (!refresh && last_switch && frame>=last_switch && frame-last_switch<60) ||
+       !kh_route_player_sheet(g,&player) || player.hp<=0 ||
+       !kh_route_object_name(g,player.obj,stem,sizeof stem)) goto feedback;
+    snprintf(path,sizeof path,"obj/%s.mdlx",stem);
+    if(kh_player_asset_key(path)!=-1) goto feedback;
+    if(target){
+        char face[96],host[4096];
+        if(!kh_look_available(path,host,sizeof host)) {line="Xion model missing"; goto feedback;}
+        snprintf(path,sizeof path,"obj/%s.a.us",stem);
+        snprintf(face,sizeof face,"remastered/%s/-%d.dds",path,kh_player_asset_key(path)-1);
+        if(!kh_look_available(path,host,sizeof host) || !kh_look_available(face,host,sizeof host)){
+            line="Xion portrait missing"; goto feedback;
+        }
+    }
+    KCtx ctx=*g;
+    kh_look_set(target);
+    if(!bind_look(&ctx,player,stem,target)){
+        if(!refresh) kh_look_set(!target);
+        line="Appearance resources unavailable";
+        goto feedback;
+    }
+    if(refresh) return;
+    line=target?"Xion":"Roxas";
+    notice_index=target?0:1;
+    if(kh_save_live_option("KHNMC_PLAYER_LOOK",target?"xion":"roxas",LOOK,target))
+        kh_fatal(g,"look-settings-save");
+    last_switch=frame;
+feedback:
+    if(refresh) return;
+    kh_warn("player appearance: %s (frame %llu)",line,(unsigned long long)frame);
+    show_look_notice(notice_index,frame);
+}
 void kh_settings_frame(KCtx *g,uint64_t frame){
     while(pending && pending->frame<=frame){
         struct change *c=pending; pending=c->next;
@@ -326,9 +569,11 @@ void kh_settings_frame(KCtx *g,uint64_t frame){
         free(c);
     }
     if(schedule_storage && !pending){free(schedule_storage);schedule_storage=NULL;}
-    extern u16 kh_input_buttons(void);
-    int enabled=atomic_load(&values[HUD_COMBO])!=0;
-    atomic_store(&kh_hide_hud,hide_combo(enabled,kh_input_buttons()));
+    int action=kh_stick_action(frame);
+    atomic_store(&kh_hide_hud,action==CHORD_HOLD && values[HUD_COMBO]!=0);
+    int target=atomic_exchange(&look_request,-1);
+    if(action==CHORD_CLICK) target=!kh_look_enabled();
+    if(g && (target>=0 || last_switch)) look_frame(g,target,frame);
     if(mp_probe && frame==mp_probe){
         KhPlayerSheet p;
         if(!kh_route_player_sheet(g,&p) || p.mp<2) kh_fatal(g,"settings-mp-probe: no active player with MP");
@@ -418,4 +663,18 @@ float kh_drop_roll_test(float chance,float roll,u16 item){
 void f_3dc170(KCtx *g){
     if(values[DROP]==1 && !test_log) orig_f_3dc170(g);
     else kh_drop_roll(g);
+}
+
+#include "rewind.h"
+void kh_rewind_look(KhRecords *r){
+    u64 legacy_notice=0; /* former guest message buffer slot */
+    KH_RECORD(r,legacy_notice);
+    if(r->loading) atomic_store(&notice,0);
+    KH_RECORD(r,art);
+    KH_RECORD(r,idle);
+    KH_RECORD(r,face_actor);
+    KH_RECORD(r,face_instance);
+    KH_RECORD(r,face_model);
+    KH_RECORD(r,face_bar);
+    KH_RECORD(r,last_switch);
 }

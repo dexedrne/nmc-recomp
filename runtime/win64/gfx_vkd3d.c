@@ -1297,6 +1297,7 @@ void kh_vkd3d_serialize_rootsig(KCtx *g){
 }
 
 /* ---- swap chain (the guest object is null_d3d12.c's: +32 width, +36 height, +40 present counter, +48 latency event) ------------ */
+#include "settings.h"
 #define SW_PTR 88                               /* guest swap-chain object: host Swap* */
 #define NBUF 3
 /* TASK36 (plan step 6): the back buffers are VkImages WE own, made on vkd3d's VkDevice with vkd3d's own settings for a committed
@@ -1311,6 +1312,7 @@ void kh_vkd3d_serialize_rootsig(KCtx *g){
  * check, the gate, a fence signalled on the queue and waited for (in slices), and the presenter's own submissions. */
 typedef struct Swap { struct KhSwapGeneration *generation; u64 obj; ID3D12CommandQueue *queue; ID3D12Device *dev; ID3D12Resource *buf[NBUF]; u32 w,h;
     ID3D12CommandAllocator *alloc; ID3D12GraphicsCommandList *list; ID3D12Fence *fence; u64 fence_val;
+    ID3D12Resource *notice_upload; const u8 *notice_text; unsigned notice_scale, notice_width;
     ID3D12Resource *rb; u64 rb_size; D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp; u8 *seen;
     int bbmode; const KhVk *vk; VkImage img[NBUF]; VkDeviceMemory mem[NBUF]; KhPresenter *pres; } Swap;
 static Swap *swap_of(KCtx *g,u64 o,const char *what){ Swap *s=(Swap*)(uintptr_t)rd64(g,o+SW_PTR); if(!s||s->obj!=o) kh_fatal(g,"gfx-swapchain-state: %s on swap chain 0x%llx that has no vkd3d back buffers",what,P(o)); return s; }
@@ -1505,6 +1507,7 @@ void kh_vkd3d_swap_test_release(KCtx *g,u64 sc){
         if(s->bbmode!=BB_COMMITTED){ bb_drain(g,s,"swap chain release"); bb_images_free(s); }
         ID3D12Resource_Release(s->rb);
     }
+    if(s->notice_upload) ID3D12Resource_Release(s->notice_upload);
     ID3D12GraphicsCommandList_Release(s->list); ID3D12CommandAllocator_Release(s->alloc); ID3D12Fence_Release(s->fence);
     pthread_mutex_lock(&cen_m); if(cen_dev==s->dev) cen_dev=NULL; pthread_mutex_unlock(&cen_m);   /* TASK38: no census read of a device that may be gone */
     ID3D12Device_Release(s->dev); ID3D12CommandQueue_Release(s->queue); free(s->seen); wr64(g,sc+SW_PTR,0); free(s);
@@ -1537,17 +1540,11 @@ static void barrier(ID3D12GraphicsCommandList *l,ID3D12Resource *r,D3D12_RESOURC
     D3D12_RESOURCE_BARRIER x; memset(&x,0,sizeof x); x.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; x.Transition.pResource=r; x.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     x.Transition.StateBefore=a; x.Transition.StateAfter=b; ID3D12GraphicsCommandList_ResourceBarrier(l,1,&x);
 }
-/* copy back buffer idx to the readback buffer and map it; the caller unmaps with readback_done.  Its ExecuteCommandLists + Signal on the
- * game's queue are an admission at the suspend gate (task 39): `where` names the place (waits while the gate is set) */
-static const u8 *readback(KCtx *g,Swap *s,u32 idx,u64 n,const char *where){
+static void begin_frame_copy(KCtx *g,Swap *s){
     HRCHK(ID3D12CommandAllocator_Reset(s->alloc),"ID3D12CommandAllocator::Reset(frame readback)");
     HRCHK(ID3D12GraphicsCommandList_Reset(s->list,s->alloc,NULL),"ID3D12GraphicsCommandList::Reset(frame readback)");
-    barrier(s->list,s->buf[idx],D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_COPY_SOURCE);
-    D3D12_TEXTURE_COPY_LOCATION src,dst; memset(&src,0,sizeof src); memset(&dst,0,sizeof dst);
-    src.pResource=s->buf[idx]; src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex=0;
-    dst.pResource=s->rb; dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint=s->fp;
-    ID3D12GraphicsCommandList_CopyTextureRegion(s->list,&dst,0,0,0,&src,NULL);
-    barrier(s->list,s->buf[idx],D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_PRESENT);
+}
+static void finish_frame_copy(KCtx *g,Swap *s,u64 n,const char *where){
     HRCHK(ID3D12GraphicsCommandList_Close(s->list),"ID3D12GraphicsCommandList::Close(frame readback)");
     ID3D12CommandList *lists[1]={(ID3D12CommandList*)s->list};
     kh_gfx_gate_enter(where);
@@ -1562,6 +1559,70 @@ static const u8 *readback(KCtx *g,Swap *s,u32 idx,u64 n,const char *where){
         if(waited>=600000) kh_fatal(g,"gfx-dump-timeout: the readback of present %llu did not complete within 300 s (fence at %llu, want %llu)",P(n),P(done),P(want));
         struct timespec ts={0,500000}; nanosleep(&ts,0);
     }
+}
+
+static unsigned glyph_ink(u8 code,unsigned x,unsigned y){
+    unsigned cell=code-0x20, px=(cell%28)*18+x, py=(cell/28)*24+y;
+    return (kh_look_font[py*256+px/2]>>((px%2)*4))&3;
+}
+static void draw_look_notice(KCtx *g,Swap *s,u32 idx,u64 n,const u8 *text){
+    unsigned scale=(s->w<s->h?s->w:s->h)/600;
+    if(!scale) scale=1;
+    if(scale>4) scale=4;
+    unsigned h=32*scale;
+    if(text!=s->notice_text || scale!=s->notice_scale){
+        unsigned w=16, advance[18];
+        for(unsigned i=0;text[i];i++){
+            unsigned ink=0;
+            if(text[i]!=1) for(unsigned x=0;x<18;x++) for(unsigned y=0;y<24;y++)
+                if(glyph_ink(text[i],x,y)) ink=x+1;
+            advance[i]=text[i]==1?6:ink+1;
+            w+=advance[i];
+        }
+        w*=scale;
+        unsigned pitch=(w*4+255)&~255u;
+        D3D12_HEAP_PROPERTIES heap={.Type=D3D12_HEAP_TYPE_UPLOAD};
+        D3D12_RESOURCE_DESC desc={.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER,.Width=pitch*h,.Height=1,
+            .DepthOrArraySize=1,.MipLevels=1,.SampleDesc.Count=1,.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+        if(s->notice_upload) ID3D12Resource_Release(s->notice_upload);
+        HRCHK(ID3D12Device_CreateCommittedResource(s->dev,&heap,0,&desc,D3D12_RESOURCE_STATE_GENERIC_READ,NULL,
+            &IID_ID3D12Resource,(void**)&s->notice_upload),"CreateCommittedResource(appearance notice)");
+        u32 *pixels=NULL; D3D12_RANGE none={0,0};
+        HRCHK(ID3D12Resource_Map(s->notice_upload,0,&none,(void**)&pixels),"Map(appearance notice)");
+        const u32 colors[]={0xff203040,0xff647383,0xffaab5c0,0xffffffff};
+        for(unsigned y=0;y<h;y++) for(unsigned x=0;x<w;x++)
+            pixels[y*(pitch/4)+x]=y<scale||y>=h-scale?colors[1]:colors[0];
+        for(unsigned i=0,left=8;text[i];left+=advance[i++]){
+            if(text[i]==1) continue;
+            for(unsigned y=0;y<24*scale;y++) for(unsigned x=0;x<(advance[i]-1)*scale;x++)
+                pixels[(4*scale+y)*(pitch/4)+left*scale+x]=colors[glyph_ink(text[i],x/scale,y/scale)];
+        }
+        ID3D12Resource_Unmap(s->notice_upload,0,NULL);
+        s->notice_width=w; s->notice_scale=scale; s->notice_text=text;
+    }
+    unsigned w=s->notice_width;
+    if(w>s->w || h>s->h) return;
+    D3D12_TEXTURE_COPY_LOCATION src={.pResource=s->notice_upload,.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+    src.PlacedFootprint.Footprint=(D3D12_SUBRESOURCE_FOOTPRINT){DXGI_FORMAT_B8G8R8A8_UNORM,w,h,1,(w*4+255)&~255u};
+    D3D12_TEXTURE_COPY_LOCATION dst={.pResource=s->buf[idx],.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    begin_frame_copy(g,s);
+    barrier(s->list,s->buf[idx],D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_COPY_DEST);
+    ID3D12GraphicsCommandList_CopyTextureRegion(s->list,&dst,(s->w-w)/2,(s->h-h)/5,0,&src,NULL);
+    barrier(s->list,s->buf[idx],D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_PRESENT);
+    finish_frame_copy(g,s,n,"Present (appearance notice)");
+}
+
+/* copy back buffer idx to the readback buffer and map it; the caller unmaps with readback_done.  Its ExecuteCommandLists + Signal on the
+ * game's queue are an admission at the suspend gate (task 39): `where` names the place (waits while the gate is set) */
+static const u8 *readback(KCtx *g,Swap *s,u32 idx,u64 n,const char *where){
+    begin_frame_copy(g,s);
+    barrier(s->list,s->buf[idx],D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION src,dst; memset(&src,0,sizeof src); memset(&dst,0,sizeof dst);
+    src.pResource=s->buf[idx]; src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex=0;
+    dst.pResource=s->rb; dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint=s->fp;
+    ID3D12GraphicsCommandList_CopyTextureRegion(s->list,&dst,0,0,0,&src,NULL);
+    barrier(s->list,s->buf[idx],D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_PRESENT);
+    finish_frame_copy(g,s,n,where);
     u8 *p=NULL; D3D12_RANGE rg={0,(SIZE_T)s->rb_size};
     HRCHK(ID3D12Resource_Map(s->rb,0,&rg,(void**)&p),"ID3D12Resource::Map(readback buffer)");
     if(!p) kh_fatal(g,"gfx-vkd3d-call: Map(readback buffer) returned a null pointer");
@@ -1718,6 +1779,8 @@ void kh_vkd3d_present(KCtx *g,u64 o,u64 n){
     memlow_check(n);                                                    /* review X38 n=2: the gfx-memory-low soft stop, before a dump allocates */
     u32 idx=rd32(g,o+40)%NBUF;
     int want_dump=dump_dir[0]&&n>=dump_from&&n<=dump_to&&n%dump_every==0, want_video=video_wanted(), want_hash=hash_f!=NULL, want_band=band_f!=NULL;
+    const u8 *notice=kh_look_notice();
+    if(notice) draw_look_notice(g,s,idx,n,notice);
     if(cut_dumps){ want_dump=1; cut_dumps--; }
     if(want_dump||want_video||want_hash||want_band){
         u64 t0=kh_host_ns(); const u8 *base=readback(g,s,idx,n,"Present (frame readback)");
