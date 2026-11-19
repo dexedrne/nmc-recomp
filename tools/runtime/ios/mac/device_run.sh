@@ -101,6 +101,7 @@ case "$CLOCK" in ''|frames) ;; *) bad "CLOCK is frames or unset (got '$CLOCK')";
 [ -z "$DUMP_EVERY" ] || case "$DUMP_EVERY" in *[!0-9]*|0*) bad "DUMP_EVERY must be a positive number of presents (got '$DUMP_EVERY')";; esac
 GFX_APP=${GFX_APP:-}; case "$GFX_APP" in ''|0|1) ;; *) bad "GFX_APP is 0 or 1 (got '$GFX_APP')";; esac
 CUTSCENES=${CUTSCENES:-}; CUTSCENES_PACK=${CUTSCENES_PACK:-}                 # TASK50
+# EXTRA_ENV="KHNMC_TITLE_CREDIT=hide" hides the title credit on the next launch (default: show).
 # EXTRA_ENV="KHNMC_A=x KHNMC_B=y" (play and route modes; 11/19): extra switches written as `env` lines with the cutscene line
 #   (e.g. KHNMC_PLAYER_LOOK=xion KHNMC_XKB_MENU=1 KHNMC_SCENE_ROXAS=1); only KHNMC_* names, no spaces in values.
 # LOOK_PACK=DIR (11/19, task 56): every file under DIR on this Mac goes to the app's Documents/looks/xion/<same relative path>

@@ -130,8 +130,14 @@ void kh_aspect_hud_config(const char *cmd,const char *hpv);   /* task 53, below 
 void kh_aspect_title_config(const char *v);                   /* task 53, below */
 static void zoom_storage_init(void);
 static int test_event_bars;
+static int hide_title_credit;
+static _Atomic u64 hidden_credit_batches;
 static void portrait_config(void);
 void kh_aspect_init(void){
+    const char *credit=getenv("KHNMC_TITLE_CREDIT");
+    hide_title_credit=credit && !strcmp(credit,"hide");
+    if(credit && *credit && !hide_title_credit && strcmp(credit,"show"))
+        kh_fatal(NULL,"title-credit-value: KHNMC_TITLE_CREDIT=%s (expected show or hide)",credit);
     portrait_config(); kh_aspect_config(getenv("KHNMC_ASPECT"),getenv("KHNMC_ASPECT_LOG"),getenv("KHNMC_ASPECT_TEST_H1"));
     const char *bars=getenv("KHNMC_ASPECT_TEST_EVENT_BARS");
     if(bars&&*bars){
@@ -1690,8 +1696,28 @@ void f_3afd90(KCtx *g){
     orig_f_3afd90(g);
     memcpy(hp(g,GX+0xa0),save,sizeof save);
 }
+/* f_1969a0 keeps the active sprite table at [rdi+8] and the first part at
+ * [rdi+0x28]. In title LAYD sequence 7 the 39 sprites precede the parts.
+ * Groups 8, 9 and 10 are the underline pair and the two credit rows. */
+static int title_credit_batch(KCtx *g,u64 ra,u64 seq,u32 vertices){
+    if(ra!=GS_BASE+0x197033 && ra!=GS_BASE+0x19701a) return 0;
+    if(!seq || (vertices!=4 && vertices!=8)) return 0;
+    u64 sprites=rd64(g,seq+8), part=rd64(g,seq+0x28);
+    u64 parts=sprites+39*44;
+    if(vertices==8)
+        return part==parts+8*20 && rd32(g,part+16)==28 && rd32(g,part+36)==27;
+    return (part==parts+10*20 && rd32(g,part+16)==20) ||
+           (part==parts+11*20 && rd32(g,part+16)==21);
+}
 void orig_f_11a330(KCtx *);
 void f_11a330(KCtx *g){
+    if(__builtin_expect(hide_title_credit,0) && kh_phase_title_alive() &&
+       title_credit_batch(g,rd64(g,KH_RSP(g)),KH_RDI(g),(u32)KH_RDX(g))){
+        KH_RDX(g)=0; /* the exe's empty submission path still finalizes the vertex buffer */
+        hidden_credit_batches++;
+        orig_f_11a330(g);
+        return;
+    }
     if(__builtin_expect(!asp_mode,1)){ orig_f_11a330(g); return; }                    /* nothing set / pc: exactly the exe */
     int k=h7_pre(g);
     if(k<0){ orig_f_11a330(g); return; }
@@ -2044,6 +2070,7 @@ static void m_report(FILE *f){
 
 /* exit report (runtime/seams.c), only when a switch is set */
 void kh_aspect_report(FILE *f){
+    if(hide_title_credit) fprintf(f,"kh: title credit: %llu batches suppressed\n",P(hidden_credit_batches));
     if(!asp_mode&&!kh_aspect_log) return;
     fprintf(f,"kh: aspect report: KHNMC_ASPECT=%s%s; H1 (0x11c1e0): calls %llu, not narrow %llu, narrow %llu (rewritten to the full height %llu, kept: no 3D view in this frame or the previous one %llu), "
               "result different from the model %llu; narrow calls by game frames since the map pass: same frame %llu, previous frame %llu, 2 or more frames earlier %llu, never %llu; map pass (0x186920) calls %llu; first guest threads: H1 %u, map pass %u\n",
@@ -2581,6 +2608,21 @@ static void h7t_screen(KCtx *g,float W,float H){
 }
 static int h7t_all(const float *out,const float (*v)[2],int nv,int raw){ for(int i=0;i<nv;i++) if(fbits(out[i])!=fbits(raw?h7t_raw(v[i][1]):0)) return 0; return 1; }
 static void h7_selftest(KCtx *g){
+    {
+        u64 seq=ga_calloc(1,0x38), sprites=ga_calloc(1,39*44+13*20), parts=sprites+39*44;
+        wr64(g,seq+8,sprites);
+        const u32 ids[]={5,28,27,20,21,10};
+        for(int i=0;i<6;i++) wr32(g,parts+(7+i)*20+16,ids[i]);
+        for(int i=7;i<=12;i++){
+            u32 count=i==8?8:4;
+            wr64(g,seq+0x28,parts+i*20);
+            ACHECK(title_credit_batch(g,GS_BASE+0x197033,seq,count)==(i==8 || i==10 || i==11));
+            ACHECK(title_credit_batch(g,GS_BASE+0x19701a,seq,count)==(i==8 || i==10 || i==11));
+            ACHECK(!title_credit_batch(g,GS_BASE+0x1977e3,seq,count));
+            ACHECK(!title_credit_batch(g,GS_BASE+0x197033,seq,12));
+        }
+        ga_free(sprites); ga_free(seq);
+    }
     { float bb[5][4]={{43,492,11,461},{-480,1015,461,682},{-480,1015,-213,11},{492,1015,11,461},{-480,43,11,461}};
       const u8 rect[5]={1,1,1,1,1};
       ACHECK(h7_wipe_caps(bb,rect,-85.333,597.333,317.65));
