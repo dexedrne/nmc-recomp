@@ -1,6 +1,7 @@
 /* Loose-first entry points; real packages use the untouched lifted implementation. */
 #include "khnmc_rt.h"
 #include "khnmc_hd.h"
+#include "kh_look.h"
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
@@ -80,14 +81,45 @@ static int relative(KCtx *g,const char *path,char *rel,size_t cap){
     for(char *p=rel;*p;){ size_t n=strcspn(p,"/"); if(n>=512||(n==2&&!strncmp(p,"..",2))) return 0; p+=n; if(*p) p++; }
     return 1;
 }
+static _Atomic int player_look=-1;
+
+void kh_look_set(int xion){
+    pthread_mutex_lock(&files_lock);
+    player_look=!!xion;
+    pthread_mutex_unlock(&files_lock);
+}
+
+void kh_look_path(KCtx *g,const char *rel,char *host,size_t cap){
+    const char *root=getenv("KHNMC_LOOK_DIR");
+    if(!root) root="private/looks/xion";
+    struct stat st;
+    if(strlen(root)+strlen(rel)+2>cap || !kh_resolve_ci(root,rel,host,cap) ||
+       stat(host,&st) || !S_ISREG(st.st_mode) || st.st_size<=0 || st.st_size>INT_MAX)
+        kh_fatal(g,"player-look-asset: missing or invalid %s/%s",root,rel);
+}
+
+int kh_look_enabled(void){
+    int selected=player_look;
+    if(selected>=0) return selected;
+    const char *env=getenv("KHNMC_PLAYER_LOOK");
+    return env && !strcmp(env,"xion");
+}
+
+static int loose_path(KCtx *g,const char *path,const char *what,char *host,size_t cap){
+    char rel[2048];
+    if(!relative(g,path,rel,sizeof rel)||kh_data_denied(g,rel,what)) return 0;
+    if(kh_look_key(rel)){ kh_look_path(g,rel,host,cap); return KH_FILE_LOOK; }
+    const char *root=getenv("KHNMC_DATA"); if(!root) root="data";
+    return strlen(root)+strlen(rel)+2<cap && kh_resolve_ci(root,rel,host,cap);
+}
 /* `what` names the kind of request for the deny list: a listed file is answered exactly as an absent one (data_deny.c) */
 static FILE *open_loose(KCtx *g,const char *path,int *size,const char *what){
-    char rel[2048],host[4096]; FILE *f=NULL; struct stat st;
-    const char *root=getenv("KHNMC_DATA"); if(!root) root="data";
-    if(relative(g,path,rel,sizeof rel)&&!kh_data_denied(g,rel,what)&&strlen(root)+strlen(rel)+2<sizeof host &&
-       kh_resolve_ci(root,rel,host,sizeof host)){
+    char host[4096]; FILE *f=NULL; struct stat st;
+    int source=loose_path(g,path,what,host,sizeof host);
+    if(source){
         f=fopen(host,"rb");
         if(f&&(fstat(fileno(f),&st)||!S_ISREG(st.st_mode)||st.st_size>INT_MAX)){ fclose(f); f=NULL; }
+        if(!f && source==KH_FILE_LOOK) kh_fatal(g,"player-look-open: %s",host);
         if(f) *size=(int)st.st_size;
     }
     return f;
@@ -100,8 +132,7 @@ int kh_cutscene_asset_exists(KCtx *g,const char *path){
 }
 /* For the stream-fd layer (stream_layer.c): the same tree-relative mapping and the same file log as the loaders. */
 int kh_file_loose_path(KCtx *g,const char *path,char *host,size_t cap){
-    char rel[2048]; const char *root=getenv("KHNMC_DATA"); if(!root) root="data";
-    return relative(g,path,rel,sizeof rel)&&!kh_data_denied(g,rel,"stream")&&strlen(root)+strlen(rel)+2<cap&&kh_resolve_ci(root,rel,host,cap);
+    return loose_path(g,path,"stream",host,cap);
 }
 void kh_file_log_entry(KCtx *g,const char *path,const char *source,long long size){ file_log(g,path,source,size>INT_MAX?INT_MAX:(int)size); }
 int kh_file_package_fallback(const char *path){ return package_fallback(path); }
@@ -225,6 +256,13 @@ int kh_file_selftest(KCtx *g){
     setenv("KHNMC_DATA",dir,1); char lp[KH_TMP_MAX+256]; snprintf(lp,sizeof lp,"%s/log",dir); setenv("KHNMC_FILELOG",lp,1);
     u64 name=ga_strdup("mixed.bin"),missing=ga_strdup("missing"),dst=ga_alloc(16,16),sz=ga_alloc(16,16);
 #define TEST(c) do { checks++; if(!(c)){ fprintf(stderr,"file selftest FAIL: %s\n",#c); bad++; } } while(0)
+    int initial_look=player_look;
+    kh_look_set(1);
+    TEST(kh_look_key("./OBJ//p_ex100.MDLX")==-1 && kh_look_key("obj/P_EX100_WI_KH1F.a.us")==40);
+    TEST(kh_look_key("remastered/obj/P_EX100.a.us/-36.dds")==37 && !kh_look_key("remastered/obj/P_EX100.a.us/-37.dds"));
+    TEST(!kh_look_key("obj/P_EX100.mset") && !kh_look_key("obj/P_EX1000.mdlx"));
+    kh_look_set(0); TEST(!kh_look_key("obj/P_EX100.mdlx"));
+    player_look=initial_look;
     TEST(kh_call(g,GS_BASE+0x1063d0,0,name,0,0)==4);
     char prefixed[2048]; snprintf(prefixed,sizeof prefixed,"%s\\.\\MIXED.BIN",gstr(g,GS_BASE+0x2bd4340));
     u64 windows=ga_strdup(prefixed); TEST(kh_call(g,GS_BASE+0x1063d0,0,windows,0,0)==4); ga_free(windows);

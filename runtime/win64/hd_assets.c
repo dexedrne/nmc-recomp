@@ -62,6 +62,7 @@
 #define _GNU_SOURCE
 #include "khnmc_hd.h"
 #include "khnmc_remaster.h"
+#include "kh_look.h"
 #include <dirent.h>
 #include <string.h>
 #include <strings.h>
@@ -90,7 +91,7 @@ typedef struct { char name[32]; uint32_t orig;
 struct HdTable {
     char *key; int64_t fsize; HdTable *next;
     int n; HdEnt *e; u64 gent;
-    int rule, game_mod, mod_files, pkg_n;        /* mod_files: the mod's files in the folder (provenance); pkg_n: entries of the package table */
+    int look, rule, game_mod, mod_files, pkg_n;        /* mod_files: the mod's files in the folder (provenance); pkg_n: entries of the package table */
     int offsets;                                 /* walker offsets of a scanned folder, -1 when nothing was walked */
     int unknown_ext;                             /* scanned folder of a file type without a walker: the package's origOffsets were used */
     int truncated;                               /* scan: mod files beyond the offset count */
@@ -121,6 +122,31 @@ static int canon_rel(const char *in,char *out,size_t cap){
         p=e;
     }
     if(!cap) return 0; out[o]=0; return 1;
+}
+
+int kh_look_key(const char *rel){
+    if(!kh_look_enabled()) return 0;
+    static const struct { const char *stem; int face; } keys[]={
+        {"P_EX100",36},{"P_EX100_BTLF",47},{"P_EX100_MAGF",38},{"P_EX100_KH1F",47},
+        {"P_EX100_TRIF",5},{"P_EX100_ULTF",41},{"P_EX100_HTLF",3},{"P_EX101",36},
+        {"P_EX101_BTLF",47},{"P_EX110_BTLF",0},{"P_EX121",36},{"P_EX100_WI",36},
+        {"P_EX100_WI_MAGF",38},{"P_EX100_WI_KH1F",39},{"P_EX100_WI_ULTF",41}
+    };
+    char key[2300];
+    if(!canon_rel(rel,key,sizeof key)) return 0;
+    int hd=!strncasecmp(key,"remastered/",11);
+    const char *obj=key+(hd?11:0);
+    if(strncasecmp(obj,"obj/",4)) return 0;
+    obj+=4;
+    for(size_t i=0;i<sizeof keys/sizeof *keys;i++){
+        size_t n=strlen(keys[i].stem);
+        if(strncasecmp(obj,keys[i].stem,n)||obj[n]!='.') continue;
+        if(!hd && !strcasecmp(obj+n,".mdlx")) return -1;
+        char suffix[32]=".a.us";
+        if(hd) snprintf(suffix,sizeof suffix,".a.us/-%d.dds",keys[i].face);
+        if(!strcasecmp(obj+n,suffix)) return keys[i].face+1;
+    }
+    return 0;
 }
 
 /* ---- provenance list: the mod's files -------------------------------------------------------------------------------- */
@@ -361,7 +387,8 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
     t->game_mod=gmod; t->mod_files=nmod; t->pkg_n=pt?pt->n:0; t->offsets=-1;
     HdFile *files=NULL; int nf=0; int32_t *offs=NULL; char *served=NULL; int rc=-1;
     char sub[2700],dir[4300],full[3000]; struct stat st;
-    if(!(gmod&&nmod)&&!pt){                                                             /* nothing to pair: no disk access */
+    t->look=kh_look_key(rel);
+    if(t->look<0 || (!(gmod&&nmod)&&!pt)){                                                             /* nothing to pair: no disk access */
         t->rule=R_NONE; t->unserved=nmod; t->e=calloc(1,sizeof *t->e); if(!t->e){ snprintf(err,cap,"out of memory"); goto fail; }
         *out=t; return 0;
     }
@@ -426,6 +453,22 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
         }
         for(int k=0;k<nf;k++) if(!served[k]) t->unserved++;
     }
+    if(t->look>0){
+        int slot=t->look-1;
+        char name[32],key[2600],path[4300];
+        snprintf(name,sizeof name,"-%d.dds",slot);
+        if(slot>=t->n || strcasecmp(t->e[slot].name,name)){
+            snprintf(err,cap,"player-look-hd-slot: %s lacks face entry %s",rel,name); goto fail;
+        }
+        snprintf(key,sizeof key,"remastered/%s/%s",rel,name);
+        kh_look_path(NULL,key,path,sizeof path);
+        HdEnt *e=&t->e[slot];
+        if(stat(path,&st)){ snprintf(err,cap,"player-look-hd-stat: %s",path); goto fail; }
+        if(e->src==SRC_MOD) t->n_mod--; else if(e->src==SRC_VANILLA) t->n_van--; else t->n_null--;
+        free(e->host); e->host=strdup(path);
+        if(!e->host){ snprintf(err,cap,"out of memory"); goto fail; }
+        e->src=SRC_MOD; t->n_mod++; e->size=e->gsize=e->fsize=st.st_size;
+    }
     rc=0;
 fail:
     free_files(files,nf); free(offs); free(served);
@@ -441,7 +484,8 @@ HdTable *kh_hd_begin(KCtx *g,const char *root,const char *rel_in,const unsigned 
     char rel[2300]; if(!canon_rel(rel_in,rel,sizeof rel)||!*rel) kh_fatal(g,"hd assets: no usable tree path in \"%s\"",rel_in);
     pthread_mutex_lock(&hd_lock);
     unsigned b=ci_hash(rel)&1023; HdTable *t;
-    for(t=buckets[b];t;t=t->next) if(t->fsize==n&&key_eq(t->key,rel)) break;
+    int look=kh_look_key(rel);
+    for(t=buckets[b];t;t=t->next) if(t->look==look&&t->fsize==n&&key_eq(t->key,rel)) break;
     if(t){ st_cache_hit++; pthread_mutex_unlock(&hd_lock); cur_table=t; return prev; }
     cfg_load(g,root);
     if(hd_build(root,rel,bytes,n,&t,err,sizeof err)){ pthread_mutex_unlock(&hd_lock); kh_fatal(g,"hd assets: %s",err); }

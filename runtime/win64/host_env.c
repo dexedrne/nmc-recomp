@@ -262,6 +262,7 @@ void kh_host_env_init(int *argc,char ***argv){
     snprintf(p,sizeof p,"%s/kh2fm.exe",he_docs); he_default("KH_EXE",p,0);
     he_default("KH_ROOT",root,0); he_default("KH_DOCS",saves,0);
     snprintf(p,sizeof p,"%s/data",he_docs); he_default("KHNMC_DATA",p,0);
+    snprintf(p,sizeof p,"%s/looks/xion",he_docs); he_default("KHNMC_LOOK_DIR",p,0);
     snprintf(p,sizeof p,"%s/pkgdir",he_docs); he_default("KHNMC_PKGDIR",p,1);
     fprintf(stderr,"kh: host dirs: temporary files in %s\n",kh_tmpdir());
     const char *wd=getenv("KH_ROOT"); he_mkdirs(wd);

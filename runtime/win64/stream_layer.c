@@ -10,6 +10,7 @@
  * original when real packages are registered (same rule as the loaders in file_layer.c).  Nothing is decoded or changed here.
  * Every open is written to KHNMC_FILELOG as `HIT STREAM <size> <path>` or `MISS NONE -1 <path>`. */
 #include "khnmc_rt.h"
+#include "kh_look.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -28,11 +29,13 @@ static int find_stream(int fd){ for(int i=0;i<MAXSTREAM;i++) if(streams[i].fd==f
 
 void f_106da0(KCtx *g){                                   /* OpenStream */
     const char *path=gstr(g,A1(g)); char host[4096]; struct stat st; int fd=-1;
-    if(kh_file_loose_path(g,path,host,sizeof host)){
+    int source=kh_file_loose_path(g,path,host,sizeof host);
+    if(source){
         fd=open(host,O_RDONLY|O_CLOEXEC);
         if(fd>=0&&(fstat(fd,&st)||!S_ISREG(st.st_mode))){ close(fd); fd=-1; }
         if(fd==0){ int d=fcntl(fd,F_DUPFD_CLOEXEC,3); close(fd); fd=d; }               /* the callers treat fd <= 0 as failure */
     }
+    if(fd<0 && source==KH_FILE_LOOK) kh_fatal(g,"player-look-stream-open: %s",host);
     if(fd>0){
         pthread_mutex_lock(&sm); int slot=-1; for(int i=0;i<MAXSTREAM;i++) if(streams[i].fd<=0){ slot=i; break; }
         if(slot<0){ pthread_mutex_unlock(&sm); kh_fatal(g,"stream layer: more than %d open streams",MAXSTREAM); }
