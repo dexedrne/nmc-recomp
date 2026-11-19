@@ -14,6 +14,7 @@
 #   1. install the app; 2. put khnmc.conf (`arg --selftest`, log + status file), a fresh status file and kh2fm.exe into the app's
 #      Documents; 3. start it, retrying every 20 s while iOS refuses because the phone is LOCKED (WAIT_UNLOCK_S, default 1800);
 #   4. read Documents/khnmc.status every 15 s until "exit N" (LIMIT_S, default 1500), then copy khnmc.log back.
+# CUTSCENES=theater THEATER_PACK=FILE installs the isolated Theater pack.
 # CUTSCENES=story (TASK50; play and route modes): the story scenes the Nobody May Cry mod emptied come back (runtime/cutscenes.c):
 #   every configuration this call writes (play, GFX play, the route's) gets env KHNMC_CUTSCENES=story.  The game reads the pack of
 #   original scenes from Documents/data/story-events.khcs (tools/cutscene_pack.py writes it on the build-host); CUTSCENES_PACK=FILE (required, a file
@@ -113,12 +114,23 @@ if [ -n "$SCENE_ROXAS_PACK" ]; then
 fi
 for kv in $EXTRA_ENV; do case "$kv" in KHNMC_*=*) k=${kv%%=*}; case "$k" in *[!A-Z0-9_]*) bad "EXTRA_ENV: bad name '$k'";; esac;; *) bad "EXTRA_ENV: '$kv' is not KHNMC_NAME=value";; esac; done
 [ -z "$LOOK_PACK" ] || [ -d "$LOOK_PACK" ] || bad "LOOK_PACK: no directory '$LOOK_PACK' on this Mac"
-case "$CUTSCENES" in ''|nmc|story) ;; *) bad "CUTSCENES is nmc or story (got '$CUTSCENES')";; esac
-[ "$CUTSCENES" != story ] || [ "$MODE" != selftest ] || bad "CUTSCENES=story is for play and route runs (the selftest tests the switch itself)"
-[ -z "$CUTSCENES_PACK" ] || { [ "$CUTSCENES" = story ] || bad "CUTSCENES_PACK needs CUTSCENES=story"; [ -f "$CUTSCENES_PACK" ] || bad "CUTSCENES_PACK: no file '$CUTSCENES_PACK' on this Mac"; }
-if [ "$CUTSCENES" = story ]; then
-  [ "${SKIP_INSTALL:-0}" != 1 ] || bad "story mode requires installation of the verified signed app"
-  [ -s "$CUTSCENES_PACK" ] || bad "story mode needs CUTSCENES_PACK on this Mac"
+case "$CUTSCENES" in ''|nmc|story|theater) ;; *) bad "CUTSCENES is nmc, story or theater (got '$CUTSCENES')";; esac
+uses_pack(){ [ "$CUTSCENES" = story ] || [ "$CUTSCENES" = theater ]; }
+pack_name=story-events.khcs
+pack_option=CUTSCENES_PACK
+if [ "$CUTSCENES" = theater ]; then
+  [ -z "$CUTSCENES_PACK" ] || bad "use THEATER_PACK for Theater"
+  CUTSCENES_PACK=${THEATER_PACK:-}
+  pack_option=THEATER_PACK
+  pack_name=theater-events.khtr
+elif [ -n "${THEATER_PACK:-}" ]; then
+  bad "THEATER_PACK needs CUTSCENES=theater"
+fi
+! uses_pack || [ "$MODE" != selftest ] || bad "CUTSCENES=$CUTSCENES is for play and route runs (the selftest tests the switch itself)"
+[ -z "$CUTSCENES_PACK" ] || { uses_pack || bad "CUTSCENES_PACK needs CUTSCENES=story"; [ -f "$CUTSCENES_PACK" ] || bad "$pack_option: no file '$CUTSCENES_PACK' on this Mac"; }
+if uses_pack; then
+  [ "${SKIP_INSTALL:-0}" != 1 ] || bad "$CUTSCENES mode requires installation of the verified signed app"
+  [ -s "$CUTSCENES_PACK" ] || bad "$CUTSCENES mode needs $pack_option on this Mac"
 fi
 [ "$GFX" = 1 ] && [ "$GFX_APP" = 0 ] && bad "GFX=1 runs the graphics backend: GFX_APP=0 (an app without it) contradicts that"
 [ "$GFX" = 1 ] && GFX_APP=1
@@ -140,10 +152,16 @@ if [ -n "$GFX_APP" ]; then gfx_has "$APP/KHNMC"; hb=$?
   [ $hb = 0 ] && [ "$GFX_APP" = 0 ] && { say "GFX_APP=0, but the signed app HAS the graphics backend (mac/build.sh iphoneos, then mac/sign_app.sh, both without GFX=1)"; exit 2; }
   say "the signed app $([ $hb = 0 ] && echo 'has the' || echo 'has no') graphics backend, as GFX_APP=$GFX_APP asks; this run uses the $([ "$GFX" = 1 ] && echo 'vkd3d backend (KHNMC_GFX=vkd3dw)' || echo 'null backend')"; fi
 app_has_cutscenes(){ grep -a -q "$pack_digest" "$APP/KHNMC"; }
-if [ "$CUTSCENES" = story ]; then
-  pack_digest=$(shasum -a 256 < "$CUTSCENES_PACK") || { say "cannot hash story pack"; exit 2; }
+if uses_pack; then
+  if [ "$CUTSCENES" = theater ]; then
+    grep -a -q 'theater-entry-without-snapshot' "$APP/KHNMC" || { say "signed app lacks Theater isolation"; exit 2; }
+  fi
+  expected_magic=KHCS
+  [ "$CUTSCENES" != theater ] || expected_magic=KHTR
+  [ "$(head -c 4 "$CUTSCENES_PACK")" = "$expected_magic" ] || { say "wrong pack format for $CUTSCENES"; exit 2; }
+  pack_digest=$(shasum -a 256 < "$CUTSCENES_PACK") || { say "cannot hash $CUTSCENES pack"; exit 2; }
   pack_digest=${pack_digest%% *}
-  [ "${#pack_digest}" = 64 ] && app_has_cutscenes || { say "signed app and reviewed story pack do not match"; exit 2; }
+  [ "${#pack_digest}" = 64 ] && app_has_cutscenes || { say "signed app and selected pack do not match"; exit 2; }
 fi
 printf 'starting\n' > "$OUT/status.init"
 if [ "${SKIP_INSTALL:-0}" != 1 ]; then
@@ -157,7 +175,7 @@ fi
 app_has_logcap(){ grep -a -q 'logcap needs a log directive' "$APP/KHNMC" 2>/dev/null; }
 quiet_lines(){ if app_has_logcap; then echo "logcap 16M"; fi; echo "env KHNMC_GFX_FRAME_LINE_EVERY=600"; }
 # TASK50: the cutscenes line, in every configuration this call writes (the app must know the variable: else it plays the stubs silently)
-cut_lines(){ [ "$CUTSCENES" != story ] || echo "env KHNMC_CUTSCENES=story"; for kv in $EXTRA_ENV; do echo "env $kv"; done; }
+cut_lines(){ if uses_pack; then echo "env KHNMC_CUTSCENES=$CUTSCENES"; fi; for kv in $EXTRA_ENV; do echo "env $kv"; done; }
 if [ -n "$SCENE_ROXAS_PACK" ]; then
   for rel in obj/H_EX500.mdlx remastered/obj/H_EX500.mdlx/-{0,1,2}.dds; do
     cp_to "$SCENE_ROXAS_PACK/$rel" "scene-roxas/$rel" || { say "scene Roxas copy failed at $rel"; exit 1; }
@@ -169,8 +187,8 @@ if [ -n "$LOOK_PACK" ]; then
   while IFS= read -r rel; do cp_to "$LOOK_PACK/$rel" "looks/xion/$rel" || { say "copy of the look pack FAILED at $rel"; exit 1; }; n=$((n+1)); done < "$OUT/look-pack.list"
   say "look pack: $n files copied to Documents/looks/xion"
 fi
-if [ "$CUTSCENES" = story ]; then
-  cp_to "$CUTSCENES_PACK" data/story-events.khcs || { say "copy of the cutscene pack FAILED"; exit 1; }
+if uses_pack; then
+  cp_to "$CUTSCENES_PACK" "data/$pack_name" || { say "copy of the cutscene pack FAILED"; exit 1; }
 fi
 play_conf(){ { echo "# the game (tools/ios/mac/device_run.sh play): the controller is pad 0, sound on, no script, no time limit"; echo "log khnmc.log"; echo "status khnmc.status"; quiet_lines; cut_lines; } > "$OUT/play.conf"; }
 [ -x "$APP/KHNMC" ] && { app_has_logcap || say "the signed app does not know the conf directive logcap (older than TASK43): the play configuration is written without a log size cap"; }

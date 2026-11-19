@@ -169,6 +169,8 @@ void kh_exit_process(int code){
     { extern void kh_import_counts_report(FILE*); kh_import_counts_report(stderr); }      /* KH_IMPORT_COUNTS=1 */
     { extern void kh_import_sites_report(FILE*); kh_import_sites_report(stderr); }        /* KH_IMPORT_SITES=text */
     { extern void kh_libm_args_close(void); kh_libm_args_close(); }                       /* KH_LIBM_ARGS=file */
+    extern void kh_theater_docs_end(void);
+    kh_theater_docs_end();
     kh_report_seams(stderr); { extern void kh_dump_threads(FILE*); if(getenv("KH_DUMP_THREADS")) kh_dump_threads(stderr); } fflush(stderr); fflush(stdout); kh_host_exit(code);
 }
 

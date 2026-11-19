@@ -184,6 +184,8 @@ void f_5375d0(KCtx *g){                                                         
 }
 void orig_f_2cbd80(KCtx *);
 void f_2cbd80(KCtx *g){
+    extern void kh_theater_scene_skip(void);
+    if(guest_return_addr(g)==GS_BASE+SITE_EV_SKIP) kh_theater_scene_skip();
     if(cur.pending) kh_movie_event_end(g,guest_return_addr(g)-GS_BASE,rd32(g,EV_STATE)==4,rd64(g,EV_TASKED_A)!=0&&rd8(g,EV_TASKED_B)!=0);
     extern int kh_cutscenes_end_pending(KCtx *);
     extern void kh_cutscenes_end_snapshot(KCtx *,int);

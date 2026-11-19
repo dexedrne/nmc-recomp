@@ -3,6 +3,7 @@
 KHNMC_CUTSCENES=story serves in its place (runtime/cutscenes.c).
 
   cutscene_pack.py --data TREE --vanilla VANILLA_ARD_US --vanilla-objentry FILE --mod MOD_ROOT [--table OUT.tsv] [--pack OUT.khcs]
+  cutscene_pack.py --theater --data TREE --vanilla VANILLA_ARD_US [--menu MENU.tsv] [--table INVENTORY.tsv] [--pack OUT.khtr]
   cutscene_pack.py --check-pack PACK --vanilla VANILLA_ARD_US      every pack entry decodes and equals the vanilla entry, byte for byte
   cutscene_pack.py --selftest                                      the rules and the pack format on synthetic data (no game data)
 
@@ -11,8 +12,9 @@ ard/us folder (the 289 area files the mod replaces or keeps).  VANILLA objentry 
 mod's own files (SillyBillyMod1): only its map/ folder is read, for the rooms it rebuilt.
 Output is analysis of the owner's own data (the table) and the owner's own data (the pack): never commit either.
 
-Only the PC command forms reviewed in implementation notes and implementation notes may be admitted. Version 2
-pins the entire pack including its sorted inventory, asset alternatives and exact stub templates.
+Story mode admits only the command forms reviewed in implementation notes and implementation notes.
+Isolated Theater admits exact vanilla originals whose required assets are present. Each mode
+pins its own pack including the sorted inventory, asset alternatives and exact stub templates.
 """
 import hashlib, argparse, collections, os, struct, sys
 sys.dont_write_bytecode = True
@@ -21,7 +23,10 @@ import event_refs as E
 
 MOVIE = 0x44
 PACK_MAGIC = b'KHCS'
-CLASS_SAFE, CLASS_EDIT = 1, 2
+CLASS_SAFE, CLASS_EDIT, CLASS_THEATER = 1, 2, 3
+THEATER_MAGIC = b'KHTR'
+THEATER_SHA = '1420a4f2a81ec6ee7545a0fbd95b3bcfa2be12a64c968aface97c2507b9a9623'
+THEATER_COUNT = 612
 
 
 def die(msg):
@@ -149,7 +154,7 @@ def classify(ev_v, changed_rows, exists, replaced_rooms=frozenset()):
     return 'SAFE', ''
 
 
-def pack_bytes(items, inventory, plain, music):
+def pack_bytes(items, inventory, plain, music, magic=PACK_MAGIC):
     # Paths are NUL-terminated groups; | offers alternative locations for one file.
     records, body = [], bytearray()
     start = (16 + 24 * len(items) + 15) & ~15
@@ -161,13 +166,13 @@ def pack_bytes(items, inventory, plain, music):
         for group in assets: body.extend(group.encode('ascii') + b'\0')
         body.append(0)
         body.extend(bytes(-len(body) % 16))
-    head = PACK_MAGIC + struct.pack('<3I', 2, len(items), start + len(body))
+    head = magic + struct.pack('<3I', 2, len(items), start + len(body))
     catalog = b''.join(a.encode('ascii') + n.encode('ascii').ljust(4, b'\0') for a,n in sorted(inventory))
     return (head + b''.join(records)).ljust(start, b'\0') + body + plain + music + catalog
 
 
-def decode_pack(raw, count, digest):
-    if len(raw) < 16 or raw[:4] != PACK_MAGIC: die('cutscenes-pack: bad header')
+def decode_pack(raw, count, digest, magic=PACK_MAGIC):
+    if len(raw) < 16 or raw[:4] != magic: die('cutscenes-pack: bad header')
     ver, n, end = struct.unpack_from('<3I', raw, 4)
     if ver != 2 or count != n: die('cutscenes-pack: version or reviewed count mismatch')
     if hashlib.sha256(raw).hexdigest() != digest: die('cutscenes-pack: reviewed manifest mismatch')
@@ -180,7 +185,7 @@ def decode_pack(raw, count, digest):
     for i in range(n):
         a, k, cl, off, size, h = struct.unpack_from('<4s4s4I', raw, 16 + 24*i)
         if a+k <= previous or a+k not in keys: die('cutscenes-pack: invalid reviewed key')
-        if cl not in (CLASS_SAFE, CLASS_EDIT): die('cutscenes-pack: invalid class')
+        if cl not in ((CLASS_THEATER,) if magic == THEATER_MAGIC else (CLASS_SAFE, CLASS_EDIT)): die('cutscenes-pack: invalid class')
         previous = a+k
         if off % 16 or off < 16+24*n or off+size >= end: die('cutscenes-pack: invalid bounds')
         data = raw[off:off+size]
@@ -188,8 +193,77 @@ def decode_pack(raw, count, digest):
         out[(a.decode(), k.rstrip(b'\0').decode())] = cl, data
     return out
 
-def read_pack(path):
-    with open(path, 'rb') as f: return decode_pack(f.read(), REVIEWED_COUNT, REVIEWED_SHA)
+def read_pack(path, theater=False):
+    with open(path, 'rb') as f:
+        raw = f.read()
+    if theater: return decode_pack(raw, THEATER_COUNT, THEATER_SHA, THEATER_MAGIC)
+    return decode_pack(raw, REVIEWED_COUNT, REVIEWED_SHA)
+
+
+def theater_pack(a):
+    tree = E.Tree(a.data)
+    graph = E.Graph(tree)
+    vanilla = events_of(a.vanilla)
+    nmc = events_of(os.path.join(a.data, 'ard', 'us'))
+    stubs = {k: data for k, data in nmc.items() if stub_like(data)}
+    def available(path):
+        rel = tree.find(path)
+        if not rel: return False
+        full = os.path.join(tree.root, rel)
+        return os.path.isfile(full) and os.path.getsize(full) > 0
+
+    items, reasons = [], {}
+    for key in sorted(stubs):
+        data = vanilla.get(key)
+        if not data or stub_like(data):
+            reasons[key] = 'no-original'
+            continue
+        ev = E.Event(tree, *key, data)
+        if ev.tail != 2:
+            reasons[key] = 'malformed-original'
+            continue
+        groups = sorted(set(asset_groups(ev)) | {'zmovie/en/%s.mp4' % m for m in ev.movies})
+        missing = [group for group in groups if not any(available(path) for path in group.split('|'))]
+        if missing:
+            reasons[key] = 'missing ' + ','.join(missing)
+            continue
+        items.append((*key, CLASS_THEATER, data, groups))
+    if a.table:
+        with open(a.table, 'w') as f:
+            print('area', 'event', 'decision', 'menu_programs', sep='\t', file=f)
+            for key in sorted(stubs):
+                print(*key, reasons.get(key, 'packed'), ','.join('%s/%d' % (w,p) for w,p,_ in graph.theater.get(key, [])), sep='\t', file=f)
+    if a.menu:
+        by_program = collections.defaultdict(set)
+        for key, refs in graph.theater.items():
+            for ref in refs:
+                by_program[ref].add(key)
+        with open(a.menu, 'w') as f:
+            print('chapter', 'heading_id', 'row', 'message_id', 'world', 'variant', 'program', 'progress_flag', 'events', sep='\t', file=f)
+            chapter = row = heading = 0
+            for kind, mid, w, pa, pb, flag in tree.eventviewer:
+                if kind != 1:
+                    chapter += 1
+                    row, heading = 0, mid
+                    for variant, program in zip('AB', (pa,pb)):
+                        print(chapter, heading, row, mid, E.WORLDS[w], variant, program, flag, 'heading', sep='\t', file=f)
+                    continue
+                row += 1
+                world = E.WORLDS[w]
+                for variant, program in zip('AB', (pa,pb)):
+                    keys = sorted(by_program[world, program, mid])
+                    entries = ['%s/%s=%s' % (*key, reasons.get(key, 'packed' if key in stubs else 'retained' if key in nmc else 'absent')) for key in keys]
+                    print(chapter, heading, row, mid, world, variant, program, flag, ';'.join(entries) or 'unmapped', sep='\t', file=f)
+    templates = {len(data): data for data in stubs.values()}
+    raw = pack_bytes(items, stubs, templates[56], templates[68], THEATER_MAGIC)
+    print('Theater: %d scenes, %d bytes, SHA-256 %s' % (len(items), len(raw), hashlib.sha256(raw).hexdigest()))
+    back = decode_pack(raw, THEATER_COUNT, THEATER_SHA, THEATER_MAGIC)
+    if any(data != vanilla[key] for key, (_, data) in back.items()):
+        die('theater original mismatch')
+    if a.pack:
+        with open(a.pack + '.tmp', 'wb') as f: f.write(raw)
+        os.replace(a.pack + '.tmp', a.pack)
+    return 0
 
 
 def run(a):
@@ -247,10 +321,10 @@ def run(a):
 
 
 def check_pack(a):
-    van = events_of(a.vanilla); back = read_pack(a.check_pack); bad = 0
+    van = events_of(a.vanilla); back = read_pack(a.check_pack, a.theater); bad = 0
     for k, (cl, d) in back.items():
         c, tail = E.ev_cmds(d)
-        if tail < 0 or van.get(k) != d or cl not in (CLASS_SAFE, CLASS_EDIT): bad += 1; print('BAD %s/%s' % k)
+        if tail < 0 or van.get(k) != d or cl not in (CLASS_SAFE, CLASS_EDIT, CLASS_THEATER): bad += 1; print('BAD %s/%s' % k)
     print('pack %s: %d entries, %d bad' % (a.check_pack, len(back), bad)); return 1 if bad else 0
 
 
@@ -328,6 +402,15 @@ def selftest():
     raw = pack_bytes([(*key, 1, entry, ['map/aa00.map'])], [key], bytes(56), bytes(68))
     digest = hashlib.sha256(raw).hexdigest()
     assert decode_pack(raw, 1, digest)[key] == (1, entry)
+    viewer = pack_bytes([(*key, CLASS_THEATER, entry, [])], [key], bytes(56), bytes(68), THEATER_MAGIC)
+    viewer_sha = hashlib.sha256(viewer).hexdigest()
+    assert decode_pack(viewer, 1, viewer_sha, THEATER_MAGIC)[key] == (CLASS_THEATER, entry)
+    for data, sha, magic in ((viewer, viewer_sha, PACK_MAGIC), (raw, digest, THEATER_MAGIC),
+                             (viewer, digest, THEATER_MAGIC)):
+        with contextlib.redirect_stderr(io.StringIO()):
+            try: decode_pack(data, 1, sha, magic)
+            except SystemExit: continue
+        raise AssertionError('pack format or SHA confusion')
     for i in (8, 16, 24, 48, len(raw)-1):
         mutated = bytearray(raw); mutated[i] ^= 1
         with contextlib.redirect_stderr(io.StringIO()):
@@ -342,11 +425,16 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--data'); ap.add_argument('--vanilla'); ap.add_argument('--vanilla-objentry'); ap.add_argument('--mod')
     ap.add_argument('--table'); ap.add_argument('--pack'); ap.add_argument('--check-pack'); ap.add_argument('--selftest', action='store_true')
+    ap.add_argument('--theater', action='store_true', help='build or verify the isolated Theater pack')
+    ap.add_argument('--menu', help='write the Theater chapter, row and variant inventory')
     a = ap.parse_args()
     if a.selftest: return selftest()
     if a.check_pack:
         if not a.vanilla: ap.error('--check-pack needs --vanilla')
         return check_pack(a)
+    if a.theater:
+        if not (a.data and a.vanilla): ap.error('--theater needs --data and --vanilla')
+        return theater_pack(a)
     if not (a.data and a.vanilla and a.vanilla_objentry and a.mod): ap.error('--data, --vanilla, --vanilla-objentry and --mod are needed')
     return run(a)
 

@@ -33,6 +33,7 @@ entries = (
     (22, '121d90', '121f09', 'kh_dispatch(g,t4);'),
     (23, '127ed0', '127ed9', 'f_121d90(g);'),
     (24, '135470', '13552f', 'rt_imp_kernel32__SwitchToFiber(g);'),
+    (56, '2b4590', '2b49d4', 'rt_hook_fiber_yield_150060(g);'),
     (27, '1572b0', '157334', 'rt_hook_fiber_yield_150060(g);'),
     (58, '2cb5d0', '2cbc2a', 'rt_hook_fiber_yield_150060(g);'),
     (58, '2cc180', '2cc31a', 'rt_hook_fiber_yield_150060(g);'),

@@ -24,11 +24,14 @@
 # (~/.cache/khnmc-ios-driver.lock) and the driver keeps it to its end (copy, steps, log fetch): a second driver, from any work
 # tree, stops with 75.  A driver started by the holder (build.sh -> sync.sh) shares the holder's lock (inherited fd 9).
 IOS_MAC=${KHNMC_IOS_MAC:-user@macbook}
-IOS_RDIR=Developer/KHNMC                       # relative to the remote home; fixed on purpose
+IOS_RDIR=${KHNMC_IOS_RDIR:-Developer/KHNMC}    # relative to the remote home; fixed unless KHNMC_IOS_RDIR is set (11/19: the office Mac mini
+                                               # builds in khnmc-work/ios/KHNMC: owner rule, the Mac mini works only in ~/khnmc-work)
 IOS_HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 IOS_SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 -o ServerAliveCountMax=6)
 IOS_RSH="ssh -o BatchMode=yes -o ConnectTimeout=20"
 IOS_ENV='export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer; export LC_ALL=C;'
+[ -n "${KHNMC_IOS_RDIR:-}" ] && IOS_ENV="$IOS_ENV export KHNMC_KROOT=\$HOME/$KHNMC_IOS_RDIR;"        # mac/lib.sh KROOT follows the remote root
+[ -n "${KHNMC_IOS_GFXDIR:-}" ] && IOS_ENV="$IOS_ENV export GFX_APPLE_DIR=$KHNMC_IOS_GFXDIR;"       # the Makefile's iOS deps (vkd3d + MoltenVK)
 # TASK38: GFX=1 (the app with the graphics backend: tools/ios/mac/lib.sh) reaches the Mac's scripts through every remote command;
 # without it the remote commands are as before
 case "${GFX:-0}" in 0|1) ;; *) echo "tools/ios: GFX must be 0 or 1 (got '${GFX}')" >&2; exit 2;; esac

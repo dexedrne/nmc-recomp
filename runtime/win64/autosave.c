@@ -129,7 +129,7 @@ void orig_f_3a0660(KCtx *);
 void kh_retry_before_3a0660(KCtx *g);                 /* tweak_options.c (task 60): retry's checkpoint, before the refresh */
 void f_3a0660(KCtx *g){
     kh_retry_before_3a0660(g);
-    if(!slots){ orig_f_3a0660(g); return; }
+    if(!slots||kh_theater_active()){ orig_f_3a0660(g); return; }
     u32 before=rd32(g,CONTINUE+12);
     orig_f_3a0660(g);
     if(rd32(g,CONTINUE+12)==before) return;

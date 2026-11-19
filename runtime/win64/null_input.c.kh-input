@@ -2102,8 +2102,16 @@ void kh_rewind_input(KhRecords *r){
     KH_RECORD(r,clock_sf0);
     KH_RECORD(r,clock_gf0);
     KH_RECORD(r,host_pad_on);
+    pthread_mutex_lock(&input_lock);
+    ScriptPad physical=host_pad;
     KH_RECORD(r,host_pad);
     KH_RECORD(r,host_latched);
+    if(r->loading && host_pad_on && kh_theater_active()){
+        /* The controller can have released Confirm while the scene played. */
+        host_pad=physical;
+        host_latched=0;
+    }
+    pthread_mutex_unlock(&input_lock);
     for(size_t i=0;i<nsteps;i++){
         Step *s=&steps[i];
         KH_RECORD(r,s->started); KH_RECORD(r,s->met); KH_RECORD(r,s->waited); KH_RECORD(r,s->warp_i);

@@ -74,6 +74,41 @@ static void close_load(void){
     kh_records_free(&disk_arena);
     opened=0;
 }
+static struct SessionSlot *theater_slot;
+static struct Trigger theater_trigger;
+static int theater_enabled, theater_had_pool, theater_confirm;
+static _Atomic int theater_skip, theater_reserved;
+static _Atomic int theater_active;
+int kh_theater_active(void){ return atomic_load(&theater_active); }
+void kh_theater_scene_skip(void){ if(kh_theater_active()) theater_skip=1; }
+/* f_2b35a0 reads pad 0 through f_39b780. Directions precede confirm.
+ * Defer only that edge until the coordinator can park the other threads. */
+void orig_f_2b35a0(KCtx *);
+void f_2b35a0(KCtx *g){
+    if(!theater_enabled || kh_theater_active() || !rd8(g,GS_BASE+0xb0d54d) ||
+       kh_route_cursor(g,KR_TITLE_CHOICE)!=2){ orig_f_2b35a0(g); return; }
+    u64 pad=GS_BASE+0xbf31a8;
+    u8 buttons=rd8(g,pad);
+    if(theater_confirm && theater_slot){
+        theater_confirm=0;
+        wr8(g,pad,(buttons&~0x30)|4);
+    }else if((buttons&0x34)==4 && !theater_slot){
+        theater_confirm=1;
+        wr8(g,pad,buttons&~4);
+    }else{ orig_f_2b35a0(g); return; }
+    orig_f_2b35a0(g);
+    wr8(g,pad,buttons);
+}
+static int refuse_theater_entry(const char *reason){
+    if(trigger_head!=&theater_trigger || theater_trigger.op!=SAVE) return 0;
+    kh_warn("theater-entry-refused: %s",reason);
+    atomic_store(&menu_status,reason);
+    atomic_store(&theater_reserved,0);
+    theater_confirm=0;
+    trigger_head=NULL;
+    completed=missed=0;
+    return 1;
+}
 static void discard_slot(struct SessionSlot *s){
     if(!s) return;
     kh_gpu_cut_free(s->gpu);
@@ -81,6 +116,49 @@ static void discard_slot(struct SessionSlot *s){
     if(s->sync) kh_sync_discard(s->sync);
     kh_audio_discard(s->audio); kh_crt_files_discard(s->files);
     free(s->pad.changes); free(s->points); free(s->path); free(s);
+}
+/* The title maps row 2 to action 2 only when f_2b3400 exposes the row.
+ * Capture at the last input boundary before confirmation can reach f_2b9a20. */
+static void theater_frame(KCtx *g,u64 frame){
+    extern int kh_phase_title_alive(void);
+    int mode=rd32(g,GS_BASE+0xb1d5ec);
+    if(theater_slot && mode==2) atomic_store(&theater_active,1);
+    int cursor=kh_route_cursor(g,KR_TITLE_CHOICE);
+    if(kh_theater_active()){
+        if((rd8(g,GS_BASE+0xbedf10)&2) || (!theater_skip && cursor<0)) return;
+        if(!theater_had_pool && rd32(g,GS_BASE+0x8bafa0)){
+            /* Only the pool created during this visit. Use the stop-and-wake
+             * sequence of f_12ff60 without destroying the title's four locks. */
+            KCtx ctx=*g;
+            for(u64 job=GS_BASE+0x8bafd8;job<GS_BASE+0x8bb278;job+=0x70){
+                if(rd64(g,job+0x20)!=GS_BASE+0x130030 || rd64(g,job+0x58))
+                    kh_fatal(g,"theater-worker-pool-busy");
+                wr32(g,job+0x30,1);
+                kh_call(&ctx,GS_BASE+0xfdcb0,job,0,0,0);
+            }
+            extern int kh_theater_pool_alive(void);
+            u64 deadline=kh_host_ns()+3000000000ull;
+            while(kh_theater_pool_alive()){
+                if(kh_host_ns()>=deadline) kh_fatal(g,"theater-worker-pool-stop");
+                struct timespec nap={0,1000000}; nanosleep(&nap,NULL);
+            }
+        }
+        theater_trigger=(struct Trigger){NULL,frame,LOAD,"Theater"};
+    }else if(cursor==2 && rd8(g,GS_BASE+0xb0d54d)){
+        if(theater_slot || !theater_confirm) return;
+        atomic_store(&theater_reserved,1);
+        theater_had_pool=rd32(g,GS_BASE+0x8bafa0)!=0;
+        kh_theater_pack_init(g);
+        theater_trigger=(struct Trigger){NULL,frame,SAVE,"Theater"};
+    }else{
+        theater_confirm=0;
+        if(theater_slot){ kh_theater_docs_end(); atomic_store(&theater_reserved,0); }
+        discard_slot(theater_slot);
+        theater_slot=NULL;
+        if(mode==2 && kh_phase_title_alive()) kh_fatal(g,"theater-entry-without-snapshot");
+        return;
+    }
+    trigger_head=&theater_trigger;
 }
 static struct SessionSlot **slot_at(const char *path){
     struct SessionSlot **p=&slots;
@@ -215,7 +293,8 @@ static void disk_cpu(struct SessionSlot *s,KhRecords *r){
     kh_rewind_fibers(r); kh_rewind_handles(r); kh_rewind_crt(r);
     kh_rewind_gfx(r); kh_rewind_aspect(r); kh_rewind_input(r); kh_rewind_shell(r); kh_rewind_route(r); kh_rewind_phase(r);
     kh_rewind_warp(r); kh_rewind_xion(r); kh_rewind_retry(r); kh_rewind_hd(r); kh_rewind_mod(r); kh_rewind_maps(r);
-    kh_rewind_ids(r); kh_rewind_files(r); kh_rewind_cutscenes(r);
+    kh_rewind_ids(r); kh_rewind_files(r);
+    if(!theater_enabled || trigger_head==&theater_trigger) kh_rewind_cutscenes(r);
 }
 static void disk_owners(struct SessionSlot *s,KhRecords *r){
     kh_disk_sync(r,s->sync);
@@ -229,7 +308,7 @@ static void disk_owners(struct SessionSlot *s,KhRecords *r){
 const char *kh_cut_menu_status(void){ return atomic_exchange(&menu_status,NULL); }
 int kh_cut_menu_request(int load,int slot){
     if(slot<1||slot>3) return -1;
-    if(!kh_cut_enabled||scripted) return -2;
+    if(!kh_cut_enabled||scripted||atomic_load(&theater_reserved)) return -2;
     int empty=0;
     return atomic_compare_exchange_strong(&menu_request,&empty,load?slot+3:slot)?0:-1;
 }
@@ -277,6 +356,11 @@ u64 kh_cut_unix_ns(void){
 }
 void kh_cut_init(void){
     const char *enable=getenv("KHNMC_SAVESTATE"), *trigger=getenv("KHNMC_TEST_SAVESTATE");
+    const char *mode=getenv("KHNMC_CUTSCENES");
+    theater_enabled=mode&&!strcmp(mode,"theater");
+    kh_theater_docs_init(theater_enabled);
+    if(theater_enabled && trigger) kh_fatal(NULL,"theater-scripted-slot-conflict");
+    if(theater_enabled && (!enable||!strcmp(enable,"0"))) enable="1";
     if(!enable||!strcmp(enable,"0")) return;
     if(strcmp(enable,"1")) kh_fatal(NULL,"savestate-switch: expected 0 or 1");
 
@@ -466,7 +550,9 @@ static int game_chain_known(KCtx *g){
 void kh_cut_frame(KCtx *g,u64 frame){
     extern _Atomic u64 gfx_presents;
     extern size_t kh_phase_files_seen(void);
-    if(!trigger_head) take_menu_request(frame);
+    if(!trigger_head && theater_enabled) theater_frame(g,frame);
+    if(!trigger_head && !atomic_load(&theater_reserved)) take_menu_request(frame);
+    if(theater_enabled && !trigger_head && !getenv("KHNMC_TEST_THEATER_HASH")) return;
     int due=trigger_head&&frame>=trigger_head->frame;
     if(due&&!at_dispatch&&game_chain_known(g)) longjmp(*game_dispatch,1);
     unsigned char digest[32];
@@ -485,10 +571,12 @@ void kh_cut_frame(KCtx *g,u64 frame){
 
     int load=trigger_head->op==LOAD;
     struct SessionSlot *session=NULL,*candidate=NULL;
+    int theater=trigger_head==&theater_trigger;
     int cold=0;
     if(load){
         const char *err=NULL;
-        if(!opened){
+        if(theater) session=theater_slot;
+        else if(!opened){
             load_started=kh_host_ns();
             err=open_slot(slot,&session,&disk_header,&disk_pad,&disk_docs,&bootstrap);
             if(!err && !session){
@@ -519,6 +607,8 @@ void kh_cut_frame(KCtx *g,u64 frame){
         }
         cold=!session;
     }
+retry_cut:
+    if(theater&&load) kh_cut_wait_active();
     KThread *threads[4096];
     u64 start=kh_host_ns(),epoch;
     pthread_mutex_lock(&mutex);
@@ -554,7 +644,9 @@ void kh_cut_frame(KCtx *g,u64 frame){
     int gate_ok=0,stream_busy=0,committing=0;
     char *tmp=NULL;
     int fd=-1;
-    if(!missing&&kh_cut_gate_begin(&epoch)){
+    int lifecycle_changed=0;
+    int acquired=!missing&&kh_cut_gate_begin(&epoch);
+    if(acquired){
         gate_ok=kh_gfx_gate_quiesce_bounded(4,10)==KH_GATE_QUIESCED;
         if(gate_ok&&!completed){
             void *callers[64];
@@ -608,7 +700,7 @@ void kh_cut_frame(KCtx *g,u64 frame){
                        !(candidate->path=strdup(slot))) kh_fatal(g,"savestate-slot-memory");
                     candidate->nthreads=n+1; candidate->header.frame=frame; session=candidate;
                 }
-                if(load&&!cold) sync_error=read_resident(session);
+                if(load&&!cold&&!theater) sync_error=read_resident(session);
                 if(!sync_error) sync_error=session_check(session,load&&!cold,n);
                 if(!sync_error&&(!load||cold)) qsort(session->points,session->nthreads,sizeof *session->points,point_order);
                 if(!sync_error&&(load||kh_gfx_vkd3d_on)){
@@ -643,17 +735,21 @@ void kh_cut_frame(KCtx *g,u64 frame){
                         session->header=disk_header;
                     }
                 }
+                KhRecords *records=load&&!theater?&disk_arena:&session->arena;
                 if(!sync_error&&load){
-                    kh_records_begin(&disk_arena,1);
-                    disk_owners(session,&disk_arena);
+                    kh_records_begin(records,1);
+                    disk_owners(session,records);
                     sync_error=kh_sync_restore(session->sync,waits,wait_threads,wait_count);
                 }
                 if(!sync_error){
-                    KhRecords *cpu=load?&disk_arena:&session->arena;
                     kh_gpu_cut_apply(session->gpu,load);
-                    disk_cpu(session,cpu);
-                    kh_records_end(cpu);
-                    if(load){ kh_pad_restore(&disk_pad); kh_audio_restore(session->audio); kh_crt_files_restore(session->files); kh_slot_docs_finish(); }
+                    disk_cpu(session,records);
+                    kh_records_end(records);
+                    if(load){ kh_pad_restore(theater?&session->pad:&disk_pad); kh_audio_restore(session->audio); kh_crt_files_restore(session->files); if(!theater) kh_slot_docs_finish(); }
+                    if(trigger_head==&theater_trigger && getenv("KHNMC_TEST_THEATER_HASH")){
+                        extern void kh_cut_arena_census(KCtx *,void (*)(KCtx *,u64,u64));
+                        kh_cut_arena_census(g,report_extent);
+                    }
                     voices=kh_cut_audio_graph(&buffers,&commands);
                     fprintf(stderr,"kh: savestate-%s at=%llu resumed-frame=%llu sample=%llu voices=%u buffers=%u commands=%u\n",
                         load?"loaded":"captured",(unsigned long long)frame,(unsigned long long)(kh_game_frames()+1),
@@ -705,7 +801,7 @@ void kh_cut_frame(KCtx *g,u64 frame){
         }
         if(gate_ok&&!save&&trigger_head->op!=HASH) kh_cut_rebuild_fibers();
         if(committing) kh_cut_gate_committed_end(epoch);
-        else gate_ok=kh_cut_gate_end(epoch)&&gate_ok;
+        else{ lifecycle_changed=!kh_cut_gate_end(epoch); gate_ok=gate_ok&&!lifecycle_changed; }
     }
     atomic_store(&kh_cut_requested,0);
     pthread_cond_broadcast(&resume);
@@ -719,14 +815,21 @@ void kh_cut_frame(KCtx *g,u64 frame){
     }
     free(tmp);
     if(oracle_failed) kh_fatal(g,"savestate-census-io: could not publish CPU comparison file");
+    if(theater && load && ((!missing && !acquired) || lifecycle_changed ||
+       (sync_error && !strcmp(sync_error,"savestate-lifecycle-changed")))){
+        /* Stay on this dispatch frame while the lifecycle worker resumes. */
+        struct timespec nap={0,10000000}; nanosleep(&nap,NULL);
+        goto retry_cut;
+    }
     if(stream_busy||missing||!gate_ok){
         discard_slot(candidate);
-        if(load) close_load();
+        if(load&&!theater) close_load();
         if(cold){
             if(trigger_head==&menu_trigger){ finish_menu("savestate-cold-cut-missed"); return; }
             kh_fatal(g,"savestate-cold-cut-missed: frame %llu",(unsigned long long)frame);
         }
         if(cs_waiter) kh_warn("savestate-critical-section: tid=%u still acquiring at frame %llu",cs_waiter,(unsigned long long)frame);
+        if(refuse_theater_entry("theater-cut-not-quiescent")) return;
         if(++missed==4){
             const char *reason=cs_waiter?"savestate-critical-section-timeout":stream_busy?"savestate-stream-drain-timeout":"savestate-cut-refused";
             if(trigger_head==&menu_trigger){ finish_menu(reason); return; }
@@ -734,20 +837,23 @@ void kh_cut_frame(KCtx *g,u64 frame){
         }
         kh_warn("savestate-cut-deferred: frame %llu, missing %d, gate %d, stream-busy %d",
                 (unsigned long long)frame,missing,gate_ok,stream_busy);
+        if(theater&&load) goto retry_cut;
         return;
     }
     completed++;
     missed=0;
-    if(load){
+    if(load&&!theater){
         if(!sync_error) fprintf(stderr,"kh: savestate-load-time cold=%d request-through-restore-us=%llu\n",cold,
                 (unsigned long long)((kh_host_ns()-load_started)/1000));
         close_load();
     }
     if(candidate){
         if(!sync_error && cold){ kh_records_free(&candidate->arena); retain_slot(candidate); }
+        else if(!sync_error && theater){ theater_slot=candidate; kh_theater_docs_begin(); }
         else if(!sync_error) sync_error=publish_slot(candidate);
         if(sync_error) discard_slot(candidate);
     }
+    if(sync_error&&refuse_theater_entry(sync_error)) return;
     if(sync_error&&trigger_head==&menu_trigger){ finish_menu(sync_error); return; }
     if(sync_error) kh_fatal(g,"%s: checkpoint at frame %llu",sync_error,(unsigned long long)frame);
     if(save&&(blocker_site||!at_dispatch)){
@@ -761,12 +867,30 @@ void kh_cut_frame(KCtx *g,u64 frame){
             snprintf(detail,sizeof detail,"tid=%u start=%llx wait=%s guest-return=%llx",blocker_tid,
                      (unsigned long long)blocker_start,blocker_site,(unsigned long long)blocker_return);
         }
+        if(refuse_theater_entry(error)) return;
         if(trigger_head==&menu_trigger){
             kh_warn("%s: %s slot=%s",error,detail,slot);
             finish_menu(error);
             return;
         }
         kh_fatal(g,"%s: %s slot=%s",error,detail,slot?slot:"sync-test");
+    }
+    if(trigger_head==&theater_trigger){
+        if(load){
+            atomic_store(&theater_active,0);
+            atomic_store(&theater_reserved,0);
+            theater_skip=0;
+            kh_theater_docs_end();
+            discard_slot(theater_slot);
+            theater_slot=NULL;
+        }
+        completed=0;
+        trigger_head=NULL;
+        /* Route input is itself rewound. Supply the physical player's different
+         * next choice in a test, on restore or on the no-visit control cut. */
+        const char *input=getenv(load?"KHNMC_TEST_THEATER_AFTER":"KHNMC_TEST_THEATER_CONTROL");
+        if(input){ theater_confirm=0; extern void kh_input_load(KCtx *,const char *); kh_input_load(g,input); }
+        return;
     }
     if(trigger_head==&menu_trigger){ finish_menu(load?"State loaded":"State saved"); return; }
     if(completed==(trigger_head->op==FREEZE?20:1)){

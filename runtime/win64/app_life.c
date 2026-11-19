@@ -109,6 +109,15 @@ static _Atomic u64 c_resign, c_suspend, c_resume, c_q_ok, c_q_not, c_drains, c_d
 
 void kh_app_set_audio(int (*start)(void),void (*stop)(void)){ pthread_mutex_lock(&lm); au_start=start?start:kh_audio_out_start; au_stop=stop?stop:kh_audio_out_stop; pthread_mutex_unlock(&lm); }
 static void l_init(void){ kh_cond_init(&l_cv); kh_cond_init(&l_done_cv); kh_cond_init(&l_susp_cv); }
+/* A pending Theater restore holds the game frame while the shell worker
+ * processes focus changes. No guest or renderer lock is held here. */
+void kh_cut_wait_active(void){
+    pthread_once(&l_once,l_init);
+    pthread_mutex_lock(&lm);
+    while(l_busy||lqn||atomic_load(&l_state)!=ST_ACTIVE||!kh_app_window_active())
+        pthread_cond_wait(&l_done_cv,&lm);
+    pthread_mutex_unlock(&lm);
+}
 static unsigned slices_of(unsigned ms){ unsigned n=ms/LIFE_SLICE_MS; return n?n:1; }
 /* caller holds lm: the suspended state ends (the null Present goes on) */
 static void l_unsuspend_locked(void){ if(atomic_load(&l_suspended)){ atomic_store(&l_suspended,0); pthread_cond_broadcast(&l_susp_cv); } }

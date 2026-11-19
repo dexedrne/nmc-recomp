@@ -2,6 +2,7 @@
  * original bytes, asset paths and exact NMC templates to one reviewed digest. */
 #include "khnmc_rt.h"
 #include "warp.h"
+#include "savestate.h"
 #include "route_state.h"
 #include <errno.h>
 #include <unistd.h>
@@ -16,7 +17,24 @@
 #define pack_sha256 SHA256
 #endif
 
+/* f_2b3400 is the only caller. It uses AL to expose the Theater title row. */
+void orig_f_2b73f0(KCtx *g);
+void f_2b73f0(KCtx *g){
+    orig_f_2b73f0(g);
+    const char *unlock=getenv("KHNMC_THEATER_UNLOCK");
+    if(unlock && !strcmp(unlock,"1")) SET_RAX(g,1);
+}
+
+/* The picker calls this predicate for chapter and scene progress words. */
+void orig_f_2b9690(KCtx *g);
+void f_2b9690(KCtx *g){
+    orig_f_2b9690(g);
+    const char *unlock=getenv("KHNMC_THEATER_UNLOCK"), *mode=getenv("KHNMC_CUTSCENES");
+    if(unlock && !strcmp(unlock,"1") && mode && !strcmp(mode,"theater")) SET_RAX(g,1);
+}
+
 static const char reviewed_digest[]="155fa7e650a5ba0fed00bfc49555aea940446ca1a11b3645d5b314521ba90ef6";
+static const char theater_digest[]="1420a4f2a81ec6ee7545a0fbd95b3bcfa2be12a64c968aface97c2507b9a9623";
 static const char *expected_digest=reviewed_digest;
 static unsigned expected_count=0;
 static u32 catalog_offset;
@@ -30,7 +48,7 @@ static void digest_hex(const u8 *data,size_t size,char hex[65]){
 #define SAVE_BASE  (GS_BASE+0x9a98b0ull)      /* GAME_SAVE: exe 0x152380 returns it */
 #define SAVE_LEN   0x10fc0u
 #define PACK_MAX   (64u<<20)
-enum { C_UNSET=-1, C_NMC=0, C_STORY=1 };
+enum { C_UNSET=-1, C_NMC=0, C_STORY=1, C_THEATER=2 };
 typedef struct { char area[4], name[4]; u32 klass, off, size, hash; } PackRec;
 static int cmode=C_UNSET;
 static u8 *pack; static size_t pack_len; static PackRec *recs; static u32 nrec; static u64 *guest; static char pack_path[4200];
@@ -70,21 +88,23 @@ static u32 entry_size(KCtx *g,u32 name){
     return 0;
 }
 static int key_cmp(const char *a,const char *an,const char *b,const char *bn){ int c=memcmp(a,b,4); return c?c:memcmp(an,bn,4); }
-static void pack_fatal(KCtx *g,const char *why){ kh_fatal(g,"cutscenes-pack: %s: %s (KHNMC_CUTSCENES=story needs the pack of original scenes that tools/cutscene_pack.py writes; set KHNMC_CUTSCENES_PACK or put story-events.khcs into the data tree)",pack_path,why); }
-static void load_pack(KCtx *g){
-    const char *e=getenv("KHNMC_CUTSCENES_PACK");
+static void pack_fatal(KCtx *g,const char *why){ kh_fatal(g,"cutscenes-pack: %s: %s",pack_path,why); }
+static void load_pack(KCtx *g,int mode){
+    int theater=mode==C_THEATER;
+    const char *name=theater?"theater-events.khtr":"story-events.khcs";
+    const char *e=getenv(theater?"KHNMC_THEATER_PACK":"KHNMC_CUTSCENES_PACK");
     if(e&&*e) snprintf(pack_path,sizeof pack_path,"%s",e);
     else { const char *root=getenv("KHNMC_DATA"); if(!root||!*root) root="data";
-           if(!kh_resolve_ci(root,"story-events.khcs",pack_path,sizeof pack_path)) snprintf(pack_path,sizeof pack_path,"%s/story-events.khcs",root); }
+           if(!kh_resolve_ci(root,name,pack_path,sizeof pack_path)) snprintf(pack_path,sizeof pack_path,"%s/%s",root,name); }
     FILE *f=fopen(pack_path,"rb"); if(!f){ char w[200]; snprintf(w,sizeof w,"cannot open it (%s)",strerror(errno)); pack_fatal(g,w); }
     struct stat st; if(fstat(fileno(f),&st)||st.st_size<16||(u64)st.st_size>PACK_MAX){ fclose(f); pack_fatal(g,"not a file of 16 bytes .. 64 MiB"); }
     pack_len=(size_t)st.st_size; pack=malloc(pack_len); if(!pack){ fclose(f); pack_fatal(g,"out of memory"); }
     if(fread(pack,1,pack_len,f)!=pack_len){ fclose(f); pack_fatal(g,"short read"); }
     fclose(f);
-    if(memcmp(pack,"KHCS",4)) pack_fatal(g,"not a KHCS pack (magic)");
+    if(memcmp(pack,theater?"KHTR":"KHCS",4)) pack_fatal(g,theater?"not a KHTR pack":"not a KHCS pack");
     if(g32(pack+4)!=2) pack_fatal(g,"version is not 2");
     nrec=g32(pack+8); if(16+24ull*nrec>pack_len) pack_fatal(g,"the record table does not fit the file");
-    if(nrec!=expected_count) pack_fatal(g,"reviewed entry count mismatch");
+    if(nrec!=(theater?612:expected_count)) pack_fatal(g,"reviewed entry count mismatch");
     catalog_offset=g32(pack+12);
     if(catalog_offset<16+24ull*nrec || (u64)catalog_offset+124+8>pack_len)
         pack_fatal(g,"incomplete reviewed catalog or stub templates");
@@ -93,24 +113,25 @@ static void load_pack(KCtx *g){
         const u8 *r=pack+16+24*i; PackRec *x=&recs[i]; memcpy(x->area,r,4); memcpy(x->name,r+4,4);
         x->klass=g32(r+8); x->off=g32(r+12); x->size=g32(r+16); x->hash=g32(r+20);
         char w[200];
-        if(x->klass!=1&&x->klass!=2){ snprintf(w,sizeof w,"entry %u (%.4s/%.4s) has class %u (1 SAFE, 2 SAFE-AFTER-EDIT)",i,x->area,x->name,x->klass); pack_fatal(g,w); }
+        if(theater ? x->klass!=3 : (x->klass!=1&&x->klass!=2)){ snprintf(w,sizeof w,"entry %u (%.4s/%.4s) has class %u (1 SAFE, 2 SAFE-AFTER-EDIT)",i,x->area,x->name,x->klass); pack_fatal(g,w); }
         if(x->off%16||(u64)x->off+x->size>=catalog_offset||x->off<16+24ull*nrec){ snprintf(w,sizeof w,"entry %u (%.4s/%.4s) lies outside the data area",i,x->area,x->name); pack_fatal(g,w); }
         if(fnv1a(pack+x->off,x->size)!=x->hash){ snprintf(w,sizeof w,"entry %u (%.4s/%.4s) fails its checksum",i,x->area,x->name); pack_fatal(g,w); }
         if(!is_event(pack+x->off,x->size)){ snprintf(w,sizeof w,"entry %u (%.4s/%.4s) is not an event entry (commands to a zero terminator)",i,x->area,x->name); pack_fatal(g,w); }
         if(i&&key_cmp(recs[i-1].area,recs[i-1].name,x->area,x->name)>=0){ snprintf(w,sizeof w,"entry %u (%.4s/%.4s) is not after the one before it (the keys must be sorted and unique)",i,x->area,x->name); pack_fatal(g,w); }
     }
     char digest[65]; digest_hex(pack,pack_len,digest);
-    if(strcmp(digest,expected_digest)) pack_fatal(g,"reviewed manifest SHA-256 mismatch");
-    fprintf(stderr,"kh: cutscenes: KHNMC_CUTSCENES=story: %u original scenes from %s (%zu bytes) replace the mod's stub where the game asks for them\n",nrec,pack_path,pack_len);
+    if(strcmp(digest,theater?theater_digest:expected_digest)) pack_fatal(g,"reviewed manifest SHA-256 mismatch");
+    fprintf(stderr,"kh: cutscenes: KHNMC_CUTSCENES=%s: %u original scenes from %s (%zu bytes) replace the mod's stub where the game asks for them\n",getenv("KHNMC_CUTSCENES"),nrec,pack_path,pack_len);
 }
 static void cinit(KCtx *g){
     const char *e=getenv("KHNMC_CUTSCENES"); int m;
     if(!e||!*e||!strcmp(e,"nmc")) m=C_NMC;
     else if(!strcmp(e,"story")) m=C_STORY;
-    else kh_fatal(g,"cutscenes-mode: KHNMC_CUTSCENES=%s is not a mode (nmc = the mod's empty scenes, the default; story = the original story scenes)",e);
-    if(m==C_STORY){ const char *ev=getenv("KHNMC_EVENTS");
-        if(ev&&*ev&&strcmp(ev,"real")) kh_fatal(g,"cutscenes-mode: KHNMC_CUTSCENES=story and KHNMC_EVENTS=%s contradict each other (the one restores scenes, the other empties them): unset one",ev);
-        load_pack(g); }
+    else if(!strcmp(e,"theater")) m=C_THEATER;
+    else kh_fatal(g,"cutscenes-mode: KHNMC_CUTSCENES=%s is not a mode (nmc = the mod's empty scenes, the default; story = reviewed story scenes; theater = reviewed scenes during isolated replay)",e);
+    if(m!=C_NMC){ const char *ev=getenv("KHNMC_EVENTS");
+        if(ev&&*ev&&strcmp(ev,"real")) kh_fatal(g,"cutscenes-mode: KHNMC_CUTSCENES=%s and KHNMC_EVENTS=%s contradict each other (the one restores scenes, the other empties them): unset one",e,ev);
+        if(m==C_STORY) load_pack(g,m); }
     const char *d=getenv("KHNMC_CUTSCENES_SAVEDUMP");
     if(d&&*d){ snprintf(dump_dir,sizeof dump_dir,"%s",d); if(mkdir(dump_dir,0755)&&errno!=EEXIST) kh_fatal(g,"cutscenes-savedump: cannot make %s (%s)",dump_dir,strerror(errno)); dump_on=1;
         char path[4300]; snprintf(path,sizeof path,"%s/live.log",dump_dir);
@@ -118,6 +139,10 @@ static void cinit(KCtx *g){
     }
     else dump_on=0;
     cmode=m;
+}
+void kh_theater_pack_init(KCtx *g){
+    if(cmode==C_UNSET) cinit(g);
+    if(cmode==C_THEATER && !pack) load_pack(g,C_THEATER);
 }
 /* selftest only */
 void kh_cutscenes_test_reset(void){
@@ -208,13 +233,13 @@ static u64 answer(KCtx *g,u32 nm,u64 p,u32 size){
         if(p){ awaiting_field=1; ended=0; last_menu=last_mission=-2;
             fprintf(live_log,"lookup %s %.4s\n",area,(const char *)&nm); }
     }
-    if(cmode==C_NMC) return p;
+    if(cmode==C_NMC || (cmode==C_THEATER && (!kh_theater_active() || !(rd8(g,GS_BASE+0xbedf10)&2)))) return p;
     c_lookup++;
     const char *nb=(const char*)&nm; unsigned long long gf=(unsigned long long)kh_input_game_frames();
     if(!p){ c_none++; fprintf(stderr,"kh: cutscenes: game-frame=%llu map %s event %.4s: no entry of that name\n",gf,area[0]?area:"?",nb); return p; }
     if(size==UINT32_MAX) size=entry_size(g,nm);
     if((size!=56 && size!=68) || !GA_OK(p) || !GA_OK(p+size-1) || !exact_stub(hp(g,p),size)){ c_real++; fprintf(stderr,"kh: cutscenes: game-frame=%llu map %s event %.4s: a scene the mod kept (passed through)\n",gf,area[0]?area:"?",nb); return p; }
-    if(size==68){ c_kept++; c_stub++; fprintf(stderr,"kh: cutscenes: %s/%.4s retains NMC volume stub\n",area,nb); return p; }   /* the two eh03 entries keep their volume command */
+    if(size==68 && cmode==C_STORY){ c_kept++; c_stub++; fprintf(stderr,"kh: cutscenes: %s/%.4s retains NMC volume stub\n",area,nb); return p; }   /* the two eh03 entries keep their volume command */
     c_stub++;
     if(!area[0]){ c_noplace++; fprintf(stderr,"kh: cutscenes: game-frame=%llu map %02x:%02x event %.4s: the mod's stub, and the place is no room (kept)\n",gf,w,r,nb); return p; }
     char key[4]={0}; for(int i=0;i<4;i++) key[i]=nb[i];
@@ -243,14 +268,14 @@ static u64 answer(KCtx *g,u32 nm,u64 p,u32 size){
                     memcpy(hp(g,b),pack+recs[lo].off,recs[lo].size); memset(hp(g,b)+recs[lo].size,0,16); guest[lo]=b; }
     u64 q=guest[lo]; pthread_mutex_unlock(&cm);
     c_restored++;
-    fprintf(stderr,"kh: cutscenes: game-frame=%llu map %s event %.4s: the original scene (%u bytes, %s) in place of the mod's stub\n",gf,area,nb,recs[lo].size,recs[lo].klass==1?"SAFE":"SAFE-AFTER-EDIT");
+    fprintf(stderr,"kh: cutscenes: game-frame=%llu map %s event %.4s: the original scene (%u bytes, %s) in place of the mod's stub\n",gf,area,nb,recs[lo].size,cmode==C_THEATER?"THEATER":recs[lo].klass==1?"SAFE":"SAFE-AFTER-EDIT");
     return q;
 }
 u64 kh_cutscenes_answer(KCtx *g,u32 nm,u64 p){ return answer(g,nm,p,UINT32_MAX); }
 void kh_cutscenes_report(FILE *f){
-    if(cmode==C_STORY||dump_on==1)
+    if(cmode==C_STORY||cmode==C_THEATER||dump_on==1)
         fprintf(f,"kh: cutscenes: mode %s: %llu event lookups: %llu originals served in place of the mod's stub, %llu stubs kept (no original in the pack), %llu stubs kept (no room), %llu scenes the mod kept, %llu found no entry; %llu save dumps; %llu missing-asset fallbacks\n",
-                cmode==C_STORY?"story":"nmc",(unsigned long long)c_lookup,(unsigned long long)c_restored,(unsigned long long)c_kept,(unsigned long long)c_noplace,(unsigned long long)c_real,(unsigned long long)c_none,(unsigned long long)c_dumps,(unsigned long long)c_missing);
+                cmode==C_THEATER?"theater":cmode==C_STORY?"story":"nmc",(unsigned long long)c_lookup,(unsigned long long)c_restored,(unsigned long long)c_kept,(unsigned long long)c_noplace,(unsigned long long)c_real,(unsigned long long)c_none,(unsigned long long)c_dumps,(unsigned long long)c_missing);
 }
 
 /* ---- selftest: a synthetic pack in a temp tree, synthetic entries in guest memory; the fatal cases in forked children -------- */
@@ -328,8 +353,28 @@ static int tree_check(KCtx *g,const char *root,const char *packp){
 }
 int kh_cutscenes_selftest(KCtx *g){
     checks=bad=0;
-    const char *keys[]={"KHNMC_DATA","KHNMC_CUTSCENES","KHNMC_CUTSCENES_PACK","KHNMC_EVENTS","KHNMC_CUTSCENES_SAVEDUMP"}; enum{NK=5}; char *old[NK];
+    const char *keys[]={"KHNMC_DATA","KHNMC_CUTSCENES","KHNMC_CUTSCENES_PACK","KHNMC_EVENTS","KHNMC_CUTSCENES_SAVEDUMP","KHNMC_THEATER_UNLOCK"}; enum{NK=6}; char *old[NK];
     for(int i=0;i<NK;i++){ const char *v=getenv(keys[i]); old[i]=v?strdup(v):NULL; unsetenv(keys[i]); }
+    u64 gate=GS_BASE+0xb1d778;
+    u8 prior=rd8(g,gate);
+    wr8(g,gate,0);
+    T(kh_call(g,GS_BASE+0x2b73f0,0,0,0,0)==0);
+    setenv("KHNMC_THEATER_UNLOCK","1",1);
+    T(kh_call(g,GS_BASE+0x2b73f0,0,0,0,0)==1 && rd8(g,gate)==0);
+    unsetenv("KHNMC_THEATER_UNLOCK");
+    wr8(g,gate,1);
+    T(kh_call(g,GS_BASE+0x2b73f0,0,0,0,0)==1);
+    wr8(g,gate,prior);
+    u64 row=ga_calloc(1,12);
+    wr16(g,row+10,0xffff); /* f_39a980 always returns false for this flag. */
+    setenv("KHNMC_CUTSCENES","theater",1);
+    T(!(kh_call(g,GS_BASE+0x2b9690,row,0,0,0)&255));
+    setenv("KHNMC_THEATER_UNLOCK","1",1);
+    T((kh_call(g,GS_BASE+0x2b9690,row,0,0,0)&255)==1 && rd16(g,row+10)==0xffff);
+    unsetenv("KHNMC_CUTSCENES");
+    T(!(kh_call(g,GS_BASE+0x2b9690,row,0,0,0)&255));
+    unsetenv("KHNMC_THEATER_UNLOCK");
+    ga_free(row);
     u32 old_catalog=catalog_offset; u64 old_missing=c_missing;
     FILE *old_live=live_log; live_log=NULL;
     int old_await=awaiting_field,old_ended=ended,old_menu=last_menu,old_mission=last_mission;
@@ -353,6 +398,13 @@ int kh_cutscenes_selftest(KCtx *g){
     kh_cutscenes_test_reset(); T(answer(g,NM("406"),gs,56)==gs); T(cmode==C_NMC&&!pack&&c_lookup==0);
     setenv("KHNMC_CUTSCENES","nmc",1); kh_cutscenes_test_reset(); T(answer(g,NM("406"),gs,56)==gs); T(answer(g,NM("406"),0,0)==0); T(!pack&&c_lookup==0);
     unsetenv("KHNMC_CUTSCENES_PACK");
+    /* A matching original and even the native replay bit need a private slot. */
+    setenv("KHNMC_DATA",dir,1); setenv("KHNMC_CUTSCENES","theater",1); kh_cutscenes_test_reset();
+    u64 replay=GS_BASE+0xbedf10;
+    u8 old_replay=rd8(g,replay);
+    wr8(g,replay,old_replay|2);
+    T(answer(g,NM("406"),gs,56)==gs && c_lookup==0 && c_restored==0);
+    wr8(g,replay,old_replay);
     /* story: the pack from KHNMC_DATA */
     setenv("KHNMC_DATA",dir,1); setenv("KHNMC_CUTSCENES","story",1); kh_cutscenes_test_reset();
     u64 a=answer(g,NM("406"),gs,56); T(a&&a!=gs&&nrec==3); T(a&&!memcmp(hp(g,a),sb,lb)); T(c_restored==1&&c_stub==1);

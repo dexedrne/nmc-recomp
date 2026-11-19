@@ -61,14 +61,14 @@ every Jump of a program that can run; every progress flag such a program, a chai
 with a constant) or the exe itself can set, and the programs those flags' scripts put into rooms.  It takes every branch and every
 trigger: it can only err towards "can run".  `--flags all` applies EVERY progress script (the widest reading).
 
-THE THEATER (KH2FM's event viewer, a title-menu mode) is a separate root, not part of the story graph (a replay advances no story):
+THE THEATER (KH2FM's event viewer, a title-menu mode) has its own graph roots. Replay uses the live GAME_SAVE (implementation notes).
   eventviewer.bar, BAR entry `even`: u32 1, u32 row count, rows of 6 u16 (kind: 0 = a chapter heading, 1 = a scene; message id of
-  the title in msg/<lang>/title.bar; world index; program A; program B; 0).  A scene row plays evt program A and B of the room that
-  07localset.bin gives the world for that program id; the events those programs' AreaSettings name are what the Theater replays
+  the title in msg/<lang>/title.bar; world index; program A; program B; 0).  A scene row selects program A or B at f_2b9660. This graph includes both.
+  07localset.bin maps the world/program pair to its room. The programs' AreaSettings name the events the Theater replays
   (Graph.theater).  The exe reads the table at boot (every run's file log has eventviewer.bar; reader 0x2b9360, called from the
   title-side menu code 0x2b3e81 / 0x2b4e82 that also uses menu/eventviewer.2ld).  The title menu gets one more row when the byte
-  0x140b0d54d is set (0x2b3400 sets it from 0x2e53a0 / 0x2b73f0; row count written at 0x2b4db5); which save state sets it was not
-  traced, and no route opens the Theater.  The port does not gate it (no runtime hook names it).
+  0x140b0d54d is set (0x2b3400 sets it from 0x2e53a0 / 0x2b73f0; row count written at 0x2b4db5); KHNMC_THEATER_UNLOCK=1 overrides the title check's return.
+  See implementation notes for the title route, replay selection and the observed live save differences after exit.
 """
 import argparse, collections, os, struct, sys
 sys.dont_write_bytecode = True
@@ -425,7 +425,7 @@ class Graph:
         self.started = {}             # (area name, event name) -> [(kind, program, trigger, type)] in programs that can run
         self.named = collections.defaultdict(list)    # (area name, event name) -> every (kind, program, trigger, type) that names it
         self.theater = collections.defaultdict(list)  # (area name, event name) -> [(world, program, title message id)]: the Theater
-        self.theater_stats = collections.Counter()    # replays it (not part of the story graph: a replay advances no story)
+        self.theater_stats = collections.Counter()    # replays it (separate graph roots)
         self.script_flags = None
         self.compute()
         self.compute_theater()

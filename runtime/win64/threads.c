@@ -97,6 +97,18 @@ int kh_cut_threads(KThread **parked,unsigned count,int report,unsigned *cs_waite
     pthread_mutex_unlock(&tlist_m);
     return missing;
 }
+/* f_12fd00 starts six f_130030 jobs through the f_fddd0 thread thunk. */
+int kh_theater_pool_alive(void){
+    int alive=0;
+    pthread_mutex_lock(&tlist_m);
+    for(u32 i=0;i<ntlist;i++){
+        KThread *t=tlist[i];
+        if(t->start==GS_BASE+0xfddd0 && t->param>=GS_BASE+0x8bafd8 &&
+           t->param<GS_BASE+0x8bb278 && (t->param-GS_BASE-0x8bafd8)%0x70==0) alive++;
+    }
+    pthread_mutex_unlock(&tlist_m);
+    return alive;
+}
 static int tlist_add_locked(KThread *t){ if(ntlist>=tlist_cap) return 0; tlist[ntlist++]=t; tlist_created++; return 1; }      /* caller holds tlist_m */
 static void tlist_remove(KThread *t){
     pthread_mutex_lock(&tlist_m);
@@ -781,8 +793,16 @@ void kh_resume_13552f(KCtx *),kh_resume_14f65b(KCtx *),kh_resume_13522e(KCtx *);
 void kh_resume_157334(KCtx *),kh_resume_2cbc2a(KCtx *),kh_resume_2cc31a(KCtx *);
 void kh_resume_1503c8(KCtx *),kh_resume_1e0351(KCtx *),kh_resume_154d8b(KCtx *);
 
+void kh_resume_2b49d4(KCtx *);
+void kh_phase_title_exit(void);
+static void resume_title(KCtx *g){
+    /* Both title yields jump to 2b4830. The fast-title patch is before this loop. */
+    kh_resume_2b49d4(g);
+    kh_phase_title_exit();
+}
 static int cut_rebuild_fiber(KFiber *f){
     static const struct { u32 ret, frame_size; KhFn resume; } tasks[]={
+        {0x2b4932,0x68,resume_title},{0x2b49d4,0x68,resume_title},
         {0x157334,0x28,kh_resume_157334},{0x2cbc2a,0x78,kh_resume_2cbc2a},
         {0x2cc31a,0x38,kh_resume_2cc31a},{0x1503c8,0x28,kh_resume_1503c8},
         {0x1e0351,0x38,kh_resume_1e0351},{0x154d8b,0x98,kh_resume_154d8b},
@@ -1326,11 +1346,19 @@ int kh_sync_vclock_selftest(KCtx *g){
 const char *kh_rewind_fiber_check(int loading){
     for(KFiber *f=cut_fibers;f;f=f->cut_next){
         if(f->owner||f->is_thread_fiber) return "savestate-active-fiber";
-        if(!loading&&!cut_rebuild_fiber(f)) return "savestate-fiber-continuation";
+        if(!loading&&!cut_rebuild_fiber(f)){
+            u64 sp=KH_RSP(f->g),end=f->gstack_lo+f->gstack_sz;
+            if(sp>=f->gstack_lo && sp<=end && end-sp>=0x38)
+                kh_warn("savestate-fiber-continuation: start=%llx return=%llx caller=%llx",
+                        (unsigned long long)f->start,(unsigned long long)rd64(f->g,sp),
+                        (unsigned long long)rd64(f->g,sp+0x30));
+            return "savestate-fiber-continuation";
+        }
     }
     return NULL;
 }
 void kh_rewind_fibers(KhRecords *r){
+    KH_RECORD(r,next_tid);
     size_t count=0;
     for(KFiber *f=cut_fibers;f;f=f->cut_next) count++;
     KH_RECORD(r,count);

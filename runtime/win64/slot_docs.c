@@ -17,9 +17,17 @@
 static char overlay[PATH_MAX];
 static _Atomic int overlay_active;
 
-const char *kh_slot_documents(void){ return atomic_load(&overlay_active)?overlay:kh_docs; }
+static const char *private_documents(void){
+    const char *visit=kh_theater_overlay();
+    return visit?visit:atomic_load(&overlay_active)?overlay:NULL;
+}
+const char *kh_slot_documents(void){
+    const char *private=private_documents();
+    return private?private:kh_docs;
+}
 const char *kh_slot_autosave_documents(void){
-    return atomic_load(&overlay_active)?overlay:kh_autosave_documents();
+    const char *private=private_documents();
+    return private?private:kh_autosave_documents();
 }
 static int rotation_slot(const char *name){
     if(strncmp(name,"KH2autosave-",12)||name[12]<'1'||name[12]>'9') return 0;
@@ -102,10 +110,10 @@ static const char *capture_tree(KhBootDocs *d,const char *root,const char *sub,i
     fts_close(tree); if(lock>=0) close(lock); return error;
 }
 const char *kh_slot_docs_capture(KhBootDocs *d){
-    const char *error=capture_tree(d,kh_docs,PROFILE,0);
+    const char *error=capture_tree(d,kh_slot_documents(),PROFILE,0);
     const char *enabled=getenv("KHNMC_AUTOSAVE");
     if(!error && enabled && !strcmp(enabled,"1"))
-        error=capture_tree(d,kh_autosave_documents(),"autosave",1);
+        error=capture_tree(d,kh_slot_autosave_documents(),"autosave",1);
     return error;
 }
 static int safe_name(const char *p){
@@ -131,12 +139,8 @@ void kh_slot_docs_finish(void){
     }
     *overlay=0;
 }
-const char *kh_slot_docs_begin(const KhBootDocs *d){
-    if(*overlay) return "savestate-overlay-busy";
+static const char *extract(const KhBootDocs *d,const char *root){
     char path[PATH_MAX];
-    if(snprintf(path,sizeof path,"%s/.khss-bootstrap-XXXXXX",kh_root)>=(int)sizeof path||
-       !mkdtemp(path)) return "savestate-overlay-create";
-    strcpy(overlay,path);
     for(size_t pos=0;pos<d->size;){
         u32 n; u64 bytes;
         if(d->size-pos<sizeof n+sizeof bytes) goto failed;
@@ -146,14 +150,14 @@ const char *kh_slot_docs_begin(const KhBootDocs *d){
         if(n>=sizeof name||n>d->size-pos||memchr(d->data+pos,0,n)) goto failed;
         memcpy(name,d->data+pos,n); pos+=n; name[n]=0;
         if(!strcmp(name,PROFILE)){
-            if(bytes!=DIRECTORY || snprintf(path,sizeof path,"%s/My Games",overlay)>=(int)sizeof path ||
+            if(bytes!=DIRECTORY || snprintf(path,sizeof path,"%s/My Games",root)>=(int)sizeof path ||
                mkdir(path,0700)) goto failed;
         }
         int profile=!strcmp(name,PROFILE)||!strncmp(name,PROFILE "/",sizeof PROFILE);
         int slot=!strncmp(name,"autosave/",9)&&rotation_slot(name+9);
         int marker=!strcmp(name,"autosave/newest");
         if(!(profile||slot||marker||(!strcmp(name,"autosave")&&bytes==DIRECTORY))||
-           !safe_name(name)||snprintf(path,sizeof path,"%s/%s",overlay,name)>=(int)sizeof path) goto failed;
+           !safe_name(name)||snprintf(path,sizeof path,"%s/%s",root,name)>=(int)sizeof path) goto failed;
         if(marker){
             u32 length; char target[40];
             if(bytes!=NEWEST||d->size-pos<sizeof length) goto failed;
@@ -174,7 +178,24 @@ const char *kh_slot_docs_begin(const KhBootDocs *d){
         if(fclose(f)||!ok) goto failed;
         pos+=bytes;
     }
-    atomic_store(&overlay_active,1); return NULL;
+    return NULL;
 failed:
-    kh_slot_docs_finish(); return "savestate-overlay-profile";
+    return "savestate-overlay-profile";
+}
+const char *kh_slot_docs_snapshot(const char *root){
+    KhBootDocs current={0};
+    const char *err=kh_slot_docs_capture(&current);
+    if(!err) err=extract(&current,root);
+    free(current.data);
+    return err;
+}
+const char *kh_slot_docs_begin(const KhBootDocs *d){
+    if(*overlay) return "savestate-overlay-busy";
+    char path[PATH_MAX];
+    if(snprintf(path,sizeof path,"%s/.khss-bootstrap-XXXXXX",kh_root)>=(int)sizeof path||
+       !mkdtemp(path)) return "savestate-overlay-create";
+    strcpy(overlay,path);
+    const char *err=extract(d,overlay);
+    if(err){ kh_slot_docs_finish(); return err; }
+    atomic_store(&overlay_active,1); return NULL;
 }

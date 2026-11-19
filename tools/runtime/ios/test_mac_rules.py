@@ -226,20 +226,21 @@ for f in sorted(x for x in os.listdir(os.path.join(D, 'mac')) if x.endswith('.sh
 # TASK50: CUTSCENES=story writes `env KHNMC_CUTSCENES=story` from cut_lines only, into all three configurations (play, GFX play, the
 # test one), and only after app_has_cutscenes found the variable in the signed app (an older app would ignore it and play the stubs)
 cut_def = [t for _, t in dr if re.search(r'^cut_lines\(\)', t)]
-check(len(cut_def) == 1 and 'echo "env KHNMC_CUTSCENES=story"' in cut_def[0] and '[ "$CUTSCENES" != story ] ||' in cut_def[0],
-      'mac/device_run.sh: cut_lines must write env KHNMC_CUTSCENES=story only when CUTSCENES=story')
-check(sum(1 for _, t in dr if 'env KHNMC_CUTSCENES=story' in t and not t.lstrip().startswith('#')) == 1, 'mac/device_run.sh: env KHNMC_CUTSCENES=story is written outside cut_lines')
+check(len(cut_def) == 1 and 'echo "env KHNMC_CUTSCENES=$CUTSCENES"' in cut_def[0] and 'if uses_pack; then' in cut_def[0],
+      'mac/device_run.sh: cut_lines must write the selected pack mode')
+check(sum(1 for _, t in dr if 'env KHNMC_CUTSCENES=$CUTSCENES' in t and not t.lstrip().startswith('#')) == 1, 'mac/device_run.sh: env KHNMC_CUTSCENES=story is written outside cut_lines')
 for tgt in ('> "$OUT/play.conf"', '> "$OUT/gfx-play.conf"'):
     hit = [t for _, t in dr if tgt in t]
     check(len(hit) == 1 and 'cut_lines' in hit[0], 'mac/device_run.sh: the configuration %s does not call cut_lines' % tgt)
 check(any(re.search(r'\[ "\$DIFF" = none \] \|\| echo "env \$DV=\$DIFF"; cut_lines; fi', t) for _, t in dr), 'mac/device_run.sh: the test configuration does not call cut_lines')
 script = '\n'.join(t for _, t in dr)
-for required in ('[ "${SKIP_INSTALL:-0}" != 1 ] || bad "story mode', '[ -s "$CUTSCENES_PACK" ] || bad',
+for required in ('[ "${SKIP_INSTALL:-0}" != 1 ] || bad "$CUTSCENES mode', '[ -s "$CUTSCENES_PACK" ] || bad',
                  'shasum -a 256 < "$CUTSCENES_PACK"', 'grep -a -q "$pack_digest" "$APP/KHNMC"',
+                 'pack_name=theater-events.khtr', 'expected_magic=KHTR', 'CUTSCENES_PACK=${THEATER_PACK:-}',
                  '&& app_has_cutscenes || { say', '--destination "Documents/$2"',
-                 'cp_to "$CUTSCENES_PACK" data/story-events.khcs || { say "copy of the cutscene pack FAILED"; exit 1; }'):
+                 'cp_to "$CUTSCENES_PACK" "data/$pack_name" || { say "copy of the cutscene pack FAILED"; exit 1; }'):
     check(required in script, 'story deployment missing ' + required)
-check(any(re.search(r'''case "\$CUTSCENES" in ''\|nmc\|story\) ;; \*\) bad ''', t) for _, t in dr), 'mac/device_run.sh: CUTSCENES must accept only nmc or story')
+check(any(re.search(r'''case "\$CUTSCENES" in ''\|nmc\|story\|theater\) ;; \*\) bad ''', t) for _, t in dr), 'mac/device_run.sh: CUTSCENES must accept the three documented modes')
 
 for f in fails:
     print('test_mac_rules: FAIL: ' + f)

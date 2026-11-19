@@ -12,6 +12,7 @@ void kh_disk_audio(KhRecords *,struct KhAudioSlot *);
 typedef struct { u8 *data; size_t size,capacity; } KhBootDocs;
 const char *kh_slot_docs_capture(KhBootDocs *);
 const char *kh_slot_docs_begin(const KhBootDocs *);
+const char *kh_slot_docs_snapshot(const char *root);
 void kh_slot_docs_finish(void);
 const char *kh_slot_autosave_documents(void);
 const char *kh_slot_documents(void);
