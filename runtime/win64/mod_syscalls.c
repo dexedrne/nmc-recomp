@@ -3,6 +3,7 @@
  * The vanilla slot is empty: the 114 entries start at index zero, not after another table.
  */
 #include "khnmc_rt.h"
+#include "xion_swap.h"
 #include <math.h>
 
 static const struct { const char *name; u32 flags, dll_rva; } entries[] = {
@@ -288,6 +289,9 @@ void f_1f9a80(KCtx *g){
 /* DLL 327e0: the sole game consumer of SetDriveMultiplier's private float. */
 void f_3a9cf0(KCtx *g){
     u64 actor=A0(g); float amount=xf(g,1);
+    // Drive orbs collected by prototype Xion belong to the canonical campaign sheet.
+    if(kh_xion_enabled&&kh_xion_progress_player()&&actor==rd64(g,GS_BASE+0x2a105d0)&&rd64(g,KH_RSP(g))==GS_BASE+0x3dcae8)
+        actor=kh_xion_progress_player();
     require_mem(g,actor,0xde4);
     u64 sheet=rd64(g,actor+0x5c0); require_mem(g,sheet,0x210);
     call(g,0x3a3990,actor,0); float rate=xf(g,0);

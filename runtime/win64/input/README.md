@@ -342,3 +342,7 @@ table slots, id-zone and far-zone marks, RSS: the PROCESS's marks, which a list 
 `tools/room_sweep.sh` (task 33) runs the sweep over every area file with these lists (see its header); `tools/room_sweep.py
 --selftest` checks its log parsing, its table and the runner's bookkeeping. Its table adds `NO-PROGRAM` from the data: a `LOADING`
 whose place names no map, btl or evt program of its room's area file (nothing of the room runs).
+
+With `KHNMC_XION_SWAP=1`, click both sticks together at a save point to switch between Roxas and rescue Xion (P_EX220). Release both before switching again. Xion has her own Attack, Jump and Laser Rain commands. Her command list omits the normal save reaction. Stand within 60 game units of the point to switch back, or press Y there to hand control to Roxas and use the save reaction. The choice lasts for the session and resets on New Game or Load Game. Field support is restricted to the area programs listed in implementation notes.
+
+`route-xion-fight.txt` checks the controller with `player-char 4` (Xion) and `player-char 1` (Roxas), checks canonical EXP with `save-exp-at-least N`, and writes a slot in the run's private Documents directory. Start a fresh process with that same `KH_DOCS` and `route-xion-reload.txt` to check native loading. `route-xion-event.txt` exercises the automatic return before the armor-shop scene.

@@ -88,6 +88,8 @@ const KhRouteCondInfo kh_route_cond_info[KR_NCOND]={
     [KR_TITLE_CHOICE]  ={"title-choice",1,0,15,"the title menu's cursor is on row N"},
     [KR_NEWGAME_DIALOG]={"newgame-dialog",1,0,2,"page N of the New Game menu takes input (0 difficulty, 1 second question, 2 confirmation)"},
     [KR_NEWGAME_CHOICE]={"newgame-choice",1,0,15,"a New Game page takes input with its cursor on row N"},
+    [KR_PLAYER_CHAR]    ={"player-char",1,0,15,"the field controller owns character sheet N"},
+    [KR_SAVE_EXP]       ={"save-exp-at-least",1,0,99999999,"the canonical save has at least N EXP"},
     [KR_GAME_LEVEL]    ={"game-level",1,0,3,"the save's difficulty is N (0 Beginner, 1 Standard, 2 Critical, 3 Less Than Nothing)"},
     [KR_FIELD]         ={"field",0,0,0,"the field is up and the player has control"},
     [KR_BATTLE]        ={"battle",0,0,0,"a battle is in progress (a hit computed in the last 300 game frames)"},
@@ -388,6 +390,8 @@ int kh_route_cond_eval(KCtx *g,int kind,int arg,u64 n,const KhRouteBase *b){
     case KR_TITLE_CHOICE:   return title_menu(g) && (s32)rd32(g,T_CURSOR)==arg;
     case KR_NEWGAME_DIALOG: return newgame_page(g)==arg;
     case KR_NEWGAME_CHOICE: return newgame_choice(g)==arg;
+    case KR_PLAYER_CHAR: return kh_route_player_sheet(g,&ps)?ps.chr==arg:KR_UNREADABLE;
+    case KR_SAVE_EXP: return rd32(g,GS_BASE+0x9acf90)>=(u32)arg;
     case KR_GAME_LEVEL:     return (s32)rd32(g,GAME_LEVEL)==arg;
     case KR_FIELD:          return field(g);
     case KR_BATTLE:         return battle(n);

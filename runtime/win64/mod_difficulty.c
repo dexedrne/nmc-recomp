@@ -2,6 +2,7 @@
  * only use of that slot is the CalcDamage syscall, DLL 0x14aff), so no state runs the vanilla body: tools/check_mod_static_link.py
  * --dll-replaces fails the build if this object references orig_f_3c12f0 (or the original of any other full replacement). */
 #include "mod_config.h"
+#include "xion_swap.h"
 #include <math.h>
 #include <limits.h>
 #include <unistd.h>
@@ -91,6 +92,8 @@ void f_3c12f0(KCtx *g){
     if((s32)rd32(g,stat)<=damage_cvtt((float)(s32)rd32(g,stat+4)*damage_rf(g,victim+0x248)))
         result=damage_add(damage_mul(result,(s32)rd32(g,damage_sstm(g)+0x180)),99)/100;
 done:
+    if(kh_xion_enabled&&kh_xion_progress_player()&&attacker==rd64(g,GS_BASE+0x2a105d0)&&result>0)
+        kh_warn("xion-swap: Xion dealt %d damage",result);
     damage_last[slot]=result;
     damage_results[slot]+=(u32)result;
     if(!result) damage_zero[slot]++;
@@ -506,6 +509,7 @@ void kh_mod_difficulty_init(KCtx *g){
     }
 }
 void f_1523a0(KCtx *g){
+    if(kh_xion_enabled) kh_xion_reset(g);
     orig_f_1523a0(g);
     if(forced_difficulty>=0){ wr32(g,GS_BASE+0x9abd48,forced_difficulty); fprintf(stderr,"kh: difficulty forced=%d after init-save\n",forced_difficulty); }
 }
@@ -526,6 +530,7 @@ void kh_mod_add_exp(KCtx *g,u64 args){
     s32 award=damage_mul(damage_mul((s16)rd16(g,params+10),input),100)/10000;
     u64 player=damage_call(g,0x3b3e80,0,0,0,0),sheet=rd64(g,player+0x5c0);
     float ratio=(float)(s32)rd32(g,sheet)/(float)(s32)rd32(g,sheet+4);
+    if(kh_xion_enabled&&kh_xion_progress_player()) sheet=rd64(g,kh_xion_progress_player()+0x5c0);
     if(damage_rf(g,damage_sstm(g)+0x14c)>=ratio) award=damage_mul(award,(s8)rd8(g,sheet+0x203));
     u64 save=damage_call(g,0x152380,0,0,0,0); u32 d=rd32(g,save+0x2498);
     if(d==3){ award=damage_mul(award,75)/100; if(!award) award=1; }

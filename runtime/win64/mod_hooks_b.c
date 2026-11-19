@@ -65,6 +65,7 @@
  * block (exe 0x3b1840 reads them through a guest pointer): +0 = 0x1800819d8, +0x10 = 0x1800819e8, adjacent as in the DLL's .bss.
  * A DLL path that would fault on the PC (it never checks a pointer) is a named fatal. */
 #include "mod_config.h"
+#include "xion_swap.h"
 #include <string.h>
 #include <strings.h>
 
@@ -257,6 +258,7 @@ void f_3f29e0(KCtx *g){
         u64 e=need(g,bcall(g,0x3b0f20,self+0x2a8,(u32)id,0,flag),H29,"the row returned by 0x3b0f20");
         wr8(g,e+6,(u8)(k+1));
     }
+    if(kh_xion_enabled) kh_xion_command_done(g,self,obj);
     KH_RET(g);
 }
 

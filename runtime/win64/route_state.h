@@ -20,6 +20,7 @@ enum { KR_INITIAL_STATE, KR_TITLE_SCREEN, KR_TITLE_MENU, KR_TITLE_CHOICE, KR_NEW
        KR_MENU_TEXT,
        /* the save's progress flags (story) and menu flags (which rows the camp menu shows) */
        KR_PROGRESS_FLAG, KR_MENU_FLAG,
+       KR_PLAYER_CHAR, KR_SAVE_EXP,
        KR_NCOND };
 /* has_arg: 0 none, 1 a number lo..hi, 2 a name (an object's model name; `arg` is then its index, kh_route_name_intern) */
 typedef struct { const char *name; int has_arg; int lo, hi; const char *what; } KhRouteCondInfo;
@@ -121,6 +122,7 @@ typedef struct { u64 w, text, page; int mode, rows, cursor, takes; } KhMessageWi
 int  kh_route_message_window(KCtx *g,KhMessageWindow *out);
 size_t kh_route_message_page(KCtx *g,u64 p,char *out,size_t cap);  /* one page of a message (up to the page break 0x10) as ASCII */
 int  kh_route_object_name(KCtx *g,u64 obj,char *out,size_t cap);   /* an object's objentry model name */
+int kh_route_at_save_point(KCtx *g);
 int  kh_route_objects_named(KCtx *g,const char *name,float px,float pz,float *nx,float *nz,float *nd);   /* count, nearest; -1 = no map */
 /* the texts a system menu looks up (0x3ad9a0 hook): `kh: menu text:` once per message id and (menu id, camp menu page) while a menu runs */
 void kh_route_menu_text_note(KCtx *g,int id,u64 p);

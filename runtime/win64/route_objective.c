@@ -404,16 +404,23 @@ int kh_route_object_name(KCtx *g,u64 obj,char *out,size_t cap){
     out[i]=0; return i>0;
 }
 /* objects of the list whose objentry model name is `name` (the nearest one to (px, pz) through nx / nz / nd); -1 = no map */
-int kh_route_objects_named(KCtx *g,const char *name,float px,float pz,float *nx,float *nz,float *nd){
+static int objects_named(KCtx *g,const char *name,float px,const float *py,float pz,float *nx,float *nz,float *nd){
     if(rd8(g,NOW_WORLD)==0xff) return -1;
     u64 o=rd64(g,OBJ_HEAD); int n=0; float best=1e30f; char nm[40];
     for(int k=0;k<512 && o && readable(o,0xe00);k++){
         if(kh_route_object_name(g,o,nm,sizeof nm) && !strcmp(nm,name)){
             float x=rdf(g,o+0x670),z=rdf(g,o+0x678);
-            if(isfinite(x)&&isfinite(z)){ n++; float d=hypotf(x-px,z-pz); if(d<best){ best=d; if(nx) *nx=x; if(nz) *nz=z; } } }
+            if(isfinite(x)&&isfinite(z)){ n++; float d=hypotf(x-px,z-pz); if(py) d=hypotf(d,rdf(g,o+0x674)-*py); if(d<best){ best=d; if(nx) *nx=x; if(nz) *nz=z; } } }
         u32 id=rd32(g,o+0xa90); if(!id) break; o=decode_id(g,id);
     }
     if(nd) *nd=best; return n;
+}
+int kh_route_objects_named(KCtx *g,const char *name,float px,float pz,float *nx,float *nz,float *nd){
+    return objects_named(g,name,px,NULL,pz,nx,nz,nd);
+}
+int kh_route_at_save_point(KCtx *g){
+    float x,y,z,yaw,d;
+    return kh_route_player_pos(g,&x,&y,&z,&yaw)&&objects_named(g,"SAVE_POINT",x,&y,z,NULL,NULL,&d)>0&&d<=60;
 }
 /* KHNMC_ROUTE_TRACE=2: the reaction command when it changes (with its name and its target's name), and every 64 game frames the
  * objects with their names and positions */
