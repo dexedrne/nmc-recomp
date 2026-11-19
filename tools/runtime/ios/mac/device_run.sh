@@ -14,6 +14,12 @@
 #   1. install the app; 2. put khnmc.conf (`arg --selftest`, log + status file), a fresh status file and kh2fm.exe into the app's
 #      Documents; 3. start it, retrying every 20 s while iOS refuses because the phone is LOCKED (WAIT_UNLOCK_S, default 1800);
 #   4. read Documents/khnmc.status every 15 s until "exit N" (LIMIT_S, default 1500), then copy khnmc.log back.
+# CUTSCENES=story (TASK50; play and route modes): the story scenes the Nobody May Cry mod emptied come back (runtime/cutscenes.c):
+#   every configuration this call writes (play, GFX play, the route's) gets env KHNMC_CUTSCENES=story.  The game reads the pack of
+#   original scenes from Documents/data/story-events.khcs (tools/cutscene_pack.py writes it on the build-host); CUTSCENES_PACK=FILE (a file
+#   on this Mac) copies it there first.  Refused when the signed app is older than TASK50 (it would ignore the line and play the stubs).
+#   CUTSCENES=nmc or unset: no line (the mod's empty scenes, as before).  A later call without CUTSCENES writes its configurations
+#   without the line, as for every other option.
 #   SKIP_INSTALL=1 skips steps 1 and 2 apart from the fresh status file (the app, the exe and the conf are already there).
 #   SOUND=1 (route mode only): the game's sound plays through the speaker; otherwise every test run is silent (KHNMC_AUDIO=null).
 # The phone's device id is read from ~/Developer/KHNMC/state/device.env (DEVICE=...), never from this repository.  Never names a
@@ -93,6 +99,10 @@ case "$HASHLOG" in 0|1) ;; *) bad "HASHLOG is 0 or 1 (got '$HASHLOG')";; esac
 case "$CLOCK" in ''|frames) ;; *) bad "CLOCK is frames or unset (got '$CLOCK')";; esac
 [ -z "$DUMP_EVERY" ] || case "$DUMP_EVERY" in *[!0-9]*|0*) bad "DUMP_EVERY must be a positive number of presents (got '$DUMP_EVERY')";; esac
 GFX_APP=${GFX_APP:-}; case "$GFX_APP" in ''|0|1) ;; *) bad "GFX_APP is 0 or 1 (got '$GFX_APP')";; esac
+CUTSCENES=${CUTSCENES:-}; CUTSCENES_PACK=${CUTSCENES_PACK:-}                 # TASK50
+case "$CUTSCENES" in ''|nmc|story) ;; *) bad "CUTSCENES is nmc or story (got '$CUTSCENES')";; esac
+[ "$CUTSCENES" != story ] || [ "$MODE" != selftest ] || bad "CUTSCENES=story is for play and route runs (the selftest tests the switch itself)"
+[ -z "$CUTSCENES_PACK" ] || { [ "$CUTSCENES" = story ] || bad "CUTSCENES_PACK needs CUTSCENES=story"; [ -f "$CUTSCENES_PACK" ] || bad "CUTSCENES_PACK: no file '$CUTSCENES_PACK' on this Mac"; }
 [ "$GFX" = 1 ] && [ "$GFX_APP" = 0 ] && bad "GFX=1 runs the graphics backend: GFX_APP=0 (an app without it) contradicts that"
 [ "$GFX" = 1 ] && GFX_APP=1
 for n in $FETCH; do case "$n" in *[!0-9]*|0*) bad "FETCH holds '$n', not a present number";; esac
@@ -123,7 +133,14 @@ fi
 # directive), so it is written only when the signed app knows it; the env lines are harmless for an older app (it ignores them).
 app_has_logcap(){ grep -a -q 'logcap needs a log directive' "$APP/KHNMC" 2>/dev/null; }
 quiet_lines(){ if app_has_logcap; then echo "logcap 16M"; fi; echo "env KHNMC_GFX_FRAME_LINE_EVERY=600"; }
-play_conf(){ { echo "# the game (tools/ios/mac/device_run.sh play): the controller is pad 0, sound on, no script, no time limit"; echo "log khnmc.log"; echo "status khnmc.status"; quiet_lines; } > "$OUT/play.conf"; }
+# TASK50: the cutscenes line, in every configuration this call writes (the app must know the variable: else it plays the stubs silently)
+app_has_cutscenes(){ grep -a -q 'KHNMC_CUTSCENES_PACK' "$APP/KHNMC" 2>/dev/null; }
+cut_lines(){ [ "$CUTSCENES" != story ] || echo "env KHNMC_CUTSCENES=story"; }
+if [ "$CUTSCENES" = story ]; then app_has_cutscenes || { say "CUTSCENES=story, but the signed app is older than TASK50 (no KHNMC_CUTSCENES in it): build and sign it from this source first"; exit 2; }
+  if [ -n "$CUTSCENES_PACK" ]; then cp_to "$CUTSCENES_PACK" data/story-events.khcs || { say "copy of the cutscene pack FAILED"; tail -5 "$OUT/devicectl.log"; exit 1; }
+    say "the cutscene pack $(basename "$CUTSCENES_PACK") ($(wc -c < "$CUTSCENES_PACK" | tr -d ' ') bytes) is Documents/data/story-events.khcs"
+  else say "CUTSCENES=story without CUTSCENES_PACK: the pack must already be Documents/data/story-events.khcs (else the game stops with the named fatal cutscenes-pack)"; fi; fi
+play_conf(){ { echo "# the game (tools/ios/mac/device_run.sh play): the controller is pad 0, sound on, no script, no time limit"; echo "log khnmc.log"; echo "status khnmc.status"; quiet_lines; cut_lines; } > "$OUT/play.conf"; }
 [ -x "$APP/KHNMC" ] && { app_has_logcap || say "the signed app does not know the conf directive logcap (older than TASK43): the play configuration is written without a log size cap"; }
 play_conf
 # TASK41: the conf lines of a run with the picture on the screen (GFX=1 PRESENT=1)
@@ -140,7 +157,7 @@ gfx_play_lines(){ :; }; if [ "$GFX" = 1 ]; then gfx_play_lines(){ echo "env KHNM
 # HUD=1 (owner 2026-11-18, default 1 for runs with the picture; HUD=0 turns it off): Apple's Metal performance HUD (fps, frame and GPU time)
 present_lines(){ echo "env KHNMC_GFX_PRESENT=layer"; echo "env KHNMC_SCREEN=layer"; echo "env KHNMC_ASPECT=fill"; [ "${HUD:-1}" = 1 ] && echo "env KHNMC_HUD=1"; [ -z "$PRESENT_CHECK" ] || echo "env KHNMC_GFX_PRESENT_CHECK=$PRESENT_CHECK"; }
 if [ "$MODE" = play ] && [ "$PRESENT" = 1 ]; then
-  { echo "# the game with its picture (tools/ios/mac/device_run.sh GFX=1 PRESENT=1 play): the controller is pad 0, sound on, no script"; echo "log khnmc.log"; echo "status khnmc.status"; quiet_lines; gfx_play_lines; present_lines; } > "$OUT/gfx-play.conf"
+  { echo "# the game with its picture (tools/ios/mac/device_run.sh GFX=1 PRESENT=1 play): the controller is pad 0, sound on, no script"; echo "log khnmc.log"; echo "status khnmc.status"; quiet_lines; gfx_play_lines; present_lines; cut_lines; } > "$OUT/gfx-play.conf"
   if grep -q '^env KHNMC_GFX_PIPECACHE=off$' "$OUT/gfx-play.conf"; then say "the disk pipeline cache is OFF in this play configuration (PIPECACHE=off, or no $STATE/pipecache-verified yet: MAC-STEPS-43.md sections 2 and 3 first, then touch that file; PIPECACHE=on decides for this call)"
   else say "the disk pipeline cache is ON in this play configuration (the app's own file, Library/Caches/khnmc/pipe.bin)"; fi
   if grep -q '^env KHNMC_GFX_VKD3D_LOG_REPEATS=' "$OUT/gfx-play.conf"; then say "vkd3d logs at warn behind the runtime's filter (8 lines per site, then counted)"; else say "the signed app does not know KHNMC_GFX_VKD3D_LOG_REPEATS (older than the TASK43 review): vkd3d logs at its default level, its warn-class failure lines are NOT in the play log"; fi
@@ -163,7 +180,7 @@ fi
     echo "env KHNMC_INPUT_SCRIPT=@DOCS@/input.txt"; echo "env KH_RUN_GAME_FRAMES=$FRAMES"; echo "env KH_RUN_SECONDS=$((LIMIT-120))"
     echo "env KH_DUMP_THREADS=1"; echo "env KHNMC_PHASELOG=@DOCS@/phase.log"; echo "env KHNMC_FILELOG=@DOCS@/files.log"
     DV=KHNMC_DIFFICULTY; grep -qE '^[[:space:]]*@(wait|press|select|expect)([[:space:]]|$)' "$INPUT" && DV=KHNMC_ROUTE_DIFFICULTY   # as tools/route_batch.sh
-    [ "$DIFF" = none ] || echo "env $DV=$DIFF"; fi
+    [ "$DIFF" = none ] || echo "env $DV=$DIFF"; cut_lines; fi
   if [ "$GFX" = 1 ]; then gfx_lines; [ "$PRESENT" = 1 ] && present_lines
     [ -z "$DUMP_EVERY" ] || { echo "env KHNMC_GFX_DUMP=@DOCS@/frames"; echo "env KHNMC_GFX_DUMP_EVERY=$DUMP_EVERY"; }
     [ "$HASHLOG" = 0 ] || echo "env KHNMC_GFX_HASHLOG=@DOCS@/hash.tsv"

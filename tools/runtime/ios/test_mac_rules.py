@@ -223,6 +223,20 @@ check(re.search(r'\bgfx_has\(\)', lib) is not None, 'mac/lib.sh: gfx_has is miss
 for f in sorted(x for x in os.listdir(os.path.join(D, 'mac')) if x.endswith('.sh')):
     bad = [no for no, t in lines('mac/' + f) if re.search(r'\bnm\s[^|;]*\|\s*grep\b', t)]
     check(not bad, 'mac/%s:%s: nm piped into grep: an unreadable file would read as "no backend" (use gfx_has)' % (f, ','.join(map(str, bad))))
+# TASK50: CUTSCENES=story writes `env KHNMC_CUTSCENES=story` from cut_lines only, into all three configurations (play, GFX play, the
+# test one), and only after app_has_cutscenes found the variable in the signed app (an older app would ignore it and play the stubs)
+cut_def = [t for _, t in dr if re.search(r'^cut_lines\(\)', t)]
+check(len(cut_def) == 1 and 'echo "env KHNMC_CUTSCENES=story"' in cut_def[0] and '[ "$CUTSCENES" != story ] ||' in cut_def[0],
+      'mac/device_run.sh: cut_lines must write env KHNMC_CUTSCENES=story only when CUTSCENES=story')
+check(sum(1 for _, t in dr if 'env KHNMC_CUTSCENES=story' in t and not t.lstrip().startswith('#')) == 1, 'mac/device_run.sh: env KHNMC_CUTSCENES=story is written outside cut_lines')
+for tgt in ('> "$OUT/play.conf"', '> "$OUT/gfx-play.conf"'):
+    hit = [t for _, t in dr if tgt in t]
+    check(len(hit) == 1 and 'cut_lines' in hit[0], 'mac/device_run.sh: the configuration %s does not call cut_lines' % tgt)
+check(any(re.search(r'\[ "\$DIFF" = none \] \|\| echo "env \$DV=\$DIFF"; cut_lines; fi', t) for _, t in dr), 'mac/device_run.sh: the test configuration does not call cut_lines')
+check(any(re.search(r"^app_has_cutscenes\(\)\{ grep -a -q 'KHNMC_CUTSCENES_PACK' \"\$APP/KHNMC\"", t) for _, t in dr) and
+      any(re.search(r'if \[ "\$CUTSCENES" = story \]; then app_has_cutscenes \|\| \{ say .*exit 2; \}', t) for _, t in dr),
+      'mac/device_run.sh: CUTSCENES=story must be refused (exit 2) when the signed app does not know KHNMC_CUTSCENES_PACK')
+check(any(re.search(r'''case "\$CUTSCENES" in ''\|nmc\|story\) ;; \*\) bad ''', t) for _, t in dr), 'mac/device_run.sh: CUTSCENES must accept only nmc or story')
 
 for f in fails:
     print('test_mac_rules: FAIL: ' + f)

@@ -257,6 +257,8 @@ static int selftest_all(KCtx *g){
               fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=movies): only the suite `movies` ran, %d failures\n",f); return f; }
           if(!strcmp(only,"aspect")){ extern int kh_aspect_selftest(KCtx *); int f=kh_aspect_selftest(g);      /* task 37: for its mutation checks */
               fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=aspect): only the suite `aspect` ran, %d failures\n",f); return f; }
+          if(!strcmp(only,"cutscenes")){ extern int kh_cutscenes_selftest(KCtx *); int f=kh_cutscenes_selftest(g);   /* task 50: for its mutation checks */
+              fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=cutscenes): only the suite `cutscenes` ran, %d failures\n",f); return f; }
           /* task 39: `gate` (the admission-counted suspend gate), `ordered` (memory ordering: the option really on in this binary) and
            * `membench` (the cost of guest loads / stores plain against acquire/release, for the Mac mini and the phone) */
           if(!strcmp(only,"gate")){ extern int kh_gfx_gate_selftest(void); int f=kh_gfx_gate_selftest();
@@ -316,6 +318,7 @@ static int selftest_all(KCtx *g){
     { extern int kh_input_route30_selftest(KCtx *); fails+=kh_input_route30_selftest(g); }   /* task 30: @fight, the programs reader */
     { extern int kh_data_deny_selftest(KCtx *); extern int kh_events_stub_selftest(KCtx *); extern int kh_music_log_selftest(KCtx *);   /* task 32 */
       fails+=kh_data_deny_selftest(g)+kh_events_stub_selftest(g)+kh_music_log_selftest(g); }
+    { extern int kh_cutscenes_selftest(KCtx *); fails+=kh_cutscenes_selftest(g); }           /* task 50: KHNMC_CUTSCENES (runtime/cutscenes.c) */
     { extern int kh_input_route31_selftest(KCtx *); fails+=kh_input_route31_selftest(g); }   /* task 31: objective / message / reaction / menu readers, @react, @goto object */
     { extern int kh_warp_selftest(KCtx *); fails+=kh_warp_selftest(g); }                     /* task 33: the debug warp (runtime/warp.c) */
     { extern int kh_input_route33_selftest(KCtx *); fails+=kh_input_route33_selftest(g); }   /* task 33: the @warp / @warp list steps */

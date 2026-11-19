@@ -150,6 +150,8 @@ void f_3a1f70(KCtx *g){
     orig_f_3a1f70(g);
     n_lookup++;
     u64 p=KH_RAX(g);
+    { extern u64 kh_cutscenes_answer(KCtx *,u32,u64); u64 c=kh_cutscenes_answer(g,nm,p);   /* task 50: KHNMC_CUTSCENES=story (runtime/cutscenes.c) */
+      if(c!=p){ SET_RAX(g,c); return; } }                                                  /* an original served: it is not a stub to replace */
     if(!p){ n_none++; if(mode>M_REAL) fprintf(stderr,"kh: events stub: game-frame=%llu map %02x:%02x event %.4s: no entry of that name\n",(unsigned long long)kh_input_game_frames(),
                                                          rd8(g,GS_BASE+0x717008),rd8(g,GS_BASE+0x717009),(const char*)&nm); return; }
     u64 before=n_replaced, before_c=n_carried, before_m=n_music_cmds;
@@ -164,6 +166,7 @@ void f_3a1f70(KCtx *g){
     }
 }
 void kh_events_stub_report(FILE *f){
+    { extern void kh_cutscenes_report(FILE *); kh_cutscenes_report(f); }                    /* task 50 */
     if(mode>M_REAL) fprintf(f,"kh: events stub: mode %s: %llu event lookups, %llu replaced by the stub, %llu were the mod's stub already (%llu of them its stub with a music command), %llu found no entry; "
                             "%llu stubs carry their scene's music commands (%llu because the scene sets the keep flag), %llu music commands carried over\n",
                             mode==M_STUB?"stub":"stub+music",(unsigned long long)n_lookup,(unsigned long long)n_replaced,(unsigned long long)n_already,(unsigned long long)n_already_music,(unsigned long long)n_none,
