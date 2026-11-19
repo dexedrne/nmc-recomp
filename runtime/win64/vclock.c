@@ -683,3 +683,33 @@ int kh_vclock_selftest(KCtx *g){
     fprintf(stderr,"kh: vclock selftest: %d checks, %d failures\n",checks,fails);
     return fails;
 }
+
+#include "slot_disk.h"
+static int clock_client_order(const void *a,const void *b){
+    const VClient *x=*(VClient *const *)a,*y=*(VClient *const *)b;
+    u32 xt=x->keyth?x->keyth->tid:0,yt=y->keyth?y->keyth->tid:0;
+    if(xt!=yt) return xt<yt?-1:1;
+    if(x->keyseq!=y->keyseq) return x->keyseq-y->keyseq;
+    return strcmp(x->name,y->name);
+}
+void kh_disk_clock(KhRecords *r,struct KhClockSlot *s){
+    kh_record_time(r,&s->now);
+    KH_VALUE(r,s->vblank); KH_VALUE(r,s->presents); KH_VALUE(r,s->ticks); KH_VALUE(r,s->frames);
+    KH_RECORD(r,s->sem); KH_VALUE(r,s->releases); KH_VALUE(r,s->taken);
+    KH_VALUE(r,s->in_wait); KH_VALUE(r,s->rest);
+    KH_RECORD(r,s->calibrated); KH_VALUE(r,s->how); KH_RECORD(r,s->stepped);
+    VClient *ordered[MAXCLIENTS]; unsigned count=0;
+    for(unsigned i=0;i<MAXCLIENTS;i++) if(s->clients[i].used) ordered[count++]=s->clients+i;
+    qsort(ordered,count,sizeof *ordered,clock_client_order);
+    KH_RECORD(r,count);
+    for(unsigned i=0;i<count;i++){
+        VClient *c=ordered[i];
+        u32 tid=c->keyth?c->keyth->tid:0;
+        KH_RECORD(r,tid); KH_RECORD(r,c->keybase); KH_RECORD(r,c->keyseq); KH_RECORD(r,c->prio);
+        char name[64];
+        if(strlen(c->name)>=sizeof name) kh_fatal(NULL,"savestate-clock-client-name");
+        memset(name,0,sizeof name); strcpy(name,c->name);
+        KH_RECORD(r,name); kh_record_time(r,&c->due);
+        KH_VALUE(r,c->quiet_wait);
+    }
+}

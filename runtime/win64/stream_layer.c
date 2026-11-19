@@ -160,3 +160,16 @@ int kh_stream_selftest(KCtx *g){
     free(root); free(log); unlink(path); unlink(lp); snprintf(path,sizeof path,"%s/VagStream",dir); rmdir(path); rmdir(dir);
     fprintf(stderr,"kh: stream selftest: %d checks, %d failures\n",checks,bad); return bad;
 }
+
+#include "slot_disk.h"
+void kh_disk_streams(KhRecords *r,struct KhStreamSlot *s){
+    for(unsigned i=0;i<MAXSTREAM;i++){
+        Stream *v=s->streams+i;
+        KH_RECORD(r,v->guest);
+        if(!v->guest) continue;
+        struct stat st;
+        if(fstat(v->fd,&st)) kh_fatal(NULL,"savestate-stream-file-stat");
+        u64 identity[]={st.st_dev,st.st_ino,v->size};
+        KH_RECORD(r,identity); KH_RECORD(r,v->name); KH_VALUE(r,v->reads); KH_VALUE(r,v->bytes);
+    }
+}

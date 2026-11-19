@@ -1,13 +1,16 @@
 #pragma once
 #include "savestate.h"
 
-/* The record stream is private to this process. A disk slot contains only its
- * session key. Sizes and addresses never come from the slot file. */
+/* Resident owner records and the pointer-free disk sections share this stream. */
 typedef struct KhRecords {
     struct KhBlock *first, **tail, *read;
     int loading;
+    size_t position;
 } KhRecords;
 void kh_record(KhRecords *,void *,size_t);
+void kh_record_value(KhRecords *,void *,size_t);
+#define KH_VALUE(r,x) kh_record_value((r),&(x),sizeof(x))
+void kh_record_time(KhRecords *,u64 *);
 void kh_record_pages(KhRecords *,void *,size_t);
 #define KH_RECORD(r,x) kh_record((r),&(x),sizeof(x))
 void kh_records_begin(KhRecords *,int load);

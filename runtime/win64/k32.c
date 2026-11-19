@@ -318,3 +318,18 @@ void kh_rewind_mapping(KhRecords *r,void **object){
     }
     kh_record(r,*object,sizeof(KMap));
 }
+
+#include "slot_disk.h"
+void kh_disk_timers(KhRecords *r,struct KhTimerSlot *s){
+    KH_RECORD(r,s->count); KH_RECORD(r,s->next);
+    for(unsigned i=0;i<s->count;i++){
+        struct TimerRecord *rec=s->records+i;
+        Timer *t=&rec->state;
+        u32 owner=t->owner?t->owner->tid:0;
+        KH_RECORD(r,t->id); KH_RECORD(r,t->delay); KH_RECORD(r,t->cb); KH_RECORD(r,t->user);
+        KH_RECORD(r,t->flags); KH_RECORD(r,owner); KH_RECORD(r,t->owner_seq); KH_RECORD(r,t->anchor);
+        KH_VALUE(r,t->fires); KH_VALUE(r,t->settled); KH_VALUE(r,t->no_consumer); KH_VALUE(r,t->guard_hits);
+        KH_RECORD(r,t->nset); KH_RECORD(r,t->seth); KH_VALUE(r,t->setsat); KH_VALUE(r,t->setwait);
+        kh_record_time(r,&rec->due);
+    }
+}

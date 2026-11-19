@@ -25,6 +25,7 @@ static char exe_path[1024];                   /* always from KH_EXE: host_env.c 
 #else
 static char exe_path[1024]="/home/user/projects/kh2-nmc-analysis/pc/kh2fm.exe";
 #endif
+const char *kh_game_image_path(void){ return exe_path; }
 static const char *entry_mode="crt";
 static u64 guest_space_size=0x300000000ull;   /* 12 GiB reserve, lazily committed */
 u64 gs_low_guard=0;                           /* bias mode: bytes of guest space below GS_BASE that are reserved without access (GS_BASE, or 0 = no guard) */

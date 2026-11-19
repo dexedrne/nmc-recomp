@@ -208,7 +208,7 @@ def app_settings():
             'OTHER_CFLAGS': PREFIX_MAP,
             # TASK38: empty here; GFX=1 builds pass it to xcodebuild (see the top of this file)
             'KHNMC_GFX_LDFLAGS': '',
-            'OTHER_LDFLAGS': ['-Wl,-force_load,$(KHNMC_LIBS)/libkhnmc-rt.a', '$(KHNMC_LIBS)/libkh2loose.a']
+            'OTHER_LDFLAGS': ['-Wl,-force_load,$(KHNMC_LIBS)/libkhnmc-rt.a', '$(KHNMC_LIBS)/libkh2loose.a', '-lz']
                              + [x for f in FRAMEWORKS for x in ('-framework', f)] + ['$(KHNMC_GFX_LDFLAGS)']}
 
 

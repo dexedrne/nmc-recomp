@@ -1056,3 +1056,42 @@ void kh_audio_report(FILE *f){
 
 #include "rewind.h"
 u64 kh_audio_output_frame(void){ return st_quanta*480; }
+
+#include "slot_disk.h"
+void kh_disk_mixer(KhRecords *,KmxEngine *);
+void kh_disk_audio(KhRecords *r,struct KhAudioSlot *s){
+    kh_disk_streams(r,s->streams);
+    KH_RECORD(r,s->nformats); KH_RECORD(r,s->neffects);
+    KH_VALUE(r,s->formats); KH_VALUE(r,s->effects);
+    KH_RECORD(r,s->iid_xapo); KH_RECORD(r,s->iid_params);
+    for(Voice *v=s->bindings;v;v=v->next){
+        KH_RECORD(r,v->object); KH_RECORD(r,v->flags); KH_RECORD(r,v->count); KH_VALUE(r,v->channels);
+        for(u32 i=0;i<v->count;i++){
+            Effect *e=v->effects+i;
+            KH_RECORD(r,e->object); KH_VALUE(r,e->enabled); KH_RECORD(r,e->channels); KH_RECORD(r,e->size);
+            kh_record(r,e->params,e->size);
+        }
+        for(Matrix *m=v->matrices;m;m=m->next){
+            KH_RECORD(r,m->dest); KH_RECORD(r,m->src); KH_RECORD(r,m->dst);
+            kh_record(r,m->values,(size_t)m->src*m->dst*sizeof(float));
+        }
+    }
+    for(SoftEngine *e=s->engines;e;e=e->next){
+        KH_RECORD(r,e->obj); KH_RECORD(r,e->cbs); KH_RECORD(r,e->ncb); KH_RECORD(r,e->manual);
+        for(SoftVoice *v=e->voices;v;v=v->next){
+            KH_RECORD(r,v->obj); KH_RECORD(r,v->cb); KH_RECORD(r,v->nfx); KH_RECORD(r,v->fmt);
+            KH_VALUE(r,v->buffers); KH_VALUE(r,v->bytes);
+            KH_VALUE(r,v->ratio_min); KH_VALUE(r,v->ratio_max); KH_VALUE(r,v->vol_min); KH_VALUE(r,v->vol_max);
+            KH_VALUE(r,v->ratio_set); KH_VALUE(r,v->vol_set);
+            for(u32 i=0;i<v->nfx;i++){
+                SoftFx *fx=v->fx+i;
+                KH_RECORD(r,fx->kind); KH_RECORD(r,fx->obj); KH_RECORD(r,fx->vtbl);
+                KH_RECORD(r,fx->xapo); KH_RECORD(r,fx->params); KH_RECORD(r,fx->fmt_in); KH_RECORD(r,fx->fmt_out);
+                KH_RECORD(r,fx->lockp); KH_RECORD(r,fx->procp); KH_RECORD(r,fx->pbuf); KH_RECORD(r,fx->regflags);
+                KH_RECORD(r,fx->in_ch); KH_RECORD(r,fx->out_ch); KH_RECORD(r,fx->pcap); KH_RECORD(r,fx->locked);
+                KH_RECORD(r,fx->stat); KH_RECORD(r,fx->blob_size); kh_record(r,fx->blob,fx->blob_size);
+            }
+        }
+        kh_disk_mixer(r,e->mx);
+    }
+}

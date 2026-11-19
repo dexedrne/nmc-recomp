@@ -15,3 +15,4 @@ struct kh_option {
 extern const struct kh_option kh_options[];
 extern const int kh_option_count;
 int kh_setting_live(int index);
+double kh_live_setting_value(int index);

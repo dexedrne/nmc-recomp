@@ -497,7 +497,7 @@ ifneq ($(UNAME_S),Darwin)
 CUTSCENE_HASH_LIB = -lcrypto
 endif
 $(BIN): $(RTOBJ) $(LIFTOBJ) $(HOOK_OBJ) $(OL)/libkh2loose.a
-	$(CC) -o $@ $(RTOBJ) $(LIFTOBJ) $(HOOK_OBJ) $(OL)/libkh2loose.a -lm -lpthread $(LDEXPORT) $(HOOK_LINK) $(CUTSCENE_HASH_LIB) $(GFX_LDFLAGS) $(COREAUDIO_LDFLAGS)
+	$(CC) -o $@ $(RTOBJ) $(LIFTOBJ) $(HOOK_OBJ) $(OL)/libkh2loose.a -lm -lpthread $(LDEXPORT) $(HOOK_LINK) $(CUTSCENE_HASH_LIB) -lz $(GFX_LDFLAGS) $(COREAUDIO_LDFLAGS)
 # ---- Task 26: the game as two static libraries and a shell that owns main() (what an iOS app links) ----
 APP_RTOBJ = $(filter-out $(O)/loader.o,$(RTOBJ)) $(O)/loader_app.o
 $(O)/loader_app.o: $(ROOT)/runtime/loader.c $(wildcard $(ROOT)/runtime/*.h)
@@ -512,7 +512,7 @@ else
 APP_WHOLE = -Wl,--whole-archive $(O)/libkhnmc-rt.a -Wl,--no-whole-archive
 endif
 $(BIN)-shell: $(ROOT)/tools/ios/host_shell.c $(O)/libkhnmc-rt.a $(OL)/libkh2loose.a
-	$(CC) $(CFLAGS) -o $@ $(ROOT)/tools/ios/host_shell.c $(APP_WHOLE) $(OL)/libkh2loose.a -lm -lpthread $(LDEXPORT) $(HOOK_LINK) $(CUTSCENE_HASH_LIB) $(GFX_LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $(ROOT)/tools/ios/host_shell.c $(APP_WHOLE) $(OL)/libkh2loose.a -lm -lpthread $(LDEXPORT) $(HOOK_LINK) $(CUTSCENE_HASH_LIB) -lz $(GFX_LDFLAGS)
 hostshell: $(O)/hostshell.ok
 $(O)/hostshell.ok: $(BIN)-shell tools/check_hook_link.py tools/check_mod_static_link.py tools/check_ios_symbols.py
 	python3 tools/check_hook_link.py --bin $(BIN)-shell --objs $(APP_RTOBJ) $(LIFTOBJ) $(HOOK_OBJ) --hooks $(HOOKS_UNIQ) --wrap $(WRAP_FNS) $(if $(HOOK_OBJ),--forwarders $(HOOK_OBJ)) $(if $(filter 1,$(HOOK_STRICT)),--strict)

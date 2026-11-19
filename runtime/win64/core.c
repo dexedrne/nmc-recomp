@@ -1079,7 +1079,10 @@ int kh_winpath(const char *win,char *out,size_t cap){
     }
     /* synthetic Windows layout: C:\KH2 = game dir (kh_root); C:\Users\khnmc\Documents = kh_docs */
     if(!strncasecmp(s,"/KH2",4)&&(s[4]=='/'||s[4]==0)) return kh_resolve_ci(kh_root,s+4,out,cap);
-    if(!strncasecmp(s,"/Users/khnmc/Documents",22)) return kh_resolve_ci(kh_docs,s+22,out,cap);
+    if(!strncasecmp(s,"/Users/khnmc/Documents",22)) {
+        extern const char *kh_slot_documents(void);
+        return kh_resolve_ci(kh_cut_enabled?kh_slot_documents():kh_docs,s+22,out,cap);
+    }
     if(s[0]=='/') { snprintf(out,cap,"%s",s); return 0; }                 /* other absolute: pass through (will not exist) */
     return kh_resolve_ci(kh_root,s,out,cap);                                 /* relative: the game dir is the working directory */
 }
@@ -1158,4 +1161,35 @@ void kh_rewind_handles(KhRecords *r){
         }
         next=index+1;
     }
+}
+
+#include "slot_disk.h"
+static int sync_wait_order(const void *a,const void *b){
+    const struct SyncWait *x=a,*y=b;
+    return (x->thread->tid>y->thread->tid)-(x->thread->tid<y->thread->tid);
+}
+void kh_disk_sync(KhRecords *r,struct KhSyncSlot *s){
+    KH_RECORD(r,s->next); KH_RECORD(r,s->objects); KH_RECORD(r,s->waiters);
+    for(u32 j=0;j<s->objects;j++){
+        struct SyncObject *o=s->records+j;
+        u32 identity[]={o->index,o->w->kind,o->w->thread?o->w->thread->tid:0,
+                        o->last_taker?o->last_taker->tid:0};
+        KH_RECORD(r,identity);
+        KH_VALUE(r,o->signaled); KH_RECORD(r,o->manual); KH_VALUE(r,o->recurse);
+        KH_RECORD(r,o->waiters); KH_VALUE(r,o->tokens); KH_VALUE(r,o->count); KH_RECORD(r,o->maxcount);
+        KH_VALUE(r,o->owner); KH_VALUE(r,o->gen); KH_VALUE(r,o->satisfied);
+        KH_VALUE(r,o->exit_code); KH_VALUE(r,o->suspended); KH_RECORD(r,o->done);
+    }
+    qsort(s->waits,s->waiters,sizeof *s->waits,sync_wait_order);
+    for(unsigned i=0;i<s->waiters;i++){
+        struct SyncWait *w=s->waits+i;
+        struct KhPendingWait *p=&w->pending;
+        u32 id=0;
+        while(id<s->objects&&s->records[id].w!=p->object) id++;
+        if(id==s->objects) kh_fatal(NULL,"savestate-sync-object-binding");
+        KH_RECORD(r,w->thread->tid); KH_RECORD(r,id); KH_RECORD(r,p->handle);
+        KH_VALUE(r,p->generation); KH_RECORD(r,p->blocked); KH_RECORD(r,p->handoff);
+        KH_VALUE(r,p->frame_wait); KH_RECORD(r,p->timeout_ms); kh_record_time(r,&p->deadline);
+    }
+    kh_disk_clock(r,s->clock); kh_disk_sections(r,s->sections); kh_disk_timers(r,s->timers);
 }

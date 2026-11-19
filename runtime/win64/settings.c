@@ -102,6 +102,7 @@ static int test_log;
 int kh_setting_action(int i){return i>=kh_option_count-DEBUG_COUNT-STATE_ACTIONS && i<kh_option_count;}
 int kh_setting_menu_count(void){return kh_option_count-(debug_enabled?(allow_reset?0:1):DEBUG_COUNT);}
 static _Atomic double values[COUNT]={0,0,1,1};
+double kh_live_setting_value(int i){ return atomic_load(&values[i]); }
 int kh_setting_live(int index){return index>=0 && index<COUNT;}
 
 static int validate(const char *name,const char *value,double *number){

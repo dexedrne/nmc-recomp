@@ -1350,7 +1350,8 @@ void kh_rewind_fibers(KhRecords *r){
         }
         KFiber *f=*next;
         KH_RECORD(r,f->start); KH_RECORD(r,f->param); KH_RECORD(r,f->gstack_lo);
-        KH_RECORD(r,f->handle); KH_RECORD(r,f->hsize); KH_RECORD(r,f->gstack_sz); KH_RECORD(r,*f->g);
+        KH_RECORD(r,f->handle); KH_RECORD(r,f->hsize); KH_RECORD(r,f->gstack_sz);
+        KH_RECORD(r,f->g->st); KH_RECORD(r,f->g->aux);
         if(r->loading){
             f->hstack=mmap(NULL,f->hsize,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
             if(f->hstack==MAP_FAILED) kh_fatal(NULL,"savestate-fiber-stack-memory");
@@ -1358,5 +1359,18 @@ void kh_rewind_fibers(KhRecords *r){
             fiber_stack_note(f->gstack_lo,f->gstack_sz,f->start);
         }
         next=&f->cut_next;
+    }
+}
+
+#include "slot_disk.h"
+static int section_order(const void *a,const void *b){
+    const struct CsRecord *x=a,*y=b;
+    return (x->address>y->address)-(x->address<y->address);
+}
+void kh_disk_sections(KhRecords *r,struct KhCsSlot *s){
+    qsort(s->records,s->count,sizeof *s->records,section_order);
+    KH_RECORD(r,s->count);
+    for(size_t i=0;i<s->count;i++){
+        KH_RECORD(r,s->records[i].address); KH_RECORD(r,s->records[i].owner); KH_VALUE(r,s->records[i].depth);
     }
 }

@@ -998,3 +998,77 @@ int kmx_wav_close(KmxWav *w, KmxWavStats *st){
     int rc = wav_header(w); if(st) *st = w->st;
     if(close(w->fd)) rc = -1; free(w->tmp); free(w); return rc;
 }
+
+#include "slot_disk.h"
+/* Guest addresses rebind mixer-owned sample/processing buffers through the
+ * new arena bias. Native allocations and voice links come from the new graph. */
+static void disk_guest_binding(KhRecords *r,const void *p){
+    u64 address=p?(uintptr_t)p-gs_bias:0;
+    KH_RECORD(r,address);
+}
+static void disk_queue(KhRecords *r,QBuf *q){
+    KH_RECORD(r,q->flags); KH_RECORD(r,q->bytes); disk_guest_binding(r,q->data);
+    KH_RECORD(r,q->ctx); KH_RECORD(r,q->frames); KH_RECORD(r,q->play_begin); KH_RECORD(r,q->play_end);
+    KH_RECORD(r,q->loop_begin); KH_RECORD(r,q->loop_end); KH_RECORD(r,q->loop_count);
+    KH_RECORD(r,q->cursor); KH_RECORD(r,q->begun);
+}
+static void disk_array(KhRecords *r,void *p,size_t bytes){
+    u8 present=p!=NULL;
+    KH_RECORD(r,present);
+    if(present) kh_record(r,p,bytes);
+}
+static void disk_voice_ref(KhRecords *r,KmxVoice *v){
+    u32 id=v?v->id:0;
+    KH_RECORD(r,id);
+}
+void kh_disk_mixer(KhRecords *r,KmxEngine *e){
+    KH_RECORD(r,e->rate); KH_RECORD(r,e->quantum); KH_RECORD(r,e->nvoices);
+    KH_RECORD(r,e->next_id); disk_voice_ref(r,e->master);
+    KH_VALUE(r,e->running); KH_VALUE(r,e->callbacks); KH_RECORD(r,e->deferred); KH_VALUE(r,e->st);
+    for(u32 i=0;i<e->nvoices;i++){
+        KmxVoice *v=e->voices[i];
+        KH_RECORD(r,v->id); KH_RECORD(r,v->kind); KH_RECORD(r,v->has_cb);
+        KH_RECORD(r,v->dead); KH_RECORD(r,v->busy); KH_RECORD(r,v->closing); KH_RECORD(r,v->hidden);
+        KH_RECORD(r,v->flags); KH_RECORD(r,v->stage);
+        KH_RECORD(r,v->in_ch); KH_RECORD(r,v->in_rate); KH_RECORD(r,v->in_frames);
+        KH_RECORD(r,v->out_ch); KH_RECORD(r,v->out_rate); KH_RECORD(r,v->out_frames); KH_RECORD(r,v->max_ch);
+        KH_VALUE(r,v->volume); KH_VALUE(r,v->prev_volume); KH_VALUE(r,v->chan_vol); KH_VALUE(r,v->prev_chan_vol);
+        KH_RECORD(r,v->default_out); KH_RECORD(r,v->nsends);
+        for(u32 j=0;j<v->nsends;j++){
+            Send *s=v->sends+j;
+            disk_voice_ref(r,s->dest); KH_RECORD(r,s->flags); KH_RECORD(r,s->msrc); KH_RECORD(r,s->mdst);
+            KH_RECORD(r,s->nprev);
+            disk_array(r,s->matrix,(size_t)s->msrc*s->mdst*sizeof(float));
+            disk_array(r,s->prev,s->nprev*sizeof(float));
+        }
+        KH_RECORD(r,v->nfx);
+        for(u32 j=0;j<v->nfx;j++){
+            Fx *f=v->fx+j;
+            KH_RECORD(r,f->kind); KH_RECORD(r,f->in_ch); KH_RECORD(r,f->out_ch);
+            KH_VALUE(r,f->enabled); KH_RECORD(r,f->inplace); KH_VALUE(r,f->peak); KH_VALUE(r,f->rms);
+        }
+        disk_guest_binding(r,v->mix); disk_guest_binding(r,v->a); disk_guest_binding(r,v->b);
+        disk_array(r,v->win,4*v->in_ch*sizeof(float));
+        KH_RECORD(r,v->frac); KH_RECORD(r,v->fill); KH_RECORD(r,v->fresh);
+        KH_RECORD(r,v->fmt); KH_RECORD(r,v->qn);
+        for(u32 j=0;j<v->qn;j++) disk_queue(r,v->q+j);
+        KH_VALUE(r,v->started); KH_VALUE(r,v->tails); KH_VALUE(r,v->tail_quiet); KH_VALUE(r,v->starving);
+        KH_VALUE(r,v->stream_open); KH_VALUE(r,v->tail_left); KH_VALUE(r,v->uncounted);
+        KH_RECORD(r,v->ratio); KH_RECORD(r,v->max_ratio); KH_VALUE(r,v->samples_played);
+        KH_VALUE(r,v->starve_count); KH_VALUE(r,v->starve_first); KH_VALUE(r,v->starve_last);
+        KH_RECORD(r,v->npend); disk_array(r,v->pend,v->npend*sizeof *v->pend);
+        disk_array(r,v->ad_cache,(size_t)v->fmt.samples_per_block*v->in_ch*sizeof(int16_t));
+        disk_guest_binding(r,v->ad_data); KH_RECORD(r,v->ad_block); KH_RECORD(r,v->ad_frames);
+        KH_VALUE(r,v->peak_stage); KH_RECORD(r,v->nstage);
+    }
+    u32 pending=e->nops-e->ophead;
+    KH_RECORD(r,pending);
+    for(u32 i=e->ophead;i<e->nops;i++){
+        Op *o=e->ops+i;
+        KH_RECORD(r,o->kind); disk_voice_ref(r,o->v); disk_voice_ref(r,o->dest);
+        kh_record_time(r,&o->stamp); KH_RECORD(r,o->a); KH_RECORD(r,o->b); KH_VALUE(r,o->f);
+        disk_array(r,o->vals,(size_t)o->a*(o->kind==OP_MATRIX?o->b:1)*sizeof(float));
+        disk_array(r,o->blob,o->b);
+        if(o->kind==OP_SUBMIT) disk_queue(r,&o->q);
+    }
+}

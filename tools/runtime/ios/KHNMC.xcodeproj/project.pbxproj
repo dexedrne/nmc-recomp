@@ -178,6 +178,7 @@
 				OTHER_LDFLAGS = (
 					"-Wl,-force_load,$(KHNMC_LIBS)/libkhnmc-rt.a",
 					"$(KHNMC_LIBS)/libkh2loose.a",
+					"-lz",
 					"-framework",
 					Foundation,
 					"-framework",
@@ -224,6 +225,7 @@
 				OTHER_LDFLAGS = (
 					"-Wl,-force_load,$(KHNMC_LIBS)/libkhnmc-rt.a",
 					"$(KHNMC_LIBS)/libkh2loose.a",
+					"-lz",
 					"-framework",
 					Foundation,
 					"-framework",

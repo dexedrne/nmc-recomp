@@ -1039,11 +1039,20 @@ void kh_rewind_hd(KhRecords *r){
     KH_RECORD(r,count);
     if(r->loading){
         while(count--){
-            HdTable *t; KH_RECORD(r,t); KH_RECORD(r,t->gent);
+            size_t n=0; int look; int64_t size; char key[2300];
+            KH_RECORD(r,n);
+            if(!n||n>sizeof key) kh_fatal(NULL,"savestate-hd-key-length");
+            kh_record(r,key,n); KH_RECORD(r,look); KH_RECORD(r,size);
+            if(key[n-1]) kh_fatal(NULL,"savestate-hd-key");
+            HdTable *t=buckets[ci_hash(key)&1023];
+            while(t && (t->look!=look||t->fsize!=size||!key_eq(t->key,key))) t=t->next;
+            if(!t) kh_fatal(NULL,"savestate-hd-binding: %s",key);
+            KH_RECORD(r,t->gent);
         }
     }else{
         for(unsigned i=0;i<1024;i++) for(HdTable *t=buckets[i];t;t=t->next) if(t->gent){
-            KH_RECORD(r,t); KH_RECORD(r,t->gent);
+            size_t n=strlen(t->key)+1;
+            KH_RECORD(r,n); kh_record(r,t->key,n); KH_RECORD(r,t->look); KH_RECORD(r,t->fsize); KH_RECORD(r,t->gent);
         }
     }
 }

@@ -422,3 +422,15 @@ void kh_crt_files_restore(struct KhCrtFiles *s){
 void kh_crt_files_discard(struct KhCrtFiles *s){
     if(s){ for(unsigned i=0;i<s->n;i++){close(s->files[i].fd); free(s->files[i].path);} free(s); }
 }
+
+#include "slot_disk.h"
+void kh_disk_files(KhRecords *r,struct KhCrtFiles *s){
+    KH_RECORD(r,s->n);
+    for(unsigned i=0;i<s->n;i++){
+        struct SavedFd *f=s->files+i;
+        struct stat st;
+        if(fstat(f->fd,&st)) kh_fatal(NULL,"savestate-crt-file-stat");
+        u64 identity[]={f->id,st.st_dev,st.st_ino,st.st_size};
+        KH_RECORD(r,identity); KH_VALUE(r,f->offset);
+    }
+}

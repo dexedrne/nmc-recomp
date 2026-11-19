@@ -24,6 +24,7 @@
 #include "warp.h"
 #include "xion_swap.h"
 #include "autosave.h"
+#include "slot_disk.h"
 typedef struct { u16 buttons; u8 lt,rt; s16 lx,ly,rx,ry; } ScriptPad;
 _Static_assert(sizeof(ScriptPad)==12,"XINPUT_GAMEPAD layout");
 typedef struct { u64 start,end; ScriptPad pad; } InputRange;
@@ -703,6 +704,69 @@ invalid: kh_fatal(g,"scripted XInput: invalid %s line %u%s%s",path,lineno,*why?"
         kh_warn("scripted XInput pad 0: route of %zu steps from %s (difficulty %d%s; game-frame clock; after the last step: %s)",nsteps,path,route_difficulty,route_difficulty_from,route_exit_at_end?"exit":"idle");
     } else kh_warn("scripted XInput pad 0: %zu ranges from %s",nranges,path);
 }
+/* Successful pad samples are ordered by input_lock. A held pad costs one
+ * transition regardless of how many times the polling worker reads it. */
+static KhPadHistory history;
+static size_t history_capacity, replay_index;
+static const KhPadHistory *replay;
+static void resize_history(size_t n){
+    if(n<=history_capacity) return;
+    size_t cap=n+128;
+    if(cap<n || cap>SIZE_MAX/sizeof(KhPadChange)) kh_fatal(NULL,"savestate-pad-history-size");
+    void *p=realloc(history.changes,cap*sizeof(KhPadChange));
+    if(!p) kh_fatal(NULL,"savestate-pad-history-memory");
+    history.changes=p; history_capacity=cap;
+}
+static void cut_pad_sample(ScriptPad *pad){
+    if(replay && history.polls<replay->polls){
+        if(replay_index<replay->count && replay->changes[replay_index].poll==history.polls) replay_index++;
+        if(!replay_index) kh_fatal(NULL,"savestate-pad-history-first");
+        memcpy(pad,replay->changes[replay_index-1].pad,sizeof *pad);
+    }
+    if(!history.count||memcmp(history.changes[history.count-1].pad,pad,sizeof *pad)){
+        resize_history(history.count+1);
+        KhPadChange *c=history.changes+history.count++;
+        *c=(KhPadChange){.poll=history.polls};
+        memcpy(c->pad,pad,sizeof *pad);
+    }
+    history.polls++;
+}
+void kh_pad_capture(KhPadHistory *out){
+    pthread_mutex_lock(&input_lock);
+    *out=history;
+    out->changes=history.count?malloc(history.count*sizeof *history.changes):NULL;
+    if(history.count){
+        if(!out->changes) kh_fatal(NULL,"savestate-pad-history-memory");
+        memcpy(out->changes,history.changes,history.count*sizeof *history.changes);
+    }
+    pthread_mutex_unlock(&input_lock);
+}
+void kh_pad_restore(const KhPadHistory *saved){
+    pthread_mutex_lock(&input_lock);
+    resize_history(saved->count);
+    if(saved->count) memcpy(history.changes,saved->changes,saved->count*sizeof *saved->changes);
+    history.count=saved->count; history.polls=saved->polls; replay=NULL;
+    pthread_mutex_unlock(&input_lock);
+}
+int kh_pad_bootstrap(const KhPadHistory *saved){
+    pthread_mutex_lock(&input_lock);
+    size_t n=0;
+    while(n<saved->count&&saved->changes[n].poll<history.polls) n++;
+    int ok=history.polls<=saved->polls && n==history.count &&
+        (!n || !memcmp(saved->changes,history.changes,n*sizeof *saved->changes));
+    if(ok){ replay=saved; replay_index=n; }
+    pthread_mutex_unlock(&input_lock);
+    return ok;
+}
+int kh_pad_caught_up(void){
+    pthread_mutex_lock(&input_lock);
+    int ok=replay && history.polls==replay->polls && history.count==replay->count;
+    pthread_mutex_unlock(&input_lock);
+    return ok;
+}
+void kh_pad_stop_bootstrap(void){
+    pthread_mutex_lock(&input_lock); replay=NULL; pthread_mutex_unlock(&input_lock);
+}
 u32 kh_input_state(KCtx *g,u32 slot,u64 out,u64 frame){
     if(!pad_source()||slot) return 1167;
     if(!out) return 87;
@@ -711,6 +775,7 @@ u32 kh_input_state(KCtx *g,u32 slot,u64 out,u64 frame){
     if(nsteps) pad=route_pad;                               /* a route: the pad route_tick computed for this game frame */
     else if(scripted){ for(size_t i=0;i<nranges;i++) if(frame>=ranges[i].start && frame<=ranges[i].end) pad=ranges[i].pad; }
     else { pad=host_pad; pad.buttons|=host_latched; host_latched=0; }   /* the shell's controller (KHNMC_INPUT=host); a tap shorter than a frame is seen once */
+    if(kh_cut_enabled) cut_pad_sample(&pad);
     if(!packet || memcmp(&last_pad,&pad,sizeof pad)){ packet++; last_pad=pad; }
     wr32(g,out,packet); wr16(g,out+4,pad.buttons); wr8(g,out+6,pad.lt); wr8(g,out+7,pad.rt);
     wr16(g,out+8,(u16)pad.lx); wr16(g,out+10,(u16)pad.ly); wr16(g,out+12,(u16)pad.rx); wr16(g,out+14,(u16)pad.ry);   /* scripts leave rx/ry 0 */
@@ -2020,7 +2085,15 @@ void kh_rewind_input(KhRecords *r){
     KH_RECORD(r,react_landing);
     KH_RECORD(r,react_open);
     KH_RECORD(r,react_shut);
-    KH_RECORD(r,react_why);
+    static char reason[160];
+    if(!r->loading){
+        if(react_why && strlen(react_why)>=sizeof reason) kh_fatal(NULL,"savestate-input-reaction-name");
+        char copy[sizeof reason]={0};
+        if(react_why) strcpy(copy,react_why);
+        memcpy(reason,copy,sizeof reason);
+    }
+    KH_RECORD(r,reason);
+    if(r->loading) react_why=*reason?reason:NULL;
     KH_RECORD(r,warp_watching);
     KH_RECORD(r,warp_seq);
     KH_RECORD(r,last_script_frame);
@@ -2031,5 +2104,8 @@ void kh_rewind_input(KhRecords *r){
     KH_RECORD(r,host_pad_on);
     KH_RECORD(r,host_pad);
     KH_RECORD(r,host_latched);
-    kh_record(r,steps,nsteps*sizeof *steps);
+    for(size_t i=0;i<nsteps;i++){
+        Step *s=&steps[i];
+        KH_RECORD(r,s->started); KH_RECORD(r,s->met); KH_RECORD(r,s->waited); KH_RECORD(r,s->warp_i);
+    }
 }
