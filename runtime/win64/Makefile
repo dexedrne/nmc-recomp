@@ -192,7 +192,7 @@ FILE_HOOKS += $(IDTABLE_HOOKS)
 MOOSE_HOOKS = 39d590 39dab0 3e5f30 3e5f90 39e260 39e270
 FILE_HOOKS += $(MOOSE_HOOKS)
 # Task 32 (runtime/events_stub.c, KHNMC_EVENTS=stub): 3a1f70 = find an event entry (BAR type 22) of the loaded area file by name; its only caller is the event starter 3ac350
-EVENT_HOOKS = 3a1f70 3aabe0 3ad5e0 3ad610 39afc0 2d9a30
+EVENT_HOOKS = 3a1f70 3aabe0 3ad5e0 3ad610 39afc0 2d9a30 2d0350 3df930
 FILE_HOOKS += $(EVENT_HOOKS)
 # Task 37 (runtime/aspect.c, NATIVE-FILL-PLAN.md section 7): KHNMC_ASPECT=fill.  11c1e0 = H1, post-call: on a screen narrower than 16:9
 # the largest-16:9 fit keeps the full height, so 0x14e050 / 0x4ed940 draw no bars; 186920 = the map pass, a pass-through that records

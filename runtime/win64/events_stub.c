@@ -145,6 +145,42 @@ u64 kh_events_stub_build(KCtx *g,u64 p){
 }
 /* exe 0x3a1f70(name as 4 characters) -> the entry's data, or 0.  Its only caller is the event starter 0x3ac350. */
 u64 kh_input_game_frames(void);
+/* Both event passes use the same object row. Keep the logical actor and slot in
+ * the event table: f_2d04e0 uses the original ID to find the ANB directory. */
+enum { ACTOR_SORA = 571, NMC_ROXAS = 84, EVENT_OBJECT = 1u << 30 };
+static int scene_roxas(KCtx *g){
+    const char *v=getenv("KHNMC_SCENE_ROXAS");
+    if(!v || !*v || !strcmp(v,"0")) return 0;
+    if(!strcmp(v,"1")) return 1;
+    kh_fatal(g,"scene-roxas-mode: KHNMC_SCENE_ROXAS=%s (expected 0 or 1)",v);
+}
+
+void orig_f_2d0350(KCtx *g);
+void f_2d0350(KCtx *g){
+    if((u32)A1(g)==ACTOR_SORA && scene_roxas(g)){
+        A1(g)=NMC_ROXAS;
+        fprintf(stderr,"kh: scene Roxas: frame=%llu preload P_EX100 slot=%u\n",
+                (unsigned long long)kh_input_game_frames(),(u32)A2(g));
+    }
+    orig_f_2d0350(g);
+}
+
+static int sora_spawn(u32 id,u64 caller){
+    return id==(EVENT_OBJECT|ACTOR_SORA) &&
+           (caller==GS_BASE+0x2d21db || caller==GS_BASE+0x2d2453 || caller==GS_BASE+0x2d2552);
+}
+
+void orig_f_3df930(KCtx *g);
+void f_3df930(KCtx *g){
+    if((u32)A0(g)==(EVENT_OBJECT|ACTOR_SORA) && scene_roxas(g) &&
+       sora_spawn((u32)A0(g),rd64(g,KH_RSP(g)))){
+        A0(g)=EVENT_OBJECT|NMC_ROXAS;
+        fprintf(stderr,"kh: scene Roxas: frame=%llu spawn P_EX100\n",
+                (unsigned long long)kh_input_game_frames());
+    }
+    orig_f_3df930(g);
+}
+
 void f_3a1f70(KCtx *g){
     u32 nm=(u32)A0(g);                                   /* the entry's name: 4 characters in ecx (call site 0x3ac388) */
     orig_f_3a1f70(g);
@@ -278,6 +314,14 @@ static int tree_check(KCtx *g,const char *root){
 }
 int kh_events_stub_selftest(KCtx *g){
     checks=bad=0;
+    T(sora_spawn(EVENT_OBJECT|571,GS_BASE+0x2d21db));
+    T(sora_spawn(EVENT_OBJECT|571,GS_BASE+0x2d2453));
+    T(sora_spawn(EVENT_OBJECT|571,GS_BASE+0x2d2552));
+    T(!sora_spawn(571,GS_BASE+0x2d21db));
+    T(!sora_spawn(EVENT_OBJECT|571,GS_BASE+0x3df970));
+    T(!sora_spawn(EVENT_OBJECT|572,GS_BASE+0x2d21db));
+    T(!sora_spawn(EVENT_OBJECT|90,GS_BASE+0x2d21db));
+    T(!sora_spawn(EVENT_OBJECT|707,GS_BASE+0x2d21db));
     const char *keys[]={"KHNMC_DATA","KHNMC_EVENTS"}; char *old[2]; for(int i=0;i<2;i++){ const char *v=getenv(keys[i]); old[i]=v?strdup(v):NULL; }
     int save_mode=mode, save_have=have_tmpl; u8 save_tmpl[STUB_LEN]; memcpy(save_tmpl,tmpl,STUB_LEN);
     u64 sv[8]={n_lookup,n_none,n_already,n_replaced,n_music_cmds,n_already_music,n_carried,n_carried_keep};
