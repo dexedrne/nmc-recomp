@@ -1,6 +1,7 @@
 #include <math.h>
 #include "xion_swap.h"
 #include "autosave.h"
+#include "rewind.h"
 #include "route_state.h"
 
 #define VA(rva) (GS_BASE+(rva))
@@ -16,6 +17,25 @@ static u16 command_evt;
 static u64 retiring;
 static s32 sheet_gauges[5];
 static s32 original_hp,original_mp,entry_hp,entry_mp;
+
+/* Guest actor addresses and gauge backups belong to the same cut as the player sheets. */
+void kh_rewind_xion(KhRecords *r){
+    KH_RECORD(r,chosen);
+    KH_RECORD(r,held);
+    KH_RECORD(r,save_interaction);
+    KH_RECORD(r,death_pending);
+    KH_RECORD(r,xion);
+    KH_RECORD(r,roxas);
+    KH_RECORD(r,command_actor);
+    KH_RECORD(r,command_place);
+    KH_RECORD(r,command_evt);
+    KH_RECORD(r,retiring);
+    KH_RECORD(r,sheet_gauges);
+    KH_RECORD(r,original_hp);
+    KH_RECORD(r,original_mp);
+    KH_RECORD(r,entry_hp);
+    KH_RECORD(r,entry_mp);
+}
 
 void kh_xion_init(void){
     const char *e=getenv("KHNMC_XION_SWAP");

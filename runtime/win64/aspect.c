@@ -588,6 +588,16 @@ int kh_aspect_zoom_shadow(u64 a){                                               
 }
 /* the M sites: the game frame of the last call; the zoom is 1 in that frame and the next */
 static _Atomic u64 zsup_frame; static _Atomic int zsup_have;
+#include "rewind.h"
+/* The guest may still hold a draw-camera pointer into zshadow at a cut. */
+void kh_rewind_aspect(KhRecords *r){
+    if(!asp_mode) return;
+    KH_RECORD(r,zent);
+    KH_RECORD(r,zshadow);
+    KH_RECORD(r,zsup_frame);
+    KH_RECORD(r,zsup_have);
+    KH_RECORD(r,last3d_plus1);
+}
 static int zoom_supp_at(u64 now,int have,u64 f){ return have&&now>=f&&now-f<=1; }
 static int zoom_suppressed(void){ return zoom_supp_at(kh_game_frames(),atomic_load(&zsup_have),atomic_load(&zsup_frame)); }
 typedef struct { u64 ra, n; } ZoomRa;
@@ -2951,6 +2961,11 @@ static void zoom_selftest(KCtx *g){
         ACHECK(zt_get(g,0,0x1cb3b5)==prev);                                                    /* the target search (G) gets the copy itself */
         r=zt_get(g,1,0x2bd4ec);                                                                /* the effect pass on the current camera: the new build */
         ACHECK(kh_aspect_zoom_shadow(r)&&!memcmp(hp(g,r),Sref2,0x40)&&!memcmp((u8*)hp(g,r)+CAM_PROJ,Sref2+CAM_PROJ,0x40)&&!memcmp((u8*)hp(g,r)+0x40,Spc2+0x40,0xc4));
+        { KhRecords cut={0};
+          kh_records_begin(&cut,0); kh_rewind_aspect(&cut); kh_records_end(&cut);
+          memset(zent,0,sizeof zent); memset(zshadow,0,sizeof zshadow); zsup_have=1; zsup_frame=kh_game_frames();
+          kh_records_begin(&cut,1); kh_rewind_aspect(&cut); kh_records_end(&cut); kh_records_free(&cut);
+          ACHECK(!memcmp(hp(g,r),Sref2,0x40) && zt_get(g,1,0x2bd4ec)==r); }
         wr8(g,CAM_SEL,1); ACHECK(zt_get(g,0,0x18ef29)!=cam&&kh_aspect_zoom_shadow(zt_get(g,0,0x18ef29)));   /* byte 0x140ac183c set: cl = 0 gives the current camera */
         /* H2 on the camera (the exe's m11) and on a copy (the copy's m11: the exe's too), divided by r and restored */
         { double rr=kh_aspect_r(2007,2853); u64 s=zt_get(g,1,0x18695c); H2Stat st={"selftest"}; st.warned=1; u32 m11=rd32(g,cam+CAM_M11);

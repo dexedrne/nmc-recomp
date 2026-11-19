@@ -15,6 +15,7 @@
 #include "khnmc_rt.h"
 #include "khnmc_app.h"
 #include "gfx_present.h"
+#include "rewind.h"
 #include <errno.h>
 
 #define HWND_MAIN 0xAB0001ull
@@ -23,7 +24,7 @@ static int win_w=1280, win_h=720, win_x=100, win_y=100, win_zoomed=0, win_visibl
 static u64 wndproc_ga, winlong[32];
 /* One snapshot for both axes, including readers on the timing thread. */
 static _Atomic u32 screen_pixels=(1080u<<16)|1920u;
-static int live_resize;
+static int live_resize,scripted_resize;
 int kh_screen_size(int *w,int *h);
 void kh_window_client_size(int *w,int *h);
 static void store_screen(int w,int h){ atomic_store(&screen_pixels,((u32)h<<16)|(u32)w); }
@@ -46,7 +47,7 @@ int kh_screen_parse(const char *s,int *w,int *h){
     *w=(int)v[0]; *h=(int)v[1]; return 0;
 }
 /* the seam's configuration from the two variables (unset = NULL); every refusal is a named fatal */
-int kh_present_layer_size(uint32_t *w,uint32_t *h);
+void kh_present_test_layer_size(uint32_t w,uint32_t h);
 void kh_screen_config(const char *screen,const char *khwin){
     if(!screen||!*screen) return;
     /* TASK41: KHNMC_SCREEN=layer = the drawable size of the shell's CAMetalLayer, handed over by kh_present_set_layer BEFORE the game
@@ -88,6 +89,29 @@ void kh_test_resize_frame(u64 frame){
     kh_present_set_size(resize_w,resize_h);
     next_resize();
 }
+/* The shell holds its queue lock and all guest workers are at the cut. */
+void kh_rewind_window(KhRecords *r,u64 *pending_size){
+    if(!live_resize) return;
+    u32 pixels=atomic_load(&screen_pixels),w=0,h=0;
+    kh_present_layer_size(&w,&h);
+    KH_RECORD(r,pixels);
+    if(scripted_resize){
+        KH_RECORD(r,resize_schedule);
+        KH_RECORD(r,resize_frame);
+        KH_RECORD(r,resize_w);
+        KH_RECORD(r,resize_h);
+        KH_RECORD(r,w);
+        KH_RECORD(r,h);
+        KH_RECORD(r,*pending_size);
+        if(r->loading){
+            kh_present_test_layer_size(w,h);
+        }
+    }else if(r->loading && w && h){
+        /* The physical drawable may have rotated since capture. Deliver its current size. */
+        *pending_size=((u64)w<<32)|h;
+    }
+    if(r->loading) atomic_store(&screen_pixels,pixels);
+}
 int kh_window_apply_size(u32 w,u32 h){
     if(!live_resize) return 0;
     if(w<16||h<16||w>16384||h>16384) kh_fatal(NULL,"drawable-size-range: %ux%u",w,h);
@@ -99,10 +123,10 @@ void kh_seam_window_init(void){
     const char *e=getenv("KH_WIN"); if(e) sscanf(e,"%dx%d",&win_w,&win_h);
     const char *screen=getenv("KHNMC_SCREEN");
     resize_schedule=getenv("KHNMC_TEST_RESIZE");
-    int test=resize_schedule&&*resize_schedule;
-    if(test) next_resize();
-    live_resize=test||(screen&&!strcmp(screen,"layer"));
-    kh_screen_config(test&&(!screen||!*screen)?"1280x720":screen,e);
+    scripted_resize=resize_schedule&&*resize_schedule;
+    if(scripted_resize) next_resize();
+    live_resize=scripted_resize||(screen&&!strcmp(screen,"layer"));
+    kh_screen_config(scripted_resize&&(!screen||!*screen)?"1280x720":screen,e);
     kh_aspect_init();                                 /* task 37: KHNMC_ASPECT / KHNMC_ASPECT_LOG (runtime/aspect.c), read with the screen */
 }
 /* the screen the seam reports (1920x1080 unless KHNMC_SCREEN); returns 1 when KHNMC_SCREEN set it */
@@ -137,6 +161,22 @@ int kh_window_resize_selftest(void){
         kh_window_client_size(&cw,&ch); failures+=cw!=w||ch!=h;
         failures+=kh_window_apply_size(w,h)!=0;
     }
+    /* Load a landscape cut after a physical turn. The shell must deliver portrait again. */
+    KhRecords cut={0};
+    u32 old_w,old_h;
+    kh_present_layer_size(&old_w,&old_h);
+    int was_scripted=scripted_resize;
+    scripted_resize=0;
+    u64 pending=0;
+    kh_records_begin(&cut,0); kh_rewind_window(&cut,&pending); kh_records_end(&cut);
+    kh_present_test_layer_size(2007,2853);
+    kh_window_apply_size(2007,2853);
+    kh_records_begin(&cut,1); kh_rewind_window(&cut,&pending); kh_records_end(&cut);
+    failures+=pending!=((2007ull<<32)|2853);
+    failures+=kh_window_apply_size(pending>>32,(u32)pending)!=1;
+    kh_records_free(&cut);
+    kh_present_test_layer_size(old_w,old_h);
+    scripted_resize=was_scripted;
     kh_screen_test_state(old,NULL); live_resize=was_live;
     return failures;
 }

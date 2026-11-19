@@ -19,10 +19,14 @@ void kh_records_free(KhRecords *);
 
 void kh_rewind_arena(KhRecords *);
 void kh_rewind_input(KhRecords *);
+void kh_rewind_aspect(KhRecords *);
 void kh_rewind_gfx(KhRecords *);
 void kh_rewind_route(KhRecords *);
 void kh_rewind_phase(KhRecords *);
 void kh_rewind_warp(KhRecords *);
+void kh_rewind_window(KhRecords *,u64 *pending_size);
+void kh_rewind_shell(KhRecords *);
+void kh_rewind_xion(KhRecords *);
 void kh_rewind_mod(KhRecords *);
 void kh_rewind_maps(KhRecords *);
 void kh_rewind_ids(KhRecords *);

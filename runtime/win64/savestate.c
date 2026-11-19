@@ -205,8 +205,8 @@ static void disk_cpu(struct SessionSlot *s,KhRecords *r){
     }
     kh_rewind_arena(r);
     kh_rewind_fibers(r); kh_rewind_handles(r); kh_rewind_crt(r);
-    kh_rewind_gfx(r); kh_rewind_input(r); kh_rewind_route(r); kh_rewind_phase(r);
-    kh_rewind_warp(r); kh_rewind_hd(r); kh_rewind_mod(r); kh_rewind_maps(r);
+    kh_rewind_gfx(r); kh_rewind_aspect(r); kh_rewind_input(r); kh_rewind_shell(r); kh_rewind_route(r); kh_rewind_phase(r);
+    kh_rewind_warp(r); kh_rewind_xion(r); kh_rewind_hd(r); kh_rewind_mod(r); kh_rewind_maps(r);
     kh_rewind_ids(r); kh_rewind_files(r); kh_rewind_cutscenes(r);
 }
 static void disk_owners(struct SessionSlot *s,KhRecords *r){

@@ -49,6 +49,12 @@ static void state_dump(KCtx *g,const char *path){
 static int shell_q[SHELL_QMAX], shell_qn, shell_in_loop, shell_suspend_flg; static u64 shell_posted, shell_minimised, shell_restored, shell_dropped;
 /* A layout may arrive before ManageRun parks or while minimised. Keep the latest pair until the form can consume it. */
 static u64 pending_size;
+#include "rewind.h"
+void kh_rewind_shell(KhRecords *r){
+    pthread_mutex_lock(&sm);
+    kh_rewind_window(r,&pending_size);
+    pthread_mutex_unlock(&sm);
+}
 void kh_shell_drawable_size(u32 w,u32 h){
     pthread_mutex_lock(&sm);
     pending_size=((u64)w<<32)|h;
