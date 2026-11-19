@@ -222,7 +222,7 @@ static void start_display_link(void){
  * the orientation it is STARTED in (checked on lavapipe at 2007x2853: the 3D fills the tall frame, the HUD is at the edges; an earlier
  * "black" result was only the loading transition).  A rotation while it runs only refits the picture until live resize exists. */
 #define KH_IOS_PORTRAIT 1
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return KH_IOS_PORTRAIT ? UIInterfaceOrientationMaskAllButUpsideDown : UIInterfaceOrientationMaskLandscape; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return KH_IOS_PORTRAIT ? UIInterfaceOrientationMaskAll : UIInterfaceOrientationMaskLandscape;   /* owner 11/18: upside-down portrait too */ }
 /* the drawable's size in pixels (bounds x nativeScale), 0 x 0 before the view has a screen */
 - (BOOL)pixelsW:(uint32_t *)w h:(uint32_t *)h {
     UIScreen *scr=self.view.window.windowScene.screen; if(!scr) return NO;
