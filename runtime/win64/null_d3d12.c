@@ -416,7 +416,9 @@ static int h_swap(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1
             b=new_resource(g,desc,3); ga_free(desc); wr64(g,o+56+8*i,b); }             /* the swap chain's own reference (count 1) */
             kh_com_ref_add(g,b); out_obj(g,A3(g),b); SET_RAX(g,0); return 1; }        /* GetBuffer(idx, riid, **pp): the caller gets a new reference (AddRef, as DXGI does) and releases it */
     case 10: SET_RAX(g,0); return 1;                                                                        /* SetFullscreenState */
-    case 12: { u64 d=A1(g); memset(hp(g,d),0,0x48); wr32(g,d,rd32(g,o+32)); wr32(g,d+4,rd32(g,o+36)); wr32(g,d+0x10,0x57); wr32(g,d+0x1c,1); wr32(g,d+0x24,0x30); wr32(g,d+0x28,3); wr32(g,d+0x38,1); wr32(g,d+0x3c,3); wr32(g,d+0x40,0x42); SET_RAX(g,0); return 1; } /* GetDesc */
+    case 12: { u64 d=A1(g); memset(hp(g,d),0,0x48); wr32(g,d,rd32(g,o+32)); wr32(g,d+4,rd32(g,o+36));
+        wr32(g,d+8,60); wr32(g,d+12,1); /* BufferDesc.RefreshRate */
+        wr32(g,d+0x10,0x57); wr32(g,d+0x1c,1); wr32(g,d+0x24,0x30); wr32(g,d+0x28,3); wr32(g,d+0x38,1); wr32(g,d+0x3c,3); wr32(g,d+0x40,0x42); SET_RAX(g,0); return 1; } /* GetDesc */
     case 13: if(__builtin_expect(kh_aspect_log,0)) kh_aspect_note_swapchain(g,"ResizeBuffers (asked)",0,(u32)A2(g),(u32)A3(g));   /* task 37: 0 = keep that side */
              if(kh_gfx_vkd3d_on){ u32 nw=(u32)A2(g)?(u32)A2(g):rd32(g,o+32), nh=(u32)A3(g)?(u32)A3(g):rd32(g,o+36); kh_vkd3d_swap_resize(g,o,nw,nh);
                  if(!(u32)KH_RAX(g)){ wr32(g,o+32,nw); wr32(g,o+36,nh); wr32(g,o+40,0); } return 1; }       /* real buffers: new size, back-buffer index restarts at 0 */
@@ -438,7 +440,7 @@ static int h_swap(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1
                SET_RAX(g,0); return 1; }
     case 15: out_obj(g,A1(g),o_output); SET_RAX(g,0); return 1;                                             /* GetContainingOutput */
     case 18: { u64 d=A1(g); memset(hp(g,d),0,0x30); wr32(g,d,rd32(g,o+32)); wr32(g,d+4,rd32(g,o+36)); wr32(g,d+8,0x57); wr32(g,d+16,1); wr32(g,d+24,0x30); wr32(g,d+28,3); wr32(g,d+36,3); wr32(g,d+44,0x42); SET_RAX(g,0); return 1; }   /* GetDesc1 */
-    case 19: { u64 d=A1(g); memset(hp(g,d),0,20); wr32(g,d+16,1); SET_RAX(g,0); return 1; }            /* GetFullscreenDesc: Windowed=TRUE */
+    case 19: { u64 d=A1(g); memset(hp(g,d),0,20); wr32(g,d,60); wr32(g,d+4,1); wr32(g,d+16,1); SET_RAX(g,0); return 1; }            /* GetFullscreenDesc: Windowed=TRUE */
     case 31: SET_RAX(g,0); return 1;                                                                        /* SetMaximumFrameLatency */
     case 33: SET_RAX(g,rd64(g,o+48)); return 1;                                                             /* GetFrameLatencyWaitableObject (manual-reset, always signalled) */
     case 36: SET_RAX(g,rd32(g,o+40)%3); return 1;                                                           /* GetCurrentBackBufferIndex */
@@ -716,12 +718,16 @@ int kh_gfx_selftest(KCtx *g){
     kh_call(g,rd64(g,rd64(g,list)+27*8),list,bundle,0,0);
     int fail=gfx_bundles!=before+1;
     gfx_bundles=before;
-    u64 swap=new_obj(C_swap,96), out=ga_alloc(48,16);
-    memset(hp(g,out),0xa5,48);
+    u64 swap=new_obj(C_swap,96), out=ga_alloc(0x50,16);
+    memset(hp(g,out),0xa5,0x50);
     kh_call(g,rd64(g,rd64(g,swap)+19*8),swap,out,0,0);
     fail+=rd32(g,out+16)!=1 || rd32(g,out+20)!=0xa5a5a5a5u || rd64(g,out+24)!=0xa5a5a5a5a5a5a5a5ull;
+    if(rd32(g,out)!=60 || rd32(g,out+4)!=1){ fail++; fprintf(stderr,"kh: gfx selftest FAIL: GetFullscreenDesc refresh must be 60/1 Hz\n"); }
+    kh_call(g,rd64(g,rd64(g,swap)+12*8),swap,out,0,0);
+    if(rd32(g,out+8)!=60 || rd32(g,out+12)!=1 || rd32(g,out+0x48)!=0xa5a5a5a5u){
+        fail++; fprintf(stderr,"kh: gfx selftest FAIL: GetDesc refresh must be 60/1 Hz within the descriptor\n"); }
     ga_free(out);
-    int checks=2;
+    int checks=4;
     /* task 44: ID3D12Device::GetAdapterLuid (slot 43) writes the LUID that the one adapter's GetDesc1 reports and returns its argument:
      * the movie path (exe 0x13ef00) finds the adapter of its D3D11 device by that comparison */
     if(!kh_gfx_vkd3d_on){ u64 dv=kh_com_obj(C_dev,0), l=ga_alloc(16,16), d1=ga_alloc(0x138,16); wr64(g,l,0xa5a5a5a5a5a5a5a5ull); wr64(g,l+8,0x5a5a5a5a5a5a5a5aull);

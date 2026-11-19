@@ -414,10 +414,11 @@ static u64 st_imp(KCtx *g,void (*f)(KCtx*),u64 a0){ u64 sp=KH_RSP(g),rc=KH_RCX(g
 int kh_vclock_selftest(KCtx *g){
     int checks=0,fails=0;
 #define VCHECK(c) do{ checks++; if(!(c)){ fails++; fprintf(stderr,"vclock selftest FAIL: %s (line %d)\n",#c,__LINE__); } }while(0)
-    extern void rt_imp_kernel32__QueryPerformanceCounter(KCtx*), rt_imp_winmm__timeGetTime(KCtx*), rt_imp_winmm__timeSetEvent(KCtx*), rt_imp_winmm__timeKillEvent(KCtx*);
+    extern void rt_imp_kernel32__QueryPerformanceCounter(KCtx*), rt_imp_kernel32__QueryPerformanceFrequency(KCtx*), rt_imp_winmm__timeGetTime(KCtx*), rt_imp_winmm__timeSetEvent(KCtx*), rt_imp_winmm__timeKillEvent(KCtx*);
     extern void rt_imp_kernel32__ReleaseSemaphore(KCtx*), rt_imp_kernel32__CreateSemaphoreA(KCtx*), rt_imp_kernel32__CloseHandle(KCtx*);
     extern u64 kh_mk_event_h(int manual,int initial);
     u64 m=ga_calloc(1,64);
+    VCHECK(st_imp(g,rt_imp_kernel32__QueryPerformanceFrequency,m)==1&&rd64(g,m)==10000000ull);
     /* 1. host mode: the guest clock is the host clock, waits are host sleeps */
     { int on=kh_vclock_on, st=atomic_load(&stepped); kh_vclock_on=0; u64 a=kh_host_ns(), b=kh_now_ns(), c=kh_host_ns(); VCHECK(a<=b&&b<=c); kh_vclock_on=on;
       if(!st){ a=kh_host_ns(); kh_vclock_wait_until(a+3000000ull); b=kh_host_ns(); VCHECK(b-a>=3000000ull&&b-a<2000000000ull); VCHECK(kh_vclock_now_ns()>=b); } }

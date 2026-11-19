@@ -559,6 +559,7 @@ $(GEN)/mod_static_lifted.c: tools/mod_static_lift.py $(MOD_EDITS) $(MOD_NEVERLAN
 	KH_UNIVERSE=$(KH_UNIVERSE) $(KHLIFT_PY) tools/mod_static_lift.py --khlift $(KHLIFT) --edits $(MOD_EDITS) --exe $(MOD_EXE) $(MOD_EXTRA_EDITS) \
 	    --funcs "$(MOD_LIFT_FUNCS)" --chained "$(MOD_LIFT_CHAINED)" --vanilla-shards $(LIFTED)/shards --out $@ --report $(GEN)/mod_static_lift.json
 endif
+$(O)/xion_swap.o: $(ROOT)/runtime/xion_fields.inc
 $(O)/mod_neverland.o $(O)/mod_neverland_test.o: $(GEN)/mod_neverland_table.h
 $(O)/moose.o: $(GEN)/mod_moose_table.h
 $(O)/mod_static.o: $(GEN)/mod_static_table.h

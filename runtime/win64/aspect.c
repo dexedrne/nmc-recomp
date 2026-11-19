@@ -2026,7 +2026,7 @@ static void seam_cases(KCtx *g,int set,int sw,int sh){
     for(int i=0;i<4;i++){ memset(hp(g,m),0,0x200);
         u64 r=st_call(g,rt_imp_user32__EnumDisplaySettingsA,(u64[]){0,modes[i],m},3,NULL);
         int expect=set?(modes[i]==0||modes[i]==0xFFFFFFFFu):(modes[i]<=1||modes[i]==0xFFFFFFFFu);   /* one mode with the seam; modes 0 and 1 without */
-        ACHECK(r==(u64)expect&&(!expect||(rd32(g,m+0x6c)==(u32)sw&&rd32(g,m+0x70)==(u32)sh))); }
+        ACHECK(r==(u64)expect&&(!expect||(rd32(g,m+0x6c)==(u32)sw&&rd32(g,m+0x70)==(u32)sh&&rd32(g,m+0x78)==60&&(rd32(g,m+0x48)&0x400000)))); }
     u64 c0,p0,c1,p1; kh_screen_test_counts(&c0,&p0);
     st_call(g,rt_imp_user32__SetWindowPos,(u64[]){0xAB0001,0,10,20,1280,720,0},7,NULL);         /* a size request */
     st_call(g,rt_imp_user32__GetClientRect,(u64[]){0xAB0001,m},2,NULL);

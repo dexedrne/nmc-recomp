@@ -22,13 +22,20 @@ void kh_xion_init(void){
     kh_xion_enabled=e&&!strcmp(e,"1");
 }
 
+static int field_supported(int world,int area,int map,int btl,int evt){
+    static const struct { u8 world,area; u16 map,btl,evt; } fields[] = {
+#include "xion_fields.inc"
+    };
+    for(size_t i=0;i<sizeof(fields)/sizeof(fields[0]);i++)
+        if(fields[i].world==world&&fields[i].area==area&&fields[i].map==map&&
+           fields[i].btl==btl&&fields[i].evt==evt) return 1;
+    return 0;
+}
+
 static int supported(KCtx *g){
     int map,btl,evt;
-    if(!kh_route_programs(g,NULL,&map,&btl,&evt)) return 0;
-    int world=kh_route_world(g),area=kh_route_area(g);
-    if(world==2&&area==7) return map==0x5f&&btl==0x5f&&evt==0x5f;
-    if(evt) return 0;
-    return (world==2&&area==2&&map==1&&btl==0)||(world==4&&area==8&&map==0&&btl==1);
+    return kh_route_programs(g,NULL,&map,&btl,&evt)&&
+           field_supported(kh_route_world(g),kh_route_area(g),map,btl,evt);
 }
 
 void kh_xion_command_done(KCtx *g,u64 controller,u64 actor){
@@ -264,7 +271,17 @@ int kh_xion_selftest(void){
     failures+=carry_back(1,2,7,20,60)!=3;
     failures+=carry_back(0,2,7,20,60)!=0;
     fprintf(stderr,"kh: xion-swap fraction selftest: 8 checks, %d failures\n",failures);
-    return failures;
+    int fields=0;
+    fields+=!field_supported(2,2,1,0,0)||!field_supported(4,8,0,1,0)||!field_supported(2,7,95,95,95);
+    fields+=!field_supported(16,1,5,1,0);
+    fields+=field_supported(16,1,5,1,0xffff)||field_supported(15,0,0,0,0);
+    fields+=field_supported(2,7,95,95,96);
+    fields+=field_supported(8,9,0,10,0);  // observed native battle fault
+    fields+=field_supported(5,7,0,0,0);   // chest interaction
+    fields+=field_supported(7,5,0,0,0);   // carpet traversal
+    fields+=field_supported(1,0,0,0,0);   // ending transit
+    fprintf(stderr,"kh: xion field classification: %d failures\n",fields);
+    return failures+fields;
 }
 
 u64 kh_xion_progress_player(void){ return xion?roxas:0; }
