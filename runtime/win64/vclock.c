@@ -240,19 +240,23 @@ int kh_vclock_client_add(const char *name,u64 first_due){ return kh_vclock_clien
  * timer's handler always sees the pass of its instant done, and the
  * calls it makes (stamped with that instant) go to the next pass.  A client of prio p waits here for its instant t: the clock at t
  * or later, and every used client of a smaller prio due later than t (done with t).  Before the clock steps, it is a host sleep. */
-static void client_wait_raw(int id,u64 t);
-void kh_vclock_client_wait(int id,u64 t){
+static u64 client_wait_raw(int id,u64 t,int registered);
+static u64 client_wait(int id,u64 t,int registered){
     pthread_once(&vonce,vc_once);
     if(kh_vclock_sync) kh_vclock_idle(1);
-    client_wait_raw(id,t);
+    t=client_wait_raw(id,t,registered);
     if(kh_vclock_sync) kh_vclock_idle(0);
+    return t;
 }
-static void client_wait_raw(int id,u64 t){
+void kh_vclock_client_wait(int id,u64 t){ (void)client_wait(id,t,0); }
+u64 kh_vclock_timer_wait(int id,u64 due){ return client_wait(id,due,1); }
+static u64 client_wait_raw(int id,u64 t,int registered){
     for(;;){
-        if(!atomic_load(&stepped)){ u64 h=kh_host_ns(); if(h>=t) return; host_sleep_until(t-h>50000000ull?h+50000000ull:t); continue; }
+        if(!atomic_load(&stepped)){ u64 h=kh_host_ns(); if(h>=t) return t; host_sleep_until(t-h>50000000ull?h+50000000ull:t); continue; }
         pthread_mutex_lock(&vm);
         for(;;){
             if(atomic_load(&kh_cut_requested)) kh_cut_poll("clock-client",&vm);
+            if(registered) t=clients[id].due;  /* a cut can move the pending tick while the CV is unlocked */
             if(!atomic_load(&stepped)) break;
             int ahead=0; if(atomic_load(&v_now)>=t){ int my=cprio(id); for(int i=0;i<MAXCLIENTS;i++) if(i!=id&&clients[i].used&&clients[i].due<=t&&cprio(i)<my){ ahead=1; break; } }
             if(atomic_load(&v_now)>=t&&!ahead){ if(!kh_vclock_sync) break;                     /* sync=all: and nothing else of the guest is still running at t */
@@ -265,7 +269,7 @@ static void client_wait_raw(int id,u64 t){
         }
         client_quiet_mark(id,0);                                                               /* runs its work now: charged from here on */
         int done=atomic_load(&stepped); pthread_mutex_unlock(&vm);
-        if(done) return;
+        if(done) return t;
     }
 }
 void kh_vclock_client_set_prio(int id,int prio){ pthread_mutex_lock(&vm); clients[id].prio=prio; pthread_cond_broadcast(&vcv); pthread_mutex_unlock(&vm); }
@@ -414,6 +418,48 @@ static void st_sleeper_thread(KCtx *g){ StSleeper *s=(StSleeper*)(uintptr_t)A0(g
 static void st_settle(_Atomic int *flag,int want){ for(int i=0;i<3000&&atomic_load(flag)!=want;i++){ struct timespec ts={0,1000000}; nanosleep(&ts,0); } }
 static _Atomic int st_tn; static u64 st_tat[8];
 static void st_anchor_cb(KCtx *g){ int n=atomic_fetch_add(&st_tn,1); if(n<8) st_tat[n]=kh_vclock_now_ns(); KH_RET(g); }   /* section 9: the virtual instant of each tick */
+/* Replay the real WinMM callback while its thread stays alive. The test has
+ * sole control of virtual time. A stale target times out here instead of
+ * letting one_period_locked wait for a tick the timer cannot deliver. */
+static int st_timer_replay(u32 timer){
+    char name[32];
+    snprintf(name,sizeof name,"winmm-timer-%u",timer);
+    pthread_mutex_lock(&vm);
+    int id=0;
+    while(id<MAXCLIENTS&&(!clients[id].used||strcmp(clients[id].name,name))) id++;
+    if(id==MAXCLIENTS){ pthread_mutex_unlock(&vm); return 0; }
+    const u64 saved_now=atomic_load(&v_now),saved_due=clients[id].due;
+    int count=atomic_load(&st_tn),ok=count==3;
+    u64 reference[3]={0};
+    for(int branch=0;ok&&branch<=10;branch++){
+        atomic_store(&v_now,saved_now);
+        clients[id].due=saved_due;
+        atomic_store(&st_tn,count);
+        memset(st_tat+count,0,sizeof reference);
+        for(int tick=0;ok&&tick<3;tick++){
+            u64 instant=saved_due+(u64)tick*5000000;
+            atomic_store(&v_now,instant);
+            pthread_cond_broadcast(&vcv);
+            struct timespec limit;
+            abs_in(&limit,1000000000);
+            while(clients[id].due==instant){
+                if(kh_cond_wait_until(&vcv,&vm,&limit)==ETIMEDOUT) break;
+            }
+            ok=clients[id].due==instant+5000000&&atomic_load(&st_tn)==count+tick+1&&
+               st_tat[count+tick]==instant;
+        }
+        if(!branch) memcpy(reference,st_tat+count,sizeof reference);
+        else ok=ok&&!memcmp(reference,st_tat+count,sizeof reference);
+    }
+    /* Leave the scheduler at B even on a stale-wait failure so kill can drain. */
+    atomic_store(&n_vblank,2);
+    atomic_store(&v_now,v_t0+2000000000ull/VC_HZ);
+    clients[id].due=saved_due+15000000;
+    pthread_cond_broadcast(&vcv);
+    pthread_mutex_unlock(&vm);
+    if(ok) fprintf(stderr,"kh: timer rewind selftest: ten replays of three callback instants matched\n");
+    return ok;
+}
 static u64 st_imp(KCtx *g,void (*f)(KCtx*),u64 a0){ u64 sp=KH_RSP(g),rc=KH_RCX(g); KH_RSP(g)=((sp-0x100)&~15ull)-8; wr64(g,KH_RSP(g),0x7ff7ffff0000ull); KH_RCX(g)=a0; f(g); u64 r=KH_RAX(g); KH_RSP(g)=sp; KH_RCX(g)=rc; return r; }
 int kh_vclock_selftest(KCtx *g){
     int checks=0,fails=0;
@@ -562,6 +608,7 @@ int kh_vclock_selftest(KCtx *g){
       kh_vclock_test_vblank(g);
       VCHECK(atomic_load(&st_tn)==3&&st_tat[0]==T1+5000000ull&&st_tat[1]==T1+10000000ull&&st_tat[2]==T1+15000000ull);
       if(atomic_load(&st_tn)!=3||st_tat[0]!=T1+5000000ull) fprintf(stderr,"vclock selftest: anchored timer: %d ticks, first at origin %+lld ns\n",atomic_load(&st_tn),(long long)(st_tat[0]-T1));
+      VCHECK(st_timer_replay(id));
       VCHECK((u32)st_imp(g,rt_imp_winmm__timeKillEvent,id)==0); kh_vclock_test_vblank(g); { struct timespec ts={0,20000000}; nanosleep(&ts,0); }
       kh_vclock_test_end(); kh_vclock_on=on0; }
     /* 8. KHNMC_CLOCK values */

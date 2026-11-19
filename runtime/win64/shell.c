@@ -116,7 +116,7 @@ void kh_cut_wake_shell(void){
     pthread_cond_broadcast(&scv);
     pthread_mutex_unlock(&sm);
 }
-void f_579bf0(KCtx *g){                                  /* ManageRun(app) */
+static void manage_run(KCtx *g){
     u64 app=KH_RCX(g);
     if(getenv("KH_STATE_DUMP")) state_dump(g,getenv("KH_STATE_DUMP"));
     kh_warn("shell: ManageRun(app=0x%llx) -> native shell: DXInput.init, GXDevice.init",(unsigned long long)app);
@@ -148,6 +148,10 @@ void f_579bf0(KCtx *g){                                  /* ManageRun(app) */
     shell_in_loop=0; pthread_mutex_unlock(&sm); kh_vclock_idle(0);
     kh_warn("shell: ExitApplication requested; ManageRun returns");
     KH_RET(g);
+}
+void f_579bf0(KCtx *g){
+    if(kh_cut_enabled) kh_cut_transfer_wait(g,KH_CUT_SHELL,manage_run);
+    manage_run(g);
 }
 void f_579bc0(KCtx *g){                                  /* ExitApplication() */
     pthread_mutex_lock(&sm); exit_requested=1; pthread_cond_broadcast(&scv); pthread_mutex_unlock(&sm); KH_RET(g);

@@ -192,7 +192,9 @@ static void timer_proc_virtual(KCtx *g,Timer *t){
     if(t->anchor==1) tm_anchored++;                                                    /* counted once registered at the origin (the selftest waits for it) */
     if(tm_nframes<16) tm_list_frames[tm_nframes++]=t;
     for(;;){
-        kh_vclock_client_wait(cid,next);                                                /* the clock is held at `next` until this client announces a later instant */
+        if(kh_cut_enabled) kh_cut_wait_owner=KH_CUT_TIMER;
+        next=kh_vclock_timer_wait(cid,next);                                                /* the clock is held at `next` until this client announces a later instant */
+        if(kh_cut_enabled) kh_cut_wait_owner=0;
         if(t->killed) break;
         t->nset=0;
         if(t->flags&0x30) timer_set_hook(t,t->cb);                                      /* SetEvent / PulseEvent by the timer itself */

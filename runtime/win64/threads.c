@@ -79,7 +79,7 @@ static pthread_mutex_t tlist_m=PTHREAD_MUTEX_INITIALIZER;
  * thread-registry-full.  tlist_created / tlist_ended count over the process's life (map reports, the sync report). */
 #define TLIST_MAX 4096
 static KThread *tlist[TLIST_MAX]; static u32 ntlist, tlist_cap=TLIST_MAX; static u64 tlist_created, tlist_ended; static _Atomic u32 next_tid=1000;
-int kh_cut_threads(KThread **parked,unsigned count,int report){
+int kh_cut_threads(KThread **parked,unsigned count,int report,unsigned *cs_waiter){
     int missing=0;
     pthread_mutex_lock(&tlist_m);
     for(u32 i=0;i<ntlist;i++){
@@ -89,6 +89,9 @@ int kh_cut_threads(KThread **parked,unsigned count,int report){
         while(k<count&&parked[k]!=t) k++;
         if(k<count) continue;
         missing++;
+        /* An acknowledged owner may hold this lock. Let the whole game run
+         * before retrying, so both owner and contender can leave the section. */
+        if(atomic_load(&t->vc_state)==3) *cs_waiter=t->tid;
         if(report) fprintf(stderr,"kh: savestate-missing tid=%u start=%llx clock-state=%d\n",t->tid,(unsigned long long)t->start,atomic_load(&t->vc_state));
     }
     pthread_mutex_unlock(&tlist_m);
@@ -394,18 +397,18 @@ static int sem_release(u64 h,long n,u32 *prev,u32 *err){
 }
 IMP(K32,CreateSemaphoreA){ SET_RAX(g,mk_sem((s32)A1(g),(s32)A2(g))); }
 IMP(K32,CreateSemaphoreW){ SET_RAX(g,mk_sem((s32)A1(g),(s32)A2(g))); }
-IMP(K32,ReleaseSemaphore){ if(tl_set_hook) tl_set_hook(tl_set_ctx,A0(g)); u64 s0=0; int wt=vc_wake_state(A0(g),&s0); u32 prev=0,err=0; int ok=sem_release(A0(g),(long)(s32)A1(g),&prev,&err); if(ok&&kh_vclock_on) kh_vclock_note_release(A0(g)); if(ok){ if(A2(g)) wr32(g,A2(g),prev); } else kh_set_last_error(err); SET_RAX(g,ok); if(ok) vc_after_wake(A0(g),wt,s0); }
+IMP(K32,ReleaseSemaphore){ if(kh_cut_enabled) kh_cut_transfer_wait(g,KH_CUT_RELEASE,i_kernel32__ReleaseSemaphore); if(tl_set_hook) tl_set_hook(tl_set_ctx,A0(g)); u64 s0=0; int wt=vc_wake_state(A0(g),&s0); u32 prev=0,err=0; int ok=sem_release(A0(g),(long)(s32)A1(g),&prev,&err); if(ok&&kh_vclock_on) kh_vclock_note_release(A0(g)); if(ok){ if(A2(g)) wr32(g,A2(g),prev); } else kh_set_last_error(err); SET_RAX(g,ok); if(ok) vc_after_wake(A0(g),wt,s0); }
 IMP(K32,CreateMutexA){ KWaitObj *w=wobj_new(HK_MUTEX); u64 h=h_new(HK_MUTEX,w); if(A1(g)&0xff){ w->owner=cur_thread()->tid; w->recurse=1; } SET_RAX(g,h); }
 IMP(K32,ReleaseMutex){ int k; KWaitObj *w=h_get_ref(A0(g),&k); if(!w||k!=HK_MUTEX){ if(w) kh_wobj_unref(w); kh_set_last_error(6); SET_RAX(g,0); return; } pthread_mutex_lock(&w->m);
     if(w->recurse==0||w->owner!=cur_thread()->tid){ pthread_mutex_unlock(&w->m); kh_wobj_unref(w); kh_set_last_error(288); SET_RAX(g,0); return; }
     if(--w->recurse==0){ w->owner=0; pthread_cond_broadcast(&w->cv); vc_released(); } pthread_mutex_unlock(&w->m); kh_wobj_unref(w); SET_RAX(g,1); }
 /* KHNMC_CLOCK=frames: the virtual display must know when the game thread is parked in its frame wait and when it has taken a release */
-IMP(K32,WaitForSingleObject){ u64 h=A0(g); int fw=kh_vclock_on&&kh_vclock_frame_wait_enter(h); u32 r=kh_wait(g,h,(u32)A1(g)); if(fw) kh_vclock_frame_wait_leave(r==0); SET_RAX(g,r); }
+IMP(K32,WaitForSingleObject){ if(kh_cut_enabled) kh_cut_transfer_wait(g,KH_CUT_HANDLE,i_kernel32__WaitForSingleObject); u64 h=A0(g); int fw=kh_vclock_on&&kh_vclock_frame_wait_enter(h); u32 r=kh_wait(g,h,(u32)A1(g)); if(fw) kh_vclock_frame_wait_leave(r==0); SET_RAX(g,r); }
 IMP(K32,WaitForSingleObjectEx){ SET_RAX(g,kh_wait(g,A0(g),(u32)A1(g))); }
 IMP(K32,CloseHandle){ u64 h=A0(g); if(h==PSEUDO_THREAD||h==PSEUDO_PROCESS){ SET_RAX(g,1); return; } int ok=h_close(h); if(!ok) kh_set_last_error(6); SET_RAX(g,ok); }
 static void host_sleep_ms(u32 ms){ struct timespec ts={ms/1000,(long)(ms%1000)*1000000L}; if(kh_vclock_sync) kh_vclock_idle(1); nanosleep(&ts,0); if(kh_vclock_sync) kh_vclock_idle(0); }
-IMP(K32,Sleep){ if(kh_cut_enabled) cut_boot_ready(g); u32 ms=(u32)A0(g); if(ms==0) sched_yield(); else if(!kh_vclock_vsleep(ms)) host_sleep_ms(ms); }
-IMP(K32,SleepEx){ u32 ms=(u32)A0(g); if(ms==0) sched_yield(); else if(!kh_vclock_vsleep(ms)) host_sleep_ms(ms); SET_RAX(g,0); }
+IMP(K32,Sleep){ if(kh_cut_enabled) kh_cut_transfer_wait(g,KH_CUT_SLEEP,i_kernel32__Sleep); if(kh_cut_enabled) cut_boot_ready(g); u32 ms=(u32)A0(g); if(ms==0) sched_yield(); else if(!kh_vclock_vsleep(ms)) host_sleep_ms(ms); }
+IMP(K32,SleepEx){ if(kh_cut_enabled) kh_cut_transfer_wait(g,KH_CUT_SLEEP,i_kernel32__SleepEx); u32 ms=(u32)A0(g); if(ms==0) sched_yield(); else if(!kh_vclock_vsleep(ms)) host_sleep_ms(ms); SET_RAX(g,0); }
 /* task 44: with KHNMC_CLOCK=frames and its default KHNMC_CLOCK_SYNC=all the virtual clock moves only while every guest thread waits, and a
  * thread that spins on SwitchToThread never does: the movie player's sound thread (exe 0x13ec00) yields in a loop until the game thread
  * sets a flag one game frame later, and that frame needs the clock (seen: every clock step then waited out the 60 s quiescence guard).

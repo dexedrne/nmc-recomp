@@ -878,7 +878,7 @@ u64 kh_call5(KCtx *g,u64 target,u64 a0,u64 a1,u64 a2,u64 a3,u64 a4){
     wr64(g,sp+0x20,a4);            /* 5th argument slot (after the 32-byte shadow space and return address) */
     sp-=8; wr64(g,sp,KH_SENTINEL_RET);
     KH_RSP(g)=sp; KH_RCX(g)=a0; KH_RDX(g)=a1; KH_R8(g)=a2; KH_R9(g)=a3;
-    if(kh_cut_enabled&&target==GS_BASE+0xfddd0) kh_cut_stream_loop(g);
+    if(kh_cut_enabled) kh_cut_worker_loop(g,target);
     else kh_dispatch(g,target);
     u64 r=KH_RAX(g); KH_RSP(g)=save; KH_RCX(g)=sv_rcx; KH_RDX(g)=sv_rdx; KH_R8(g)=sv_r8; KH_R9(g)=sv_r9; return r;
 }

@@ -91,6 +91,11 @@ static int scan_hook_on;                               /* 4ad270 takes its slow 
 /* a call made from the loader loop that blocks or runs long: without the lock */
 static __thread int loader_idle;
 int kh_cut_loader_safe(void){ return !bg_tls()->depth && (!bg_tls()->is_loader || loader_idle); }
+void kh_cut_loader_relock(KCtx *g){
+    if(!loader_idle || bg_tls()->depth) kh_fatal(g,"savestate-loader-relock: expected unlocked idle call");
+    loader_idle=0;
+    bg_lock(g);
+}
 static void released(KCtx *g,KhFn orig,u64 site){
     BgTls *t=bg_tls();
     if(bg_lock_on && t->is_loader && t->depth==1 && rd64(g,KH_RSP(g))==site){

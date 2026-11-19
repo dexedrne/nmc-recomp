@@ -449,7 +449,9 @@ static void mix_thread_virtual(KCtx *g){
     for(u64 n=0;;n++){
         u64 due=t0+n*10000000ull;
         if(n) kh_vclock_client_due(mix_client,due);
+        if(kh_cut_enabled) kh_cut_wait_owner=KH_CUT_MIXER;
         kh_vclock_wait_until(due);
+        if(kh_cut_enabled) kh_cut_wait_owner=0;
         if(atomic_load(&mix_quit)) break;
         int sink=out_pull?pull_sink():SINK_WAV;
         u64 h=mono_ns(); soft_quantum(g,apply_mode?UINT64_MAX:due,sink); u64 dur=mono_ns()-h; st_pass_ns+=dur; if(dur>st_max_pass_ns) st_max_pass_ns=dur;

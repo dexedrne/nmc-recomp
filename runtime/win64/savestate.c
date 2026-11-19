@@ -28,7 +28,7 @@ static struct Trigger {
 } *trigger_head;
 static pthread_mutex_t mutex=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t resume=PTHREAD_COND_INITIALIZER;
-static struct Park { struct Park *next; KThread *thread; const char *site; void *callers[64]; int depth,stream; } *parks;
+static struct Park { struct Park *next; KThread *thread; const char *site,*owner; void *callers[64]; int depth,stream; } *parks;
 static unsigned generation, completed, missed;
 static FILE *oracle; /* CPU comparison evidence only; never accepted as a playable slot. */
 static int oracle_failed;
@@ -137,6 +137,16 @@ void kh_cut_poll(const char *site,pthread_mutex_t *held){
     if(atomic_load(&kh_cut_requested)){
         struct Park p={parks,cur_thread(),site};
         p.stream=kh_cut_on_stream();
+        static const struct { const char *site,*name; } waits[]={
+            [KH_CUT_SLEEP]={"clock-client","sleeper"}, [KH_CUT_HANDLE]={"handle-wait","handle"},
+            [KH_CUT_RELEASE]={"wake-handoff","handoff"}, [KH_CUT_SHELL]={"shell-loop","shell"},
+            [KH_CUT_TIMER]={"clock-client","timer"}, [KH_CUT_MIXER]={"clock-deadline","mixer"}
+        };
+        if(kh_cut_wait_owner&&!strcmp(waits[kh_cut_wait_owner].site,site))
+            p.owner=waits[kh_cut_wait_owner].name;
+        if(!strcmp(site,"thread-start")) p.owner="unstarted";
+        if(p.stream&&(!strcmp(site,"stream-idle")||!strcmp(site,"stream-loop-top")||
+                      !strcmp(site,"stream-next-request"))) p.owner="stream";
         if(!completed) p.depth=backtrace(p.callers,64);
         parks=&p;
         unsigned epoch=generation;
@@ -272,7 +282,7 @@ void kh_cut_frame(KCtx *g,u64 frame){
     atomic_store(&kh_cut_requested,1);
     extern void kh_cut_wake_shell(void);
     kh_cut_wake_shell();
-    unsigned n;
+    unsigned n,cs_waiter=0;
     int missing;
     for(;;){
         n=0;
@@ -281,8 +291,8 @@ void kh_cut_frame(KCtx *g,u64 frame){
             threads[n++]=p->thread;
         }
         int expired=kh_host_ns()-start>=1000000000ull;
-        missing=kh_cut_threads(threads,n,expired);
-        if(!missing||expired) break;
+        missing=kh_cut_threads(threads,n,expired,&cs_waiter);
+        if(!missing||cs_waiter||expired) break;
         pthread_mutex_unlock(&mutex);
         struct timespec nap={0,1000000};
         nanosleep(&nap,NULL);
@@ -292,11 +302,24 @@ void kh_cut_frame(KCtx *g,u64 frame){
     unsigned blocker_tid=0;
     u64 blocker_start=0,blocker_return=0;
     const char *blocker_site=NULL;
+    unsigned wait_tid=0;
+    u64 wait_handle=0,wait_generation=0;
+    int wait_kind=0;
     int gate_ok=0,stream_busy=0;
     char *tmp=NULL;
     int fd=-1;
     if(!missing&&kh_cut_gate_begin(&epoch)){
         gate_ok=kh_gfx_gate_quiesce_bounded(4,10)==KH_GATE_QUIESCED;
+        if(gate_ok&&!completed){
+            void *callers[64];
+            int depth=backtrace(callers,64);
+            report_callers(cur_thread()->tid,callers,depth);
+            for(struct Park *p=parks;p;p=p->next){
+                report_callers(p->thread->tid,p->callers,p->depth);
+                fprintf(stderr,"kh: savestate-park tid=%u start=%llx at=%s\n",p->thread->tid,(unsigned long long)p->thread->start,p->site);
+                fprintf(stderr,"kh: savestate-wait tid=%u owner=%s\n",p->thread->tid,p->owner?p->owner:"unresolved");
+            }
+        }
         if(save&&gate_ok){
             /* The stream dispatcher owns only the guest successor and suspend predicate. */
             for(struct Park *p=parks;p;p=p->next){
@@ -314,6 +337,17 @@ void kh_cut_frame(KCtx *g,u64 frame){
                     }
                     stream_busy=1;
                 }
+                if(!p->stream&&p->owner){
+                    KThread *t=p->thread;
+                    if(!strcmp(p->site,"handle-wait")&&atomic_load(&t->vc_state)==1&&
+                       (!wait_tid||t->tid<wait_tid)){
+                        wait_tid=t->tid;
+                        wait_handle=KH_RCX(t->g);
+                        wait_generation=atomic_load(&t->vc_gen0);
+                        wait_kind=atomic_load(&t->vc_k);
+                    }
+                    continue;
+                }
                 if(blocker_site&&strcmp(p->site,"self-suspend")) continue;
                 blocker_tid=p->thread->tid;
                 blocker_start=p->thread->start;
@@ -323,13 +357,6 @@ void kh_cut_frame(KCtx *g,u64 frame){
             }
         }
         if(!save&&!completed&&gate_ok){
-            void *callers[64];
-            int depth=backtrace(callers,64);
-            report_callers(cur_thread()->tid,callers,depth);
-            for(struct Park *p=parks;p;p=p->next){
-                report_callers(p->thread->tid,p->callers,p->depth);
-                fprintf(stderr,"kh: savestate-park tid=%u start=%llx at=%s\n",p->thread->tid,(unsigned long long)p->thread->start,p->site);
-            }
             extern void kh_cut_arena_census(KCtx *,void (*)(KCtx *,u64,u64));
             if(census){
                 if(asprintf(&tmp,"%s.XXXXXX",slot)<0) tmp=NULL;
@@ -363,8 +390,9 @@ void kh_cut_frame(KCtx *g,u64 frame){
     free(tmp);
     if(oracle_failed) kh_fatal(g,"savestate-census-io: could not publish CPU comparison file");
     if(stream_busy||missing||!gate_ok){
+        if(cs_waiter) kh_warn("savestate-critical-section: tid=%u still acquiring at frame %llu",cs_waiter,(unsigned long long)frame);
         if(++missed==4){
-            const char *reason=stream_busy?"savestate-stream-drain-timeout":"savestate-cut-refused";
+            const char *reason=cs_waiter?"savestate-critical-section-timeout":stream_busy?"savestate-stream-drain-timeout":"savestate-cut-refused";
             if(trigger_head==&menu_trigger){ finish_menu(reason); return; }
             kh_fatal(g,"%s: four successive incomplete cuts; last frame %llu",reason,(unsigned long long)frame);
         }
@@ -386,7 +414,9 @@ void kh_cut_frame(KCtx *g,u64 frame){
                      (unsigned long long)blocker_start,blocker_site,(unsigned long long)blocker_return);
         }else{
             error="savestate-host-state";
-            snprintf(detail,sizeof detail,"runtime owners have no restore records");
+            if(wait_tid) snprintf(detail,sizeof detail,"no restore record for pending handle=%llx kind=%d generation=%llu waiter=%u",
+                         (unsigned long long)wait_handle,wait_kind,(unsigned long long)wait_generation,wait_tid);
+            else snprintf(detail,sizeof detail,"runtime owners have no restore records");
         }
         if(trigger_head==&menu_trigger){
             kh_warn("%s: %s slot=%s",error,detail,slot);
