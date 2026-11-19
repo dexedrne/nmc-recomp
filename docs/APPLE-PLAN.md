@@ -289,3 +289,11 @@ owner decides and the phone's own numbers exist (implementation notes section 6,
   from that size: the default route passes at KHNMC_SCREEN=2007x2853 KHNMC_ASPECT=fill on the null backend (7,006 presents, built size
   right at every present, no fatal). Installed 18:13 (no selftest: the phone was locked). A rotation while the game runs only refits
   the picture (the presenter's swapchain follows; the game's size does not): live resize is task 47, now much smaller.
+- **The disk pipeline cache on the phone** (2026-11-18 evening, task 43's MAC-STEPS-43 sections 2 and 4.1; section 3 is a Mac mini
+  game run and was skipped by the owner's rule). Device selftest on the A20: 111 / 0; MoltenVK wrote 39,415 bytes of its own cache
+  data and the pattern frame drawn through the RELOADED cache equals the first one (0 of 24,576 bytes differ); totals 175,613 / 0.
+  Title route three times (frames clock, hash log): no cache / fresh (saved 114,845 bytes at exit) / loaded (114,845 bytes): every
+  one of the 2,702 presents of the loaded run has its identical picture in the no-cache run (aligned by content, 0 nowhere). Pipeline
+  creation on the title: 10.1 ms in all, longest 4.8 ms without the cache; 2.4 ms, longest 0.5 ms with it. The cache is ON in the
+  play configuration since 21:04 ($STATE/pipecache-verified on the MacBook). The story pair and the field-route gain runs (4.1 second
+  half, 4.2) are not done yet. Also installed 20:56: tasks 43 and 44 (selftest on the phone 174,840 / 0).
