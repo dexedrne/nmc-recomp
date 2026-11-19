@@ -213,9 +213,11 @@ ASPECT_HOOKS += 2bd190 156f10 156e20 126fd0 126500 19d040
 # lifted body draws it.  With nothing set or KHNMC_ASPECT=pc it is one flag test and the lifted body.
 ASPECT_HOOKS += 11a330
 # Task 49 (runtime/aspect.c, "the zoom of the tall screen"; KHNMC_FOV_ZOOM, fill mode, a screen taller than wide): 19cad0 = the camera
-# matrix build (the scene cameras' distance cam+0x40 times the zoom around it, restored), 19d010 = the distance accessor (returns the
-# distance the matrices were built with).  With KHNMC_ASPECT unset or pc both are one flag test and the lifted body.
-ASPECT_HOOKS += 19cad0 19d010
+# matrix build (the scene cameras are built as the exe builds them, then once more with the distance times the zoom; that build's
+# draw matrices cam+0x00 / +0x104 are noted and the camera, registers and stack put back), 19cfc0 = the camera accessor (its 9 drawing
+# call sites get a copy of the camera with the noted zoomed matrices; game logic gets the camera; the gummi ship, garage and minigame
+# sites switch the zoom off while they run).  With KHNMC_ASPECT unset or pc each hook is a flag test and the lifted body.
+ASPECT_HOOKS += 19cad0 19cfc0
 FILE_HOOKS += $(ASPECT_HOOKS)
 # Task 44, review (runtime/null_mf.c): the movie seam's three pass-through hooks.  5375d0 = the movie module's command function
 # (command 0 = start: a request the game drops at its own guard is seen and said), 2cbd80 = the event's end (did the movie's event end

@@ -17,9 +17,10 @@
  *                                at each present where they changed (the VRAM guard and the 16:9 fit), and the H1 counts.  Null
  *                                graphics backend (runtime/null_d3d12.c); the vkd3d bridges print their own census.
  * Any other value of these three is a named fatal.
- *   KHNMC_FOV_ZOOM=<number>      task 49 (section "the zoom of the tall screen" below): the camera zoom of a screen TALLER THAN WIDE in
- *                                fill mode, 1.0 .. 2.0 (plain decimal), default 1.15; 1.0 = no zoom, nothing written.  A screen that is
- *                                not taller than wide always has zoom 1.  With KHNMC_ASPECT unset or pc the value is checked, reported
+ *   KHNMC_FOV_ZOOM=<number>      task 49 (section "the zoom of the tall screen" below): the zoom of the 3D picture of a screen TALLER
+ *                                THAN WIDE in fill mode, 1.0 .. 1.89 (plain decimal), default 1.3; 1.0 = no zoom, nothing written.  The
+ *                                game's camera stays the exe's (only what is drawn is zoomed).  A screen that is not taller than wide
+ *                                always has zoom 1.  With KHNMC_ASPECT unset or pc the value is checked, reported
  *                                as not applied (NOTE fov-zoom-not-applied) and changes nothing.  Malformed, or outside the range: the
  *                                named fatals fov-zoom-value-malformed / fov-zoom-value-range.
  *
@@ -123,8 +124,12 @@ void kh_aspect_test_config(const char *off,const char *nocull){
 }
 void kh_aspect_drawlog_config(const char *v);
 void kh_aspect_zoom_config(const char *v);          /* task 49, below */
+void kh_aspect_hud_config(const char *cmd,const char *hpv);   /* task 53, below */
+void kh_aspect_title_config(const char *v);                   /* task 53, below */
 void kh_aspect_init(void){ kh_aspect_config(getenv("KHNMC_ASPECT"),getenv("KHNMC_ASPECT_LOG"),getenv("KHNMC_ASPECT_TEST_H1"));
     kh_aspect_zoom_config(getenv("KHNMC_FOV_ZOOM"));
+    kh_aspect_hud_config(getenv("KHNMC_HUD_SCALE_CMD"),getenv("KHNMC_HUD_SCALE_HP"));
+    kh_aspect_title_config(getenv("KHNMC_TITLE_LAYOUT"));
     kh_aspect_test_config(getenv("KHNMC_ASPECT_TEST_OFF"),getenv("KHNMC_ASPECT_TEST_NOCULL"));
     kh_aspect_drawlog_config(getenv("KHNMC_ASPECT_M_DRAWLOG")); }
 
@@ -280,6 +285,9 @@ void kh_screen_check_counts(u64 *presents,u64 *bad){ if(presents) *presents=scr_
  *       the wide m11 for the render-side readers of rctx+0x488 (plan 4.4).  The frame note for H1 (task 37) stays here.
  *   H2c f_2bd190 (ryj::EFFECT, callers f_2bd4c0 and 0x300104): camera = guest rcx (0x2bd1b2 mov rdi,rcx).
  *   The kn / YS / Ti readers of cam+0x84 (gameplay: on-screen and line-of-sight tests) keep the PC value (plan 4.4, "not widened").
+ *   Task 49 keeps that true on a zoomed tall screen: the camera stays the exe's build; only the drawing sites of f_19cfc0 (the map
+ *   pass, the effect pass, ...) get a copy with zoomed cam+0x00 / +0x104, whose cam+0x84 is the exe's, so H2 divides the same m11
+ *   (section "task 49" below).
  * H4 (plan section 5 "full-screen fades", "event letterbox bars"; the setter offsets [R] verified here): f_160cc0(obj, w, h) stores
  *   s16 w, h at obj+0x8 / +0xa and f_160cd0(obj, x, y) s16 x, y at obj+0xc / +0xe (shard_0028.c:1516 / :1538).  The three fades
  *   (f_156940 -> object 0x140abb3b0, f_1569b0 -> 0x140abb720, f_156a70 -> 0x140abb290) set y = -1, h = 0x1a2 and then DRAW at once:
@@ -322,12 +330,13 @@ static H2Stat h2b={"H2b (0x186920, map pass)"}, h2c={"H2c (0x2bd190, effect pass
 static const double H2_NOCULL=2047.0/208.0;
 /* the m11 value written for a saved value at the ratio `div` (r, or 2047/208 for the no-cull reference) */
 static u32 h2_value(u32 saved,double div){ return fbits((float)((double)bf(saved)/div)); }
+int kh_aspect_zoom_shadow(u64 a);           /* task 49, below */
 static void h2_around(KCtx *g,u64 cam,void (*fn)(KCtx *),H2Stat *st){
     st->calls++;
     double r=gx_r(g);
     if(r==1.0){ st->identity++; fn(g); return; }                                   /* 16:9 or wider: nothing is written */
     u64 a=cam+CAM_M11;
-    if(!cam||!GA_OK(a)||!GA_OK(a+3)){ st->badcam++;
+    if(!cam||((!GA_OK(a)||!GA_OK(a+3))&&!kh_aspect_zoom_shadow(a))){ st->badcam++;  /* (task 49: a drawing site's camera copy is host memory) */
         if(!atomic_exchange(&st->warned,1)) fprintf(stderr,"kh: aspect: WARNING: %s: camera pointer 0x%llx is not guest memory: m11 not edited (counted)\n",st->name,P(cam));
         fn(g); return; }
     u32 saved=rd32(g,a), w=h2_value(saved,asp_nocull?H2_NOCULL:r);
@@ -405,7 +414,8 @@ void f_2bd190(KCtx *g){
     if(__builtin_expect(!asp_mode&&!kh_aspect_m,1)){ orig_f_2bd190(g); return; }
     h2c_wrap(g,orig_f_2bd190);
 }
-/* M only: f_19d040 = `lea rax,[rcx+0x84]`, the accessor every cam+0x84 reader calls */
+/* M only: f_19d040 = `lea rax,[rcx+0x84]`, the accessor every cam+0x84 reader calls (task 49 leaves it alone: the camera's own cam+0x84
+ * is the exe's build, section "task 49" below) */
 void f_19d040(KCtx *g){
     if(__builtin_expect(kh_aspect_m,0)) m_cam(g,rd64(g,KH_RSP(g)),KH_RCX(g));
     orig_f_19d040(g);
@@ -414,66 +424,84 @@ void f_19d040(KCtx *g){
 /* ==== task 49: the zoom of the tall (portrait) screen ===============================================================================
  *
  * Below 16:9 the exe keeps the HORIZONTAL view of a 16:9 screen and adds rows (Vert+, plan sections 2 and 4), so on a portrait screen
- * (the phone: 2007x2853, r = 2.53) the picture is very wide-angle and characters are small.  The zoom z (default 1.15 on a screen
- * taller than wide, KHNMC_FOV_ZOOM; exactly 1 on every other screen, in pc and with nothing set) makes the scene camera's picture z
- * times bigger about the screen centre.
+ * (the phone: 2007x2853, r = 2.53) the picture is very wide-angle and characters are small.  The zoom z (default 1.3 on a screen taller
+ * than wide, KHNMC_FOV_ZOOM 1.0 .. 1.89; exactly 1 on every other screen, in pc and with nothing set) makes the 3D picture z times
+ * bigger about the screen centre.  Owner rule: gameplay exactly PC NMC, only the picture changes.
  *
- * The one place.  A camera struct (0x184 bytes) holds its projection distance d at +0x40; the FOV angles at +0x44 / +0x48 are derived
- * from it against the fixed 512 x 416 frame (f_19dde0, f_19df00, f_19dc50: fov_x = 2 atan(256 / (d * cam+0x4c)), fov_y = 2 atan(208 /
- * (d * cam+0x50))) and are the GAME'S FOV state (f_19ce90 reads them back for its FOV animations and save / restore: f_177f20,
- * f_2901a0, f_38ebc0, ...).  Every matrix of a camera is built by f_19cad0(cam) (shard_0032.c:51918) from d and nothing else of the
- * FOV state:
- *   f_4748b0(cam+0x00, cam+0x144, cam+0x104, d = [cam+0x40], cam+0x4c, cam+0x50, ...)  (0x14019cb3e): cam+0x104 = the projection
- *       (f_4747a0: its x / y scales are linear in d: 0x1404747c8 `addss xmm6,xmm6` .. 0x1404747fb), cam+0x144 = the screen matrix (no
- *       d in it), cam+0x00 = their product (f_13f850 at 0x140474a8e) = the 3D vertex shaders' ViewProjection and the matrix the
- *       marker projector f_1abdc0 multiplies (lock-on, damage numbers, gauges over heads: f_1f3e10, f_219470, f_219900, f_430ea0);
- *   f_19c820(cam, cam+0x84, 256 + margin, 208)  (0x14019cb78): the world-to-GS clip matrix, m00 = d * cam+0x4c / halfW (0x14019c89a),
- *       m11 = d * cam+0x50 / halfH (0x14019c8b0: cam+0x98, the float H2 divides by r);
- *   f_19c820(cam, cam+0xc4, 2047, 2047)  (tail jump 0x14019cb97): the guard-band clip matrix.
- * So the hook on f_19cad0 saves the 4 bytes at cam+0x40, writes (float)(d * z), runs the lifted body and puts the saved bytes back:
- * every matrix of that camera is, bit for bit, the game's own build for the distance d * z (the selftest compares them with the
- * lifted body's build of a camera whose d is that float), and d, the FOV angles and every other field read back unchanged.  The
- * copies need nothing: f_19cba0 copies 0x140ac1840[idx] to 0x140ac1220[idx] with f_186810 BEFORE it rebuilds (0x14019cbe7 /
- * 0x14019cc7c), and the map pass copies the camera to rctx+0x38 (0x186962); a copy carries the zoomed matrices and the unzoomed d.
- * H2 is untouched and stays exact: it divides whatever m11 the camera holds by r around the two culling passes, and the Vert+ clip of
- * a camera with distance d * z is that camera's clip with m11 / r.  Culling follows by itself: both passes cull with cam+0x84 of the
- * same build, so they cull exactly the zoomed view (never less than is visible).
+ * The camera.  A camera struct (0x184 bytes) holds its projection distance d at +0x40; the FOV angles at +0x44 / +0x48 are derived from
+ * it against the fixed 512 x 416 frame (f_19dde0, f_19df00, f_19dc50).  f_19cad0(cam) (shard_0032.c:51918) builds every matrix of it
+ * from d and fields that do not depend on d: f_4748b0 (0x14019cb3e) writes cam+0x104 = the projection (its x / y scales linear in d),
+ * cam+0x144 = the screen matrix (no d) and cam+0x00 = their product (the camera half of the 3D vertex shaders' ViewProjection);
+ * f_19c820 (0x14019cb78) cam+0x84 = the world-to-GS clip matrix (m00 = d cam+0x4c / halfW, m11 = d cam+0x50 / 208, cam+0x98: the
+ * float H2 divides by r), f_19c820 (tail jump 0x14019cb97) cam+0xc4 = the guard band (2047).  Nothing else is written (f_142ec0 and
+ * the f_11c150 getters it and f_4748b0 call only read).  So a build with d * z in cam+0x40 gives the zoomed matrices; d, the FOV
+ * angles and every other field are the same.
  *
- * Which cameras.  f_19cad0 has 17 call sites (16 calls and the tail jump of the init f_19dc50; no pointer to it anywhere in the
- * image); the scene cameras are the two of the camera system (f_19d050 builds exactly two with
- * f_19dc50: 0x140ac1840 at 0x14019d140 and 0x140ac19c4 = 0x140ac1840 + 0x184 at 0x14019d18e; 0x140ac1b50, 8 bytes behind the second,
- * is the previous-frame view array of f_19ce40(0)), the ones f_19cfc0 returns, f_19cba0 rebuilds every frame (0x14019cc7c) and the Ti minigames set
- * (f_543020 ...).  Those two are zoomed, by address.  One more build belongs to the scene: f_188120 (the map pass, a map object with
- * its own projection distance, flag 0x1000 at obj+0x118) copies the pass's camera rctx+0x38 to its stack, sets d from the object's
- * matrix with f_19df00 and rebuilds (0x14018830d, return address 0x140188312); it is zoomed too, or such an object would be drawn
- * with another scale than the scene around it.  Every other build is a camera an object owns (menu models Tz 0x2ffbb0, the
- * sub-scenes 0x272480 / 0x290d50 / 0x2915f0, 0x535040): not zoomed, the menus stay as they are; each such build on a tall screen is
- * counted and its return address listed in the exit report (no silent path).
+ * Who reads a scene camera's matrices (review of task 49, finding 1: the first version zoomed the camera itself, and gameplay code read
+ * it: the on-screen tests of kn f_1b5e30 / YS f_3f3ed0 (script syscall f_42ee40, object-list scan f_41f730, the camera module) through
+ * cam+0x84, the camera's framing f_176710 / f_176ec0 through cam+0x00; the lock-on camera took another path for 84 frames).  The
+ * matrices are read only through the camera pointer f_19cfc0 returns (62 call sites; the arrays 0x140ac1840 / 0x140ac1220 are not
+ * referenced outside the camera module 0x19cad0..0x19ddd0) and from copies of a camera made there (the map pass's rctx+0x38 / +0x280,
+ * f_19cba0's previous-frame copy 0x140ac1220[idx], object copies).  The 62 sites, by the use of what they get (implementation notes, "the
+ * readers"; zsites below):
+ *   D, drawing (9): the map pass f_186920 (copies the camera to rctx: every 3D draw's ViewProjection rctx+0x240, the cull and guard
+ *       frustums rctx+0x488 / +0x4c8, the render's own projections f_16fcd0 / f_170450 into rctx+0xa0c / +0xf4c..0xf54), the render
+ *       frame f_170450, the effect pass f_2bd4c0 -> f_2bd190 (f_2c31e0: the effects' matrices 0x142b0ede0 / 0x142b0ef20; its cull
+ *       context from cam+0x84), dk f_1666f0 / f_1673b0 (dk::COMMAND_DRAW: [0x140abcd20]+0x30), dk::ModelSprite f_18eee0, dk::SpotBlend
+ *       f_18f240, the prize draw order f_411f30 (PRIZEOBJ slot 4: a depth sort, then f_2bebe0 draws) and f_3b7150 (only for f_3b1fa0 /
+ *       f_3b2340: the command menu's fade while the player is in the lower left of the picture, [0x140abc508]+0x3bc).
+ *   G, game logic and other readers (20): the camera module (distance f_19d010 in f_1c8d90 / f_1c9f70 / f_1cb360 / f_396b80; FOV get
+ *       and set f_165700, f_177f20, f_1780d0, f_178580, f_38eb50, f_38ebc0, f_2d27a0, near plane f_1a1610), kn f_1b5e30, YS f_3f3ed0,
+ *       the camera's framing f_176710, the script syscall f_430ea0 (screen position of a point, table 0x140756730), the object picker
+ *       f_438070 (YS::ROOTWINDOW).
+ *   M, play modes whose own code projects with the scene camera for play and picture alike (33): the gummi ship gb (f_1e2580 ..
+ *       f_219900: camera init, lock-on guns, screen positions), the gummi garage gm (f_247420 .. f_2827d0) and the minigames Ti
+ *       (f_543020 .. f_554a30, f_2e1110).
+ * The design follows from that: THE CAMERA STRUCT STAYS THE EXE'S BUILD, and only the drawing sites get the zoomed matrices.
+ *   - zoom_build (the hook on f_19cad0), scene camera 0x140ac1840 / 0x140ac19c4: the lifted body builds the camera as the exe does
+ *     (1); then, from the guest state of the call, with cam+0x40 = (float)(d * z), it builds again (2) and the zoomed cam+0x00 / +0x104
+ *     are noted, with the build-1 matrices they belong to (the last two builds per camera: the previous-frame copy holds the one
+ *     before); then the camera (all 0x184 bytes), the guest registers and the stack below the call are put back to what build 1 left.
+ *     So every field of the camera, the registers and the stack are bit for bit the exe's (selftest), and game logic, which reads
+ *     only that (G above, and anything unknown), sees PC.
+ *   - zoom_cam_post (the hook on f_19cfc0): at a D site, on a zoomed screen, a camera of the two arrays (current or previous-frame
+ *     copy) whose cam+0x00 / +0x104 are a noted build 1 is handed out as a COPY: its 0x184 bytes with the zoomed cam+0x00 / +0x104 of
+ *     that build, in host memory owned by the site (zshadow, given to the game by its guest address as runtime/null_audio.c GADDR
+ *     does; nothing is allocated, the guest heap is as without the zoom); each site uses its pointer before it can call again (the
+ *     map pass and f_170450 copy it at once, the effect pass reads it at its start).  Everything else gets the camera.  So what is
+ *     drawn is zoomed consistently (3D, effects, the render's markers and the dk sprites all take the same matrices), the clip and
+ *     guard band in the copy are the exe's: culling is over-inclusive (it keeps what the PC view keeps; H2 divides the copy's m11 as
+ *     it does the camera's), never under.  A camera none of whose noted builds matches (built at zoom 1, or another camera) is handed
+ *     out as it is (counted).
+ *   - M sites: the gummi ship, its garage and the minigames project with the scene camera both for play (lock-on guns, targets) and
+ *     for their 2D (sights, markers); a zoomed picture there would put their 2D off its 3D, and play must stay PC.  So while one of
+ *     them runs (a call from an M site in this game frame or the last), the zoom is 1: builds are the exe's only and D sites get the
+ *     camera.  The field, battles and events have no M call (routes: 0).
+ *   - The map pass's per-object camera (f_188120: a stack copy of rctx+0x38 with the object's own distance, rebuilt at 0x14018830d,
+ *     return address 0x140188312) is drawing only: it is built the same way and keeps the zoomed cam+0x00 / +0x104.
+ *   - Other cameras (object-owned: menu models Tz 0x2ffbb0, gm::CAMERA 0x272480, gm::WORKAREACAMERA 0x290d50 / 0x2915f0, 0x535040)
+ *     are not zoomed (counted, their return addresses listed).
+ * f_19d010 (the distance) and f_19ce90 (the FOV angles) are not hooked: d and the FOV are put back, and they are the game's state.  The
+ * lock-on camera's limit (f_178580: the target within half the FOV minus 10 degrees, 0x1405b2300) is game logic and stays PC; the
+ * picture's left / right edge is at tan = (341.33 / 256) tan(fov_x / 2) / z, so the limit stays inside the picture while z <= (4 / 3)
+ * tan(f) / tan(f - 10 deg), whose least value over all f is 1.894 (f = 50 deg; the routes' field camera, fov_x = 1.55 rad: 1.907);
+ * hence the range 1.0 .. 1.89 (review finding 3).
  *
- * The distance accessor.  d is read outside the build only through f_19d010 (`movss xmm0,[rcx+0x40]`), always on a camera f_19cfc0
- * returned (0x1401c8ef8, 0x1401ca0c4, 0x1401cb3b8, 0x1402e1516, 0x140396c8e), to turn a screen offset into a world offset at a depth
- * (offset * depth / d: 0x140396c9a).  Those must use the distance the matrices were built with, or what they place lands z times
- * further from the screen centre: the hook on f_19d010 returns (float)(d * z), the same bits the build wrote, for the two scene
- * cameras and their previous-frame copies 0x140ac1220[k], and d as stored for every other camera.  f_19ce90 (the FOV angles) is left
- * alone: its callers copy, animate and set the game's FOV; the one geometric use (f_178580: the camera keeps a target inside half the
- * FOV minus 10 degrees, 0x1405b2300) stays inside the zoomed view for every allowed z (tan 16.6 deg = 0.30 against 0.667 / z).
- *
- * What follows the zoom besides the picture (measured, implementation notes): the game's own readers of the camera matrices see the zoomed
- * view, as they would with a FOV the game had set itself: the on-screen tests of kn / YS (cam+0x84, f_1b5e30 / f_3f3ed0) test the
- * zoomed frame, and after a lock-on the game's camera takes another path for a while (two null-backend routes: turned by more than
- * 0.1 degrees for 84 frames, at most 8.6, then identical again).  The game's FOV state, the look-at point, the route's states, the
- * battle's hits and the files it reads are the same with and without the zoom (the camera lines of KHNMC_ASPECT_LOG=1).
- *
- * Identity: with KHNMC_ASPECT unset or pc both hooks are one flag test and the lifted body; in fill mode on a screen that is not
- * taller than wide, or with KHNMC_FOV_ZOOM=1, z is exactly 1 and nothing is written (counted). */
+ * Identity: with KHNMC_ASPECT unset or pc the hooks are a flag test and the lifted body; in fill mode on a screen that is not taller
+ * than wide, or with KHNMC_FOV_ZOOM=1, z is exactly 1: one build, nothing written, every site gets the camera (counted). */
 #define CAM_D          0x40ull                     /* the projection distance */
+#define CAM_VP         0x00ull                     /* projection x screen matrix: what is drawn with */
+#define CAM_PROJ       0x104ull                    /* the projection */
 #define ZOOM_NCAM      2                           /* the scene cameras f_19d050 builds: 0x140ac1840 and 0x140ac19c4 */
 #define ZOOM_RA_MAPOBJ (GS_BASE+0x188312ull)       /* f_188120: return address of its f_19cad0 (a stack copy of the map pass's camera) */
-#define ZOOM_DEFAULT   1.15                        /* owner 2026-11-18: "a bit less than halfway" between 1.0 and 2853/2007 = 1.42 */
+#define ZOOM_DEFAULT   1.3                         /* owner 2026-11-18 ~22:15, playing portrait on the phone: "the zoom is still alot i
+                                                    * want roxas a bit closer" (task 49's first default was 1.15) */
+#define ZOOM_MAX       1.89                        /* review finding 3: f_178580's limit inside the picture for every FOV (above) */
+#define ZOOM_STACK     0x1000ull                   /* the guest stack below the call that the two builds may write (put back) */
 enum { ZC_SCENE0=0, ZC_SCENE1=1, ZC_MAPOBJ=2, ZC_OTHER=3 };
 static double asp_zoom_tall=ZOOM_DEFAULT; static int asp_zoom_set;
 /* a KHNMC_FOV_ZOOM value: DIGITS[.DIGITS] with at most 15 digits in all and nothing else (no sign, exponent, space; no locale).
- * 0 = *z set, 1 = malformed, 2 = a number outside 1.0 .. 2.0 */
+ * 0 = *z set, 1 = malformed, 2 = a number outside 1.0 .. 1.89 */
 int kh_fov_zoom_parse(const char *s,double *z){
     u64 n=0, den=1; int nd=0, ni=0, nf=0, dot=0;
     if(!s) return 1;
@@ -484,110 +512,372 @@ int kh_fov_zoom_parse(const char *s,double *z){
         n=n*10+(u64)(*p-'0'); if(dot){ den*=10; nf++; } else ni++; }
     if(!ni||(dot&&!nf)) return 1;
     double v=(double)n/(double)den;                                                  /* both exact below 2^53: the correctly rounded value */
-    if(!(v>=1.0&&v<=2.0)) return 2;
+    if(!(v>=1.0&&v<=ZOOM_MAX)) return 2;
     *z=v; return 0;
 }
 void kh_aspect_zoom_config(const char *v){
     if(v&&*v){ double z=0; int e=kh_fov_zoom_parse(v,&z);
-        if(e==1) kh_fatal(NULL,"fov-zoom-value-malformed: KHNMC_FOV_ZOOM=%s (expected a plain decimal number from 1.0 to 2.0, such as 1.15)",v);
-        if(e) kh_fatal(NULL,"fov-zoom-value-range: KHNMC_FOV_ZOOM=%s (allowed: 1.0 to 2.0; 1.0 = no zoom)",v);
+        if(e==1) kh_fatal(NULL,"fov-zoom-value-malformed: KHNMC_FOV_ZOOM=%s (expected a plain decimal number from 1.0 to 1.89, such as 1.3)",v);
+        if(e) kh_fatal(NULL,"fov-zoom-value-range: KHNMC_FOV_ZOOM=%s (allowed: 1.0 to 1.89; 1.0 = no zoom)",v);
         asp_zoom_tall=z; asp_zoom_set=1;
         if(!asp_mode){ fprintf(stderr,"kh: aspect: NOTE: fov-zoom-not-applied: KHNMC_FOV_ZOOM=%s is set, but KHNMC_ASPECT is pc: the zoom applies in fill mode only, nothing is zoomed\n",v); return; } }
-    if(asp_mode) fprintf(stderr,"kh: aspect: zoom (task 49): %g on a screen taller than wide (%s), 1 = nothing written on every other screen; the scene cameras' distance cam+0x40 times the zoom around f_19cad0\n",
-                         asp_zoom_tall,asp_zoom_set?"KHNMC_FOV_ZOOM":"the default; KHNMC_FOV_ZOOM=1.0..2.0 changes it");
+    if(asp_mode) fprintf(stderr,"kh: aspect: zoom (task 49): %g on a screen taller than wide (%s), 1 = nothing written on every other screen; the camera stays the exe's build, "
+                         "the drawing sites of f_19cfc0 get a copy with the matrices of the distance times the zoom\n",
+                         asp_zoom_tall,asp_zoom_set?"KHNMC_FOV_ZOOM":"the default; KHNMC_FOV_ZOOM=1.0..1.89 changes it");
 }
-/* the zoom of a W x H screen: KHNMC_FOV_ZOOM (default 1.15) in fill mode when it is taller than wide, else exactly 1 */
+/* the zoom of a W x H screen: KHNMC_FOV_ZOOM (default 1.3) in fill mode when it is taller than wide, else exactly 1 */
 double kh_aspect_zoom(double W,double H){ return (asp_mode==1&&W>0&&H>W)?asp_zoom_tall:1.0; }
 static double gx_zoom(KCtx *g){ return kh_aspect_zoom(rdf(g,GX+0x18),rdf(g,GX+0x1c)); }
 static int zoom_class(u64 cam,u64 ra){
     for(int k=0;k<ZOOM_NCAM;k++) if(cam==CAM_CUR+CAM_SIZE*(u64)k) return k;
     return ra==ZOOM_RA_MAPOBJ?ZC_MAPOBJ:ZC_OTHER;
 }
-typedef struct { _Atomic u64 calls, identity, other, edited[3], inside, badcam, d_calls, d_identity, d_other, d_scaled[2], d_thread; _Atomic u32 tid; _Atomic int warned; } ZoomStat;
+/* the 62 call sites of f_19cfc0, by return address (0x140000000 + rva), and what their camera is used for (comment above) */
+enum { ZS_DRAW=1, ZS_GAME=2, ZS_MODE=3 };
+typedef struct { u32 rva; u8 cls; s8 slot; const char *what; } ZoomSite;
+static const ZoomSite zsites[]={
+    {0x16598e,ZS_GAME,-1,"f_165700 FOV set"},           {0x166719,ZS_DRAW,0,"f_1666f0 dk view-projection"},    {0x16740a,ZS_DRAW,1,"f_1673b0 dk::COMMAND_DRAW"},
+    {0x17072b,ZS_DRAW,2,"f_170450 render frame"},       {0x176740,ZS_GAME,-1,"f_176710 camera framing"},       {0x177fbc,ZS_GAME,-1,"f_177f20 FOV save"},
+    {0x178343,ZS_GAME,-1,"f_1780d0 FOV set"},           {0x178620,ZS_GAME,-1,"f_178580 lock-on limit x"},      {0x1786b7,ZS_GAME,-1,"f_178580 lock-on limit y"},
+    {0x18695c,ZS_DRAW,3,"f_186920 map pass"},           {0x18ef29,ZS_DRAW,4,"f_18eee0 dk::ModelSprite"},       {0x18f2f5,ZS_DRAW,5,"f_18f240 dk::SpotBlend"},
+    {0x1a17c1,ZS_GAME,-1,"f_1a1610 near plane"},        {0x1b5f25,ZS_GAME,-1,"f_1b5e30 kn on-screen"},         {0x1c8ef5,ZS_GAME,-1,"f_1c8d90 camera (distance)"},
+    {0x1ca0c1,ZS_GAME,-1,"f_1c9f70 camera (distance)"}, {0x1cb3b5,ZS_GAME,-1,"f_1cb360 target search"},        {0x1e2598,ZS_MODE,-1,"gb f_1e2580 camera init"},
+    {0x1e2c83,ZS_MODE,-1,"gb f_1e2c40"},                {0x1e3839,ZS_MODE,-1,"gb f_1e3820 camera init"},       {0x1f3e39,ZS_MODE,-1,"gb f_1f3e10 screen position"},
+    {0x205d73,ZS_MODE,-1,"gb f_205d30"},                {0x20d7f0,ZS_MODE,-1,"gb f_20d760"},                   {0x21969c,ZS_MODE,-1,"gb f_219470 projector"},
+    {0x2199cc,ZS_MODE,-1,"gb f_219900 projector"},      {0x219b3a,ZS_MODE,-1,"gb f_219900 projector"},         {0x24760d,ZS_MODE,-1,"gm f_247420"},
+    {0x24818c,ZS_MODE,-1,"gm f_248160"},                {0x258a70,ZS_MODE,-1,"gm f_258930"},                   {0x25b3e5,ZS_MODE,-1,"gm f_25b010"},
+    {0x25b461,ZS_MODE,-1,"gm f_25b010"},                {0x26e463,ZS_MODE,-1,"gm f_26e440 FOV"},               {0x271f40,ZS_MODE,-1,"gm f_271d00 copy"},
+    {0x271f53,ZS_MODE,-1,"gm f_271d00 copy"},           {0x273950,ZS_MODE,-1,"gm::SPRITEFROM3D f_273820"},     {0x27cc3d,ZS_MODE,-1,"gm::GUMIOBJ f_27cbc0"},
+    {0x282882,ZS_MODE,-1,"gm f_2827d0"},                {0x2bd4ec,ZS_DRAW,6,"f_2bd4c0 effect pass"},           {0x2d27d7,ZS_GAME,-1,"f_2d27a0 FOV"},
+    {0x2d31e5,ZS_GAME,-1,"f_2d27a0 camera copy"},       {0x2e1513,ZS_MODE,-1,"Ti f_2e1110"},                   {0x38eb8d,ZS_GAME,-1,"f_38eb50 FOV get"},
+    {0x38ec06,ZS_GAME,-1,"f_38ebc0 FOV get"},           {0x38ecf0,ZS_GAME,-1,"f_38ebc0 FOV set"},              {0x396c8b,ZS_GAME,-1,"f_396b80 camera pan"},
+    {0x3b717e,ZS_DRAW,7,"f_3b7150 command menu fade"},  {0x3f3ef0,ZS_GAME,-1,"f_3f3ed0 YS on-screen"},          {0x411fb1,ZS_DRAW,8,"f_411f30 prize draw order"},
+    {0x430ecb,ZS_GAME,-1,"f_430ea0 script syscall"},    {0x4381ab,ZS_GAME,-1,"f_438070 object picker"},        {0x543048,ZS_MODE,-1,"Ti f_543020"},
+    {0x543ea7,ZS_MODE,-1,"Ti f_543e00"},                {0x5467f6,ZS_MODE,-1,"Ti f_546750"},                   {0x546b61,ZS_MODE,-1,"Ti f_546ab0"},
+    {0x546d1f,ZS_MODE,-1,"Ti f_546c80"},                {0x547420,ZS_MODE,-1,"Ti f_547370"},                   {0x5481ce,ZS_MODE,-1,"Ti f_548130"},
+    {0x548348,ZS_MODE,-1,"Ti f_548330"},                {0x549187,ZS_MODE,-1,"Ti f_549170"},                   {0x549254,ZS_MODE,-1,"Ti f_549240"},
+    {0x5539a1,ZS_MODE,-1,"Ti f_553970"},                {0x554a60,ZS_MODE,-1,"Ti f_554a30"} };
+#define ZOOM_NSITE ((int)(sizeof zsites/sizeof *zsites))
+#define ZOOM_NDRAW 9
+static int zoom_site(u64 ra){                                                         /* index into zsites, or -1 */
+    if(ra<GS_BASE||ra-GS_BASE>0xffffffffull) return -1;
+    u32 r=(u32)(ra-GS_BASE); int lo=0, hi=ZOOM_NSITE-1;
+    while(lo<=hi){ int m=(lo+hi)/2; if(zsites[m].rva==r) return m; if(zsites[m].rva<r) lo=m+1; else hi=m-1; }
+    return -1;
+}
+typedef struct { _Atomic u64 calls, identity, suppressed, other, edited[3], inside, differ, badcam,
+                 s_calls, s_game, s_mode, s_draw, d_copy[2], d_z1, d_supp, d_nomatch, d_other, d_thread, s_unknown, site[64];
+                 _Atomic u32 tid; _Atomic int warned, s_warned; } ZoomStat;
 static ZoomStat zs;
+/* the zoomed draw matrices of the last two builds of each scene camera ([k][0] the last), with the matrices of build 1 they belong to */
+typedef struct { u8 pc_vp[0x40], pc_pr[0x40], z_vp[0x40], z_pr[0x40]; int valid; } ZoomEnt;
+static ZoomEnt zent[ZOOM_NCAM][2];
+/* per D site: the copy handed out (0x184 bytes, host memory given to the game by its guest address) */
+static u8 zshadow[ZOOM_NDRAW][0x190] __attribute__((aligned(64)));
+#define ZOOM_GADDR(p) ((u64)((uintptr_t)(p)-gs_bias))
+int kh_aspect_zoom_shadow(u64 a){                                                     /* a lies in a copy of zshadow (H2c, GA_OK's stand-in) */
+    u64 lo=ZOOM_GADDR(zshadow[0]); return a>=lo&&a<lo+sizeof zshadow;
+}
+/* the M sites: the game frame of the last call; the zoom is 1 in that frame and the next */
+static _Atomic u64 zsup_frame; static _Atomic int zsup_have;
+static int zoom_supp_at(u64 now,int have,u64 f){ return have&&now>=f&&now-f<=1; }
+static int zoom_suppressed(void){ return zoom_supp_at(kh_game_frames(),atomic_load(&zsup_have),atomic_load(&zsup_frame)); }
 typedef struct { u64 ra, n; } ZoomRa;
 static ZoomRa zra[16]; static int n_zra; static u64 zra_cut;      /* builds of other cameras on a tall screen, by return address (under mm) */
-/* the bits written for a saved distance at zoom z (the build and the accessor use this one function) */
+static ZoomRa zua[8]; static int n_zua; static u64 zua_cut;       /* f_19cfc0 from an unknown return address (under mm) */
+/* the bits written for a saved distance at zoom z */
 static u32 zoom_value(u32 saved,double z){ return fbits((float)((double)bf(saved)*z)); }
-/* KHNMC_ASPECT_LOG=1 or 2: the scene camera as the GAME set it (before the zoom), at f_19cba0's build of every 50th game frame:
- * the distance cam+0x40, the FOV angles cam+0x44 / +0x48 and the view's eye / look-at point / roll (the view array of f_19ce40(1),
- * 0x140ac1020 + 0x80 k: +0x48, +0x58, +0x78; f_19cba0 builds the view matrix from them at 0x14019cc9e..).  Two runs that differ only
- * in the zoom show with these lines whether the game's FOV state and its camera stayed the same (the lines of task 49's routes). */
+static void zoom_push(int k,const u8 *pc,const u8 *zz){                               /* note build k's matrices (zz NULL: none zoomed) */
+    zent[k][1]=zent[k][0];
+    if(zz){ memcpy(zent[k][0].pc_vp,pc+CAM_VP,0x40); memcpy(zent[k][0].pc_pr,pc+CAM_PROJ,0x40); memcpy(zent[k][0].z_vp,zz+CAM_VP,0x40); memcpy(zent[k][0].z_pr,zz+CAM_PROJ,0x40); zent[k][0].valid=1; }
+    else zent[k][0].valid=0;
+}
+/* KHNMC_ASPECT_LOG=1 or 2: the scene camera after f_19cba0's build of every 50th game frame: the distance cam+0x40, the FOV angles
+ * cam+0x44 / +0x48, the view's eye / look-at point / roll (the view array of f_19ce40(1), 0x140ac1020 + 0x80 k: +0x48, +0x58, +0x78)
+ * and FNV-1a hashes of all 0x184 bytes of the camera and the 0x80 bytes of its view: two runs that differ only in the zoom show with
+ * these lines whether the game's camera stayed the same (task 49's route pairs) */
 #define ZOOM_RA_FRAME  (GS_BASE+0x19cc81ull)       /* f_19cba0: return address of its f_19cad0 */
 #define VIEW_CUR       (GS_BASE+0xac1020ull)
+
+#define ZOOM_LOG_EVERY 50                           /* (run-G49/fix/diag builds a copy with 1: every game frame) */
+#define ZOOM_LOG_MAX   600
+
 static _Atomic u64 zoom_log_lines, zoom_log_cut;
+static u64 zoom_fnv(const u8 *p,size_t n){ u64 h=0xcbf29ce484222325ull; for(size_t i=0;i<n;i++){ h^=p[i]; h*=0x100000001b3ull; } return h; }
 static void zoom_log(KCtx *g,u64 cam,u64 ra){
     if(ra!=ZOOM_RA_FRAME) return;
     int k=cam==CAM_CUR?0:cam==CAM_CUR+CAM_SIZE?1:-1; if(k<0) return;
-    u64 fr=kh_game_frames(); if(fr%50) return;
-    if(atomic_fetch_add(&zoom_log_lines,1)>=600){ zoom_log_cut++; return; }
+    u64 fr=kh_game_frames(); if(fr%ZOOM_LOG_EVERY) return;
+    if(atomic_fetch_add(&zoom_log_lines,1)>=ZOOM_LOG_MAX){ zoom_log_cut++; return; }
     u64 v=VIEW_CUR+0x80ull*(u64)k;
-    fprintf(stderr,"kh: aspect: zoom: camera %d at game frame %llu: distance %.9g, fov %.9g / %.9g; eye (%.9g, %.9g, %.9g), at (%.9g, %.9g, %.9g), roll %.9g\n",k,P(fr),
-            rdf(g,cam+CAM_D),rdf(g,cam+0x44),rdf(g,cam+0x48),rdf(g,v+0x48),rdf(g,v+0x4c),rdf(g,v+0x50),rdf(g,v+0x58),rdf(g,v+0x5c),rdf(g,v+0x60),rdf(g,v+0x78));
+    fprintf(stderr,"kh: aspect: zoom: camera %d at game frame %llu: distance %.9g, fov %.9g / %.9g; eye (%.9g, %.9g, %.9g), at (%.9g, %.9g, %.9g), roll %.9g; camera %016llx view %016llx\n",k,P(fr),
+            rdf(g,cam+CAM_D),rdf(g,cam+0x44),rdf(g,cam+0x48),rdf(g,v+0x48),rdf(g,v+0x4c),rdf(g,v+0x50),rdf(g,v+0x58),rdf(g,v+0x5c),rdf(g,v+0x60),rdf(g,v+0x78),
+            P(zoom_fnv(hp(g,cam),CAM_SIZE)),P(zoom_fnv(hp(g,v),0x80)));
 }
-/* f_19cad0(cam = guest rcx) with the lifted body as a parameter (the selftest passes a stand-in that records cam+0x40) */
+/* f_19cad0(cam = guest rcx) with the lifted body as a parameter (the selftest passes a stand-in) */
 static void zoom_build(KCtx *g,void (*body)(KCtx *)){
     u64 cam=KH_RCX(g), ra=rd64(g,KH_RSP(g));
     zs.calls++;
-    if(__builtin_expect(kh_aspect_log,0)) zoom_log(g,cam,ra);
-    double z=gx_zoom(g);
-    if(z==1.0){ zs.identity++; body(g); return; }                                   /* not taller than wide, or the value 1: nothing is written */
-    int k=zoom_class(cam,ra);
+    double z=gx_zoom(g); int k=zoom_class(cam,ra);
+    if(z==1.0){ zs.identity++; if(k<ZOOM_NCAM) zoom_push(k,NULL,NULL);              /* not taller than wide, or the value 1: nothing is written */
+        body(g); if(__builtin_expect(kh_aspect_log,0)) zoom_log(g,cam,ra); return; }
     if(k==ZC_OTHER){ zs.other++;
         pthread_mutex_lock(&mm); int i; for(i=0;i<n_zra;i++) if(zra[i].ra==ra) break;
         if(i==n_zra){ if(n_zra<16){ zra[i].ra=ra; zra[i].n=0; n_zra++; } else zra_cut++; }
         if(i<16) zra[i].n++; pthread_mutex_unlock(&mm);
         body(g); return; }
-    u64 a=cam+CAM_D;
-    if(!cam||!GA_OK(a)||!GA_OK(a+3)){ zs.badcam++;
-        if(!atomic_exchange(&zs.warned,1)) fprintf(stderr,"kh: aspect: WARNING: zoom: camera pointer 0x%llx (return address 0x%llx) is not guest memory: not zoomed (counted)\n",P(cam),P(ra));
+    if(zoom_suppressed()){ zs.suppressed++; if(k<ZOOM_NCAM) zoom_push(k,NULL,NULL);   /* a play mode of the M sites runs: the exe's build only */
+        body(g); if(__builtin_expect(kh_aspect_log,0)) zoom_log(g,cam,ra); return; }
+    u64 sp=KH_RSP(g);
+    if(!cam||!GA_OK(cam)||!GA_OK(cam+CAM_SIZE-1)||!GA_OK(sp-ZOOM_STACK)||!GA_OK(sp-1)){ zs.badcam++;
+        if(!atomic_exchange(&zs.warned,1)) fprintf(stderr,"kh: aspect: WARNING: zoom: camera 0x%llx or the stack below 0x%llx (return address 0x%llx) is not guest memory: not zoomed (counted)\n",P(cam),P(sp),P(ra));
+        if(k<ZOOM_NCAM) zoom_push(k,NULL,NULL);
         body(g); return; }
     { u32 t0=0; atomic_compare_exchange_strong(&zs.tid,&t0,cur_tid()); }
-    u32 saved=rd32(g,a), w=zoom_value(saved,z);
-    wr32(g,a,w);
-    body(g);
-    u32 now=rd32(g,a);
-    if(now==w){ wr32(g,a,saved); zs.edited[k]++; }
-    else { zs.inside++;
-        if(!atomic_exchange(&zs.warned,1)) fprintf(stderr,"kh: aspect: WARNING: zoom: cam+0x40 of camera 0x%llx changed inside f_19cad0 (we wrote 0x%08x, found 0x%08x): the game's value is kept (counted)\n",P(cam),w,now); }
+    static __thread u8 st0[KH_ST_SIZE] __attribute__((aligned(64))), st1[KH_ST_SIZE] __attribute__((aligned(64))), S1[CAM_SIZE], S2[CAM_SIZE], stk[ZOOM_STACK];
+    memcpy(st0,g->st,KH_ST_SIZE);
+    body(g);                                                                          /* 1: the exe's build */
+    memcpy(st1,g->st,KH_ST_SIZE); memcpy(S1,hp(g,cam),CAM_SIZE); memcpy(stk,hp(g,sp-ZOOM_STACK),ZOOM_STACK);
+    u32 d=rd32(g,cam+CAM_D), w=zoom_value(d,z);
+    memcpy(g->st,st0,KH_ST_SIZE); wr32(g,cam+CAM_D,w);
+    body(g);                                                                          /* 2: the same call with the distance d * z */
+    memcpy(S2,hp(g,cam),CAM_SIZE);
+    memcpy(hp(g,cam),S1,CAM_SIZE); memcpy(hp(g,sp-ZOOM_STACK),stk,ZOOM_STACK); memcpy(g->st,st1,KH_ST_SIZE);   /* all as build 1 left it */
+    if(__builtin_expect(kh_aspect_log,0)) zoom_log(g,cam,ra);                        /* the camera as the game now has it */
+    if(memcmp(S2+CAM_D,&w,4)){ zs.inside++; if(k<ZOOM_NCAM) zoom_push(k,NULL,NULL);
+        if(!atomic_exchange(&zs.warned,1)) fprintf(stderr,"kh: aspect: WARNING: zoom: cam+0x40 of camera 0x%llx changed inside f_19cad0 (we wrote 0x%08x): no zoomed matrices noted, the exe's build stands (counted)\n",P(cam),w);
+        return; }
+    if(memcmp(S2+0x44,S1+0x44,0x84-0x44)||memcmp(S2+0x144,S1+0x144,CAM_SIZE-0x144)){ zs.differ++;   /* fields without d: the same in both builds */
+        if(!atomic_exchange(&zs.warned,1)) fprintf(stderr,"kh: aspect: WARNING: zoom: the zoomed build of camera 0x%llx differs from the exe's in a field that has no distance in it (counted; its draw matrices are used all the same)\n",P(cam)); }
+    if(k<ZOOM_NCAM){ zoom_push(k,S1,S2); zs.edited[k]++; return; }
+    memcpy(hp(g,cam+CAM_VP),S2+CAM_VP,0x40); memcpy(hp(g,cam+CAM_PROJ),S2+CAM_PROJ,0x40); zs.edited[ZC_MAPOBJ]++;   /* the map pass's own stack camera: drawn only */
 }
-/* f_19d010 returned [cam+0x40] in xmm0: for a scene camera or its previous-frame copy, the distance its matrices were built with */
-static void zoom_d_post(KCtx *g,u64 cam){
-    zs.d_calls++;
-    double z=gx_zoom(g);
-    if(z==1.0){ zs.d_identity++; return; }
-    int k=-1; for(int i=0;i<ZOOM_NCAM;i++){ if(cam==CAM_CUR+CAM_SIZE*(u64)i) k=0; else if(cam==CAM_PREV+CAM_SIZE*(u64)i) k=1; }
-    if(k<0){ zs.d_other++; return; }
-    { u32 t=atomic_load(&zs.tid); if(t&&t!=cur_tid()) zs.d_thread++; }             /* reported: a read on another thread could meet the build's window */
-    u32 d; memcpy(&d,&KH_XMM(g,0),4); ret_f(g,bf(zoom_value(d,z))); zs.d_scaled[k]++;
-}
-void orig_f_19cad0(KCtx *); void orig_f_19d010(KCtx *);
+void orig_f_19cad0(KCtx *);
 void f_19cad0(KCtx *g){
     if(__builtin_expect(!asp_mode,1)){ orig_f_19cad0(g); return; }                 /* nothing set or pc: exactly the exe */
     zoom_build(g,orig_f_19cad0);
 }
-void f_19d010(KCtx *g){
-    if(__builtin_expect(!asp_mode,1)){ orig_f_19d010(g); return; }
-    u64 cam=KH_RCX(g);
-    orig_f_19d010(g);
-    zoom_d_post(g,cam);
+/* f_19cfc0 returned the camera in rax (fill mode), called from return address ra */
+static void zoom_cam_post(KCtx *g,u64 ra){
+    zs.s_calls++;
+    int i=zoom_site(ra);
+    if(i<0){ zs.s_unknown++;
+        pthread_mutex_lock(&mm); int j; for(j=0;j<n_zua;j++) if(zua[j].ra==ra) break;
+        if(j==n_zua){ if(n_zua<8){ zua[j].ra=ra; zua[j].n=0; n_zua++; } else zua_cut++; }
+        if(j<8) zua[j].n++; pthread_mutex_unlock(&mm);
+        if(!atomic_exchange(&zs.s_warned,1)) fprintf(stderr,"kh: aspect: WARNING: zoom-camera-site-unknown: f_19cfc0 called from return address 0x%llx, none of its 62 call sites: the camera as the exe built it is returned (counted)\n",P(ra));
+        return; }
+    zs.site[i]++;
+    if(zsites[i].cls==ZS_GAME){ zs.s_game++; return; }
+    if(zsites[i].cls==ZS_MODE){ zs.s_mode++; atomic_store(&zsup_frame,kh_game_frames()); atomic_store(&zsup_have,1); return; }
+    zs.s_draw++;
+    if(gx_zoom(g)==1.0){ zs.d_z1++; return; }
+    if(zoom_suppressed()){ zs.d_supp++; return; }
+    u64 cam=KH_RAX(g); int k=-1, pv=0;
+    for(int j=0;j<ZOOM_NCAM;j++){ if(cam==CAM_CUR+CAM_SIZE*(u64)j) k=j; else if(cam==CAM_PREV+CAM_SIZE*(u64)j){ k=j; pv=1; } }
+    if(k<0){ zs.d_other++; return; }
+    const u8 *c=hp(g,cam);
+    for(int e=0;e<2;e++){ const ZoomEnt *t=&zent[k][e];
+        if(!t->valid||memcmp(c+CAM_VP,t->pc_vp,0x40)||memcmp(c+CAM_PROJ,t->pc_pr,0x40)) continue;
+        u8 *s=zshadow[(int)zsites[i].slot]; memcpy(s,c,CAM_SIZE); memcpy(s+CAM_VP,t->z_vp,0x40); memcpy(s+CAM_PROJ,t->z_pr,0x40);
+        { u32 t0=atomic_load(&zs.tid); if(t0&&t0!=cur_tid()) zs.d_thread++; }
+        KH_RAX(g)=ZOOM_GADDR(s); zs.d_copy[pv]++; return; }
+    zs.d_nomatch++;                                                                   /* built at zoom 1 (or before any zoomed build): drawn as it is */
+}
+void orig_f_19cfc0(KCtx *);
+void f_19cfc0(KCtx *g){
+    if(__builtin_expect(!asp_mode,1)){ orig_f_19cfc0(g); return; }                 /* nothing set or pc: exactly the exe */
+    u64 ra=rd64(g,KH_RSP(g));
+    orig_f_19cfc0(g);
+    zoom_cam_post(g,ra);
 }
 static void zoom_report(FILE *f){
     fprintf(f,"kh: aspect report: zoom (task 49; 0x19cad0, the camera matrix build): %g on a screen taller than wide (%s); builds %llu: zoom 1, nothing written %llu; "
-              "cam+0x40 times the zoom and restored: scene camera 0x140ac1840 %llu, 0x140ac19c4 %llu, the map pass's per-object copy (return address 0x140188312) %llu; "
-              "other cameras (object-owned), not zoomed %llu; cam+0x40 changed inside the build (game's value kept) %llu; camera not guest memory %llu; first guest thread %u\n",
-            asp_zoom_tall,asp_zoom_set?"KHNMC_FOV_ZOOM":"default",P(zs.calls),P(zs.identity),P(zs.edited[ZC_SCENE0]),P(zs.edited[ZC_SCENE1]),P(zs.edited[ZC_MAPOBJ]),
-            P(zs.other),P(zs.inside),P(zs.badcam),atomic_load(&zs.tid));
-    fprintf(f,"kh: aspect report: zoom: distance accessor 0x19d010: calls %llu: zoom 1, as stored %llu; the built distance returned for a scene camera %llu, for its previous-frame copy (0x140ac1220) %llu; "
-              "another camera, as stored %llu; scaled reads on another guest thread than the builds %llu\n",
-            P(zs.d_calls),P(zs.d_identity),P(zs.d_scaled[0]),P(zs.d_scaled[1]),P(zs.d_other),P(zs.d_thread));
+              "a play mode ran (M sites), the exe's build only %llu; built twice, the camera kept as the exe built it and the zoomed draw matrices noted: scene camera 0x140ac1840 %llu, 0x140ac19c4 %llu; "
+              "the map pass's per-object copy (return address 0x140188312), draw matrices zoomed %llu; other cameras (object-owned), not zoomed %llu; "
+              "cam+0x40 changed inside the zoomed build %llu; a field without the distance differs %llu; camera or stack not guest memory %llu; first guest thread %u\n",
+            asp_zoom_tall,asp_zoom_set?"KHNMC_FOV_ZOOM":"default",P(zs.calls),P(zs.identity),P(zs.suppressed),P(zs.edited[ZC_SCENE0]),P(zs.edited[ZC_SCENE1]),P(zs.edited[ZC_MAPOBJ]),
+            P(zs.other),P(zs.inside),P(zs.differ),P(zs.badcam),atomic_load(&zs.tid));
+    fprintf(f,"kh: aspect report: zoom: camera accessor 0x19cfc0: calls %llu: game logic and other readers (G), the camera %llu; play modes (M: gummi ship, garage, minigames) %llu; "
+              "drawing sites (D) %llu: a zoomed copy %llu (of a previous-frame copy %llu), zoom 1 %llu, a play mode ran %llu, no noted build matches %llu, not a scene camera %llu; "
+              "copies on another guest thread than the builds %llu; unknown return address %llu\n",
+            P(zs.s_calls),P(zs.s_game),P(zs.s_mode),P(zs.s_draw),P(zs.d_copy[0]+zs.d_copy[1]),P(zs.d_copy[1]),P(zs.d_z1),P(zs.d_supp),P(zs.d_nomatch),P(zs.d_other),P(zs.d_thread),P(zs.s_unknown));
+    fprintf(f,"kh: aspect report: zoom: camera accessor by call site:"); int any=0;
+    for(int i=0;i<ZOOM_NSITE;i++) if(zs.site[i]){ fprintf(f,"%s 0x%llx %c %s %llu",any?";":"",P(GS_BASE+zsites[i].rva),zsites[i].cls==ZS_DRAW?'D':zsites[i].cls==ZS_MODE?'M':'G',zsites[i].what,P(zs.site[i])); any=1; }
+    fprintf(f,"%s\n",any?"":" none");
     pthread_mutex_lock(&mm);
     if(n_zra){ fprintf(f,"kh: aspect report: zoom: camera builds NOT zoomed on a tall screen, by return address:"); for(int i=0;i<n_zra;i++) fprintf(f," 0x%llx x%llu",P(zra[i].ra),P(zra[i].n));
         if(zra_cut) fprintf(f," (+%llu calls from further return addresses: table full)",P(zra_cut)); fputc('\n',f); }
+    if(n_zua){ fprintf(f,"kh: aspect: WARNING: zoom: f_19cfc0 from unknown return addresses (the camera was returned):"); for(int i=0;i<n_zua;i++) fprintf(f," 0x%llx x%llu",P(zua[i].ra),P(zua[i].n));
+        if(zua_cut) fprintf(f," (+%llu calls from further return addresses)",P(zua_cut)); fputc('\n',f); }
     pthread_mutex_unlock(&mm);
-    if(zs.inside||zs.badcam) fprintf(f,"kh: aspect: WARNING: zoom: %llu builds changed cam+0x40 inside (game's value kept), %llu cameras not guest memory\n",P(zs.inside),P(zs.badcam));
-    if(kh_aspect_log) fprintf(f,"kh: aspect report: zoom: camera lines (every 50th game frame, KHNMC_ASPECT_LOG): %llu printed, %llu not printed (600 at most)\n",P(atomic_load(&zoom_log_lines)-zoom_log_cut),P(zoom_log_cut));
-    if(zs.d_thread) fprintf(f,"kh: aspect: WARNING: zoom-accessor-other-thread: %llu scaled reads of the distance on another guest thread than the camera builds (a read inside a build's window would be scaled twice)\n",P(zs.d_thread));
+    if(zs.inside||zs.differ||zs.badcam||zs.d_thread) fprintf(f,"kh: aspect: WARNING: zoom: %llu builds changed cam+0x40 inside, %llu zoomed builds differ in a field without the distance, %llu cameras or stacks not guest memory, %llu copies on another thread\n",
+                                                  P(zs.inside),P(zs.differ),P(zs.badcam),P(zs.d_thread));
+    if(kh_aspect_log) fprintf(f,"kh: aspect report: zoom: camera lines (every %d game frames, KHNMC_ASPECT_LOG): %llu printed, %llu not printed (%d at most)\n",ZOOM_LOG_EVERY,P(atomic_load(&zoom_log_lines)-zoom_log_cut),P(zoom_log_cut),ZOOM_LOG_MAX);
+}
+
+/* ==== task 53: the HUD scale of the tall (portrait) screen =========================================================================
+ *
+ * In fill mode the exe lays its 2D out in a 16:9 band as wide as the screen; on the portrait phone (2007x2853) that band is 1129 of
+ * 2853 rows and the HUD, sized for a 2007-wide 16:9 screen, looks tiny.  On a screen TALLER THAN WIDE (fill mode only; exactly 1 on
+ * every other screen, in pc and with nothing set) H3 (task 42, below) scales two HUD widgets about their own outer corner:
+ *   the command menu (dk groups 1 and 2: dk::COMMAND_DRAW and its children, COMMAND_ONE, the reaction command dk::ReactionDecideSprite,
+ *       and the sub-menus the command menu's code registers with group 1) by KHNMC_HUD_SCALE_CMD, default 1.25, about its outer
+ *       BOTTOM-LEFT corner;
+ *   the player gauges (dk group 3: GAUGE_PLAYER, the HP / MP / Drive bars dk::GAUGE_ONE, the face ring dk::CIRCLE_MASK, the face
+ *       dk::FACE, dk::SECTOR_MASK, their dk::Sprite children; and the party gauges, groups 4 / 5, which the exe stacks over them in the
+ *       same corner: scaled about the same point they keep their place against the player's gauge) by KHNMC_HUD_SCALE_HP, default 1.5,
+ *       about their outer BOTTOM-RIGHT corner.
+ * How: every HUD draw uses vertex shader 586160, pixel = (POSITION - xyOffset) * MS.xy + MS.zw (586160.asm: `mad r0.xy, r0.xyxx,
+ * cb2[2].xyxx, cb2[2].zwzz`, then `round_pi`), with MagicScale MS = GX+0xa0..0xac staged by f_1121d0 at every draw, and the D3D12
+ * scissor of a draw is mapped with the same MS (f_142c00: x * [r8+0x10] + [r8+0x18], y * [r8+0x14] + [r8+0x1c], r8 = GX+0x90,
+ * 0x140142cde..0x140142d1b).  H3 already writes MS.w per dk object; for an object of a scaled group that H3 anchors to the BOTTOM it
+ * writes all four: MS' = (s MS.x, s MS.y, MS.z + (1 - s) px MS.x, MS.w_bottom + (1 - s) py MS.y), i.e. the object's every vertex, its
+ * text and its scissor are scaled by s about the GS point (px, py), which keeps its pixel.  Any other object of such a pass gets the
+ * loop's MS.x / .y / .z back (and its MS.w as H3 decides), so nothing outside the two widgets changes.
+ * The pivots are constants (GS frame = POSITION - xyOffset), the widgets' resting outer corners measured in the draw logs
+ * (implementation notes: base binary, default route, 2007x2853 fill, presents 1000..1403, field and battle): the command menu's slots span
+ * x -70..82 and its last slot ends at y 416 (the band's last row: on the PC it sits on the screen's bottom edge), so (-70, 416); the
+ * face ring dk::CIRCLE_MASK spans x 490..590, y 305..405 (the outermost piece of the gauges: GAUGE_ONE 377..585 x 310..400.5, FACE
+ * 504..574 x 305..400), so (590, 405).  A pivot taken from the widgets' extent per frame would move with their slide-in / slide-out and
+ * shake animations (M: CIRCLE_MASK x 490..790 over the route) and the HUD would wobble; fixed, the animation is scaled with the widget.
+ * Margins stay as the PC has them (the pivot is the widget's own corner): no piece can be pushed off the frame by s >= 1 (it grows up
+ * and inward); the largest s before the resting box would pass the opposite frame edge on ANY screen taller than wide (frame x -85.33
+ * .. 597.33, y -b .. 416 + b, b > 161.7) is 3.17 for the gauges' width, more for the rest, above the allowed 3.0 (selftest).
+ * KHNMC_HUD_SCALE_CMD / KHNMC_HUD_SCALE_HP: a plain decimal 0.5 .. 3.0 (the grammar of KHNMC_FOV_ZOOM); 1.0 = exactly today (nothing
+ * written); malformed or outside the range: the named fatals hud-scale-value-malformed / hud-scale-value-range; set with KHNMC_ASPECT
+ * pc or unset: checked, the NOTE hud-scale-not-applied, nothing changes. */
+#define HUD_CMD_DEFAULT 1.25                       /* owner 2026-11-18: "the command menu 25% bigger" */
+#define HUD_HP_DEFAULT  1.5                        /* owner 2026-11-18: "hp portrait thing 50% bigger" */
+enum { HUD_CMD=0, HUD_HP=1, HUD_N };
+static double hud_s[HUD_N]={HUD_CMD_DEFAULT,HUD_HP_DEFAULT}; static int hud_set[HUD_N];
+static const char *hud_env[HUD_N]={"KHNMC_HUD_SCALE_CMD","KHNMC_HUD_SCALE_HP"};
+static const char *hud_what[HUD_N]={"command menu (dk groups 1, 2)","player gauges (dk groups 3, 4, 5)"};
+static const float hud_px[HUD_N]={-70.0f,590.0f}, hud_py[HUD_N]={416.0f,405.0f};       /* the pivots, GS frame (measured: above) */
+/* a KHNMC_HUD_SCALE_* value: DIGITS[.DIGITS], at most 15 digits, nothing else.  0 = *v set, 1 = malformed, 2 = outside 0.5 .. 3.0 */
+int kh_hud_scale_parse(const char *s,double *v){
+    u64 n=0, den=1; int nd=0, ni=0, nf=0, dot=0;
+    if(!s) return 1;
+    for(const char *p=s;*p;p++){
+        if(*p=='.'){ if(dot||!ni) return 1; dot=1; continue; }
+        if(*p<'0'||*p>'9') return 1;
+        if(++nd>15) return 1;
+        n=n*10+(u64)(*p-'0'); if(dot){ den*=10; nf++; } else ni++; }
+    if(!ni||(dot&&!nf)) return 1;
+    double x=(double)n/(double)den;
+    if(!(x>=0.5&&x<=3.0)) return 2;
+    *v=x; return 0;
+}
+void kh_aspect_hud_config(const char *cmd,const char *hpv){
+    const char *v[HUD_N]={cmd,hpv};
+    for(int k=0;k<HUD_N;k++) if(v[k]&&*v[k]){ double s=0; int e=kh_hud_scale_parse(v[k],&s);
+        if(e==1) kh_fatal(NULL,"hud-scale-value-malformed: %s=%s (expected a plain decimal number from 0.5 to 3.0, such as 1.25)",hud_env[k],v[k]);
+        if(e) kh_fatal(NULL,"hud-scale-value-range: %s=%s (allowed: 0.5 to 3.0; 1.0 = the size of today)",hud_env[k],v[k]);
+        hud_s[k]=s; hud_set[k]=1; }
+    if(!asp_mode){ if(hud_set[HUD_CMD]||hud_set[HUD_HP]) fprintf(stderr,"kh: aspect: NOTE: hud-scale-not-applied: %s%s%s is set, but KHNMC_ASPECT is pc: the HUD scale applies in fill mode only, nothing is scaled\n",
+                                                             hud_set[HUD_CMD]?hud_env[HUD_CMD]:"",hud_set[HUD_CMD]&&hud_set[HUD_HP]?" / ":"",hud_set[HUD_HP]?hud_env[HUD_HP]:""); return; }
+    fprintf(stderr,"kh: aspect: HUD scale (task 53): command menu %g (%s), player gauges %g (%s) on a screen taller than wide, about their outer corners; 1 = nothing written; every other screen: 1\n",
+            hud_s[HUD_CMD],hud_set[HUD_CMD]?hud_env[HUD_CMD]:"default",hud_s[HUD_HP],hud_set[HUD_HP]?hud_env[HUD_HP]:"default");
+}
+/* the HUD scale of kind k (HUD_CMD / HUD_HP) on a W x H screen: the configured value in fill mode when it is taller than wide, else 1 */
+double kh_aspect_hud_scale(int k,double W,double H){ return (asp_mode==1&&W>0&&H>W&&k>=0&&k<HUD_N)?hud_s[k]:1.0; }
+static int hud_kind(u32 grp){ return grp==1||grp==2?HUD_CMD:grp>=3&&grp<=5?HUD_HP:-1; }
+/* MagicScale for an object scaled by s about the GS point (px, py): ms = the loop's MS.x / .y / .z bits and the anchored MS.w bits in,
+ * the scaled four out (single precision, as MS is stored) */
+static void hud_ms(u32 *ms,double s,float px,float py){
+    double x=bf(ms[0]), y=bf(ms[1]), z=bf(ms[2]), w=bf(ms[3]);
+    ms[0]=fbits((float)(s*x)); ms[1]=fbits((float)(s*y)); ms[2]=fbits((float)(z+(1.0-s)*(double)px*x)); ms[3]=fbits((float)(w+(1.0-s)*(double)py*y));
+}
+/* ---- task 53 item 2: the title screen's layout on a screen taller than wide (KHNMC_TITLE_LAYOUT=portrait|band, default portrait)
+ * The title is drawn in the dk loop by two Tz::Layout objects the title code keeps in static pointers: the title layout
+ * [0x140b1d5d0] (created at 0x1402b467b..0x1402b46b5: 0xf8 bytes, vtable Tz::Layout 0x1405b1dc0) and the title menu's layout
+ * [0x140b1d5d8] (0x1402b448a..0x1402b44c5, the same class; runtime/route_state.c reads both for the title states).  Their parts come
+ * through f_11a330 from the layout draw f_1969a0 (return addresses 0x140197033 / 0x14019701a, and 0x1401977e3 for the menu's glow
+ * strips).  In the 16:9 band (GS 0..416) they are composed for a wide screen: the alley picture at the right (x 195..595, y 0..400:
+ * its top is a straight cut that meets the screen's top edge; task 46's R3 moves it to the frame's top), the logo block at the left
+ * (KINGDOM HEARTS x -77..298 y 83..194, the heart 11..206 x 52..275, the Disney / Square Enix line 10..205 x 37..69, the crown, the
+ * Nobody May Cry line -5..247 x 154..218, the credits and a sweep line 253..293; centre x 110.5), the menu rows NEW GAME / LOAD /
+ * BACK (y 295..402, bars across the width), GAME SETTINGS at the top right (344..597 x 14..36).  On a tall frame (GS y -b .. 416 + b,
+ * x -85.33 .. 597.33) that leaves the picture in a top corner, everything else in the middle band and a third of the screen empty.
+ * Portrait layout: each part of those two objects is classified by its GS box (as submitted, ttl_elem) and moved as its group:
+ *   picture  scaled by sP about its top centre (395, 0) to the frame's horizontal centre (256) and top row (-b): its cut top edge stays
+ *            on the screen's edge (a gap above it would show that edge as a hard line: task 46 review finding 1), its faded sides
+ *            and rounded bottom are all on screen;  sP = 1.35 (540 GS columns of 682.67: a margin of 71 each side), less when the
+ *            screen is too short for the stack below (never less than 1: then the band layout is kept, counted);
+ *   menu     NEW GAME / LOAD / BACK and GAME SETTINGS moved down (x unchanged: the bars run across the screen) so that GAME SETTINGS
+ *            ends TTL_MB GS rows above the frame's bottom, the menu 18 rows above it;
+ *   logo     scaled by sL = 1.1 about its top centre (110.5, 37) to the frame's centre column, centred between the picture and the
+ *            menu.
+ *   Everything else (the backdrops, which H7's R1 stretches; the fade-in flashes; the New Game dialogs, which are other dk objects
+ *   (dk::SpriteMessage, Tz::MenuItem) and are already centred on the screen: the band is) keeps today's place.  The parts are drawn
+ *   at these places in every frame they are drawn, so the composition stays put through the fades, the menu's opening and the
+ *   exit animation.  KHNMC_TITLE_LAYOUT=band keeps today's placement (R3 for the picture); other values: the named fatal
+ *   title-layout-value; with KHNMC_ASPECT pc / unset: checked, NOTE title-layout-not-applied. */
+int kh_phase_title_alive(void); void kh_phase_test_set_alive(int initial,int title,int newgame);   /* runtime/phase_log.c: the title task 0x2b4590 runs */
+#define T_LAYOUT_PTR (GS_BASE+0xb1d5d0ull)         /* the title layout object (runtime/route_state.c T_LAYOUT) */
+#define T_MENU_PTR   (GS_BASE+0xb1d5d8ull)         /* the title menu's layout object (T_MENU) */
+#define TTL_SP_MAX 1.35                            /* the picture's scale */
+#define TTL_SL     1.1                             /* the logo's scale */
+#define TTL_MB     60.0                            /* GS rows below GAME SETTINGS (163 px at 2007x2853) */
+#define TTL_GAP_MS 18.0                            /* GS rows between the menu and GAME SETTINGS */
+#define TTL_GAP_MIN 12.0                           /* the least gap above and below the logo */
+enum { TT_PIC=0, TT_LOGO, TT_MENU, TT_SET, TT_N };
+static const char *tt_name[TT_N]={"the alley picture","the logo","the title menu (NEW GAME / LOAD / BACK)","GAME SETTINGS"};
+/* each element's anchor point P (GS, as the exe lays it out) and block height */
+static const double tt_px[TT_N]={395.0,110.5,0.0,0.0}, tt_py[TT_N]={0.0,37.0,295.0,14.0}, tt_h[TT_N]={400.0,247.0,107.0,22.0};
+static int asp_title_band, asp_title_set;          /* KHNMC_TITLE_LAYOUT=band / set */
+void kh_aspect_title_config(const char *v){
+    if(v&&*v){ if(!strcmp(v,"portrait")) asp_title_band=0; else if(!strcmp(v,"band")) asp_title_band=1;
+        else kh_fatal(NULL,"title-layout-value: KHNMC_TITLE_LAYOUT=%s (known: portrait, band)",v);
+        asp_title_set=1;
+        if(!asp_mode){ fprintf(stderr,"kh: aspect: NOTE: title-layout-not-applied: KHNMC_TITLE_LAYOUT=%s is set, but KHNMC_ASPECT is pc: the title layout applies in fill mode only, nothing is moved\n",v); return; } }
+    if(asp_mode) fprintf(stderr,"kh: aspect: title layout (task 53): %s on a screen taller than wide (%s); every other screen: the band\n",asp_title_band?"band (today's placement)":"portrait",
+                         asp_title_set?"KHNMC_TITLE_LAYOUT":"the default; KHNMC_TITLE_LAYOUT=band keeps today's");
+}
+/* the portrait layout of a W x H screen: 0 = none (not fill, not taller than wide, band chosen, or too short: *tooshort = 1);
+ * else per element the scale s[e] and the target T (tx, ty) of its anchor point */
+typedef struct { double s[TT_N], tx[TT_N], ty[TT_N]; } TtLay;
+int kh_aspect_title_layout(double W,double H,TtLay *L,int *tooshort){
+    if(tooshort) *tooshort=0;
+    if(asp_mode!=1||!(W>0&&H>W)||asp_title_band) return 0;
+    double b=kh_aspect_b(W,H), yT=-b, yB=416.0+b;
+    double setTop=yB-TTL_MB-tt_h[TT_SET], menuTop=setTop-TTL_GAP_MS-tt_h[TT_MENU];
+    double sP=(menuTop-yT-tt_h[TT_LOGO]*TTL_SL-2.0*TTL_GAP_MIN)/tt_h[TT_PIC]; if(sP>TTL_SP_MAX) sP=TTL_SP_MAX;
+    if(!(sP>=1.0)){ if(tooshort) *tooshort=1; return 0; }
+    double picBot=yT+tt_h[TT_PIC]*sP, gap=(menuTop-picBot-tt_h[TT_LOGO]*TTL_SL)/2.0;
+    L->s[TT_PIC]=sP;      L->tx[TT_PIC]=256.0;     L->ty[TT_PIC]=yT;
+    L->s[TT_LOGO]=TTL_SL; L->tx[TT_LOGO]=256.0;    L->ty[TT_LOGO]=picBot+gap;
+    L->s[TT_MENU]=1.0;    L->tx[TT_MENU]=0.0;      L->ty[TT_MENU]=menuTop;
+    L->s[TT_SET]=1.0;     L->tx[TT_SET]=0.0;       L->ty[TT_SET]=setTop;
+    return 1;
+}
+/* a part of the title's layouts by its GS box bb = x0, x1, y0, y1 (as submitted): TT_* or -1 (left where it is) */
+int kh_aspect_title_elem(const float *bb){
+    double x0=bb[0], x1=bb[1], y0=bb[2], y1=bb[3], cx=(x0+x1)/2.0, cy=(y0+y1)/2.0;
+    if(!(x1>=x0&&y1>=y0)) return -1;
+    if(x0>=194.0&&x0<=196.0&&x1>=594.0&&x1<=596.0&&y0>=-1.0&&y0<=1.0&&y1>=399.0&&y1<=401.0) return TT_PIC;   /* the 400 x 400 picture */
+    if(x0>=330.0&&x1<=610.0&&y0>=5.0&&y1<=45.0) return TT_SET;                        /* GAME SETTINGS (344..597 x 14..36) */
+    if(y0>=288.0&&y1-y0<=140.0) return TT_MENU;                                       /* the rows 295..402, their glow, the cursor; sliding down in the exit animation (to 447) */
+    if(y1-y0<=420.0&&cy>=30.0&&cy<=290.0&&cx>=-600.0&&cx<=360.0) return TT_LOGO;       /* the logo block, its credits and sweep line (sliding out to the left in the exit animation, x -413) and its exit flash; not the backdrops (479 tall) nor the fade-in flashes (511 / 639) */
+    return -1;
+}
+typedef struct { _Atomic u64 batches, q[TT_N], left, other, tooshort; Ivs fr[TT_N]; } TtStat;
+static TtStat ttl;
+static _Atomic int ttl_logged;
+static void ttl_report(FILE *f){
+    fprintf(f,"kh: aspect report: title layout (task 53; KHNMC_TITLE_LAYOUT=%s): batches of the title's two layout objects on a screen taller than wide %llu; quads moved: picture %llu, logo %llu, menu %llu, GAME SETTINGS %llu; "
+              "their quads left where they are (unclassified: backdrops, flashes) %llu; Tz::Layout quads of other dk objects while the title runs (left) %llu; batches on a screen too short for the layout (band kept) %llu\n",
+            asp_title_band?"band":"portrait",P(ttl.batches),P(ttl.q[TT_PIC]),P(ttl.q[TT_LOGO]),P(ttl.q[TT_MENU]),P(ttl.q[TT_SET]),P(ttl.left),P(ttl.other),P(ttl.tooshort));
+    pthread_mutex_lock(&mm);
+    for(int e=0;e<TT_N;e++) if(ttl.q[e]){ fprintf(f,"kh: aspect report: title layout: %s:",tt_name[e]); iv_print(f,&ttl.fr[e]); fputc('\n',f); }
+    pthread_mutex_unlock(&mm);
+}
+typedef struct { _Atomic u64 passes, objs[HUD_N], back; } HudStat;
+static HudStat hud;
+static void hud_report(FILE *f){
+    fprintf(f,"kh: aspect report: HUD scale (task 53; H3's MagicScale per dk object): on a screen taller than wide the %s x%g about GS (%g, %g), the %s x%g about GS (%g, %g); "
+              "dk passes with a scale %llu; objects scaled: command menu %llu, player gauges %llu; other objects of those passes given the loop's MagicScale.x / .y / .z back %llu\n",
+            hud_what[HUD_CMD],hud_s[HUD_CMD],hud_px[HUD_CMD],hud_py[HUD_CMD],hud_what[HUD_HP],hud_s[HUD_HP],hud_px[HUD_HP],hud_py[HUD_HP],P(hud.passes),P(hud.objs[HUD_CMD]),P(hud.objs[HUD_HP]),P(hud.back));
 }
 
 /* ---- H4 ---------------------------------------------------------------------------------------------------------------------- */
@@ -809,10 +1099,20 @@ static __thread int h3_on[H3_DEPTH]; static __thread float h3_wc[H3_DEPTH], h3_o
 /* per anchored pass: the loop's MagicScale as H3a found it (GX+0xa0..0xac bits, before H3 wrote) and the current object (its class, its
  * anchor, the MS.w H3 wrote for it; anchor -1 = none yet) */
 static __thread u32 h3_ms[H3_DEPTH][4]; static __thread u64 h3_cur_vt[H3_DEPTH]; static __thread int h3_cur_a[H3_DEPTH]; static __thread float h3_cur_v[H3_DEPTH];
-/* one object: its anchor, GX+0xac written; `first` = H3a (the list head), else H3b */
+/* task 53: per anchored pass on a screen taller than wide, the HUD scales (h3_hs = one of them is not 1: MS.x / .y / .z are written
+ * for every object of the pass) and the four MagicScale words written for the current object */
+static __thread int h3_hs[H3_DEPTH]; static __thread double h3_hsc[H3_DEPTH][HUD_N]; static __thread u32 h3_cur_ms[H3_DEPTH][4];
+static __thread u64 h3_cur_obj[H3_DEPTH];  /* task 53 item 2: the current dk object (the title's layouts are told by their address) */
+/* one object: its anchor, GX+0xac written (task 53: with a HUD scale, GX+0xa0..0xac); `first` = H3a (the list head), else H3b */
 static void h3_apply(KCtx *g,u64 obj,int first){
     int d=h3_depth-1; u64 vt=(GA_OK(obj)&&GA_OK(obj+0x17))?rd64(g,obj):0; u32 grp=vt?rd32(g,obj+0x14):0; int why, a=kh_aspect_h3_anchor(vt,grp,&why);
-    float v=h3_value(h3_wc[d],h3_o[d],a); wrf(g,GX+0xac,v); h3_cur_vt[d]=vt; h3_cur_a[d]=a; h3_cur_v[d]=v;
+    float v=h3_value(h3_wc[d],h3_o[d],a);
+    if(h3_hs[d]){ u32 *ms=h3_cur_ms[d]; int k=a==H3_BOTTOM?hud_kind(grp):-1;            /* task 53: the scaled widgets, the loop's MS.x / .y / .z for the rest */
+        ms[0]=h3_ms[d][0]; ms[1]=h3_ms[d][1]; ms[2]=h3_ms[d][2]; ms[3]=fbits(v);
+        if(k>=0&&h3_hsc[d][k]!=1.0){ hud_ms(ms,h3_hsc[d][k],hud_px[k],hud_py[k]); hud.objs[k]++; } else hud.back++;
+        for(int i=0;i<3;i++) wr32(g,GX+0xa0+4ull*(u64)i,ms[i]);
+        v=bf(ms[3]); }
+    wrf(g,GX+0xac,v); h3_cur_vt[d]=vt; h3_cur_a[d]=a; h3_cur_v[d]=v; h3_cur_obj[d]=obj;
     h3.anchored++; (first?h3.first:h3.next)[a]++; h3.why[why]++; { int c=h3_cls_index(vt); h3.cls[c<0?H3_NCLS:c][a]++; }
     if(why>=H3W_UNLISTED&&vt){ pthread_mutex_lock(&mm); int i; for(i=0;i<n_h3odd;i++) if(h3odd[i].vt==vt&&h3odd[i].grp==grp&&h3odd[i].why==why) break;
         if(i==n_h3odd){ if(n_h3odd<32){ h3odd[i].vt=vt; h3odd[i].grp=grp; h3odd[i].why=why; rtti_name(g,vt,h3odd[i].name,sizeof h3odd[i].name); n_h3odd++; } else h3odd_cut++; }
@@ -822,7 +1122,7 @@ static void h3_apply(KCtx *g,u64 obj,int first){
 static void h3a_post(KCtx *g){
     h3.passes++;
     if(h3_depth>0) h3.nested++;
-    int d=h3_depth<H3_DEPTH?h3_depth:H3_DEPTH-1; h3_depth=d+1; h3_on[d]=0;
+    int d=h3_depth<H3_DEPTH?h3_depth:H3_DEPTH-1; h3_depth=d+1; h3_on[d]=0; h3_hs[d]=0;
     if(asp_off_h3){ h3.off++; return; }
     float W=rdf(g,GX+0x18), H=rdf(g,GX+0x1c); double o=(W>0&&H>0)?kh_aspect_o(W,H):0.0;
     if(o==0.0){ h3.identity++; return; }                                             /* 16:9 or wider: nothing is written */
@@ -833,8 +1133,10 @@ static void h3a_post(KCtx *g){
     double dw=(double)wc-o; if(!(dw<=0.5&&dw>=-0.5)){ h3.mismatch++; h3.mm_wc=wc; h3.mm_o=(float)o;
         if(!atomic_exchange(&h3.warned,1)) fprintf(stderr,"kh: aspect: WARNING: h3-band-mismatch: the dk loop's MagicScale.w is %g where the band offset o of the %gx%g screen is %g: the pass is left as the exe made it (counted)\n",wc,W,H,o);
         return; }
-    h3_on[d]=1; h3_wc[d]=wc; h3_o[d]=(float)o; h3_cur_vt[d]=0; h3_cur_a[d]=-1;
+    h3_on[d]=1; h3_wc[d]=wc; h3_o[d]=(float)o; h3_cur_vt[d]=0; h3_cur_a[d]=-1; h3_cur_obj[d]=0;
     for(int i=0;i<4;i++) h3_ms[d][i]=rd32(g,GX+0xa0+4ull*(u64)i);
+    for(int k=0;k<HUD_N;k++){ h3_hsc[d][k]=kh_aspect_hud_scale(k,W,H); if(h3_hsc[d][k]!=1.0) h3_hs[d]=1; }   /* task 53: a screen taller than wide */
+    if(h3_hs[d]) hud.passes++;
     if(kh_aspect_log&&!atomic_exchange(&h3_logged,1))
         fprintf(stderr,"kh: aspect: H3: first anchored dk pass: screen %gx%g, o %g; MagicScale (GX+0xa0..0xac) %g %g %g %g; GS frame GX+0x38/0x3c %g/%g, GX+0x48/0x4c %g/%g; GX+0x28 %g; game frame %llu, present %llu, guest thread %u\n",
                 W,H,o,rdf(g,GX+0xa0),rdf(g,GX+0xa4),rdf(g,GX+0xa8),wc,rdf(g,GX+0x38),rdf(g,GX+0x3c),rdf(g,GX+0x48),rdf(g,GX+0x4c),rdf(g,GX+0x28),P(kh_game_frames()),P(gfx_presents),cur_tid());
@@ -862,7 +1164,8 @@ static void h3_inner_post(KCtx *g,u64 ra){
     int d=h3_depth-1, a=h3_cur_a[d]; u64 vt=h3_cur_vt[d]; int anch=a==H3_TOP||a==H3_BOTTOM, back=1;
     for(int i=0;i<4;i++) if(rd32(g,GX+0xa0+4ull*(u64)i)!=h3_ms[d][i]) back=0;
     h3.inner++; if(back) h3.inner_back++;
-    if(anch){ h3.inner_anch++; if(back){ wrf(g,GX+0xac,h3_cur_v[d]); h3.inner_reapplied++; } else h3.inner_other++; }
+    if(anch){ h3.inner_anch++; if(back){ if(h3_hs[d]) for(int i=0;i<3;i++) wr32(g,GX+0xa0+4ull*(u64)i,h3_cur_ms[d][i]);   /* task 53: a scaled object's MS.x / .y / .z too */
+            wrf(g,GX+0xac,h3_cur_v[d]); h3.inner_reapplied++; } else h3.inner_other++; }
     pthread_mutex_lock(&mm); int i; for(i=0;i<n_h3in;i++) if(h3in[i].vt==vt&&h3in[i].ra==ra) break;
     if(i==n_h3in){ if(n_h3in<16){ memset(&h3in[i],0,sizeof h3in[i]); h3in[i].vt=vt; h3in[i].ra=ra; h3in[i].a=a; if(vt) rtti_name(g,vt,h3in[i].name,sizeof h3in[i].name); else snprintf(h3in[i].name,sizeof h3in[i].name,"(no object yet)"); n_h3in++; } else h3in_cut++; }
     if(i<16){ h3in[i].n++; if(back) h3in[i].back++; }
@@ -970,12 +1273,13 @@ static void h3_report(FILE *f){
 #define H7_MAXQ (H7_MAXV/4)                /* so every quad of an examined batch has its box in h7_pre's tables */
 #define H7_E 0.125                         /* GS units: a rectangle's corners against its box, and "exactly on a band edge" (R3); GS coordinates are multiples of 1/16 */
 #define H7_R3_MIN 312.0                    /* R3: the rectangle is at least 3/4 of the band tall (GS rows) */
-enum { H7K_FULL=0, H7K_PIECE, H7K_STACK, H7K_ALREADY, H7K_SITE, H7K_SHAPE, H7K_EDGE, H7K_BATCH, H7K_N };
+enum { H7K_FULL=0, H7K_PIECE, H7K_STACK, H7K_ALREADY, H7K_SITE, H7K_SHAPE, H7K_EDGE, H7K_BATCH, H7K_TITLE, H7K_N };
 static const char *h7_kname[H7K_N]={"R1 stretched, full band width","R1 stretched, a band-height piece narrower than the band","R2 stretched, a quad of a batch whose wide stripes stack over the band height",
                                      "already covering the frame's height, left","a band-height rectangle or stripe stack from a draw routine that is not in H7's table, left",
                                      "the batch's box spans the band height but neither R1 nor R2 applies, left",
                                      "R3 moved to the frame's edge, a picture cut by a band edge",
-                                     "a band-height rectangle whose batch covers the strips above and below it, left"};
+                                     "a band-height rectangle whose batch covers the strips above and below it, left",
+                                     "a part of the title's layout moved to its portrait place (task 53)"};
 /* the draw routines whose rectangles H7 may stretch, by the return address f_11a330 finds on the guest stack (it is entered by a jump
  * from f_11a2f0, so this is the address after `call 0x14011a2f0`).  Any other routine is left alone whatever it draws: the pppEi /
  * ppp effect routines (0x1404b3c85, 0x1404ade0d, 0x1404b8de6 ...) submit world-space quads through f_11a330 too, some with the same
@@ -1104,8 +1408,29 @@ static int h7_pre(KCtx *g){
         for(int i=0;i<4;i++){ v[i][0]=rdf(g,a+(u64)i*stride)-ox; v[i][1]=rdf(g,a+(u64)i*stride+4)-oy; }
         qr[q]=(u8)h7_box(v,bb); h7.quads++;
         if(bb[0]<ab[0]) ab[0]=bb[0]; if(bb[1]>ab[1]) ab[1]=bb[1]; if(bb[2]<ab[2]) ab[2]=bb[2]; if(bb[3]>ab[3]) ab[3]=bb[3]; }
+    /* task 53 item 2: the parts of the title's two layout objects (the current dk object is [0x140b1d5d0] or [0x140b1d5d8] while the
+     * title task runs) to their portrait places, on a screen taller than wide; R1 / R2 / R3 do not touch them */
+    u8 qt[H7_MAXQ]; memset(qt,0,(size_t)(nq>0?nq:0));
+    { u64 ob=(h3_depth>0&&h3_on[h3_depth-1])?h3_cur_obj[h3_depth-1]:0;
+      if(ob&&nq&&W>0&&H>W&&kh_phase_title_alive()){
+        if(ob==rd64(g,T_LAYOUT_PTR)||ob==rd64(g,T_MENU_PTR)){ TtLay L; int ts=0;
+            if(kh_aspect_title_layout(W,H,&L,&ts)){ int tsite=ra==GS_BASE+0x197033ull||ra==GS_BASE+0x19701aull||ra==GS_BASE+0x1977e3ull; ttl.batches++;   /* f_1969a0, the layout draw */
+                if(!atomic_exchange(&ttl_logged,1)) fprintf(stderr,"kh: aspect: title layout (task 53): first portrait batch: screen %gx%g: picture x%.4f to GS (256, %.2f), logo x%.2f to (256, %.2f), menu to y %.2f, GAME SETTINGS to y %.2f\n",
+                                                            W,H,L.s[TT_PIC],L.ty[TT_PIC],L.s[TT_LOGO],L.ty[TT_LOGO],L.ty[TT_MENU],L.ty[TT_SET]);
+                for(int q=0;q<nq;q++){ int e=tsite?kh_aspect_title_elem(qb[q]):-1; if(e<0){ ttl.left++; continue; }
+                    u64 a=vp+(u64)q*4u*stride; double sc=L.s[e], y0n=L.ty[e]+sc*((double)qb[q][2]-tt_py[e]), y1n=L.ty[e]+sc*((double)qb[q][3]-tt_py[e]);
+                    for(int i=0;i<4;i++){ u64 p=a+(u64)i*stride;
+                        if(e==TT_PIC||e==TT_LOGO) wrf(g,p,(float)(L.tx[e]+sc*((double)(rdf(g,p)-ox)-tt_px[e]))+ox);      /* the menu rows keep x */
+                        wrf(g,p+4,(float)(L.ty[e]+sc*((double)(rdf(g,p+4)-oy)-tt_py[e]))+oy); }
+                    if(__builtin_expect(kh_aspect_m,0)) h7_quadlog(g,ra,prim,q,nq,qb[q],H7K_TITLE,sc,y0n,y1n,a,stride);
+                    qt[q]=1; wrote=1; ttl.q[e]++;
+                    pthread_mutex_lock(&mm); iv_add(&ttl.fr[e],(u32)kh_game_frames()); pthread_mutex_unlock(&mm); } }
+            else if(ts) ttl.tooshort++; }
+        else if(h3_cur_vt[h3_depth-1]==GS_BASE+0x5b1dc0ull) ttl.other+=(u64)nq; } }       /* another Tz::Layout while the title runs: left, counted */
     /* R1, quad by quad */
-    for(int q=0;q<nq;q++){ const float *bb=qb[q]; u64 a=vp+(u64)q*4u*stride; int kind=h7_r1(bb,qr[q],r,xl,xr,&s);
+    for(int q=0;q<nq;q++){ const float *bb=qb[q]; u64 a=vp+(u64)q*4u*stride;
+        if(qt[q]){ qk[q]=(signed char)H7K_TITLE; h7.kind[H7K_TITLE]++; if(best<0||H7K_TITLE<best) best=H7K_TITLE; continue; }   /* task 53: moved above */
+        int kind=h7_r1(bb,qr[q],r,xl,xr,&s);
         if((kind==H7K_FULL||kind==H7K_PIECE)&&nq>1&&h7_batch_covers((const float (*)[4])qb,qr,nq,q,b,xl,xr)) kind=H7K_BATCH;   /* review finding 2 */
         if(kind>=0&&site<0) kind=H7K_SITE;                                           /* not one of the 2D draw routines of the table: never written */
         int st=kind==H7K_FULL||kind==H7K_PIECE; qk[q]=(signed char)kind;
@@ -1505,6 +1830,8 @@ void kh_aspect_report(FILE *f){
         h3_report(f);                                                               /* task 42 */
         h7_report(f);                                                               /* task 46 */
         zoom_report(f);                                                             /* task 49 */
+        hud_report(f);                                                              /* task 53 */
+        ttl_report(f);                                                              /* task 53 item 2 */
     }
     if(kh_aspect_m) m_report(f);
     if(!kh_aspect_log) return;
@@ -1576,13 +1903,31 @@ static int fatal_case(int which,const char *expect){
         case 19: kh_aspect_zoom_config("0.99"); break;
         case 20: kh_aspect_zoom_config("1,15"); break;
         case 21: kh_aspect_zoom_config("1.15x"); break;
-        /* not fatals: the value is taken and announced (22); pc: the named NOTE and no zoom (23); unset or empty: the default 1.15 (24).
+        case 37: kh_aspect_zoom_config("2.0"); break;                                      /* review finding 3: 1.89 at most (task 49 fix; 25 is task 53's) */
+        /* not fatals: the value is taken and announced (22); pc: the named NOTE and no zoom (23); unset or empty: the default 1.3 (24).
          * Exit code 3 = the state is as expected (the caller also looks for the line) */
-        case 22: asp_mode=1; asp_zoom_set=0; asp_zoom_tall=ZOOM_DEFAULT; kh_aspect_zoom_config("1.3");
-                 if(asp_zoom_tall==1.3&&asp_zoom_set&&kh_aspect_zoom(2007,2853)==1.3&&kh_aspect_zoom(2853,2007)==1.0) _exit(3); break;
-        case 23: asp_mode=0; asp_zoom_set=0; asp_zoom_tall=ZOOM_DEFAULT; kh_aspect_zoom_config("1.3"); if(kh_aspect_zoom(2007,2853)==1.0) _exit(3); break;
+        case 22: asp_mode=1; asp_zoom_set=0; asp_zoom_tall=ZOOM_DEFAULT; kh_aspect_zoom_config("1.15");
+                 if(asp_zoom_tall==1.15&&asp_zoom_set&&kh_aspect_zoom(2007,2853)==1.15&&kh_aspect_zoom(2853,2007)==1.0) _exit(3); break;
+        case 23: asp_mode=0; asp_zoom_set=0; asp_zoom_tall=ZOOM_DEFAULT; kh_aspect_zoom_config("1.15"); if(kh_aspect_zoom(2007,2853)==1.0) _exit(3); break;
         case 24: asp_mode=1; asp_zoom_set=0; asp_zoom_tall=ZOOM_DEFAULT; kh_aspect_zoom_config(NULL); kh_aspect_zoom_config("");
-                 if(asp_zoom_tall==1.15&&!asp_zoom_set&&kh_aspect_zoom(2007,2853)==1.15) _exit(3); break;
+                 if(asp_zoom_tall==1.3&&!asp_zoom_set&&kh_aspect_zoom(2007,2853)==1.3) _exit(3); break;
+        case 25: kh_aspect_hud_config("3.5",NULL); break;                                  /* task 53: KHNMC_HUD_SCALE_CMD / _HP */
+        case 26: kh_aspect_hud_config(NULL,"0.4"); break;
+        case 27: kh_aspect_hud_config("1,25",NULL); break;
+        case 28: kh_aspect_hud_config(NULL,"1.5x"); break;
+        /* not fatals (exit code 3 = the state is as expected): values taken and announced (29); pc: the named NOTE and no scale (30);
+         * unset or empty: the defaults 1.25 / 1.5 on a screen taller than wide, 1 on every other (31) */
+        case 29: asp_mode=1; hud_s[0]=HUD_CMD_DEFAULT; hud_s[1]=HUD_HP_DEFAULT; hud_set[0]=hud_set[1]=0; kh_aspect_hud_config("2","1.0");
+                 if(hud_s[0]==2.0&&hud_s[1]==1.0&&hud_set[0]&&hud_set[1]&&kh_aspect_hud_scale(HUD_CMD,2007,2853)==2.0&&kh_aspect_hud_scale(HUD_HP,2007,2853)==1.0&&kh_aspect_hud_scale(HUD_CMD,2853,2007)==1.0) _exit(3); break;
+        case 30: asp_mode=0; hud_s[0]=HUD_CMD_DEFAULT; hud_s[1]=HUD_HP_DEFAULT; hud_set[0]=hud_set[1]=0; kh_aspect_hud_config("2",NULL);
+                 if(kh_aspect_hud_scale(HUD_CMD,2007,2853)==1.0&&kh_aspect_hud_scale(HUD_HP,2007,2853)==1.0) _exit(3); break;
+        case 31: asp_mode=1; hud_s[0]=HUD_CMD_DEFAULT; hud_s[1]=HUD_HP_DEFAULT; hud_set[0]=hud_set[1]=0; kh_aspect_hud_config(NULL,"");
+                 if(kh_aspect_hud_scale(HUD_CMD,2007,2853)==1.25&&kh_aspect_hud_scale(HUD_HP,2007,2853)==1.5&&kh_aspect_hud_scale(HUD_HP,2007,2007)==1.0&&kh_aspect_hud_scale(HUD_HP,1920,1350)==1.0) _exit(3); break;
+        case 32: asp_mode=1; kh_aspect_title_config("wide"); break;                        /* task 53 item 2: KHNMC_TITLE_LAYOUT */
+        case 33: asp_mode=0; asp_title_band=0; kh_aspect_title_config("band"); { TtLay L; if(asp_title_band&&!kh_aspect_title_layout(2007,2853,&L,NULL)) _exit(3); } break;
+        case 34: asp_mode=1; asp_title_band=0; kh_aspect_title_config("band"); { TtLay L; if(asp_title_band&&!kh_aspect_title_layout(2007,2853,&L,NULL)) _exit(3); } break;
+        case 36: asp_mode=1; asp_title_band=0; asp_title_set=0; kh_aspect_title_config(NULL); kh_aspect_title_config("");   /* unset or empty: portrait */
+                 { TtLay L; if(!asp_title_band&&kh_aspect_title_layout(2007,2853,&L,NULL)) _exit(3); } break;
         }
         _exit(99); }
     int status=0; if(child<0){ fclose(f); return 0; } waitpid(child,&status,0);
@@ -1685,6 +2030,19 @@ static int h3t_pass(KCtx *g,const u64 *objs,int n,float *ws,float *wsend){
     ga_free(list); ga_free(out); ga_free(mode); ga_free(back); return ok;
 }
 static u64 h3t_obj(KCtx *g,u64 vt,u32 grp){ u64 o=ga_calloc(1,0x40); wr64(g,o,vt); wr32(g,o+0x14,grp); return o; }
+/* task 53: the same pass, recording all four MagicScale words after each object's hook (ms[i][0..3] = GX+0xa0..0xac); before every H3b
+ * call all four hold the signalling NaN, so a word that is still that NaN was not written; ms0 = the loop's MagicScale (f_1433a0's) */
+static int h3t_pass4(KCtx *g,const u64 *objs,int n,u32 (*ms)[4],u32 *ms0){
+    u64 list=ga_calloc(1,0x80), out=ga_calloc(1,0x20), mode=ga_calloc(1,0x10), back=ga_calloc(1,0x20); int ok=h3_depth==0, k;
+    wr64(g,list+0x18,objs[0]); wrf(g,mode,1.0f);
+    st_call_ra(g,f_126500,DK_RA_MODE,list,(u64[]){out,mode},2,&k); ok&=k&&h3_depth==(asp_mode?1:0);
+    for(int j=0;j<4;j++){ ms[0][j]=rd32(g,GX+0xa0+4ull*(u64)j); ms0[j]=h3_ms[0][j]; }
+    for(int i=1;i<n;i++){ u32 id=(u32)kh_call(g,GS_BASE+0x4ad240ull,objs[i],0,0,0); for(int j=0;j<4;j++) wr32(g,GX+0xa0+4ull*(u64)j,H3T_SNAN);
+        u64 r=st_call_ra(g,f_4ad270,DK_RA_NEXT,list,(u64[]){id},1,&k); ok&=k&&r==objs[i]; for(int j=0;j<4;j++) ms[i][j]=rd32(g,GX+0xa0+4ull*(u64)j); }
+    u64 r=st_call_ra(g,f_4ad270,DK_RA_NEXT,list,(u64[]){0},1,&k); ok&=k&&r==0;
+    st_call_ra(g,f_126500,DK_RA_END,list,(u64[]){back,out},2,&k); ok&=k&&h3_depth==0;
+    ga_free(list); ga_free(out); ga_free(mode); ga_free(back); return ok;
+}
 static void h3_selftest(KCtx *g){
     /* the anchor lookup: every class of the table, the generic children by their owner group, the guards */
     { int w;
@@ -1841,6 +2199,83 @@ static void h3_selftest(KCtx *g){
           asp_off_h3=0; asp_mode=1; note_3d(kh_game_frames()); }
       ga_free(list); ga_free(out); ga_free(mode); ga_free(wm); ga_free(sv); ga_free(tmp); ga_free(win);
       memcpy(h3in,hin,sizeof hin); n_h3in=nhin; h3in_cut=hcut; }
+    /* ---- task 53: the HUD scale through the same hooks (f_126500 at 0x140166677 with the lifted f_1433a0, f_4ad270 at 0x140166693) ----
+     * The objects of one pass: a top class first (H3a), the HP class, the command menu's generic child (group 1), COMMAND_ONE (2), the
+     * reaction command (2), the lock-on (centre), a generic child of the gauges (3), the party gauges (4) and a child of group 5, the
+     * enemy gauge (top), a generic child of group 0 (centre), a gauge class in the top group (class and group disagree: centre), a
+     * class not in the table in group 3 (centre), the face ring (3).  hk = the scale each must get (-1 none), an = its anchor. */
+    { const u64 ob[14]={h3t_obj(g,GS_BASE+0x5b2400ull,7),h3t_obj(g,GS_BASE+0x5b2078ull,3),h3t_obj(g,GS_BASE+0x5b1a70ull,1),h3t_obj(g,GS_BASE+0x5b1bf8ull,2),
+                        h3t_obj(g,GS_BASE+0x5b1bc8ull,2),h3t_obj(g,GS_BASE+0x5b24f8ull,0x11),h3t_obj(g,GS_BASE+0x5b1a70ull,3),h3t_obj(g,GS_BASE+0x5b2158ull,4),
+                        h3t_obj(g,GS_BASE+0x5b1a70ull,5),h3t_obj(g,GS_BASE+0x5b21e0ull,6),h3t_obj(g,GS_BASE+0x5b1a70ull,0),h3t_obj(g,GS_BASE+0x5b2078ull,7),
+                        h3t_obj(g,GS_BASE+0x5b9990ull,3),h3t_obj(g,GS_BASE+0x5b2018ull,3)};
+      static const int hk[14]={-1,HUD_HP,HUD_CMD,HUD_CMD,HUD_CMD,-1,HUD_HP,HUD_HP,HUD_HP,-1,-1,-1,-1,HUD_HP}, an[14]={-1,1,1,1,1,0,1,1,1,-1,0,0,0,1};
+      static const double PX[2]={-70.0,590.0}, PY[2]={416.0,405.0};                                   /* the pivots (implementation notes: measured), pinned */
+      double hs0[2]={hud_s[0],hud_s[1]}; int hset0[2]={hud_set[0],hud_set[1]}; HudStat hsv; memcpy(&hsv,&hud,sizeof hsv);
+      u32 ms[14][4], ref[14][4], m0[4];
+      /* the arithmetic: parse, the screens, the map keeps the pivot's pixel and scales distances by s */
+      { double v=0; ACHECK(kh_hud_scale_parse("1.25",&v)==0&&v==1.25&&kh_hud_scale_parse("0.5",&v)==0&&v==0.5&&kh_hud_scale_parse("3.0",&v)==0&&v==3.0&&kh_hud_scale_parse("3",&v)==0&&v==3.0);
+        ACHECK(kh_hud_scale_parse("0.49",&v)==2&&kh_hud_scale_parse("3.01",&v)==2&&kh_hud_scale_parse("0",&v)==2);
+        ACHECK(kh_hud_scale_parse("1,25",&v)==1&&kh_hud_scale_parse("1.25x",&v)==1&&kh_hud_scale_parse("",&v)==1&&kh_hud_scale_parse(".5",&v)==1&&kh_hud_scale_parse("1.",&v)==1&&kh_hud_scale_parse("-1",&v)==1&&kh_hud_scale_parse("1e0",&v)==1&&kh_hud_scale_parse(NULL,&v)==1);
+        hud_s[0]=1.25; hud_s[1]=1.5; asp_mode=1;
+        ACHECK(kh_aspect_hud_scale(HUD_CMD,2007,2853)==1.25&&kh_aspect_hud_scale(HUD_HP,2007,2853)==1.5&&kh_aspect_hud_scale(HUD_HP,1000,1001)==1.5);
+        ACHECK(kh_aspect_hud_scale(HUD_HP,2853,2007)==1.0&&kh_aspect_hud_scale(HUD_HP,2007,2007)==1.0&&kh_aspect_hud_scale(HUD_CMD,1920,1350)==1.0&&kh_aspect_hud_scale(HUD_CMD,2670,1878)==1.0&&kh_aspect_hud_scale(HUD_CMD,1920,1080)==1.0);
+        asp_mode=0; ACHECK(kh_aspect_hud_scale(HUD_CMD,2007,2853)==1.0&&kh_aspect_hud_scale(HUD_HP,2007,2853)==1.0); asp_mode=1;
+        ACHECK(hud_kind(1)==HUD_CMD&&hud_kind(2)==HUD_CMD&&hud_kind(3)==HUD_HP&&hud_kind(4)==HUD_HP&&hud_kind(5)==HUD_HP&&hud_kind(0)<0&&hud_kind(6)<0&&hud_kind(7)<0&&hud_kind(8)<0&&hud_kind(0x11)<0);
+        u32 t[4]={fbits(2.93994f),fbits(2.71379f),fbits(250.875f),fbits(1724.06f)}; hud_ms(t,1.5,590.0f,405.0f);
+        ACHECK(near(590.0*bf(t[0])+bf(t[2]),590.0*2.93994f+250.875f,1e-3)&&near(405.0*bf(t[1])+bf(t[3]),405.0*2.71379f+1724.06f,1e-3));   /* the pivot keeps its pixel */
+        ACHECK(near((377.0*bf(t[0])+bf(t[2]))-(590.0*bf(t[0])+bf(t[2])),1.5*(377.0-590.0)*2.93994f,1e-3)&&near(bf(t[1]),1.5*2.71379f,1e-6));   /* 213 GS columns: 1.5 times as many pixels */
+        /* the margins: a scale >= 1 moves every point of the resting boxes away from the pivot's edges only (up / inward); the largest
+         * allowed (3.0) keeps the boxes inside the frame of ANY screen taller than wide (x -85.33 .. 597.33, y -b .. 416 + b, b > 161.7):
+         * gauges x 377..590 y 305..405 about (590, 405), command menu x -70..82 y 290..416 about (-70, 416) */
+        double bmin=208.0*(16.0/9.0-1.0), xl=-256.0*(16.0/9.0)/(4.0/3.0)+256.0, xr=512.0-xl;
+        ACHECK(near(xl,-85.333,1e-3)&&kh_aspect_b(1000,1001)>bmin&&kh_aspect_b(2007,2853)>bmin);
+        ACHECK(590.0-(590.0-377.0)*3.0>=xl&&405.0-(405.0-305.0)*3.0>=-bmin&&-70.0+(82.0+70.0)*3.0<=xr&&416.0-(416.0-290.0)*3.0>=-bmin); }
+      /* the passes */
+      H3SCREEN(2007,2853); note_3d(kh_game_frames());
+      double o_=kh_aspect_o(2007,2853);
+      asp_mode=0; ACHECK(h3t_pass4(g,ob,14,ref,m0)); for(int i=1;i<14;i++) for(int j=0;j<4;j++) ACHECK(ref[i][j]==H3T_SNAN);   /* pc: nothing written */
+      ACHECK(near(bf(ref[0][3]),o_,0.5)&&bf(ref[0][0])>0&&bf(ref[0][1])>0);                            /* the loop's MagicScale (f_1433a0) */
+      const u32 *L=ref[0];
+      asp_mode=1;
+      for(int c=0;c<4;c++){                                                                               /* scales: defaults, 1 / 1, command 1 only, 2.0 / 0.5 */
+          hud_s[0]=c==0?1.25:c==1?1.0:c==2?1.0:2.0; hud_s[1]=c==0?1.5:c==1?1.0:c==2?1.5:0.5;
+          u64 p0=hud.passes, so0[2]={hud.objs[0],hud.objs[1]}, bk0=hud.back; int nk[2]={0,0}, nb=0;
+          ACHECK(h3t_pass4(g,ob,14,ms,m0));
+          int any=hud_s[0]!=1.0||hud_s[1]!=1.0;
+          for(int i=0;i<14;i++){ float w=h3_value(bf(L[3]),(float)o_,an[i]<0?H3_TOP:an[i]>0?H3_BOTTOM:H3_CENTRE); int k=hk[i]; double s=k>=0?hud_s[k]:1.0;
+              if(k>=0&&s!=1.0){ nk[k]++;
+                  ACHECK(ms[i][0]==fbits((float)(s*bf(L[0])))&&ms[i][1]==fbits((float)(s*bf(L[1]))));
+                  ACHECK(ms[i][2]==fbits((float)(bf(L[2])+(1.0-s)*PX[k]*bf(L[0])))&&ms[i][3]==fbits((float)(w+(1.0-s)*PY[k]*bf(L[1]))));
+                  ACHECK(near(PX[k]*bf(ms[i][0])+bf(ms[i][2]),PX[k]*bf(L[0])+bf(L[2]),2e-3)&&near(PY[k]*bf(ms[i][1])+bf(ms[i][3]),PY[k]*bf(L[1])+w,2e-3)); }   /* the corner stays */
+              else if(any||i==0){ if(i) nb++; for(int j=0;j<3;j++) ACHECK(ms[i][j]==L[j]); ACHECK(ms[i][3]==fbits(w)); }   /* the loop's MS.x / .y / .z, H3's MS.w */
+              else { for(int j=0;j<3;j++) ACHECK(ms[i][j]==H3T_SNAN); ACHECK(ms[i][3]==fbits(w)); } }    /* both 1: only MS.w, as task 42 */
+          ACHECK(hud.passes==p0+(any?1u:0u)&&hud.objs[0]==so0[0]+(u64)nk[0]&&hud.objs[1]==so0[1]+(u64)nk[1]&&hud.back==bk0+(any?(u64)(14-nk[0]-nk[1]):0u));
+          (void)nb; }
+      /* not taller than wide (the landscape phone, 1920x1350, 16:9): H3 as task 42, MS.x / .y / .z never written, whatever the scales */
+      hud_s[0]=2.0; hud_s[1]=3.0;
+      { static const int sc[3][2]={{2670,1878},{1920,1350},{1920,1080}};
+        for(int s=0;s<3;s++){ H3SCREEN(sc[s][0],sc[s][1]); u64 p0=hud.passes; ACHECK(h3t_pass4(g,ob,14,ms,m0)&&hud.passes==p0);
+            for(int i=1;i<14;i++) for(int j=0;j<3;j++) ACHECK(ms[i][j]==H3T_SNAN); } }
+      /* the test aid h3 off and the bars on (H7 off, no 3D view): no scale either */
+      H3SCREEN(2007,2853);
+      { u64 p0=hud.passes; asp_off_h3=1; ACHECK(h3t_pass4(g,ob,14,ms,m0)); asp_off_h3=0; for(int i=1;i<14;i++) for(int j=0;j<4;j++) ACHECK(ms[i][j]==H3T_SNAN);
+        int sh7=asp_off_h7; asp_off_h7=1; atomic_store(&last3d_plus1,0); ACHECK(h3t_pass4(g,ob,14,ms,m0)); for(int i=1;i<14;i++) for(int j=0;j<4;j++) ACHECK(ms[i][j]==H3T_SNAN);
+        asp_off_h7=sh7; note_3d(kh_game_frames()); ACHECK(hud.passes==p0); }
+      /* setScreenMode inside a scaled object (the case of task 42 review finding 2): its own mode is left as the exe made it; the loop's
+       * mode back gets all four scaled words again */
+      { hud_s[0]=1.25; hud_s[1]=1.5;
+        u64 list=ga_calloc(1,0x40), out=ga_calloc(1,0x20), mode=ga_calloc(1,0x10), wm=ga_calloc(1,0x10), sv=ga_calloc(1,0x20), tmp=ga_calloc(1,0x20); int k;
+        H3Inner hin[16]; memcpy(hin,h3in,sizeof hin); int nhin=n_h3in; u64 hcut=h3in_cut;
+        wrf(g,mode,1.0f); wrf(g,wm,0.8f); wrf(g,wm+12,0.1f); wr64(g,list+0x18,ob[1]);
+        st_call_ra(g,f_126500,DK_RA_MODE,list,(u64[]){out,mode},2,&k); u32 a4[4]; for(int j=0;j<4;j++) a4[j]=rd32(g,GX+0xa0+4ull*(u64)j);
+        ACHECK(k&&h3_depth==1&&a4[1]==fbits((float)(1.5*bf(L[1])))&&a4[0]!=L[0]);
+        st_call_ra(g,f_126500,GS_BASE+0x3bc4ccull,list,(u64[]){sv,wm},2,&k); ACHECK(k&&rd32(g,GX+0xa4)!=a4[1]&&rd32(g,GX+0xa4)!=L[1]);   /* its own mode */
+        st_call_ra(g,f_126500,GS_BASE+0x3bc4f5ull,list,(u64[]){tmp,sv},2,&k); ACHECK(k); for(int j=0;j<4;j++) ACHECK(rd32(g,GX+0xa0+4ull*(u64)j)==a4[j]);   /* scaled again */
+        ACHECK(st_call_ra(g,f_4ad270,DK_RA_NEXT,list,(u64[]){0},1,&k)==0&&k); st_call_ra(g,f_126500,DK_RA_END,list,(u64[]){tmp,out},2,&k); ACHECK(k&&h3_depth==0);
+        memcpy(h3in,hin,sizeof hin); n_h3in=nhin; h3in_cut=hcut;
+        ga_free(list); ga_free(out); ga_free(mode); ga_free(wm); ga_free(sv); ga_free(tmp); }
+      for(int i=0;i<14;i++) ga_free(ob[i]);
+      hud_s[0]=hs0[0]; hud_s[1]=hs0[1]; hud_set[0]=hset0[0]; hud_set[1]=hset0[1]; memcpy(&hud,&hsv,sizeof hsv); asp_mode=1; }
     #undef H3SCREEN
     for(int i=0;i<8;i++) ga_free(o[i]);
     memcpy(&h3,&sh,sizeof sh); asp_mode=sm; asp_h1_uncond=su; asp_off_h3=so; kh_aspect_dk=sdk; kh_aspect_m=sml; atomic_store(&last3d_plus1,s3);
@@ -2170,6 +2605,71 @@ static void h7_selftest(KCtx *g){
       asp_off_h7=1; ACHECK(h3t_pass(g,o,2,ws,&we)&&ws[0]==135.0f&&fbits(ws[1])==H3T_SNAN&&h7_h3_no3d==n0+1&&h3.bars==b0+1); asp_off_h7=0;
       h7t_screen(g,1920,1080); ACHECK(h3t_pass(g,o,2,ws,&we)&&fbits(ws[1])==H3T_SNAN&&h7_h3_no3d==n0+1);                     /* 16:9: nothing written */
       kh_aspect_dk=sdk2; ga_free(o[0]); ga_free(o[1]); memcpy(hp(g,ID_TAB),tsave,0x204); }
+    /* ---- task 53 item 2: the title's portrait layout through the hooks (H3a opens a dk pass whose head is the title's layout object,
+     * then f_11a330 with the layout draw's return address) ---- */
+    { /* the parts by their GS boxes as M logged them (dl-title-p.tsv: presents 405..812 of the field route at 2007x2853) */
+      static const struct { float b[4]; int e; } tb[]={{{195,595,0,400},TT_PIC},{{195,595,0.5f,399.5f},TT_PIC},{{344,597,14,36},TT_SET},
+          {{-47,522,305,330},TT_MENU},{{-71,-47,305,330},TT_MENU},{{198,326,306,330},TT_MENU},{{-83,-42,295,336},TT_MENU},{{-47,389,388,413},TT_MENU},{{-39,-39,427,447},TT_MENU},{{535,598,378,402},TT_MENU},
+          {{10,205,37,69},TT_LOGO},{{11,206,52,275},TT_LOGO},{{-77,298,83,194},TT_LOGO},{{87,133,78,113},TT_LOGO},{{-5,247,154,218},TT_LOGO},{{-68,92,253,265},TT_LOGO},
+          {{-65,105,269,284},TT_LOGO},{{-124,-52,266,268},TT_LOGO},{{-413,-243,278,293},TT_LOGO},{{-373,596,-4,283},TT_LOGO},{{-397,621,-11,290},TT_LOGO},{{-114,336,73,206},TT_LOGO},
+          {{-149,660,-31,448},-1},{{-129,680,-30,449},-1},{{0,511,-100,411},-1},{{-107,702,-18,621},-1},{{200,595,0,400},-1},{{-93,604,-8,423},-1}};
+      for(size_t i=0;i<sizeof tb/sizeof *tb;i++) ACHECK(kh_aspect_title_elem(tb[i].b)==tb[i].e);
+      /* the layout of the phone's portrait screen, from the numbers (not from the code's tables): GAME SETTINGS 60 GS rows above the
+       * bottom, the menu 18 above it, the picture 1.35 at the top, the logo 1.1 centred between */
+      double b=kh_aspect_b(2007,2853), yT=-b, yB=416.0+b, st=yB-60.0-22.0, mt=st-18.0-107.0, sP=1.35, pb=yT+400.0*sP, lt=pb+(mt-pb-247.0*1.1)/2.0; TtLay L; int ts=0;
+      ACHECK(kh_aspect_title_layout(2007,2853,&L,&ts)==1&&ts==0&&near(L.s[TT_PIC],1.35,1e-12)&&near(L.s[TT_LOGO],1.1,1e-12)&&L.s[TT_MENU]==1.0&&L.s[TT_SET]==1.0);
+      ACHECK(near(L.ty[TT_PIC],yT,1e-9)&&near(L.ty[TT_SET],st,1e-9)&&near(L.ty[TT_MENU],mt,1e-9)&&near(L.ty[TT_LOGO],lt,1e-9)&&L.tx[TT_PIC]==256.0&&L.tx[TT_LOGO]==256.0);
+      ACHECK(256.0-200.0*sP>=-85.334&&256.0+200.0*sP<=597.334&&pb<lt-12.0&&lt+247.0*1.1<mt-12.0&&st+22.0<=yB-60.0+1e-9);   /* inside the frame, in this order */
+      ACHECK(near(lt-pb,mt-(lt+247.0*1.1),1e-9));                                                     /* the logo centred between */
+      ACHECK(kh_aspect_title_layout(2853,2007,&L,&ts)==0&&kh_aspect_title_layout(1920,1350,&L,&ts)==0&&kh_aspect_title_layout(2007,2007,&L,&ts)==0&&ts==0);
+      ACHECK(kh_aspect_title_layout(1000,1001,&L,&ts)==0&&ts==1);                                       /* too short for the stack: the band, counted */
+      ACHECK(kh_aspect_title_layout(1080,1920,&L,&ts)==1&&L.s[TT_PIC]==1.35&&near(L.ty[TT_SET],416.0+kh_aspect_b(1080,1920)-82.0,1e-9));   /* a taller screen: the same sizes, more room */
+      asp_title_band=1; ACHECK(kh_aspect_title_layout(2007,2853,&L,&ts)==0); asp_title_band=0;
+      asp_mode=0; ACHECK(kh_aspect_title_layout(2007,2853,&L,&ts)==0); asp_mode=1;
+      /* through the hooks */
+      u8 tsv[16]; memcpy(tsv,hp(g,T_LAYOUT_PTR),16); u8 tsave[0x204]; memcpy(tsave,hp(g,ID_TAB),0x204); int sdk2=kh_aspect_dk; kh_aspect_dk=1; TtStat stt; memcpy(&stt,&ttl,sizeof stt);
+      u64 tl=h3t_obj(g,GS_BASE+0x5b1dc0ull,0), tm=h3t_obj(g,GS_BASE+0x5b1dc0ull,0), other=h3t_obj(g,GS_BASE+0x5b1dc0ull,0); wr64(g,T_LAYOUT_PTR,tl); wr64(g,T_MENU_PTR,tm);
+      u64 list=ga_calloc(1,0x40), lo=ga_calloc(1,0x20), md=ga_calloc(1,0x10), bk=ga_calloc(1,0x20); wrf(g,md,1.0f);
+      #define TTPASS(obj_) do{ int k_; wr64(g,list+0x18,(obj_)); st_call_ra(g,f_126500,DK_RA_MODE,list,(u64[]){lo,md},2,&k_); ACHECK(k_&&h3_depth==1&&h3_cur_obj[0]==(obj_)); }while(0)
+      #define TTEND() do{ int k_; st_call_ra(g,f_126500,DK_RA_END,list,(u64[]){bk,lo},2,&k_); ACHECK(k_&&h3_depth==0); }while(0)
+      /* xs / ys: the quad's 4 corners after the hook (GS, the offsets removed) */
+      #define TTSUB(ra_,x0_,x1_,y0_,y1_) do{ h7t_quad(v,(x0_),(x1_),(y0_),(y1_)); H7SUB((ra_),8,4); for(int i_=0;i_<4;i_++){ xs[i_]=rdf(g,h7t_vb+(u64)i_*H7_STRIDE)-H7T_OX; ys[i_]=out[i_]-H7T_OY; } }while(0)
+      float xs[4], ys[4];
+      double r=kh_aspect_r(2007,2853);
+      kh_phase_test_set_alive(0,1,0);
+      h7t_screen(g,2007,2853); TTPASS(tl);
+      { u64 b0=ttl.batches, p0=ttl.q[TT_PIC];
+        TTSUB(H7T_LAY,195,595,0,400); ACHECK(k&&near(xs[0],256.0-200.0*sP,2e-3)&&near(xs[1],256.0+200.0*sP,2e-3)&&near(ys[0],yT,2e-3)&&near(ys[2],yT+400.0*sP,2e-3)&&ttl.batches==b0+1&&ttl.q[TT_PIC]==p0+1);
+        ACHECK(near(xs[0],xs[2],0)&&near(ys[0],ys[1],0));                                             /* still an axis-aligned rectangle */
+        TTSUB(H7T_LAYB,-77,298,83,194); ACHECK(near(xs[0],256.0+1.1*(-77.0-110.5),2e-3)&&near(xs[1],256.0+1.1*(298.0-110.5),2e-3)&&near(ys[0],lt+1.1*(83.0-37.0),2e-3)&&near(ys[2],lt+1.1*(194.0-37.0),2e-3));
+        TTSUB(H7T_LAY,344,597,14,36); ACHECK(xs[0]==344.0f&&xs[1]==597.0f&&near(ys[0],st,2e-3)&&near(ys[2],st+22.0,2e-3));   /* GAME SETTINGS: x as it was */
+        TTSUB(H7T_LAY,-47,522,305,330); ACHECK(xs[0]==-47.0f&&xs[1]==522.0f&&near(ys[0],mt+10.0,2e-3)&&near(ys[2],mt+35.0,2e-3));   /* the menu row drawn by the title layout (the exit animation) */
+        u64 r10=h7.kind[H7K_FULL];
+        TTSUB(H7T_LAY,-149,660,-31,448); ACHECK(xs[0]==-149.0f&&near(ys[0],h7_map(-31,h7_cover(-31,448,208.0*(r-1.0))),2e-3)&&h7.kind[H7K_FULL]==r10+1);   /* the backdrop: R1 as before */
+        u64 l0=ttl.left; TTSUB(H7T_LAY,0,511,-100,411); ACHECK(xs[0]==0.0f&&ys[0]==-100.0f&&ys[2]==411.0f&&ttl.left==l0+1);   /* the fade-in flash: left */
+        TTSUB(H7T_RECT,195,595,0,400); ACHECK(xs[0]==195.0f&&near(ys[0],-b,2e-3)&&ttl.left==l0+2); }          /* another draw routine: not the layout's part (R3 as before) */
+      TTEND();
+      TTPASS(tm);                                                                                        /* the menu's layout object */
+      { TTSUB(GS_BASE+0x1977e3ull,198,326,306,330); ACHECK(xs[0]==198.0f&&near(ys[0],mt+11.0,2e-3)&&near(ys[2],mt+35.0,2e-3));     /* its glow strip (f_1969a0's third path) */
+        TTSUB(H7T_LAYB,-83,-42,295,336); ACHECK(xs[0]==-83.0f&&near(ys[0],mt,2e-3)); }
+      TTEND();
+      /* not the title's: another Tz::Layout (counted), the title task not running, KHNMC_TITLE_LAYOUT=band, a landscape screen, a screen
+       * too short: the picture keeps today's placement (R3: moved up by b, x as it was), the logo stays where it is */
+      for(int c=0;c<5;c++){ float W=c==3?2670.0f:c==4?1000.0f:2007.0f, H=c==3?1878.0f:c==4?1001.0f:2853.0f; double bb_=kh_aspect_b(W,H); u64 ot=ttl.other, ts0=ttl.tooshort;
+          h7t_screen(g,W,H); if(c==1) kh_phase_test_set_alive(0,0,0); if(c==2) asp_title_band=1;
+          TTPASS(c==0?other:tl);
+          TTSUB(H7T_LAY,195,595,0,400); ACHECK(k&&xs[0]==195.0f&&xs[1]==595.0f&&near(ys[0],-bb_,2e-3)&&near(ys[2],400.0-bb_,2e-3));
+          TTSUB(H7T_LAY,-77,298,83,194); ACHECK(xs[0]==-77.0f&&ys[0]==83.0f&&ys[2]==194.0f);
+          ACHECK(ttl.other==ot+(c==0?2u:0u)&&ttl.tooshort==ts0+(c==4?2u:0u));
+          TTEND(); kh_phase_test_set_alive(0,1,0); asp_title_band=0; }
+      /* pc and the test aid h7: not one bit */
+      h7t_screen(g,2007,2853); TTPASS(tl); asp_off_h7=1; TTSUB(H7T_LAY,195,595,0,400); ACHECK(k&&same&&xs[0]==195.0f&&ys[0]==0.0f&&ys[2]==400.0f); asp_off_h7=0; TTEND();
+      asp_mode=0; { int k_; wr64(g,list+0x18,tl); st_call_ra(g,f_126500,DK_RA_MODE,list,(u64[]){lo,md},2,&k_); TTSUB(H7T_LAY,195,595,0,400); ACHECK(k&&same&&ys[0]==0.0f&&ys[2]==400.0f); st_call_ra(g,f_126500,DK_RA_END,list,(u64[]){bk,lo},2,&k_); } asp_mode=1;
+      #undef TTPASS
+      #undef TTEND
+      #undef TTSUB
+      kh_phase_test_set_alive(0,0,0); memcpy(hp(g,T_LAYOUT_PTR),tsv,16); memcpy(&ttl,&stt,sizeof stt); kh_aspect_dk=sdk2; memcpy(hp(g,ID_TAB),tsave,0x204);
+      ga_free(tl); ga_free(tm); ga_free(other); ga_free(list); ga_free(lo); ga_free(md); ga_free(bk); }
     #undef H7SUB
     ga_free(h7t_vb); h7t_vb=0;
     memcpy(&h7,&sh7,sizeof sh7); memcpy(&h3,&sh3,sizeof sh3); memcpy(h7r,srow,sizeof srow); n_h7r=snr; h7r_cut=scut; h7_h1_no3d=sn1; h7_h3_no3d=sn3;
@@ -2177,18 +2677,27 @@ static void h7_selftest(KCtx *g){
     wr64(g,GX+0x59b8,s59b8); wr64(g,GX+0x7c00,s7c00); memcpy(hp(g,GX+0x578c),svb,0x60); memcpy(hp(g,GX+0x4b0),s4b0,0x18); wr32(g,GX_GUARD,guard); memcpy(hp(g,GX),gxsave,0x148);
 }
 /* ---- task 49: the zoom ----------------------------------------------------------------------------------------------------------------
- * A: zoom_build (what the hook f_19cad0 runs in fill mode) around a stand-in for the lifted body that records cam+0x40 as it sees it.
+ * A: zoom_build (what the hook f_19cad0 runs in fill mode) around a stand-in for the lifted body that records cam+0x40 as it sees it,
+ *    writes marks into the four matrices, the stack below the call and rax, and "returns" (rsp + 8) as the lifted body does.
  * B: the real hooks and the lifted bodies.  The game's own camera init f_19dc50(cam, d, sx, sy, 2048, 2048, 1, 16770000, near, far)
  *    with the arguments f_19d050 passes for the two scene cameras (read from the image: 0x14019d05e..0x14019d140), which ends in the
- *    tail jump to f_19cad0, i.e. the hook (0x14019dd92): every matrix of the zoomed build is compared, bit for bit, with the lifted
- *    body's own build of a camera whose distance is d x z; and the lifted f_19d010 through its hook. */
-void f_19dc50(KCtx *);
-static u64 zt_cam; static u32 zt_seen, zt_put; static int zt_calls;
-static void zt_fn(KCtx *g){ zt_calls++; zt_seen=rd32(g,zt_cam+CAM_D); if(zt_put) wr32(g,zt_cam+CAM_D,zt_put); }
-/* zoom_build as the hook calls it (camera in guest rcx, the return address on the guest stack), around the stand-in */
-static void zt_build(KCtx *g,u64 cam,u64 ra){
-    u64 sv_sp=KH_RSP(g), sv_cx=KH_RCX(g), sp=((sv_sp-0x400)&~15ull)-8; wr64(g,sp,ra); KH_RSP(g)=sp; KH_RCX(g)=cam;
-    zoom_build(g,zt_fn); KH_RSP(g)=sv_sp; KH_RCX(g)=sv_cx;
+ *    tail jump to f_19cad0, i.e. the hook (0x14019dd92): the camera after the hook is, all 0x184 bytes, the exe's build; the noted
+ *    draw matrices are, bit for bit, the lifted body's build of a camera whose distance is d x z.  Then the lifted f_19cfc0 through its
+ *    hook from D, G, M and unknown return addresses on both scene cameras and their previous-frame copies (0x140ac1840 / 0x140ac1220
+ *    and 0x140ac19c4 / 0x140ac13a4), the lifted f_19d040 and f_19d010 (not changed by the zoom), H2 on the camera and on a copy. */
+void f_19dc50(KCtx *); void f_19cfc0(KCtx *); void f_19d010(KCtx *);
+static u64 zt_cam; static u32 zt_seen[4], zt_put; static int zt_calls, zt_put_on;
+static void zt_fn(KCtx *g){
+    int n=zt_calls++; u32 d=rd32(g,zt_cam+CAM_D); if(n<4) zt_seen[n]=d;
+    wr32(g,zt_cam+CAM_VP,d); wr32(g,zt_cam+0x84,d^1u); wr32(g,zt_cam+0xc4,d^2u); wr32(g,zt_cam+CAM_PROJ,d^3u); wr32(g,zt_cam+0x7c,0x43800000u);
+    wr32(g,KH_RSP(g)-0x100,d^4u); KH_RAX(g)=0x1000u+(u64)n;                         /* the stack below the call and a register */
+    if(zt_put&&n+1==zt_put_on) wr32(g,zt_cam+CAM_D,zt_put);
+    KH_RSP(g)+=8;                                                                    /* `ret` */
+}
+/* zoom_build as the hook calls it (camera in guest rcx, the return address on the guest stack), around the stand-in; *sp_out = rsp at the call */
+static void zt_build(KCtx *g,u64 cam,u64 ra,u64 *sp_out){
+    u64 sv_sp=KH_RSP(g), sv_cx=KH_RCX(g), sp=((sv_sp-0x400)&~15ull)-8; wr64(g,sp,ra); KH_RSP(g)=sp; KH_RCX(g)=cam; zt_calls=0;
+    zoom_build(g,zt_fn); if(sp_out) *sp_out=sp; KH_RSP(g)=sv_sp; KH_RCX(g)=sv_cx;
 }
 /* the lifted f_19dc50 on cam with distance d and return address ra (its tail jump keeps ra for f_19cad0) */
 static int zt_init(KCtx *g,u64 cam,float d,u64 ra){
@@ -2201,131 +2710,179 @@ static int zt_init(KCtx *g,u64 cam,float d,u64 ra){
     for(int i=0;i<4;i++) KH_XMM(g,i)=sx[i];
     return ok;
 }
-/* the lifted f_19d010(cam) through its hook: the low 4 bytes of xmm0 (the rest must be 0, as MOVSS from memory leaves it) */
-static u32 zt_d(KCtx *g,u64 cam,int *ok){
-    v128 s0=KH_XMM(g,0); memset(&KH_XMM(g,0),0xa5,sizeof(v128)); int k=0; st_call(g,f_19d010,(u64[]){cam},1,&k);
-    u32 r[4]; memcpy(r,&KH_XMM(g,0),16); KH_XMM(g,0)=s0; *ok=k&&!r[1]&&!r[2]&&!r[3]; return r[0];
-}
+/* the lifted f_19cfc0(cl) through its hook from return address ra: the camera pointer */
+static u64 zt_get(KCtx *g,int cl,u64 ra){ int ok=0; u64 r=st_call_ra(g,f_19cfc0,GS_BASE+ra,KH_RDI(g),(u64[]){(u64)cl},1,&ok); return ok?r:0; }
+/* the lifted f_19d010(cam): the low 4 bytes of xmm0 */
+static u32 zt_d(KCtx *g,u64 cam){ v128 s0=KH_XMM(g,0); int k=0; st_call(g,f_19d010,(u64[]){cam},1,&k); u32 r; memcpy(&r,&KH_XMM(g,0),4); KH_XMM(g,0)=s0; return k?r:0xdeadbeefu; }
 static float zt_f(const u8 *s,u32 off){ float f; memcpy(&f,s+off,4); return f; }
 static void zoom_selftest(KCtx *g){
-    /* the value: DIGITS[.DIGITS] in 1.0 .. 2.0 */
+    /* the value: DIGITS[.DIGITS] in 1.0 .. 1.89 (review finding 3) */
     { double z=0;
-      ACHECK(kh_fov_zoom_parse("1.15",&z)==0&&z==1.15); ACHECK(kh_fov_zoom_parse("1",&z)==0&&z==1.0); ACHECK(kh_fov_zoom_parse("1.0",&z)==0&&z==1.0);
-      ACHECK(kh_fov_zoom_parse("2",&z)==0&&z==2.0); ACHECK(kh_fov_zoom_parse("2.000",&z)==0&&z==2.0); ACHECK(kh_fov_zoom_parse("1.42",&z)==0&&z==1.42);
-      ACHECK(kh_fov_zoom_parse("01.5",&z)==0&&z==1.5); ACHECK(kh_fov_zoom_parse("1.99999999999999",&z)==0&&z==1.99999999999999);
+      ACHECK(kh_fov_zoom_parse("1.3",&z)==0&&z==1.3); ACHECK(kh_fov_zoom_parse("1",&z)==0&&z==1.0); ACHECK(kh_fov_zoom_parse("1.0",&z)==0&&z==1.0);
+      ACHECK(kh_fov_zoom_parse("1.89",&z)==0&&z==1.89); ACHECK(kh_fov_zoom_parse("1.8900",&z)==0&&z==1.89); ACHECK(kh_fov_zoom_parse("1.42",&z)==0&&z==1.42);
+      ACHECK(kh_fov_zoom_parse("01.5",&z)==0&&z==1.5); ACHECK(kh_fov_zoom_parse("1.15",&z)==0&&z==1.15); ACHECK(kh_fov_zoom_parse("1.88999999999999",&z)==0&&z==1.88999999999999);
       static const char *bad[]={"","1.",".",".5","1..2","1.2.3","+1.2","-1.2"," 1.2","1.2 ","1,15","1e0","0x1p0","nan","inf","1.15x","one","1.0000000000000001"};
       z=7.0; for(size_t i=0;i<sizeof bad/sizeof *bad;i++) ACHECK(kh_fov_zoom_parse(bad[i],&z)==1&&z==7.0);
       ACHECK(kh_fov_zoom_parse(NULL,&z)==1);
-      static const char *range[]={"0","0.99","0.999999","2.01","2.0000001","3","10","1000000","0.0"};
+      static const char *range[]={"0","0.99","0.999999","1.891","1.8900000000001","1.9","2","2.0","3","1000000","0.0"};
       for(size_t i=0;i<sizeof range/sizeof *range;i++) ACHECK(kh_fov_zoom_parse(range[i],&z)==2&&z==7.0); }
+    /* finding 3, the bound itself: (4 / 3) tan(f) / tan(f - 10 deg), f = half the horizontal FOV, has its least value 1.894 > 1.89 at 50 deg;
+     * the routes' field camera (fov_x 1.55 rad): 1.907 */
+    { const double PI_=3.14159265358979323846; double lo=9; for(int i=1001;i<8999;i++){ double f=i/100.0*PI_/180, q=(341.333333/256.0)*__builtin_tan(f)/__builtin_tan(f-10*PI_/180); if(q<lo) lo=q; }
+      ACHECK(lo>ZOOM_MAX&&lo<1.8940&&near((341.333333/256.0)*__builtin_tan(0.775)/__builtin_tan(0.775-0.17453),1.907,1e-3)); }
     int sm=asp_mode, szs=asp_zoom_set, snc=asp_nocull; double szt=asp_zoom_tall; ZoomStat sst; memcpy(&sst,&zs,sizeof sst);
-    ZoomRa sra[16]; memcpy(sra,zra,sizeof sra); int snra=n_zra; u64 scut=zra_cut;
+    ZoomRa sra[16]; memcpy(sra,zra,sizeof sra); int snra=n_zra; u64 scut=zra_cut; ZoomRa sua[8]; memcpy(sua,zua,sizeof sua); int snua=n_zua; u64 sucut=zua_cut;
+    static ZoomEnt sent[ZOOM_NCAM][2]; memcpy(sent,zent,sizeof sent); u64 ssf=zsup_frame; int ssh=zsup_have;
     u8 gxsave[0x100]; memcpy(gxsave,hp(g,GX),0x100); u32 guard=rd32(g,GX_GUARD); wr32(g,GX_GUARD,0x80000000u);
     static u8 ccsave[ZOOM_NCAM*CAM_SIZE], cpsave[ZOOM_NCAM*CAM_SIZE]; memcpy(ccsave,hp(g,CAM_CUR),sizeof ccsave); memcpy(cpsave,hp(g,CAM_PREV),sizeof cpsave);
+    u32 sidx=rd32(g,CAM_IDX); u8 ssel=rd8(g,CAM_SEL);
     int slog=kh_aspect_log; kh_aspect_log=0;                                                 /* no camera lines from the test cases */
-    memset(&zs,0,sizeof zs); zs.warned=1; n_zra=0; zra_cut=0; asp_nocull=0;                  /* warned: no WARNING lines from the test cases */
-    /* the zoom of a screen: KHNMC_FOV_ZOOM (default 1.15) in fill mode when it is taller than wide, else exactly 1 */
+    memset(&zs,0,sizeof zs); zs.warned=1; zs.s_warned=1; n_zra=0; zra_cut=0; n_zua=0; zua_cut=0; asp_nocull=0;   /* warned: no WARNING lines from the test cases */
+    memset(zent,0,sizeof zent); zsup_have=0; zsup_frame=0;
+    /* the zoom of a screen: KHNMC_FOV_ZOOM (default 1.3) in fill mode when it is taller than wide, else exactly 1 */
     asp_mode=1; asp_zoom_tall=ZOOM_DEFAULT;
-    ACHECK(ZOOM_DEFAULT==1.15&&kh_aspect_zoom(2007,2853)==1.15&&kh_aspect_zoom(1878,2670)==1.15&&kh_aspect_zoom(1080,1081)==1.15);
+    ACHECK(ZOOM_DEFAULT==1.3&&kh_aspect_zoom(2007,2853)==1.3&&kh_aspect_zoom(1878,2670)==1.3&&kh_aspect_zoom(1080,1081)==1.3);
     ACHECK(kh_aspect_zoom(2853,2007)==1.0&&kh_aspect_zoom(1920,1080)==1.0&&kh_aspect_zoom(1920,1350)==1.0&&kh_aspect_zoom(2670,1878)==1.0);
     ACHECK(kh_aspect_zoom(2000,2000)==1.0&&kh_aspect_zoom(0,0)==1.0&&kh_aspect_zoom(0,100)==1.0&&kh_aspect_zoom(2560,1080)==1.0);
     asp_mode=0; ACHECK(kh_aspect_zoom(2007,2853)==1.0); asp_mode=1;                             /* pc: never */
-    asp_zoom_tall=1.3; ACHECK(kh_aspect_zoom(2007,2853)==1.3&&kh_aspect_zoom(2853,2007)==1.0); asp_zoom_tall=ZOOM_DEFAULT;
-    ACHECK(zoom_value(fbits(512.0f),1.15)==fbits(588.8f)&&zoom_value(fbits(512.0f),2.0)==fbits(1024.0f)&&zoom_value(fbits(512.0f),1.5)==fbits(768.0f));
-    /* the cameras, against the image: f_19d050 builds two scene cameras (`lea rcx,[rip+..]` at 0x14019d05e and 0x14019d14c), the second
-     * ends 8 bytes before the view array of f_19ce40(0) and the previous-frame copies end at the int 0x140ac1528; f_188120's build is the
-     * call at 0x14018830d; f_19d010 is `movss xmm0,[rcx+0x40]; ret` */
+    asp_zoom_tall=1.15; ACHECK(kh_aspect_zoom(2007,2853)==1.15&&kh_aspect_zoom(2853,2007)==1.0); asp_zoom_tall=ZOOM_DEFAULT;
+    ACHECK(zoom_value(fbits(512.0f),1.3)==fbits(665.6f)&&zoom_value(fbits(512.0f),1.89)==fbits((float)(512.0*1.89))&&zoom_value(fbits(512.0f),1.5)==fbits(768.0f));
+    /* the play modes: the zoom is 1 in the game frame of an M call and the next one */
+    ACHECK(zoom_supp_at(100,1,100)&&zoom_supp_at(100,1,99)&&!zoom_supp_at(100,1,98)&&!zoom_supp_at(100,0,100)&&!zoom_supp_at(100,1,101)&&!zoom_supp_at(0,0,0));
+    /* the cameras and the call sites, against the image: f_19d050 builds two scene cameras (`lea rcx,[rip+..]` at 0x14019d05e and
+     * 0x14019d14c), the second ends 8 bytes before the view array of f_19ce40(0) and the previous-frame copies end at the int 0x140ac1528;
+     * f_188120's build is the call at 0x14018830d; every entry of zsites is the return address of a `call f_19cfc0`, in rising order,
+     * and .text has exactly 62 such calls and no jump to it (D sites: the slots 0..8, once each) */
     #define LEA_T(a_) ((a_)+7+(u64)(s64)(s32)rd32(g,(a_)+3))
     ACHECK(rd8(g,GS_BASE+0x19d05eull)==0x48&&rd8(g,GS_BASE+0x19d05full)==0x8d&&rd8(g,GS_BASE+0x19d060ull)==0x0d&&LEA_T(GS_BASE+0x19d05eull)==CAM_CUR);
     ACHECK(rd8(g,GS_BASE+0x19d14cull)==0x48&&rd8(g,GS_BASE+0x19d14dull)==0x8d&&rd8(g,GS_BASE+0x19d14eull)==0x0d&&LEA_T(GS_BASE+0x19d14cull)==CAM_CUR+CAM_SIZE);
     #undef LEA_T
     ACHECK(CAM_CUR+ZOOM_NCAM*CAM_SIZE+8==GS_BASE+0xac1b50ull&&CAM_PREV+ZOOM_NCAM*CAM_SIZE==GS_BASE+0xac1528ull);
     ACHECK(rd8(g,ZOOM_RA_MAPOBJ-5)==0xe8&&ZOOM_RA_MAPOBJ+(u64)(s64)(s32)rd32(g,ZOOM_RA_MAPOBJ-4)==GS_BASE+0x19cad0ull);
-    ACHECK(rd32(g,GS_BASE+0x19d010ull)==0x41100ff3u&&rd16(g,GS_BASE+0x19d014ull)==0xc340u);
-    ACHECK(zoom_class(CAM_CUR,0)==ZC_SCENE0&&zoom_class(CAM_CUR+CAM_SIZE,ZOOM_RA_MAPOBJ)==ZC_SCENE1&&zoom_class(CAM_CUR+2*CAM_SIZE,0)==ZC_OTHER);
-    ACHECK(zoom_class(CAM_PREV,0)==ZC_OTHER&&zoom_class(CAM_CUR+8,0)==ZC_OTHER&&zoom_class(0x1234,ZOOM_RA_MAPOBJ)==ZC_MAPOBJ&&zoom_class(0x1234,ZOOM_RA_MAPOBJ+1)==ZC_OTHER);
+    ACHECK(rd32(g,GS_BASE+0x19d010ull)==0x41100ff3u&&rd16(g,GS_BASE+0x19d014ull)==0xc340u);   /* f_19d010: movss xmm0,[rcx+0x40]; ret */
+    { int ok=ZOOM_NSITE==62, nd=0, slots=0;
+      for(int i=0;i<ZOOM_NSITE;i++){ u64 r=GS_BASE+zsites[i].rva;
+          if(rd8(g,r-5)!=0xe8||r+(u64)(s64)(s32)rd32(g,r-4)!=GS_BASE+0x19cfc0ull||(i&&zsites[i].rva<=zsites[i-1].rva)) ok=0;
+          if(zoom_site(r)!=i||zoom_site(r+1)>=0||zoom_site(r-1)>=0) ok=0;
+          if(zsites[i].cls==ZS_DRAW){ nd++; if(zsites[i].slot<0||zsites[i].slot>=ZOOM_NDRAW||(slots&(1<<zsites[i].slot))) ok=0; else slots|=1<<zsites[i].slot; }
+          else if(zsites[i].slot!=-1) ok=0; }
+      ACHECK(ok&&nd==ZOOM_NDRAW&&slots==(1<<ZOOM_NDRAW)-1);
+      const u8 *t=hp(g,GS_BASE+0x1000ull); int ne8=0, ne9=0, inside=0;                    /* .text: VA 0x1000, virtual size 0x5773f3 */
+      for(u64 i=0;i+5<=0x5773f3ull;i++){ if(t[i]!=0xe8&&t[i]!=0xe9) continue;
+          s32 rel; memcpy(&rel,t+i+1,4); u64 va=GS_BASE+0x1000ull+i;
+          if(va+5+(u64)(s64)rel==GS_BASE+0x19cfc0ull){ if(t[i]==0xe8){ ne8++; if(zoom_site(va+5)>=0) inside++; } else ne9++; } }
+      ACHECK(ne8==62&&ne9==0&&inside==62); }
     #define ZSCREEN(W_,H_) do{ wrf(g,GX+0x18,(float)(W_)); wrf(g,GX+0x1c,(float)(H_)); wrf(g,GX+0x10,(float)(W_)); wrf(g,GX+0x14,(float)(H_)); wrf(g,GX+0x20,1); wrf(g,GX+0x24,1); wrf(g,GX+0x28,1); \
                                wrf(g,GX+0x38,512); wrf(g,GX+0x3c,416); wrf(g,GX+0x48,640); wrf(g,GX+0x4c,480); }while(0)   /* the GS frame values a run has (task 42's first-pass line) */
-    const u32 snan=0x7f812345u, v=fbits(512.0f), vz=fbits(588.8f);                              /* a signalling NaN (any write changes it), d, d x 1.15 */
+    const u32 snan=0x7f812345u, v=fbits(512.0f), vz=fbits(665.6f);                              /* a signalling NaN (any write changes it), d, d x 1.3 */
     const u64 RA=GS_BASE+0x19cc81ull;                                                          /* f_19cba0's call of f_19cad0 returns here */
-    u64 heap=ga_calloc(1,0x200);
-    /* A: the portrait screen, fill, the default zoom */
+    u64 heap=ga_calloc(1,0x200), sp=0;
+    /* A: the portrait screen, fill, the default zoom: two builds, the first (the exe's) stands */
     ZSCREEN(2007,2853);
-    for(int k=0;k<ZOOM_NCAM;k++){ u64 cam=CAM_CUR+CAM_SIZE*(u64)k; zt_cam=cam; zt_put=0; zt_calls=0;
-        wr32(g,cam+CAM_D,v); u64 e0=zs.edited[k]; zt_build(g,cam,RA);
-        ACHECK(zt_calls==1&&zt_seen==vz&&rd32(g,cam+CAM_D)==v&&zs.edited[k]==e0+1);              /* the body sees 588.8; the saved bits are back */
-        wr32(g,cam+CAM_D,snan); zt_build(g,cam,RA); ACHECK(zt_seen!=snan&&rd32(g,cam+CAM_D)==snan); /* written, and restored bit for bit */
-        zt_put=0x40490fdbu; u64 in0=zs.inside; wr32(g,cam+CAM_D,v); zt_build(g,cam,RA);
-        ACHECK(rd32(g,cam+CAM_D)==0x40490fdbu&&zs.inside==in0+1&&zs.edited[k]==e0+2); zt_put=0; }  /* the body wrote cam+0x40 itself: its value stays, counted */
-    { zt_cam=heap; wr32(g,heap+CAM_D,snan); u64 o0=zs.other; zt_build(g,heap,RA);                 /* an object-owned camera: nothing written, listed */
-      ACHECK(zt_seen==snan&&rd32(g,heap+CAM_D)==snan&&zs.other==o0+1&&n_zra==1&&zra[0].ra==RA&&zra[0].n==1);
-      zt_cam=CAM_PREV; wr32(g,CAM_PREV+CAM_D,snan); zt_build(g,CAM_PREV,RA+0x10);              /* a previous-frame copy is no build target */
-      ACHECK(zt_seen==snan&&rd32(g,CAM_PREV+CAM_D)==snan&&zs.other==o0+2&&n_zra==2&&zra[1].ra==RA+0x10);
-      zt_cam=heap; wr32(g,heap+CAM_D,v); u64 e0=zs.edited[ZC_MAPOBJ]; zt_build(g,heap,ZOOM_RA_MAPOBJ);   /* the map pass's per-object copy, by its return address */
-      ACHECK(zt_seen==vz&&rd32(g,heap+CAM_D)==v&&zs.edited[ZC_MAPOBJ]==e0+1&&zs.other==o0+2);
-      u64 b0=zs.badcam; zt_seen=0; zt_build(g,0,ZOOM_RA_MAPOBJ); ACHECK(zs.badcam==b0+1&&zt_seen==v); }   /* no camera: the body runs, counted */
-    /* identity: a screen that is not taller than wide, and the value 1 on the tall one: nothing is written at all */
+    for(int k=0;k<ZOOM_NCAM;k++){ u64 cam=CAM_CUR+CAM_SIZE*(u64)k; zt_cam=cam; zt_put=0;
+        memset(hp(g,cam),0,CAM_SIZE); wr32(g,cam+CAM_D,v); u64 e0=zs.edited[k]; zt_build(g,cam,RA,&sp);
+        ACHECK(zt_calls==2&&zt_seen[0]==v&&zt_seen[1]==vz&&zs.edited[k]==e0+1);                  /* 1: d, 2: d x 1.3 */
+        ACHECK(rd32(g,cam+CAM_D)==v&&rd32(g,cam+CAM_VP)==v&&rd32(g,cam+0x84)==(v^1u)&&rd32(g,cam+0xc4)==(v^2u)&&rd32(g,cam+CAM_PROJ)==(v^3u));   /* the camera: build 1 */
+        ACHECK(KH_RAX(g)==0x1000u&&rd32(g,sp-0x100)==(v^4u));                                 /* registers and the stack below the call: as build 1 left them */
+        ACHECK(zent[k][0].valid&&!memcmp(zent[k][0].pc_vp,&v,4)&&rd32(g,cam+CAM_VP)==v);
+        { u32 a,b; memcpy(&a,zent[k][0].z_vp,4); memcpy(&b,zent[k][0].z_pr,4); ACHECK(a==vz&&b==(vz^3u)); }   /* the noted draw matrices: build 2 */
+        wr32(g,cam+CAM_D,snan); zt_build(g,cam,RA,&sp); ACHECK(zt_calls==2&&zt_seen[0]==snan&&zt_seen[1]!=snan&&rd32(g,cam+CAM_D)==snan);   /* restored bit for bit */
+        ACHECK(zent[k][1].valid&&!memcmp(zent[k][1].pc_vp,&v,4)&&zent[k][0].valid);           /* the build before stays noted (the previous-frame copy) */
+        zt_put=0x40490fdbu; zt_put_on=2; u64 in0=zs.inside; wr32(g,cam+CAM_D,v); zt_build(g,cam,RA,&sp);   /* build 2 wrote cam+0x40 itself: build 1 stands, nothing noted */
+        ACHECK(rd32(g,cam+CAM_D)==v&&rd32(g,cam+CAM_VP)==v&&zs.inside==in0+1&&!zent[k][0].valid&&zs.edited[k]==e0+2);
+        zt_put_on=1; wr32(g,cam+CAM_D,v); zt_build(g,cam,RA,&sp);                              /* build 1 wrote it (the exe would): its value stays, build 2 from it */
+        ACHECK(rd32(g,cam+CAM_D)==0x40490fdbu&&zt_seen[1]==zoom_value(0x40490fdbu,1.3)&&zs.inside==in0+1&&zent[k][0].valid); zt_put=0; }
+    { zt_cam=heap; wr32(g,heap+CAM_D,snan); u64 o0=zs.other; zt_build(g,heap,RA,0);              /* an object-owned camera: one build, listed */
+      ACHECK(zt_calls==1&&zt_seen[0]==snan&&rd32(g,heap+CAM_D)==snan&&zs.other==o0+1&&n_zra==1&&zra[0].ra==RA&&zra[0].n==1);
+      zt_cam=CAM_PREV; wr32(g,CAM_PREV+CAM_D,snan); zt_build(g,CAM_PREV,RA+0x10,0);             /* a previous-frame copy is no build target */
+      ACHECK(zt_calls==1&&rd32(g,CAM_PREV+CAM_D)==snan&&zs.other==o0+2&&n_zra==2&&zra[1].ra==RA+0x10);
+      zt_cam=heap; wr32(g,heap+CAM_D,v); u64 e0=zs.edited[ZC_MAPOBJ]; zt_build(g,heap,ZOOM_RA_MAPOBJ,0);   /* the map pass's per-object copy: drawn only, zoomed */
+      ACHECK(zt_calls==2&&zt_seen[1]==vz&&rd32(g,heap+CAM_D)==v&&rd32(g,heap+CAM_VP)==vz&&rd32(g,heap+CAM_PROJ)==(vz^3u)&&rd32(g,heap+0x84)==(v^1u)&&rd32(g,heap+0xc4)==(v^2u));
+      ACHECK(zs.edited[ZC_MAPOBJ]==e0+1&&zs.other==o0+2);
+      u64 b0=zs.badcam; zt_build(g,0,ZOOM_RA_MAPOBJ,0); ACHECK(zs.badcam==b0+1&&zt_calls==1); }   /* no camera: one build, counted */
+    /* identity: a screen that is not taller than wide, and the value 1 on the tall one: one build, nothing written, nothing noted */
     { static const int wide[6][2]={{2853,2007},{1920,1080},{1920,1350},{2670,1878},{2000,2000},{2560,1080}}; u64 cam=CAM_CUR; zt_cam=cam;
       for(int i=0;i<7;i++){ if(i<6) ZSCREEN(wide[i][0],wide[i][1]); else { ZSCREEN(2007,2853); asp_zoom_tall=1.0; }
-          wr32(g,cam+CAM_D,snan); u64 id0=zs.identity, c0=zs.calls, o0=zs.other; zt_seen=0; zt_build(g,cam,RA);
-          ACHECK(zt_seen==snan&&rd32(g,cam+CAM_D)==snan&&zs.identity==id0+1&&zs.calls==c0+1&&zs.other==o0); }
-      asp_zoom_tall=2.0; wr32(g,cam+CAM_D,v); zt_build(g,cam,RA); ACHECK(zt_seen==fbits(1024.0f)&&rd32(g,cam+CAM_D)==v);   /* the range's ends */
-      asp_zoom_tall=1.5; zt_build(g,cam,RA); ACHECK(zt_seen==fbits(768.0f)&&rd32(g,cam+CAM_D)==v); asp_zoom_tall=ZOOM_DEFAULT; }
-    /* B: the real hooks and the lifted bodies, on the second scene camera */
-    { u64 cam=CAM_CUR+CAM_SIZE, prev=CAM_PREV+CAM_SIZE; static u8 Spc[CAM_SIZE], Sz[CAM_SIZE], Sref[CAM_SIZE], Sa[CAM_SIZE], Sb[CAM_SIZE];
-      float d0=rdf(g,GS_BASE+0x5b1390ull); int ok=0; ACHECK(d0==512.0f);
+          zent[0][0].valid=1; wr32(g,cam+CAM_D,snan); u64 id0=zs.identity, c0=zs.calls, o0=zs.other; zt_build(g,cam,RA,0);
+          ACHECK(zt_calls==1&&zt_seen[0]==snan&&rd32(g,cam+CAM_D)==snan&&zs.identity==id0+1&&zs.calls==c0+1&&zs.other==o0&&!zent[0][0].valid); }
+      asp_zoom_tall=1.89; wr32(g,cam+CAM_D,v); zt_build(g,cam,RA,0); ACHECK(zt_calls==2&&zt_seen[1]==fbits((float)(512.0*1.89))&&rd32(g,cam+CAM_D)==v);   /* the range's ends */
+      asp_zoom_tall=1.5; zt_build(g,cam,RA,0); ACHECK(zt_seen[1]==fbits(768.0f)&&rd32(g,cam+CAM_D)==v); asp_zoom_tall=ZOOM_DEFAULT;
+      /* a play mode ran in this game frame: one build, nothing noted */
+      zsup_have=1; zsup_frame=kh_game_frames(); zent[0][0].valid=1; u64 su0=zs.suppressed; zt_build(g,cam,RA,0);
+      ACHECK(zt_calls==1&&zt_seen[0]==v&&zs.suppressed==su0+1&&!zent[0][0].valid); zsup_have=0;
+      zt_build(g,cam,ZOOM_RA_MAPOBJ,0); ACHECK(zt_calls==2); zsup_have=1; zt_build(g,cam,ZOOM_RA_MAPOBJ,0); ACHECK(zt_calls==1); zsup_have=0; }
+    /* B: the real hooks and the lifted bodies, on both scene cameras */
+    { static u8 Spc[CAM_SIZE], Spc2[CAM_SIZE], Sref[CAM_SIZE], Sref2[CAM_SIZE], Sa[CAM_SIZE], Sb[CAM_SIZE];
+      float d0=rdf(g,GS_BASE+0x5b1390ull), d1=600.0f; ACHECK(d0==512.0f);
       ZSCREEN(2007,2853);
-      asp_mode=0; memset(hp(g,cam),0,CAM_SIZE); u64 c0=zs.calls; ACHECK(zt_init(g,cam,d0,RA)); memcpy(Spc,hp(g,cam),CAM_SIZE);   /* pc: the exe's build */
+      asp_mode=0; memset(hp(g,CAM_CUR),0,CAM_SIZE); u64 c0=zs.calls; ACHECK(zt_init(g,CAM_CUR,d0,RA)); memcpy(Spc,hp(g,CAM_CUR),CAM_SIZE);   /* pc: the exe's build */
       /* the numbers by hand: halfW = 256 + 85.33, halfH = 208; clip m00 = d sx / halfW = 512 * 0.8 / 341.33 = 1.2, m11 = d sy / 208 =
        * 512 * 0.86667 / 208 = 2.13333; the guard band divides by 2047 */
-      ACHECK(zs.calls==c0&&rd32(g,cam+CAM_D)==v&&near(zt_f(Spc,0x7c),341.33333,1e-3)&&zt_f(Spc,0x80)==208.0f);
+      ACHECK(zs.calls==c0&&rd32(g,CAM_CUR+CAM_D)==v&&near(zt_f(Spc,0x7c),341.33333,1e-3)&&zt_f(Spc,0x80)==208.0f);
       ACHECK(near(zt_f(Spc,0x84),1.2,1e-5)&&near(zt_f(Spc,0x98),2.1333333,1e-5)&&near(zt_f(Spc,0xc4),512.0*0.8/2047.0,1e-6)&&near(zt_f(Spc,0xd8),512.0*(13.0/15.0)/2047.0,1e-6));
-      asp_mode=1; memset(hp(g,cam),0,CAM_SIZE); u64 e0=zs.edited[ZC_SCENE1]; ACHECK(zt_init(g,cam,d0,RA)); memcpy(Sz,hp(g,cam),CAM_SIZE);   /* fill, tall: zoomed */
-      ACHECK(zs.edited[ZC_SCENE1]==e0+1&&zs.calls==c0+1&&rd32(g,cam+CAM_D)==v);                   /* through the hook (f_19dc50's tail jump); d reads back 512 */
-      ACHECK(!memcmp(Sz+0x40,Spc+0x40,0x44));                                                    /* d, the FOV angles, scales, near / far, halfW / halfH: the game's state is the exe's */
-      asp_mode=0; memset(hp(g,cam),0,CAM_SIZE); ACHECK(zt_init(g,cam,bf(vz),RA)); memcpy(Sref,hp(g,cam),CAM_SIZE);   /* the exe's own build for d = 588.8 */
-      ACHECK(!memcmp(Sz,Sref,0x40));                                                             /* cam+0x00, the 3D ViewProjection (and the marker projector's matrix) */
-      ACHECK(!memcmp(Sz+0x84,Sref+0x84,0x40));                                                   /* cam+0x84, the world-to-GS clip matrix (culling, on-screen tests) */
-      ACHECK(!memcmp(Sz+0xc4,Sref+0xc4,0x40));                                                   /* cam+0xc4, the guard-band clip matrix */
-      ACHECK(!memcmp(Sz+0x104,Sref+0x104,0x80));                                                 /* cam+0x104 projection, cam+0x144 screen matrix */
-      ACHECK(memcmp(Sz,Spc,0x40)!=0&&memcmp(Sz+0x84,Spc+0x84,0x40)!=0&&memcmp(Sz+0x104,Spc+0x104,0x40)!=0&&!memcmp(Sz+0x144,Spc+0x144,0x40));   /* another picture; the screen matrix has no d */
-      ACHECK(near(zt_f(Sz,0x84)/zt_f(Spc,0x84),1.15,1e-6)&&near(zt_f(Sz,0x98)/zt_f(Spc,0x98),1.15,1e-6)&&near(zt_f(Sz,0x84),1.38,1e-5)&&near(zt_f(Sz,0x98),2.4533333,1e-5));   /* both axes by the same z */
-      ACHECK(near(zt_f(Sz,0xc4)/zt_f(Spc,0xc4),1.15,1e-6)&&near(zt_f(Sz,0xd8)/zt_f(Spc,0xd8),1.15,1e-6));
-      ACHECK(near(zt_f(Sz,0x104)/zt_f(Spc,0x104),1.15,1e-6)&&near(zt_f(Sz,0x118)/zt_f(Spc,0x118),1.15,1e-6));
-      /* H2 on the zoomed camera: the zoomed m11 divided by r, restored (H2 is not changed by the zoom) */
-      { memcpy(hp(g,cam),Sz,CAM_SIZE); h2t_cam=cam; h2t_put=0; h2t_seen=0; H2Stat st={"selftest"}; st.warned=1; u32 m11=fbits(zt_f(Sz,CAM_M11)); double r=kh_aspect_r(2007,2853);
-        h2_around(g,cam,h2t_fn,&st);
-        ACHECK(st.edited==1&&h2t_seen==h2_value(m11,r)&&rd32(g,cam+CAM_M11)==m11&&near(bf(h2t_seen),2.4533333/r,1e-5)&&near(r,2.527155,1e-6)); }
-      /* the distance accessor through its hook: the built distance for the scene camera and its previous-frame copy, the stored one
-       * for any other camera, on a screen that is not taller than wide, with the value 1 and in pc */
-      memcpy(hp(g,cam),Sz,CAM_SIZE); asp_mode=1;
-      { u64 s0=zs.d_scaled[0], s1=zs.d_scaled[1], o0=zs.d_other, i0=zs.d_identity, n0=zs.d_calls;
-        ACHECK(zt_d(g,cam,&ok)==vz&&ok&&rd32(g,cam+CAM_D)==v&&zs.d_scaled[0]==s0+1);
-        ACHECK(vz==fbits(zt_f(Sref,CAM_D)));                                                     /* = the d of the reference build */
-        wr32(g,prev+CAM_D,v); ACHECK(zt_d(g,prev,&ok)==vz&&ok&&rd32(g,prev+CAM_D)==v&&zs.d_scaled[1]==s1+1);
-        wr32(g,heap+CAM_D,v); ACHECK(zt_d(g,heap,&ok)==v&&ok&&zs.d_other==o0+1);
-        wr32(g,cam+CAM_D,snan); ACHECK(zt_d(g,cam,&ok)!=snan&&ok);                              /* (a NaN shows the scaling: quieted) */
-        ZSCREEN(2853,2007); ACHECK(zt_d(g,cam,&ok)==snan&&ok&&zs.d_identity==i0+1);              /* landscape: the stored bits */
-        ZSCREEN(2007,2853); asp_zoom_tall=1.0; ACHECK(zt_d(g,cam,&ok)==snan&&ok&&zs.d_identity==i0+2); asp_zoom_tall=ZOOM_DEFAULT;
-        ACHECK(zs.d_calls==n0+6); asp_mode=0; ACHECK(zt_d(g,cam,&ok)==snan&&ok&&zs.d_calls==n0+6); asp_mode=1; }   /* pc: the hook counts nothing */
+      memset(hp(g,CAM_CUR),0,CAM_SIZE); ACHECK(zt_init(g,CAM_CUR,bf(vz),RA)); memcpy(Sref,hp(g,CAM_CUR),CAM_SIZE);   /* the exe's own build for d = 665.6 */
+      memset(hp(g,CAM_CUR),0,CAM_SIZE); ACHECK(zt_init(g,CAM_CUR,d1,RA)); memcpy(Spc2,hp(g,CAM_CUR),CAM_SIZE);       /* and for d = 600, 780 */
+      memset(hp(g,CAM_CUR),0,CAM_SIZE); ACHECK(zt_init(g,CAM_CUR,bf(zoom_value(fbits(d1),1.3)),RA)); memcpy(Sref2,hp(g,CAM_CUR),CAM_SIZE);
+      asp_mode=1;
+      for(int k=0;k<ZOOM_NCAM;k++){ u64 cam=CAM_CUR+CAM_SIZE*(u64)k, prev=CAM_PREV+CAM_SIZE*(u64)k; wr32(g,CAM_IDX,(u32)k);
+        /* the build through the hook (f_19dc50's tail jump): the camera is the exe's build, all 0x184 bytes; the noted matrices are the
+         * exe's build for d x 1.3, both axes by 1.3 */
+        memset(hp(g,cam),0,CAM_SIZE); u64 e0=zs.edited[k]; ACHECK(zt_init(g,cam,d0,RA)); ACHECK(zs.edited[k]==e0+1&&!memcmp(hp(g,cam),Spc,CAM_SIZE));
+        ACHECK(zent[k][0].valid&&!memcmp(zent[k][0].pc_vp,Spc+CAM_VP,0x40)&&!memcmp(zent[k][0].pc_pr,Spc+CAM_PROJ,0x40));
+        ACHECK(!memcmp(zent[k][0].z_vp,Sref+CAM_VP,0x40)&&!memcmp(zent[k][0].z_pr,Sref+CAM_PROJ,0x40));
+        ACHECK(memcmp(Sref,Spc,0x40)!=0&&near(zt_f(Sref,0x104)/zt_f(Spc,0x104),1.3,1e-6)&&near(zt_f(Sref,0x118)/zt_f(Spc,0x118),1.3,1e-6));
+        /* f_19cfc0 through its hook: a D site gets a copy (the camera with the zoomed cam+0x00 / +0x104), a G site the camera */
+        u64 m0=zs.d_copy[0]; u64 r=zt_get(g,1,0x18695c);                                     /* the map pass */
+        ACHECK(kh_aspect_zoom_shadow(r)&&r!=cam&&zs.d_copy[0]==m0+1);
+        if(kh_aspect_zoom_shadow(r)){ const u8 *s=hp(g,r);
+            ACHECK(!memcmp(s,Sref,0x40)&&!memcmp(s+0x40,Spc+0x40,0xc4)&&!memcmp(s+CAM_PROJ,Sref+CAM_PROJ,0x40)&&!memcmp(s+0x144,Spc+0x144,0x40)); }
+        ACHECK(zt_get(g,1,0x1b5f25)==cam&&zt_get(g,1,0x3f3ef0)==cam&&zt_get(g,1,0x176740)==cam&&zt_get(g,1,0x430ecb)==cam);   /* kn, YS, the framing, the script syscall */
+        /* the clip matrix (f_19d040, kn's return address) and the distance (f_19d010) of the camera and of its copy are the exe's */
+        { int ok=0; u64 c=st_call_ra(g,f_19d040,GS_BASE+0x1b5f2dull,KH_RDI(g),(u64[]){cam},1,&ok); ACHECK(ok&&c==cam+0x84&&!memcmp(hp(g,c),Spc+0x84,0x80)); }
+        ACHECK(zt_d(g,cam)==v&&fbits(zt_f(hp(g,r),CAM_D))==v);
+        /* the next frame as f_19cba0 makes it: the previous-frame copy, then a build with another distance */
+        memcpy(hp(g,prev),hp(g,cam),CAM_SIZE); ACHECK(zt_init(g,cam,d1,RA)&&!memcmp(hp(g,cam),Spc2,CAM_SIZE)&&zt_d(g,prev)==v&&zt_d(g,cam)==fbits(d1));
+        wr8(g,CAM_SEL,0); u64 p0=zs.d_copy[1];
+        r=zt_get(g,0,0x166719);                                                                /* dk f_1666f0, cl = 0: the previous-frame copy */
+        ACHECK(kh_aspect_zoom_shadow(r)&&zs.d_copy[1]==p0+1&&!memcmp(hp(g,r),Sref,0x40)&&!memcmp((u8*)hp(g,r)+CAM_PROJ,Sref+CAM_PROJ,0x40)&&!memcmp((u8*)hp(g,r)+0x40,Spc+0x40,0xc4));
+        ACHECK(zt_get(g,0,0x1cb3b5)==prev);                                                    /* the target search (G) gets the copy itself */
+        r=zt_get(g,1,0x2bd4ec);                                                                /* the effect pass on the current camera: the new build */
+        ACHECK(kh_aspect_zoom_shadow(r)&&!memcmp(hp(g,r),Sref2,0x40)&&!memcmp((u8*)hp(g,r)+CAM_PROJ,Sref2+CAM_PROJ,0x40)&&!memcmp((u8*)hp(g,r)+0x40,Spc2+0x40,0xc4));
+        wr8(g,CAM_SEL,1); ACHECK(zt_get(g,0,0x18ef29)!=cam&&kh_aspect_zoom_shadow(zt_get(g,0,0x18ef29)));   /* byte 0x140ac183c set: cl = 0 gives the current camera */
+        /* H2 on the camera (the exe's m11) and on a copy (the copy's m11: the exe's too), divided by r and restored */
+        { double rr=kh_aspect_r(2007,2853); u64 s=zt_get(g,1,0x18695c); H2Stat st={"selftest"}; st.warned=1; u32 m11=rd32(g,cam+CAM_M11);
+          h2t_cam=cam; h2t_put=0; h2t_seen=0; h2_around(g,cam,h2t_fn,&st); ACHECK(st.edited==1&&h2t_seen==h2_value(m11,rr)&&rd32(g,cam+CAM_M11)==m11);
+          h2t_cam=s; h2t_seen=0; h2_around(g,s,h2t_fn,&st); ACHECK(st.edited==2&&st.badcam==0&&h2t_seen==h2_value(m11,rr)&&rd32(g,s+CAM_M11)==m11&&near(rr,2.527155,1e-6)); }
+        /* a play mode (M site) in this game frame: D sites get the camera; landscape: the camera; a camera built at zoom 1: no noted
+         * build matches, the camera */
+        u64 n0=zs.d_supp; ACHECK(zt_get(g,1,0x1f3e39)==cam&&zsup_have&&zt_get(g,1,0x18695c)==cam&&zs.d_supp==n0+1); zsup_have=0;
+        ZSCREEN(2853,2007); n0=zs.d_z1; ACHECK(zt_get(g,1,0x18695c)==cam&&zs.d_z1==n0+1);
+        n0=zs.identity; ACHECK(zt_init(g,cam,d0,RA)&&zs.identity==n0+1&&!zent[k][0].valid); ZSCREEN(2007,2853);   /* landscape build: one, nothing noted */
+        n0=zs.d_nomatch; ACHECK(zt_get(g,1,0x18695c)==cam&&zs.d_nomatch==n0+1);
+        n0=zs.s_unknown; ACHECK(zt_get(g,1,0x18695d)==cam&&zs.s_unknown==n0+1);               /* an unknown return address: the camera, counted */
+        /* pc: the hook is the lifted body, nothing counted */
+        asp_mode=0; n0=zs.s_calls; ACHECK(zt_init(g,cam,d0,RA)&&zt_get(g,1,0x18695c)==cam&&zs.s_calls==n0); asp_mode=1; }
+      ACHECK(zs.site[zoom_site(GS_BASE+0x18695cull)]>=2*ZOOM_NCAM&&zs.d_other==0&&zs.d_thread==0);
       /* identity through the real hook: fill on screens that are not taller than wide, and the value 1 on the tall one, build what pc
-       * builds, bit for bit (all 0x184 bytes) */
-      { static const int scr[5][2]={{2853,2007},{1920,1080},{2670,1878},{1920,1350},{2007,2853}};
+       * builds, bit for bit (all 0x184 bytes), and nothing is noted */
+      { static const int scr[5][2]={{2853,2007},{1920,1080},{2670,1878},{1920,1350},{2007,2853}}; u64 cam=CAM_CUR+CAM_SIZE;
         for(int i=0;i<5;i++){ ZSCREEN(scr[i][0],scr[i][1]); asp_zoom_tall=i==4?1.0:ZOOM_DEFAULT;
             asp_mode=0; memset(hp(g,cam),0,CAM_SIZE); ACHECK(zt_init(g,cam,d0,RA)); memcpy(Sa,hp(g,cam),CAM_SIZE);
             asp_mode=1; memset(hp(g,cam),0,CAM_SIZE); u64 id0=zs.identity; ACHECK(zt_init(g,cam,d0,RA)); memcpy(Sb,hp(g,cam),CAM_SIZE);
-            ACHECK(!memcmp(Sa,Sb,CAM_SIZE)&&zs.identity==id0+1&&near(zt_f(Sb,0x84),1.2,1e-5)); }
+            ACHECK(!memcmp(Sa,Sb,CAM_SIZE)&&zs.identity==id0+1&&near(zt_f(Sb,0x84),1.2,1e-5)&&!zent[1][0].valid); }
         asp_zoom_tall=ZOOM_DEFAULT; }
-      /* the map pass's per-object build through the real hook (return address 0x140188312): zoomed; an object-owned camera: the exe's */
+      /* the map pass's per-object build through the real hook (return address 0x140188312): the zoomed draw matrices, the rest the exe's;
+       * an object-owned camera: the exe's */
       ZSCREEN(2007,2853); asp_mode=1;
       memset(hp(g,heap),0,CAM_SIZE); ACHECK(zt_init(g,heap,d0,ZOOM_RA_MAPOBJ));
-      ACHECK(!memcmp(hp(g,heap),Sref,0x40)&&!memcmp((u8*)hp(g,heap)+0x84,Sref+0x84,0x100)&&rd32(g,heap+CAM_D)==v);
+      ACHECK(!memcmp(hp(g,heap),Sref,0x40)&&!memcmp((u8*)hp(g,heap)+CAM_PROJ,Sref+CAM_PROJ,0x40)&&!memcmp((u8*)hp(g,heap)+0x40,Spc+0x40,0xc4)&&!memcmp((u8*)hp(g,heap)+0x144,Spc+0x144,0x40));
       memset(hp(g,heap),0,CAM_SIZE); ACHECK(zt_init(g,heap,d0,RA)); ACHECK(!memcmp(hp(g,heap),Spc,CAM_SIZE)); }
     #undef ZSCREEN
     ga_free(heap);
-    memcpy(hp(g,CAM_CUR),ccsave,sizeof ccsave); memcpy(hp(g,CAM_PREV),cpsave,sizeof cpsave);
+    memcpy(hp(g,CAM_CUR),ccsave,sizeof ccsave); memcpy(hp(g,CAM_PREV),cpsave,sizeof cpsave); wr32(g,CAM_IDX,sidx); wr8(g,CAM_SEL,ssel);
     wr32(g,GX_GUARD,guard); memcpy(hp(g,GX),gxsave,0x100);
     kh_aspect_log=slog; asp_mode=sm; asp_zoom_set=szs; asp_zoom_tall=szt; asp_nocull=snc; memcpy(&zs,&sst,sizeof zs); memcpy(zra,sra,sizeof zra); n_zra=snra; zra_cut=scut;
+    memcpy(zua,sua,sizeof zua); n_zua=snua; zua_cut=sucut; memcpy(zent,sent,sizeof zent); zsup_frame=ssf; zsup_have=ssh;
 }
 
 int kh_aspect_selftest(KCtx *g){
@@ -2570,10 +3127,20 @@ int kh_aspect_selftest(KCtx *g){
         ACHECK(fatal_case(16,"aspect-m-drawlog-value: KHNMC_ASPECT_M_DRAWLOG=x.tsv@1-2,")); ACHECK(fatal_case(17,"aspect-m-drawlog-open: KHNMC_ASPECT_M_DRAWLOG: cannot create /nonexistent-khnmc-dir/x.tsv"));
         ACHECK(fatal_case(18,"fov-zoom-value-range: KHNMC_FOV_ZOOM=2.5 ")); ACHECK(fatal_case(19,"fov-zoom-value-range: KHNMC_FOV_ZOOM=0.99 "));   /* task 49 */
         ACHECK(fatal_case(20,"fov-zoom-value-malformed: KHNMC_FOV_ZOOM=1,15 ")); ACHECK(fatal_case(21,"fov-zoom-value-malformed: KHNMC_FOV_ZOOM=1.15x "));
-        ACHECK(fatal_case(22,"kh: aspect: zoom (task 49): 1.3 on a screen taller than wide (KHNMC_FOV_ZOOM)"));
-        ACHECK(fatal_case(23,"kh: aspect: NOTE: fov-zoom-not-applied: KHNMC_FOV_ZOOM=1.3 is set, but KHNMC_ASPECT is pc"));
-        ACHECK(fatal_case(24,"kh: aspect: zoom (task 49): 1.15 on a screen taller than wide (the default")); }
-    else kh_selftest_not_run("aspect","the 18 named fatals of KHNMC_SCREEN / KHNMC_ASPECT* and the 7 KHNMC_FOV_ZOOM value cases (no child process)",25);
+        ACHECK(fatal_case(22,"kh: aspect: zoom (task 49): 1.15 on a screen taller than wide (KHNMC_FOV_ZOOM)"));
+        ACHECK(fatal_case(23,"kh: aspect: NOTE: fov-zoom-not-applied: KHNMC_FOV_ZOOM=1.15 is set, but KHNMC_ASPECT is pc"));
+        ACHECK(fatal_case(24,"kh: aspect: zoom (task 49): 1.3 on a screen taller than wide (the default"));
+        ACHECK(fatal_case(25,"hud-scale-value-range: KHNMC_HUD_SCALE_CMD=3.5 ")); ACHECK(fatal_case(26,"hud-scale-value-range: KHNMC_HUD_SCALE_HP=0.4 "));   /* task 53 */
+        ACHECK(fatal_case(27,"hud-scale-value-malformed: KHNMC_HUD_SCALE_CMD=1,25 ")); ACHECK(fatal_case(28,"hud-scale-value-malformed: KHNMC_HUD_SCALE_HP=1.5x "));
+        ACHECK(fatal_case(29,"kh: aspect: HUD scale (task 53): command menu 2 (KHNMC_HUD_SCALE_CMD), player gauges 1 (KHNMC_HUD_SCALE_HP) on a screen taller than wide"));
+        ACHECK(fatal_case(30,"kh: aspect: NOTE: hud-scale-not-applied: KHNMC_HUD_SCALE_CMD is set, but KHNMC_ASPECT is pc"));
+        ACHECK(fatal_case(31,"kh: aspect: HUD scale (task 53): command menu 1.25 (default), player gauges 1.5 (default) on a screen taller than wide"));
+        ACHECK(fatal_case(32,"title-layout-value: KHNMC_TITLE_LAYOUT=wide (known: portrait, band)"));          /* task 53 item 2 */
+        ACHECK(fatal_case(33,"kh: aspect: NOTE: title-layout-not-applied: KHNMC_TITLE_LAYOUT=band is set, but KHNMC_ASPECT is pc"));
+        ACHECK(fatal_case(34,"kh: aspect: title layout (task 53): band (today's placement) on a screen taller than wide (KHNMC_TITLE_LAYOUT)"));
+        ACHECK(fatal_case(36,"kh: aspect: title layout (task 53): portrait on a screen taller than wide (the default"));
+        ACHECK(fatal_case(37,"fov-zoom-value-range: KHNMC_FOV_ZOOM=2.0 (allowed: 1.0 to 1.89"));   /* task 49 fix: finding 3 range */ }
+    else kh_selftest_not_run("aspect","the named fatals and value cases of KHNMC_SCREEN / KHNMC_ASPECT* / KHNMC_FOV_ZOOM / KHNMC_HUD_SCALE_* / KHNMC_TITLE_LAYOUT (no child process)",37);
     asp_off_h7=0; h7_selftest(g); asp_off_h7=s_h7;
     fprintf(stderr,"kh: aspect selftest: %d checks, %d failures\n",schecks,sfails);
     return sfails;
