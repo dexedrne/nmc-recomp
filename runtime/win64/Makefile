@@ -158,14 +158,14 @@ RTSRC += $(ROOT)/runtime/ios/audio_coreaudio.c
 CFLAGS += -DKH_AUDIO_COREAUDIO=1
 COREAUDIO_LDFLAGS = -framework AudioToolbox -framework CoreFoundation
 endif
-RTOBJ = $(patsubst $(ROOT)/runtime/%.c,$(O)/%.o,$(RTSRC))
+RTOBJ = $(O)/cheat_drop.o $(patsubst $(ROOT)/runtime/%.c,$(O)/%.o,$(RTSRC))
 LIFTOBJ = $(O)/khrt_cpu.o $(O)/khrt_rcp_tab.o $(O)/rt_libm.o $(O)/kh_table.o $(O)/rt_imports_default.o $(O)/nep_stubs.o
 # link-time entry probes (runtime/gxwrap.c): ld --wrap on Linux, renamed definitions + generated forwarders with HOOKMODE=rename
 WRAP_FNS = 11d070 11d0a0 124060 10e860 11c150 127ed0 129110
 comma := ,
 WRAP = $(patsubst %,-Wl$(comma)--wrap=f_%,$(WRAP_FNS))
 PHASE_HOOKS = 1505a0 5111d0 5122e0 511300 13da10 13d260 405440 3f29e0 3c12f0 2b4590 4f94b0
-DIFFICULTY_HOOKS = 1523a0 152370 3ed7d0 3edf90 3c4b80 3c3da0
+DIFFICULTY_HOOKS = 17ca70 418f30 3fc7a0 3fcbe0 3fc350 3fc2d0 3f1e20 27a740 3c0860 3c20a0 3a14b0 3f2030 3a5650 3c0b50 3dbea0 404d00 405030 408520 421d60 3d3cf0 3ecf30 3dc170 1523a0 152370 3ed7d0 3edf90 3c4b80 3c3da0
 MOD_A_HOOKS = 2fc860 2fc4e0 4014a0 3a7cb0 29efa0 3a89a0 3d61d0 3d60c0   # 405440 is already in PHASE_HOOKS
 # Task 23 (runtime/mod_hooks_b.c): the mod DLL detours that were still missing.  3f29e0 is already in PHASE_HOOKS (the phase counter runs first).
 MOD_B_HOOKS = 3f27d0 3c4780 351390 368820 4060e0 3d1730 3f65a0 3f6620 3f6510 3a17f0 153850 15aab0 15aba0 31dd70
@@ -176,7 +176,7 @@ STREAM_HOOKS = 106da0 106fa0 106b40      # OpenStream / ReadStream / CloseStream
 BGLOAD_HOOKS = 3a0c60 15edd0 3f99e0 3f9850 3a64f0 3a0aa0 3a0b30 3a0bd0 19c470 4ad270
 # scripted input clock (runtime/null_input.c): 0x105e10 is called once per game frame (end-of-frame task and the settings menu loop)
 # Task 27: 0x2b7420 = the New Game menu task (runtime/phase_log.c: alive between entry and return; the route's newgame-* conditions)
-INPUT_HOOKS = 105e10 2b7420
+INPUT_HOOKS = 3a0660 105e10 2b7420
 # Save-point Xion prototype, including the native pre-use boundaries and MICKEY lifecycle.
 INPUT_HOOKS += 3dca50 3ed110 3d5c70 4151e0 414dd0 3e2eb0 414e30 414eb0 4150e0 415380 416030 416100 3ac350 3a24c0 152990 2ed0e0 2ed110 3ad540 2e4950
 # Task 30 (diagnostic, runtime/route_state.c, KHNMC_TRACE_PLACE=1): YS::OBJ::set_pos 0x3b64d0 / 0x3b6510 and the rotation setters 0x3b6420 / 0x3b6560, passed through
@@ -245,7 +245,7 @@ MOD_STATIC_REPLACED = 3f29e0
 # of the table in implementation notes section 2; re-derived from the DLL: no reference to the slot between the handler's start and its
 # INT3 padding).  The runtime object that defines f_<rva> must not reference orig_f_<rva>: a forward to the vanilla body is a path
 # the PC game does not have (tools/check_mod_static_link.py --dll-replaces fails the build).
-MOD_DLL_REPLACES = 29efa0 4014a0 3a9cf0 3c4b80 351390 2fc860 2fc4e0 3ed7d0 3c12f0 1f9a80 3f29e0 3f27d0 15aba0 15aab0 153850 3edf90
+MOD_DLL_REPLACES = 3a9cf0 3c4b80 351390 2fc860 2fc4e0 3ed7d0 3c12f0 1f9a80 3f29e0 3f27d0 15aba0 15aab0 153850 3edf90
 GEN ?= $(ROOT)/gen
 MOD_EDITS ?= /home/user/projects/kh2-nmc-analysis/scratch/mod-gummi/edit_list.json
 MOD_EXE ?= $(ROOT)/pc/kh2fm.exe
@@ -423,6 +423,9 @@ $(O)/ordered_mem.o: CFLAGS += -DKH_OM_SHARDS=$(words $(SHARD_NAMES))
 ifeq ($(ORDERED_MEM),1)
 $(SHARD_OBJ) $(RTOBJ) $(LIFTOBJ) $(O)/loader_app.o $(O)/hook_forwarders.o: $(wildcard $(ROOT)/lifter-rt/*.h)
 endif
+$(OL)/hooks.list: FORCE
+	@mkdir -p $(OL); echo "hooks: $(strip $(HOOKS_UNIQ)) wrap: $(strip $(WRAP_FNS))" | cmp -s - $@ || echo "hooks: $(strip $(HOOKS_UNIQ)) wrap: $(strip $(WRAP_FNS))" > $@
+FORCE:
 ifeq ($(HOOKMODE),objcopy)
 $(OL)/lifted/%.o: $(SHARDS_DIR)/%.c
 	@mkdir -p $(OL)/lifted && $(CC) $(LIFT_CFLAGS) -c $< -o $@
@@ -430,17 +433,13 @@ $(OL)/libkh2lifted.a: $(SHARD_OBJ)
 	@test -n "$(SHARD_OBJ)" || { echo "no shard_*.c in $(SHARDS_DIR)" >&2; exit 1; }
 	rm -f $@ && ar rcs $@ $(SHARD_OBJ)
 # Weak definitions also allow same-shard relocations to bind to the runtime hooks.
-$(OL)/libkh2loose.a: $(LIFTLIB) Makefile tools/alias_file_hooks.py
+$(OL)/libkh2loose.a: $(LIFTLIB) Makefile tools/alias_file_hooks.py $(OL)/hooks.list
 	@mkdir -p $(OL)
 	python3 tools/alias_file_hooks.py $< $@ $(FILE_HOOKS)
 HOOK_LINK = $(WRAP)
 else
 # HOOKMODE=rename: the generated copy of the shards.  The stamp reruns the generator when a shard, the hook lists (Makefile) or the
 # tool changes; the generator rewrites only files whose content changed, so unchanged shards are not recompiled.
-# the expanded hook lists as a file that changes only when the lists do (also when they are overridden on the command line)
-$(OL)/hooks.list: FORCE
-	@mkdir -p $(OL); echo "hooks: $(strip $(HOOKS_UNIQ)) wrap: $(strip $(WRAP_FNS))" | cmp -s - $@ || echo "hooks: $(strip $(HOOKS_UNIQ)) wrap: $(strip $(WRAP_FNS))" > $@
-FORCE:
 $(OL)/shards/.stamp: $(wildcard $(SHARDS_DIR)/shard_*.c) Makefile tools/hook_shards.py $(OL)/hooks.list
 	@mkdir -p $(OL)/shards
 	python3 tools/hook_shards.py shards $(SHARDS_DIR) $(OL)/shards --hooks $(HOOKS_UNIQ) --wrap $(WRAP_FNS)
@@ -468,6 +467,11 @@ endif
 all: $(O)/hook_link.ok
 $(O)/hook_link.ok: $(BIN) tools/check_hook_link.py
 	python3 tools/check_hook_link.py --bin $(BIN) --objs $(RTOBJ) $(LIFTOBJ) $(HOOK_OBJ) --hooks $(HOOKS_UNIQ) --wrap $(WRAP_FNS) $(if $(HOOK_OBJ),--forwarders $(HOOK_OBJ)) $(if $(filter 1,$(HOOK_STRICT)),--strict) && touch $@
+$(O)/cheat_drop.c: $(addprefix $(SHARDS_DIR)/shard_,0051.c 0076.c 0079.c 0081.c 0083.c 0085.c 0087.c) tools/tweak_lift.py
+	@mkdir -p $(O)
+	python3 tools/tweak_lift.py $(SHARDS_DIR) > $@.new && mv $@.new $@
+$(O)/cheat_drop.o: $(O)/cheat_drop.c
+	$(CC) $(LIFT_CFLAGS) -c $< -o $@
 $(O)/%.o: $(ROOT)/runtime/%.c $(wildcard $(ROOT)/runtime/*.h)
 	@mkdir -p $(@D) && $(CC) $(CFLAGS) -c $< -o $@
 $(O)/khrt_cpu.o: $(ROOT)/lifter-rt/khrt_cpu.c
@@ -562,8 +566,11 @@ endif
 $(O)/xion_swap.o: $(ROOT)/runtime/xion_fields.inc
 $(O)/mod_neverland.o $(O)/mod_neverland_test.o: $(GEN)/mod_neverland_table.h
 $(O)/moose.o: $(GEN)/mod_moose_table.h
-$(O)/mod_static.o: $(GEN)/mod_static_table.h
-$(O)/mod_static_lifted.o: $(GEN)/mod_static_lifted.c
+$(O)/mod_static.o $(O)/tweak_options.o: $(GEN)/mod_static_table.h
+$(O)/tweak_static.c: $(GEN)/mod_static_lifted.c $(GEN)/mod_static_table.h tools/tweak_static.py
+	@mkdir -p $(O)
+	python3 tools/tweak_static.py $< $(GEN)/mod_static_table.h > $@.new && mv $@.new $@
+$(O)/mod_static_lifted.o: $(O)/tweak_static.c
 	@mkdir -p $(O) && $(CC) $(LIFT_CFLAGS) -c $< -o $@
 all: $(O)/mod_static_link.ok
 $(O)/mod_static_link.ok: $(BIN) tools/check_mod_static_link.py

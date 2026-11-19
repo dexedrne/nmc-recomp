@@ -61,6 +61,8 @@ int kh_mod_site_360a5a(KCtx *g){
         u16 w=LD(u16,ent); cmp_flags(g,1,(u64)w,(u64)di);
         if((s16)w<(s16)di) return 1;
     }
+    extern int kh_patch_ability_categories;
+    if(!kh_patch_ability_categories) return 0;
     u16 k=LD(u16,info+0xc);
     cmp_flags(g,1,(u64)k,(u64)1);
     if(k!=1) return 0;

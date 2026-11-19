@@ -311,6 +311,7 @@ static int selftest_all(KCtx *g){
     { extern int kh_gfx_vklog_selftest(void); fails+=kh_gfx_vklog_selftest(); }   /* review C43 n=2: vkd3d's log, de-duplicated (null_d3d12.c) */
     { extern int kh_ordered_mem_selftest(KCtx *); fails+=kh_ordered_mem_selftest(g); }   /* task 39: KH_ORDERED_MEM (runtime/ordered_mem.c) */
     { extern int kh_loader_selftest(void); fails+=kh_loader_selftest(); }      /* review U35 n=24: the bias-mode reservation keeps its low guard or is a named fatal */
+    { extern int kh_autosave_selftest(KCtx *); fails+=kh_autosave_selftest(g); }
     { extern int kh_xion_selftest(void); fails+=kh_xion_selftest(); }
     input_selftest(g);
     { extern int kh_input_hold_selftest(KCtx *); fails+=kh_input_hold_selftest(g); }

@@ -1,5 +1,6 @@
 #include <math.h>
 #include "xion_swap.h"
+#include "autosave.h"
 #include "route_state.h"
 
 #define VA(rva) (GS_BASE+(rva))
@@ -212,7 +213,9 @@ void kh_xion_reset(KCtx *g){
 void orig_f_2ed0e0(KCtx *);
 void f_2ed0e0(KCtx *g){
     if(kh_xion_enabled) kh_xion_reset(g);
+    int menu_load=rd64(g,KH_RSP(g))==VA(0x2e59b6);
     orig_f_2ed0e0(g);
+    if(menu_load) kh_autosave_load(g);
     if(kh_xion_enabled) kh_warn("xion-swap: loaded Roxas, save EXP %u munny %u",rd32(g,VA(0x9acf90)),rd32(g,VA(0x9abcf0)));
 }
 BOUNDARY(2e4950,"system menu",0)

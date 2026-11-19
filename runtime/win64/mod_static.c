@@ -82,6 +82,8 @@ void kh_mod_static_init(KCtx *g){
     kh_mod_dual_slots_va=ga_alloc(sizeof kh_mod_dual_slots_image,16);
     if(!kh_mod_dual_slots_va) kh_fatal(g,"mod-static: guest allocation of the dual-wield slot block failed");
     memcpy(hp(g,kh_mod_dual_slots_va),kh_mod_dual_slots_image,sizeof kh_mod_dual_slots_image);
+    extern void kh_tweak_static_options(KCtx *,u64);
+    kh_tweak_static_options(g,nmc);
     applied=1;
     fprintf(stderr,"kh: mod static: %d edits verified and applied (%d code / %d .rdata / %d .data; %d+%d+%d bytes), buffer 0x%llx+0x%x (%d init bytes), %d re-lifted functions linked\n",
             KH_MOD_STATIC_NEDITS,KH_MOD_STATIC_NCODE,KH_MOD_STATIC_NRDATA,KH_MOD_STATIC_NDATA,KH_MOD_STATIC_CODE_BYTES,KH_MOD_STATIC_RDATA_BYTES,KH_MOD_STATIC_DATA_BYTES,

@@ -261,7 +261,8 @@ void kh_mod_syscalls_init(KCtx *g){
     if(rd64(g,GS_BASE+0x7534a8)) kh_fatal(g,"expected empty vanilla syscall table 3");
     table=ga_calloc(114,16); drive_multiplier=ga_alloc(4,16); sstm_name=ga_strdup("sstm");
     if(!table || !drive_multiplier || !sstm_name) kh_fatal(g,"mod syscall allocation failed");
-    wr32(g,drive_multiplier,0x3f800000); /* shipped DLL drive_add_mult=1.0 */
+    float initial_drive=getenv("KHNMC_TWEAK_COMBAT_DRIVE_ADD_MULT")?strtof(getenv("KHNMC_TWEAK_COMBAT_DRIVE_ADD_MULT"),NULL):1.0f;
+    memcpy(hp(g,drive_multiplier),&initial_drive,4); /* shipped DLL drive_add_mult=1.0 */
     for(int i=0;i<114;i++){
         char name[128]; snprintf(name,sizeof name,"mod.syscall.3.%d.%s",i,entries[i].name);
         targets[i]=kh_host_fn(name,syscall_handler);

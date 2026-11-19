@@ -47,11 +47,11 @@ static void xmm_d(KCtx *g,int i,double f){ v128 o=VZ; memcpy(&o,&f,8); KH_XMM(g,
 
 /* ---- DLL 2da30 -> exe 2fc860 ------------------------------------------------------------------------------------------------ */
 /* cmp ecx,[six ini slots]; sete al / mov al,1.  Only AL is written: RAX bits 8..63 survive.  Slots (dualwield_forms=0,2,3,0,5,0). */
-static const u32 dual_slots[6]={0,2,3,0,5,0};
+u32 kh_dual_forms[6]={0,2,3,0,5,0};
 void f_2fc860(KCtx *g){
     enter(H_2FC860);
     u32 form=(u32)A0(g); u32 in=0;
-    for(int i=0;i<6;i++) if(form==dual_slots[i]) in=1;
+    for(int i=0;i<6;i++) if(form==kh_dual_forms[i]) in=1;
     if(in) extensions[H_2FC860]++;
     KH_RAX(g)=(KH_RAX(g)&~255ull)|in;
     KH_RET(g);
@@ -60,8 +60,8 @@ void f_2fc860(KCtx *g){
 void f_2fc4e0(KCtx *g){
     enter(H_2FC4E0);
     u32 mask=0;
-    for(int i=0;i<6;i++) if(dual_slots[i]==0) mask|=1;
-    for(u32 k=1;k<=6;k++) for(int i=0;i<6;i++) if(dual_slots[i]==k) mask|=1u<<k;
+    for(int i=0;i<6;i++) if(kh_dual_forms[i]==0) mask|=1;
+    for(u32 k=1;k<=6;k++) for(int i=0;i<6;i++) if(kh_dual_forms[i]==k) mask|=1u<<k;
     KH_RAX(g)=mask;
     KH_RET(g);
 }
@@ -81,6 +81,8 @@ static void ability_levels(KCtx *g,u64 t){
 /* 15-bit sign decode of an entry with bit 15 set: add cx,cx / movsx / sar 1. */
 static s32 ability_decode(u16 e){ return (s32)(s16)(u16)(e<<1)>>1; }
 void f_4014a0(KCtx *g){
+    extern int kh_patch_ability_categories; void orig_f_4014a0(KCtx *);
+    if(!kh_patch_ability_categories){orig_f_4014a0(g);return;}
     enter(H_4014A0);
     u64 list=A0(g), sheet=rd64(g,list+0x28);
     if(!sheet) kh_fatal(g,"mod 4014a0: ability list %llx has no actor block at +28 (the DLL would fault)",(unsigned long long)list);
@@ -111,6 +113,8 @@ void f_4014a0(KCtx *g){
 
 /* ---- DLL 32780 -> exe 3a7cb0 (solo_summon_fix) --------------------------------------------------------------------------------- */
 void f_3a7cb0(KCtx *g){
+    extern int kh_solo_summon_fix; void orig_f_3a7cb0(KCtx *);
+    if(!kh_solo_summon_fix){orig_f_3a7cb0(g);return;}
     enter(H_3A7CB0);
     u64 rcx=A0(g),rdx=A1(g),r8=A2(g),r9=A3(g);
     v128 xs[4]; for(int i=0;i<4;i++) xs[i]=KH_XMM(g,i);
@@ -127,6 +131,8 @@ void f_3a7cb0(KCtx *g){
 
 /* ---- DLL 2d190 -> exe 29efa0 (shopface_fix, full replacement) ------------------------------------------------------------------ */
 void f_29efa0(KCtx *g){
+    extern int kh_shopface_fix; void orig_f_29efa0(KCtx *);
+    if(!kh_shopface_fix){orig_f_29efa0(g);return;}
     enter(H_29EFA0);
     u32 id=(u32)A0(g); u64 out=A1(g);
     u32 selector=(u32)xcall(g,KHA_SHOP_SEL,id,0,0,0);

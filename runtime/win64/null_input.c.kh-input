@@ -1,3 +1,4 @@
+#include "settings.h"
 #include "khnmc_rt.h"
 /* Scripted XInput pad 0; other input backends remain empty. Ranges are inclusive;
  * gaps release all controls, and later lines win when ranges overlap.
@@ -21,6 +22,7 @@
 #include "mod_config.h"
 #include "warp.h"
 #include "xion_swap.h"
+#include "autosave.h"
 typedef struct { u16 buttons; u8 lt,rt; s16 lx,ly,rx,ry; } ScriptPad;
 _Static_assert(sizeof(ScriptPad)==12,"XINPUT_GAMEPAD layout");
 typedef struct { u64 start,end; ScriptPad pad; } InputRange;
@@ -92,14 +94,19 @@ static u64 run_game_frames;
 u64 kh_game_frames(void){ return atomic_load(&game_frames); }      /* frames the game thread has made (diagnostic logs) */
 static void route_tick(KCtx *g,u64 n);                                /* task 27: the route's steps, once per game frame */
 static void hold_check(KCtx *g,u64 present);                          /* task 31 review: the hold's time-out */
+u16 kh_input_buttons(void){
+    pthread_mutex_lock(&input_lock); u16 buttons=last_pad.buttons; pthread_mutex_unlock(&input_lock); return buttons;
+}
 void orig_f_105e10(KCtx *g);
 void f_105e10(KCtx *g){
     u64 n=atomic_fetch_add(&game_frames,1)+1;
+    extern void kh_settings_frame(KCtx *,uint64_t); kh_settings_frame(g,n);
+    extern void kh_retry_frame(KCtx *); kh_retry_frame(g);
+    extern void kh_shortcut_frame(KCtx *); kh_shortcut_frame(g);
     extern void kh_test_resize_frame(u64); kh_test_resize_frame(n);
     { extern void kh_idtable_game_frame(u64); kh_idtable_game_frame(n); extern void kh_moose_game_frame(KCtx *); kh_moose_game_frame(g); }
     if(kh_xion_enabled){
-        pthread_mutex_lock(&input_lock); u16 buttons=last_pad.buttons; pthread_mutex_unlock(&input_lock);
-        kh_xion_frame(g,buttons);
+        kh_xion_frame(g,kh_input_buttons());
     }
     kh_route_state_tick(g,n); route_tick(g,n); hold_check(g,atomic_load(&gfx_presents));
     if(run_game_frames && n>=run_game_frames){ extern void kh_exit_process(int); kh_warn("input: KH_RUN_GAME_FRAMES=%llu reached, ending the run",(unsigned long long)run_game_frames); kh_exit_process(0); }
@@ -716,7 +723,7 @@ static int h_di(KCtx *g,u64 o,int s,const char *c){ (void)o;(void)c;
 static int h_dev(KCtx *g,u64 o,int s,const char *c){ (void)o;(void)c;
     if(s==9){ memset(hp(g,A2(g)),0,(size_t)(u32)A1(g)); SET_RAX(g,0); return 1; }    /* GetDeviceState(cb, data): all zero */
     SET_RAX(g,0); return 1; }
-void kh_seam_input_init(void){ kh_xion_init(); kh_input_load(NULL,getenv("KHNMC_INPUT_SCRIPT"));
+void kh_seam_input_init(void){ kh_autosave_init(); kh_xion_init(); kh_input_load(NULL,getenv("KHNMC_INPUT_SCRIPT"));
     { const char *e=getenv("KH_RUN_GAME_FRAMES"); if(e&&*e) run_game_frames=strtoull(e,0,0); }
     { const char *im=getenv("KHNMC_INPUT"); extern int kh_run_is_selftest;
       if(im&&*im&&strcmp(im,"host")&&strcmp(im,"script")) kh_fatal(NULL,"KHNMC_INPUT=%s: known values are host (the platform's game controller as pad 0) and script (KHNMC_INPUT_SCRIPT only)",im);

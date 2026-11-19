@@ -111,6 +111,7 @@ void kh_host_exit(int status){
 #if !KH_IOS_PATHS
 void kh_host_env_init(int *argc,char ***argv){ (void)argc; (void)argv; }
 int kh_host_env_selftest(void){ return 0; }
+const char *kh_autosave_documents(void){ return kh_docs; }
 const char *kh_host_caches_dir(void){ return ""; }               /* TASK43: no app container: no default cache file (KHNMC_GFX_PIPECACHE names one) */
 #else
 /* Layout, all inside the app's home (the container on iOS; KH_APP_HOME names it, and it is REQUIRED when the switch is forced on a
@@ -139,6 +140,7 @@ const char *kh_host_caches_dir(void){ return ""; }               /* TASK43: no a
  * Anything else is the named fatal `host-conf` with the file and line: a typo must not become a silently different run. */
 #define HE_MAXARG 64
 static char he_home[KH_TMP_MAX], he_docs[KH_TMP_MAX+32], he_support[KH_TMP_MAX+64], he_status[KH_TMP_MAX+320], he_caches[KH_TMP_MAX+64];
+const char *kh_autosave_documents(void){ return *he_docs ? he_docs : kh_docs; }
 static void he_mkdirs(const char *path);
 /* TASK43: <home>/Library/Caches/khnmc, made at its first use ("" when it cannot be made: the caller then has no default file there) */
 const char *kh_host_caches_dir(void){

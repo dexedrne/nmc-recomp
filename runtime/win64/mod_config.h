@@ -1,15 +1,10 @@
 /* Effective shipped INI values. "begginer_*" is ignored by the DLL. */
 #pragma once
 #include "khnmc_rt.h"
-static const struct kh_mod_difficulty_config {
+extern struct kh_mod_difficulty_config {
     s32 enemy_damage, party_damage;
     float ap, hp, mp;
-} kh_mod_difficulty_config[4] = {
-    {50,150,1.0f,1.0f,1.0f},
-    {100,100,1.0f,1.0f,1.0f},
-    {200,125,1.5f,0.5f,0.5f},
-    {200,125,1.5f,0.5f,0.5f},
-};
+} kh_mod_difficulty_config[4];
 /* The difficulty dword [save+0x2498] = [0x1409abd48].  The game writes 0..3.  The DLL's handlers that read it (0x32d30, 0x31ee0,
  * 0x2f9b0, 0x31260, 0x30f60) are attached for every value and none of the first four reaches its trampoline, so no value of the
  * dword runs the vanilla body on the PC.  Per-difficulty counters have one more slot for "any other value". */
@@ -157,7 +152,7 @@ u64  kh_mod_b_names(void);                                         /* 25 probe n
 int  kh_mod_b_load_command_menu(const char *path,char *err,size_t cap);   /* 1 loaded, 0 no file / no header, -1 err */
 u32  kh_mod_b_command_menu(const u8 **entries);                     /* entry count and the 16-byte entries of tweaks/command_menu_offsets.bin */
 int  kh_mod_b_option_on(const char *root,const char *ini,const char *key);   /* <root>/dll/<ini> [Settings] key: 1 on, 0 not on, -1 no file / key */
-void kh_mod_b_check_options(KCtx *g,const char *root);             /* named fatal when an option whose detours are not ported is on */
+void kh_mod_b_check_options(KCtx *g,const char *root);             /* selects the retry, savepoint and Gummi handlers */
 void kh_mod_b_icons(u8 *c8,u8 *c9,u8 *ca,int set);                  /* the DLL's three icon bytes 0x1800817c8..ca: read (set = 0) or write */
 void kh_mod_hooks_b_dump(void);
 int  kh_mod_hooks_b_selftest(KCtx *g);

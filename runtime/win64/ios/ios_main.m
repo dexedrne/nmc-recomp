@@ -47,6 +47,8 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include "../khnmc_app.h"
+#include "../settings.h"
+#include <string.h>
 #include "../gfx_present.h"
 #include "../khnmc_audio_out.h"
 
@@ -61,6 +63,96 @@ void kh_input_host_pad_set(unsigned short buttons,unsigned char lt,unsigned char
  * options button BACK 0x20, the stick clicks 0x40/0x80, the d-pad 0x1/0x2/0x4/0x8; triggers 0..255; sticks -32767..32767 (up = +). */
 static short pad_axis(float v){ if(!(v>=-1.0f)) v=-1.0f; if(v>1.0f) v=1.0f; return (short)lrintf(v*32767.0f); }
 static unsigned char pad_trigger(float v){ if(!(v>=0.0f)) v=0.0f; if(v>1.0f) v=1.0f; return (unsigned char)lrintf(v*255.0f); }
+static UILabel *test_label,*options_label;
+static NSMutableDictionary<NSString *,NSString *> *chosen_options;
+static int selected_option,selected_component;
+static unsigned short previous_buttons;
+static BOOL suppress_buttons;
+static NSString *option_value(int index){
+    const struct kh_option *o=&kh_options[index];
+    NSString *chosen=chosen_options[@(o->name)];
+    const char *configured=getenv(o->name);
+    return chosen ?: @(configured ?: o->initial);
+}
+static void show_options(NSString *error){
+    NSMutableString *text=[NSMutableString stringWithString:@"Options\n\n"];
+    int first=MAX(0,MIN(selected_option-2,kh_setting_menu_count()-5));
+    for(int i=first;i<MIN(first+5,kh_setting_menu_count());i++){
+        [text appendFormat:@"%@%@   %@\n",i==selected_option?@"▶  ":@"     ",@(kh_options[i].label),option_value(i)];
+    }
+    [text appendFormat:@"\n%@\nD-pad to select and change   •   Circle to close",
+     error ?: (kh_setting_action(selected_option)?@"Cross to execute when play resumes":kh_setting_live(selected_option)?@"Applies immediately":@"Applies on the next launch")];
+    if(strchr(kh_options[selected_option].initial,',')){
+        [text appendFormat:@"\nL1/R1 to select value %d",selected_component+1];
+    }
+    options_label.text=text;
+}
+static void adjust_option(int direction){
+    const struct kh_option *o=&kh_options[selected_option];
+    NSString *current=option_value(selected_option),*value;
+    if(o->choices){
+        NSArray<NSString *> *choices=[@(o->choices) componentsSeparatedByString:@"|"];
+        NSInteger index=[choices indexOfObject:current];
+        if(index==NSNotFound) index=0;
+        index=(index+direction+(NSInteger)choices.count)%(NSInteger)choices.count;
+        value=choices[index];
+    }else{
+        NSMutableArray<NSString *> *parts=[[current componentsSeparatedByString:@","] mutableCopy];
+        double next=fmax(o->minimum,fmin(o->maximum,parts[selected_component].doubleValue+direction*o->step));
+        parts[selected_component]=[NSString stringWithFormat:@"%.8f",next];
+        NSString *part=parts[selected_component];
+        while([part hasSuffix:@"0"]) part=[part substringToIndex:part.length-1];
+        if([part hasSuffix:@"."]) part=[part substringToIndex:part.length-1];
+        parts[selected_component]=part;
+        value=[parts componentsJoinedByString:@","];
+    }
+    if(!kh_setting_action(selected_option) && kh_setting_set(o->name,value.UTF8String)){show_options(@"Could not save this value");return;}
+    chosen_options[@(o->name)]=value;
+    show_options(nil);
+}
+static BOOL options_input(unsigned short buttons){
+    unsigned short down=buttons & ~previous_buttons;
+    previous_buttons=buttons;
+    if(suppress_buttons){if(!buttons) suppress_buttons=NO;return YES;}
+    if(UIApplication.sharedApplication.applicationState!=UIApplicationStateActive) return YES;
+    if(options_label){
+        if(down&0x2000){
+            [options_label removeFromSuperview]; options_label=nil; suppress_buttons=YES;
+            kh_app_resume(KH_APP_RESUME_BOUND_MS);
+        }else if((down&0x1000) && kh_setting_action(selected_option)){
+            if(kh_setting_set(kh_options[selected_option].name,option_value(selected_option).UTF8String)) show_options(@"A command is already queued");
+            else show_options(@"Queued. Circle to resume.");
+        }else if(down&3){
+            selected_option=(selected_option+((down&1)?-1:1)+kh_setting_menu_count())%kh_setting_menu_count();
+            selected_component=0; show_options(nil);
+        }else if(down&0x300){
+            int count=(int)[option_value(selected_option) componentsSeparatedByString:@","].count;
+            selected_component=(selected_component+((down&0x200)?1:-1)+count)%count;show_options(nil);
+        }else if(down&12) adjust_option((down&8)?1:-1);
+        return YES;
+    }
+    /* Hold L3 first, then press the DualSense Options button (GC buttonMenu). */
+    if((buttons&0x40) && (down&0x10) && test_label.superview && kh_present_presented()>0){
+        const char *life=getenv("KHNMC_APP_LIFE");
+        if(life && !strcmp(life,"off")) return NO;
+        kh_input_host_pad_set(0,0,0,0,0,0,0);
+        kh_app_will_resign_active();
+        kh_app_suspend(KH_APP_SUSPEND_BOUND_MS);
+        UIView *parent=test_label.superview;
+        options_label=[[UILabel alloc] initWithFrame:parent.bounds];
+        options_label.autoresizingMask=UIViewAutoresizingFlexibleWidth|UIViewAutoresizingFlexibleHeight;
+        options_label.backgroundColor=[UIColor colorWithWhite:0.05 alpha:0.96];
+        options_label.textColor=UIColor.whiteColor; options_label.textAlignment=NSTextAlignmentCenter;
+        options_label.numberOfLines=0; options_label.font=[UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+        options_label.adjustsFontSizeToFitWidth=YES; options_label.minimumScaleFactor=0.7;
+        [parent addSubview:options_label];
+        if(!chosen_options) chosen_options=[NSMutableDictionary new];
+        show_options(nil);
+        return YES;
+    }
+    return NO;
+}
+
 static void pad_send(GCExtendedGamepad *p){
     unsigned short b=0;
     if(p.dpad.up.pressed) b|=0x0001; if(p.dpad.down.pressed) b|=0x0002; if(p.dpad.left.pressed) b|=0x0004; if(p.dpad.right.pressed) b|=0x0008;
@@ -68,6 +160,7 @@ static void pad_send(GCExtendedGamepad *p){
     if(p.leftThumbstickButton.pressed) b|=0x0040; if(p.rightThumbstickButton.pressed) b|=0x0080;
     if(p.leftShoulder.pressed) b|=0x0100; if(p.rightShoulder.pressed) b|=0x0200;
     if(p.buttonA.pressed) b|=0x1000; if(p.buttonB.pressed) b|=0x2000; if(p.buttonX.pressed) b|=0x4000; if(p.buttonY.pressed) b|=0x8000;
+    if(options_input(b)) return;
     kh_input_host_pad_set(b,pad_trigger(p.leftTrigger.value),pad_trigger(p.rightTrigger.value),
                           pad_axis(p.leftThumbstick.xAxis.value),pad_axis(p.leftThumbstick.yAxis.value),
                           pad_axis(p.rightThumbstick.xAxis.value),pad_axis(p.rightThumbstick.yAxis.value));
@@ -81,6 +174,7 @@ static int pad_attach(GCController *c){
     if(!p){ fprintf(stderr,"kh: ios: controller '%s' has no extended gamepad profile: not used\n",c.vendorName.UTF8String?:"?"); return 0; }
     if(pad_active && pad_active!=c){ fprintf(stderr,"kh: ios: controller '%s' connected: not used (another controller is pad 0)\n",c.vendorName.UTF8String?:"?"); return 0; }
     pad_active=c;
+    c.handlerQueue=dispatch_get_main_queue();
     p.valueChangedHandler=^(GCExtendedGamepad *gp,GCControllerElement *el){ (void)el; pad_send(gp); };
     pad_send(p);
     fprintf(stderr,"kh: ios: controller connected: %s (pad 0)\n",c.vendorName.UTF8String?:"?");
@@ -94,7 +188,7 @@ static void setup_controllers(void){
         usingBlock:^(NSNotification *n){
             GCController *c=(GCController *)n.object; if(c!=pad_active) return;
             if(c.extendedGamepad) c.extendedGamepad.valueChangedHandler=nil;
-            pad_active=nil; kh_input_host_pad_set(0,0,0,0,0,0,0); fprintf(stderr,"kh: ios: controller disconnected: pad 0 released\n");
+            pad_active=nil; previous_buttons=0; suppress_buttons=NO; kh_input_host_pad_set(0,0,0,0,0,0,0); fprintf(stderr,"kh: ios: controller disconnected: pad 0 released\n");
             for(GCController *o in GCController.controllers) if(o!=c && pad_attach(o)) break; }];
 }
 /* TASK41: after a suspension the CURRENT state of pad 0 (a button that came up meanwhile sent no event), or neutral without one */
@@ -153,7 +247,6 @@ static void start_game_once(void){
 }
 
 /* ---- TASK41: the display link, on its own thread ---- */
-static UILabel *test_label;
 @interface KHDisplayTicker : NSObject
 - (void)tick:(CADisplayLink *)link;
 @end
@@ -287,16 +380,19 @@ static void start_display_link(void){
 }
 - (void)sceneWillResignActive:(UIScene *)scene {
     (void)scene; _left=YES;
+    if(options_label) return;
     kh_app_will_resign_active();                               /* the gate is set and the focus lost; returns at once */
 }
 - (void)sceneDidEnterBackground:(UIScene *)scene {
     (void)scene; _left=YES;
+    if(options_label) return;
     kh_app_suspend(KH_APP_SUSPEND_BOUND_MS);                   /* bounded; every expired bound is logged and counted by the runtime */
 }
 - (void)sceneDidBecomeActive:(UIScene *)scene {
     (void)scene;
     if(!_left) return;                                         /* the first activation at launch: nothing was suspended */
     _left=NO;
+    if(options_label){previous_buttons=0;return;}
     [(KHGameViewController *)self.window.rootViewController reportSize];   /* the layer's size before our swapchain is rebuilt */
     kh_app_resume(KH_APP_RESUME_BOUND_MS);                     /* bounded: stale swapchain, the PC's restore, audio (also after an interruption), focus, gate cleared */
     pad_resync();                                              /* every controller's CURRENT state */

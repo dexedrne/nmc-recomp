@@ -547,10 +547,6 @@ static int option_value_on(char *p){
     while(*p&&strchr(ws,*p)) p++;
     return !strcasecmp(p,"on")||!strcasecmp(p,"true")||!strcmp(p,"1");
 }
-static const struct { const char *ini, *key, *what; } off_options[]={
-    {"KH2_Tweaks_Retry.ini","retry","5 detours (DLL handlers 0x30d70, 0x30df0, 0x2fce0, 0x324a0, 0x32550: retry / continue menu)"},
-    {"KH2_Tweaks_Savepoint.ini","savepoint_qol","1 detour (DLL handler 0x329a0)"},
-    {"KH2_Tweaks_Worlds.ini","patch_gummiskip","1 detour (DLL handler 0x33870)"}};
 int kh_mod_b_option_on(const char *root,const char *ini,const char *key){
     char rel[300],host[4096],line[512]; snprintf(rel,sizeof rel,"dll/%s",ini);
     if(!kh_resolve_ci(root,rel,host,sizeof host)) return -1;
@@ -568,11 +564,12 @@ int kh_mod_b_option_on(const char *root,const char *ini,const char *key){
     fclose(f); return res;
 }
 void kh_mod_b_check_options(KCtx *g,const char *root){
-    for(unsigned i=0;i<sizeof off_options/sizeof *off_options;i++)
-        if(kh_mod_b_option_on(root,off_options[i].ini,off_options[i].key)==1)
-            kh_fatal(g,"mod-option-not-ported: %s/dll/%s has %s set to on (the DLL's option reader 0x2a840 takes on, true and 1, in any letter case): "
-                       "KH2Tweaks_Refactor.dll would attach %s; the shipped mod has this option off and the port does not implement it",
-                     root,off_options[i].ini,off_options[i].key,off_options[i].what);
+    extern int kh_retry,kh_savepoint;
+    extern int kh_tweak_boolean(KCtx *,const char *,int);
+    kh_retry=kh_tweak_boolean(g,"KHNMC_TWEAK_RETRY_RETRY",kh_mod_b_option_on(root,"KH2_Tweaks_Retry.ini","retry"));
+    kh_savepoint=kh_tweak_boolean(g,"KHNMC_TWEAK_SAVEPOINT_SAVEPOINT_QOL",kh_mod_b_option_on(root,"KH2_Tweaks_Savepoint.ini","savepoint_qol"));
+    extern int kh_gummiskip;
+    kh_gummiskip=kh_tweak_boolean(g,"KHNMC_TWEAK_WORLDS_PATCH_GUMMISKIP",kh_mod_b_option_on(root,"KH2_Tweaks_Worlds.ini","patch_gummiskip"));
 }
 void kh_mod_hooks_b_init(KCtx *g){
     if(lists_va) kh_fatal(g,"mod-b-reinit: the DLL's command word lists are already allocated");

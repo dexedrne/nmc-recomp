@@ -1,6 +1,7 @@
 /* DLL 115f0 script AddExp path, with actual lifted gate/position/table/award helpers. */
 #include "khnmc_rt.h"
 #include <math.h>
+#include "settings.h"
 static void exp_wf(KCtx *g,u64 p,float f){ u32 bits; memcpy(&bits,&f,4); wr32(g,p,bits); }
 static s32 wrapmul(s32 a,s32 b){ return (s32)((u32)a*(u32)b); }
 int kh_mod_exp_selftest(KCtx *g){
@@ -62,6 +63,34 @@ int kh_mod_exp_selftest(KCtx *g){
     wr32(g,GS_BASE+0x9abd48,3); wr32(g,sheet,50); wr8(g,sheet+0x203,3);
     wr32(g,args+8,4); wr32(g,GS_BASE+0x9acf90,0); kh_call(g,target,args,0,0,0); ET(rd32(g,GS_BASE+0x9acf90)==9);
     wr32(g,GS_BASE+0x9acf90,9999998); kh_call(g,target,args,0,0,0); ET(rd32(g,GS_BASE+0x9acf90)==9999999);
+    extern int kh_settings_selftest(void);
+    ET(kh_settings_selftest()==0);
+    /* Compare the same award, player sheet delta, and MP cast through the actual guest entries. */
+    ET(kh_setting_set("KHNMC_EXP_MULT","nan")==-1);
+    ET(kh_setting_set("KHNMC_EXP_MULT","10.1")==-1);
+    ET(kh_setting_set("KHNMC_CHEAT_INF_MP","true")==-1);
+    ET(kh_setting_set("KHNMC_EXP_MULT","2")==0);
+    wr32(g,GS_BASE+0x9acf90,0); kh_call(g,target,args,0,0,0); ET(rd32(g,GS_BASE+0x9acf90)==18);
+    ET(kh_setting_set("KHNMC_EXP_MULT","0.5")==0);
+    wr32(g,GS_BASE+0x9acf90,0); kh_call(g,target,args,0,0,0); ET(rd32(g,GS_BASE+0x9acf90)==4);
+    ET(kh_setting_set("KHNMC_EXP_MULT","1")==0);
+    wr32(g,sheet,40);wr32(g,sheet+4,40);wr32(g,sheet+8,0);
+    kh_call(g,GS_BASE+0x3c0860,sheet,(u32)-10,0,0); ET(rd32(g,sheet)==30);
+    ET(kh_setting_set("KHNMC_CHEAT_INF_HP","1")==0);
+    kh_call(g,GS_BASE+0x3c0860,sheet,(u32)-100,0,0); ET(rd32(g,sheet)==30);
+    wr64(g,GS_BASE+0x2a105d0,0);
+    kh_call(g,GS_BASE+0x3c0860,sheet,(u32)-10,0,0); ET(rd32(g,sheet)==20);
+    wr64(g,GS_BASE+0x2a105d0,player);
+    ET(kh_setting_set("KHNMC_CHEAT_INF_HP","0")==0);
+    wr32(g,sheet+0x180,50);wr32(g,sheet+0x184,50);
+    kh_call(g,GS_BASE+0x3d3cf0,player,(u32)-10,0,0); ET(rd32(g,sheet+0x180)==40);
+    ET(kh_setting_set("KHNMC_CHEAT_INF_MP","1")==0);
+    kh_call(g,GS_BASE+0x3d3cf0,player,(u32)-100,0,0); ET(rd32(g,sheet+0x180)==40);
+    kh_call(g,GS_BASE+0x3c20a0,sheet,0,0,0); ET(rd32(g,sheet+0x180)==40);
+    ET(kh_setting_set("KHNMC_CHEAT_INF_MP","0")==0);
+    ET(kh_setting_set("KHNMC_DROP_MULT","0.5")==0); ET(kh_drop_chance(5)==2.5f);
+    ET(kh_setting_set("KHNMC_DROP_MULT","10")==0); ET(kh_drop_chance(12)==100 && kh_drop_chance(0)==0);
+    ET(kh_setting_set("KHNMC_DROP_MULT","1")==0);
     /* Disabled award gate does not read uninitialized params/sstm or change EXP. */
     wr64(g,GS_BASE+0x2a171c8,0); wr64(g,GS_BASE+0x2ae5980,0); wr64(g,GS_BASE+0x2ae5768,0);
     wr32(g,GS_BASE+0x9acf90,77); kh_call(g,target,args,0,0,0); ET(rd32(g,GS_BASE+0x9acf90)==77);

@@ -644,13 +644,11 @@ static void test_menu(KCtx *g){
     wr64(g,GS_BASE+0xbef528,sv1); wr64(g,GS_BASE+0xbef538,sv2); memcpy(hp(g,GS_BASE+0x717008),svw,0x30); ov_clear();
 }
 
-/* ---- the options whose detours are not ported: off in the shipped ini files, a named fatal when a tree turns one on ---------------- */
-static char opt_root[KH_TMP_MAX];
-static void fatal_option(KCtx *g){ kh_mod_b_check_options(g,opt_root); }
+/* Check the shipped DLL boolean syntax and selection of the three optional handlers. */
 static void put(const char *dir,const char *name,const char *text){ char p[KH_TMP_MAX+64]; snprintf(p,sizeof p,"%s/dll/%s",dir,name); FILE *f=fopen(p,"w"); if(f){ fputs(text,f); fclose(f); } }
 static void test_options(KCtx *g){
-    char dir[KH_TMP_MAX], sub[KH_TMP_MAX+8], out[4096]; kh_tmp_path(dir,sizeof dir,"khnmc-modb-opt-XXXXXX"); if(!mkdtemp(dir)){ T(0); return; }
-    snprintf(sub,sizeof sub,"%s/dll",dir); T(mkdir(sub,0700)==0); snprintf(opt_root,sizeof opt_root,"%s",dir);
+    char dir[KH_TMP_MAX], sub[KH_TMP_MAX+8]; kh_tmp_path(dir,sizeof dir,"khnmc-modb-opt-XXXXXX"); if(!mkdtemp(dir)){ T(0); return; }
+    snprintf(sub,sizeof sub,"%s/dll",dir); T(mkdir(sub,0700)==0);
     T(kh_mod_b_option_on(dir,"KH2_Tweaks_Retry.ini","retry")==-1);                                        /* no file */
     put(dir,"KH2_Tweaks_Retry.ini","[Settings]\r\nretry=off");                                             /* the shipped files: CRLF, no final newline */
     put(dir,"KH2_Tweaks_Savepoint.ini","[Settings]\r\nsavepoint_qol=off\r\n\r\n#Allows savepoints to restore Drive Gauge.\r\n");
@@ -664,46 +662,43 @@ static void test_options(KCtx *g){
     kh_mod_b_check_options(g,dir); T(1);                                                                    /* all off: returns */
     /* The DLL's boolean reader 0x2a840: the value (GetPrivateProfileStringA, then the DLL's trim of " \t\r\n") is lower-cased
      * (0x2a8f0) and is TRUE for exactly "on" (0x2a9ad), "true" (0x2a9d3) or "1" (0x2a9f9); everything else is FALSE (0x2aa85). */
-    static const struct { const char *ini,*text,*msg; int on; } oc[]={
-        {"KH2_Tweaks_Retry.ini","[Settings]\r\nretry=on\r\n","KH2_Tweaks_Retry.ini has retry set to on",1},
-        {"KH2_Tweaks_Retry.ini","[Settings]\n retry = on \n","KH2_Tweaks_Retry.ini has retry set to on",1}, /* the value is trimmed */
-        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=on #comment\n",NULL,0},                              /* an inline comment is part of the value: not \"on\" */
-        {"KH2_Tweaks_Retry.ini","[Other]\nretry=on\n[Settings]\nretry=off\n",NULL,0},                    /* only [Settings] */
-        {"KH2_Tweaks_Savepoint.ini","[Settings]\nsavepoint_qol=ON\n","KH2_Tweaks_Savepoint.ini has savepoint_qol set to on",1},
-        {"KH2_Tweaks_Worlds.ini","[Settings]\npatch_gummiskip=on\n","KH2_Tweaks_Worlds.ini has patch_gummiskip set to on",1},
+    static const struct { const char *ini,*text; int on; } oc[]={
+        {"KH2_Tweaks_Retry.ini","[Settings]\r\nretry=on\r\n",1},
+        {"KH2_Tweaks_Retry.ini","[Settings]\n retry = on \n",1}, /* the value is trimmed */
+        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=on #comment\n",0},                              /* an inline comment is part of the value: not \"on\" */
+        {"KH2_Tweaks_Retry.ini","[Other]\nretry=on\n[Settings]\nretry=off\n",0},                    /* only [Settings] */
+        {"KH2_Tweaks_Savepoint.ini","[Settings]\nsavepoint_qol=ON\n",1},
+        {"KH2_Tweaks_Worlds.ini","[Settings]\npatch_gummiskip=on\n",1},
         /* the two other spellings of TRUE, for each of the three options */
-        {"KH2_Tweaks_Retry.ini","[Settings]\r\nretry=true\r\n","KH2_Tweaks_Retry.ini has retry set to on",1},
-        {"KH2_Tweaks_Retry.ini","[Settings]\r\nretry=1","KH2_Tweaks_Retry.ini has retry set to on",1},
-        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=\ttRuE \r\n","KH2_Tweaks_Retry.ini has retry set to on",1},
-        {"KH2_Tweaks_Savepoint.ini","[Settings]\nsavepoint_qol=TRUE\n","KH2_Tweaks_Savepoint.ini has savepoint_qol set to on",1},
-        {"KH2_Tweaks_Savepoint.ini","[Settings]\nsavepoint_qol=1\n","KH2_Tweaks_Savepoint.ini has savepoint_qol set to on",1},
-        {"KH2_Tweaks_Worlds.ini","[Settings]\npatch_gummiskip=1\n","KH2_Tweaks_Worlds.ini has patch_gummiskip set to on",1},
-        {"KH2_Tweaks_Worlds.ini","[Settings]\npatch_gummiskip=True\n","KH2_Tweaks_Worlds.ini has patch_gummiskip set to on",1},
+        {"KH2_Tweaks_Retry.ini","[Settings]\r\nretry=true\r\n",1},
+        {"KH2_Tweaks_Retry.ini","[Settings]\r\nretry=1",1},
+        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=\ttRuE \r\n",1},
+        {"KH2_Tweaks_Savepoint.ini","[Settings]\nsavepoint_qol=TRUE\n",1},
+        {"KH2_Tweaks_Savepoint.ini","[Settings]\nsavepoint_qol=1\n",1},
+        {"KH2_Tweaks_Worlds.ini","[Settings]\npatch_gummiskip=1\n",1},
+        {"KH2_Tweaks_Worlds.ini","[Settings]\npatch_gummiskip=True\n",1},
         /* GetPrivateProfileStringA drops one pair of enclosing quotes; what is left goes through the DLL's own trim */
-        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=\"on\"\n","KH2_Tweaks_Retry.ini has retry set to on",1},
-        {"KH2_Tweaks_Retry.ini","[Settings]\nretry='TRUE'\n","KH2_Tweaks_Retry.ini has retry set to on",1},
-        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=\" 1 \"\n","KH2_Tweaks_Retry.ini has retry set to on",1},
-        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=\"\"on\"\"\n",NULL,0},                              /* one pair only */
-        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=\"on\n",NULL,0},                                     /* no closing quote: the quote stays */
-        {"KH2_Tweaks_Retry.ini","[Settings]\nretry='on\"\n",NULL,0},
+        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=\"on\"\n",1},
+        {"KH2_Tweaks_Retry.ini","[Settings]\nretry='TRUE'\n",1},
+        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=\" 1 \"\n",1},
+        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=\"\"on\"\"\n",0},                              /* one pair only */
+        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=\"on\n",0},                                     /* no closing quote: the quote stays */
+        {"KH2_Tweaks_Retry.ini","[Settings]\nretry='on\"\n",0},
         /* FALSE: the three spellings the DLL tests for it (0x74374 "off", 0x72da8 "false", 0x74378 "0") and everything else */
-        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=false\n",NULL,0}, {"KH2_Tweaks_Retry.ini","[Settings]\nretry=0\n",NULL,0},
-        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=\n",NULL,0},       {"KH2_Tweaks_Retry.ini","[Settings]\nretry=yes\n",NULL,0},
-        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=2\n",NULL,0},      {"KH2_Tweaks_Retry.ini","[Settings]\nretry=10\n",NULL,0},
-        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=01\n",NULL,0},     {"KH2_Tweaks_Retry.ini","[Settings]\nretry=tru\n",NULL,0},
-        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=truee\n",NULL,0},  {"KH2_Tweaks_Retry.ini","[Settings]\nretry=onn\n",NULL,0},
-        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=o\n",NULL,0},      {"KH2_Tweaks_Retry.ini","[Settings]\nretry=1 ;x\n",NULL,0},
-        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=#1\n",NULL,0},     {"KH2_Tweaks_Retry.ini","[Settings]\nretry=;true\n",NULL,0},
-        {"KH2_Tweaks_Savepoint.ini","[Settings]\nsavepoint_qol=FALSE\n",NULL,0}, {"KH2_Tweaks_Worlds.ini","[Settings]\npatch_gummiskip=0\n",NULL,0}};
+        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=false\n",0}, {"KH2_Tweaks_Retry.ini","[Settings]\nretry=0\n",0},
+        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=\n",0},       {"KH2_Tweaks_Retry.ini","[Settings]\nretry=yes\n",0},
+        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=2\n",0},      {"KH2_Tweaks_Retry.ini","[Settings]\nretry=10\n",0},
+        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=01\n",0},     {"KH2_Tweaks_Retry.ini","[Settings]\nretry=tru\n",0},
+        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=truee\n",0},  {"KH2_Tweaks_Retry.ini","[Settings]\nretry=onn\n",0},
+        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=o\n",0},      {"KH2_Tweaks_Retry.ini","[Settings]\nretry=1 ;x\n",0},
+        {"KH2_Tweaks_Retry.ini","[Settings]\nretry=#1\n",0},     {"KH2_Tweaks_Retry.ini","[Settings]\nretry=;true\n",0},
+        {"KH2_Tweaks_Savepoint.ini","[Settings]\nsavepoint_qol=FALSE\n",0}, {"KH2_Tweaks_Worlds.ini","[Settings]\npatch_gummiskip=0\n",0}};
     for(unsigned i=0;i<sizeof oc/sizeof *oc;i++){
         put(dir,"KH2_Tweaks_Retry.ini","[Settings]\nretry=off\n"); put(dir,"KH2_Tweaks_Savepoint.ini","[Settings]\nsavepoint_qol=off\n"); put(dir,"KH2_Tweaks_Worlds.ini","[Settings]\npatch_gummiskip=off\n");
         put(dir,oc[i].ini,oc[i].text);
-        if(!kh_fork_ok()){                                                                  /* iOS: no fork (host_env.c) */
-            if(oc[i].on) kh_selftest_not_run("mod B","an option the port does not have, turned on in the ini (named fatal)",2);
-            else { kh_mod_b_check_options(g,opt_root); T(1); }                                 /* off: returns, in this process */
-            continue; }
-        int st=run_fatal(g,fatal_option,out,sizeof out);
-        if(oc[i].on){ T(st==3); T(strstr(out,"mod-option-not-ported:")!=NULL&&strstr(out,oc[i].msg)!=NULL); } else T(st==99);
+        extern int kh_retry,kh_savepoint,kh_gummiskip;
+        kh_mod_b_check_options(g,dir);
+        T((strstr(oc[i].ini,"Retry")?kh_retry:strstr(oc[i].ini,"Worlds")?kh_gummiskip:kh_savepoint)==oc[i].on);
     }
     char p[KH_TMP_MAX+64]; static const char *const fn[]={"KH2_Tweaks_Retry.ini","KH2_Tweaks_Savepoint.ini","KH2_Tweaks_Worlds.ini"};
     for(int i=0;i<3;i++){ snprintf(p,sizeof p,"%s/dll/%s",dir,fn[i]); unlink(p); } rmdir(sub); rmdir(dir);
