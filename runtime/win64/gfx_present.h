@@ -112,6 +112,7 @@ void kh_vsync_register(void);                   /* a tick source exists from now
 void kh_vsync_tick(uint64_t host_ns);           /* one display refresh at host_ns (CLOCK_MONOTONIC ns); any thread */
 /* runtime-internal */
 void kh_vsync_init(void);                       /* start-up: KHNMC_DISPLAY=timer60 starts the stand-in source */
+void kh_vsync_forget_ticks(void);
 int  kh_vsync_wait(void);                       /* WaitForVBlank on the host clock: 1 = paced by ticks (done), 0 = no source (sleep as before) */
 void kh_vsync_note_virtual(void);               /* WaitForVBlank answered by the virtual vblank (KHNMC_CLOCK=frames) */
 void kh_vsync_note_sleep(void);                 /* WaitForVBlank answered by the old 16.67 ms sleep */

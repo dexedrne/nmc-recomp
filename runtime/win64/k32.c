@@ -141,7 +141,7 @@ IMP(winmm,timeEndPeriod){ SET_RAX(g,0); }
 IMP(winmm,timeGetDevCaps){ if(A0(g)){ wr32(g,A0(g),1); wr32(g,A0(g)+4,1000000); } SET_RAX(g,0); }
 static u64 t0ms; IMP(winmm,timeGetTime){ if(kh_cut_enabled){ SET_RAX(g,(u32)(1000+kh_cut_elapsed_ns()/1000000)); return; } u64 n=kh_now_ns()/1000000; if(!t0ms) t0ms=n; SET_RAX(g,(u32)(n-t0ms+1000)); }
 typedef struct Timer { u32 id; u32 delay; u64 cb, user; u32 flags; volatile int killed; struct Timer *next;
-    u64 fires, settled, no_consumer, guard_hits; u64 seth[4]; u64 setsat[4]; int setwait[4]; int nset; KThread *owner; int owner_seq; int clock_client; int anchor; } Timer;   /* anchor: review of task 28, 1 = created before the first vblank and anchored there, -1 = not anchored (guard) */   /* frames clock: consumer tracking, same-instant order (TASK28) */
+    u64 fires, settled, no_consumer, guard_hits; u64 seth[4]; u64 setsat[4]; int setwait[4]; int nset; KThread *owner; int owner_seq; int clock_client; int anchor; u64 host_due; } Timer;   /* anchor: review of task 28, 1 = created before the first vblank and anchored there, -1 = not anchored (guard) */   /* frames clock: consumer tracking, same-instant order (TASK28) */
 static Timer *timers; static u32 next_timer=1; static pthread_mutex_t tmm=PTHREAD_MUTEX_INITIALIZER;
 /* A multimedia timer fires on a fixed grid (start + n*period), it does not drift by the time its handler takes: absolute deadlines.
  * A timer that fell behind by more than a period drops the missed periods, as Windows does.  TIME_CALLBACK_EVENT_SET (0x10) is
@@ -233,6 +233,28 @@ static void timer_proc(KCtx *g){
         if(!t) kh_fatal(g,"savestate-timer-binding: unknown id %llu",(unsigned long long)id);
     }else t=(Timer*)(uintptr_t)A0(g);
     if(kh_vclock_on&&!ga_deterministic){ timer_proc_virtual(g,t); KH_RET(g); return; }
+    if(kh_cut_enabled&&!kh_vclock_on){
+        u64 period=(u64)t->delay*1000000;
+        t->host_due=kh_vclock_now_ns()+period;
+        for(;;){
+            kh_cut_wait_owner=KH_CUT_TIMER;
+            if(atomic_load(&kh_cut_requested)) kh_cut_poll("clock-client",NULL);
+            kh_cut_wait_owner=0;
+            if(t->killed) break;
+            u64 now=kh_vclock_now_ns();
+            if(now<t->host_due){
+                u64 remaining=t->host_due-now;
+                struct timespec nap={0,(long)(remaining>10000000?10000000:remaining)};
+                nanosleep(&nap,NULL);
+                continue;
+            }
+            if(now-t->host_due>period) t->host_due=now;
+            t->host_due+=period;
+            timer_fire(g,t);
+            if(!(t->flags&1)) break;
+        }
+        KH_RET(g); return;
+    }
     struct timespec next; clock_gettime(CLOCK_MONOTONIC,&next);
     for(;;){
         if(ga_deterministic){ struct timespec ts={t->delay/1000,(long)(t->delay%1000)*1000000L}; nanosleep(&ts,0); }
@@ -265,7 +287,7 @@ struct KhTimerSlot *kh_timer_capture(void){
     for(Timer *t=timers;t;t=t->next){
         struct TimerRecord *r=&slot->records[slot->count++];
         r->target=t; r->state=*t;
-        if(t->clock_client>=0) r->due=kh_clock_client_deadline(t->clock_client);
+        r->due=t->clock_client>=0?kh_clock_client_deadline(t->clock_client):t->host_due;
     }
     return slot;
 }
@@ -283,6 +305,7 @@ void kh_timer_restore(struct KhTimerSlot *s){
         struct TimerRecord *r=&s->records[i];
         *r->target=r->state;
         if(r->state.clock_client>=0) kh_vclock_client_due(r->state.clock_client,r->due);
+        else r->target->host_due=r->due;
     }
 }
 

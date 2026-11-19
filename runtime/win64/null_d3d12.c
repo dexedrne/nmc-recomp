@@ -5,6 +5,7 @@
  * Also: d3dcompiler_47!D3DStripShader (copy), D3D12SerializeRootSignature (blob holding the desc), D3D11CreateDevice (movie decode device). */
 #include "khnmc_rt.h"
 #include "khnmc_app.h"
+#include "savestate.h"
 #include "gfx_present.h"
 #include <time.h>
 
@@ -192,14 +193,28 @@ static int h_adapter(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) retur
     case 8: case 10: { u64 d=A1(g); memset(hp(g,d),0,s==8?0x118:0x138); utf8_to_gw(g,d,128,"KHNMC null GPU (headless)"); wr32(g,d+0x100,0x106b); wr32(g,d+0x104,1); wr64(g,d+0x110,8ull<<30); wr64(g,d+0x128,NULL_ADAPTER_LUID); SET_RAX(g,0); return 1; }   /* GetDesc / GetDesc1 */
     case 14: { u64 info=ARG(g,3); wr64(g,info,DXGI_BUDGET_ANSWER); wr64(g,info+8,64ull<<20); wr64(g,info+16,3ull<<30); wr64(g,info+24,0); SET_RAX(g,0); return 1; }   /* QueryVideoMemoryInfo(node, group, info) */
     default: return 0; } }
+static void host_vblank(KCtx *g){
+    if(!kh_vsync_wait()){
+        kh_vsync_note_sleep();
+        struct timespec ts={0,vblank_ns};
+        nanosleep(&ts,NULL);
+    }
+    if(kh_cut_enabled){
+        kh_cut_host_vblank();
+        if(atomic_load(&kh_cut_requested)){
+            kh_cut_poll("display-tick",NULL);
+            kh_vsync_forget_ticks();
+        }
+    }
+    SET_RAX(g,0);
+}
 static int h_output(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)o;(void)c;
     if(s==10){                                                                                                        /* WaitForVBlank */
         if(kh_vclock_on){ u64 ra=guest_return_addr(g)-GS_BASE;                 /* KHNMC_CLOCK=frames: one virtual display period; rbx = GXDevice at the timing thread's two call sites (0x1288cc, 0x128f3b) */
             kh_vsync_note_virtual();
             kh_vclock_vblank(g,(ra==0x1288cf||ra==0x128f3e)&&GA_OK(KH_RBX(g))?KH_RBX(g):0); SET_RAX(g,0); return 1; }
-        if(kh_vsync_wait()){ SET_RAX(g,0); return 1; }                       /* TASK36: a display tick source (iOS display link, KHNMC_DISPLAY=timer60) paces it (gfx_present.c) */
-        kh_vsync_note_sleep();
-        struct timespec ts={0,vblank_ns}; nanosleep(&ts,0); SET_RAX(g,0); return 1; }                                 /* host clock: pace at 60 Hz (KHNMC_NULL_VBLANK_NS: another frame time, for timing experiments) */
+        if(kh_cut_enabled) kh_cut_transfer_wait(g,KH_CUT_VBLANK,host_vblank);
+        host_vblank(g); return 1; }
     if(s==7){ u64 d=A1(g); memset(hp(g,d),0,0x60); utf8_to_gw(g,d,32,"\\\\.\\DISPLAY1"); int sw,sh; kh_screen_size(&sw,&sh);     /* task 37 (S2): 1920x1080 unless KHNMC_SCREEN */
         /* DesktopCoordinates RECT at +0x40, AttachedToDesktop +0x50 */ wr32(g,d+0x48,(u32)sw); wr32(g,d+0x4c,(u32)sh); wr32(g,d+0x50,1); wr64(g,d+0x58,0xAB0100); SET_RAX(g,0); return 1; }
     return 0; }
@@ -288,7 +303,8 @@ void kh_vklog_callback(const char *fmt,va_list ap){
 /* start-up (gfx_vkd3d.c kh_gfxc_init_common): 1 = the callback is to be installed */
 int kh_vklog_setup(void){
     const char *e=getenv("KHNMC_GFX_VKD3D_LOG_REPEATS"); if(!e||!*e) return 0;
-    u64 n=0; if(!vklog_parse(e,&n)) kh_fatal(NULL,"gfx-vkd3d-log-value: KHNMC_GFX_VKD3D_LOG_REPEATS=%s (a number of lines per vkd3d log site, 1..1000000; unset = vkd3d writes its log itself, every line)",e);
+    u64 n=0;
+    if(!vklog_parse(e,&n)){ kh_warn("vkd3d log filter disabled: expected a positive line count up to 1000000"); return 0; }
     pthread_mutex_lock(&vklog.m); vklog.limit=n; pthread_mutex_unlock(&vklog.m);
     fprintf(stderr,"kh: gfx vkd3d log: KHNMC_GFX_VKD3D_LOG_REPEATS=%llu: each vkd3d log site (function + message) prints its first %llu lines; after that its lines are counted and one is printed at every power of ten\n",(unsigned long long)n,(unsigned long long)n);
     return 1;
@@ -585,8 +601,12 @@ static u64 mk_blob(KCtx *g,u64 src,u64 size){ u64 b=new_obj(C_blob,16); u64 d=ga
 void kh_seam_gfx_init(void){
     const char *e=getenv("KH_LOG_GFX"); log_gfx=e&&*e=='1'; (void)log_gfx;
     e=getenv("KHNMC_GFX_PSOLOG"); log_pso=e&&*e=='1';
-    e=getenv("KHNMC_NULL_VBLANK_NS"); if(e&&*e){ long v=strtol(e,0,10); if(v<1000000||v>500000000) kh_fatal(NULL,"KHNMC_NULL_VBLANK_NS=%s: expected 1000000..500000000 nanoseconds",e);
-        vblank_ns=v; fprintf(stderr,"kh: gfx: null backend frame sleep %ld ns instead of 16666667 (KHNMC_NULL_VBLANK_NS)\n",v); }
+    e=getenv("KHNMC_NULL_VBLANK_NS");
+    if(e && *e){
+        char *end; long v=strtol(e,&end,10);
+        if(*end || v<1000000 || v>500000000) kh_warn("null vblank override disabled: expected 1000000..500000000 ns");
+        else { vblank_ns=v; fprintf(stderr,"kh: gfx: null backend frame sleep %ld ns (KHNMC_NULL_VBLANK_NS)\n",v); }
+    }
     kh_vsync_init();                                                          /* TASK36: KHNMC_DISPLAY=timer60 (the Linux stand-in for the display link) */
     e=getenv("KHNMC_GFX");                                                  /* graphics backend: unset / "null" = this recorder, "vkd3d" = gfx_vkd3d.c, "vkd3dw" = gfx_wrap.c */
     if(e&&!strcmp(e,"vkd3d")) kh_gfx_vkd3d_init();
@@ -595,14 +615,14 @@ void kh_seam_gfx_init(void){
     kh_present_init(kh_gfx_vkd3d_on);                                         /* TASK36 review n=5: KHNMC_GFX_PRESENT in every build, with every backend */
     { extern void kh_pc_init(int); kh_pc_init(kh_gfx_vkd3d_on); }              /* TASK43 (plan step 12): the disk pipeline cache's file, if one is configured */
     e=getenv("KHNMC_GFX_FRAME_LINE_EVERY");                                 /* TASK43: play mode prints the per-present line rarely */
-    if(e&&*e){ if(!frame_line_parse(e,&frame_line_every)) kh_fatal(NULL,"gfx-frame-line-value: KHNMC_GFX_FRAME_LINE_EVERY=%s (a number of presents, 1..1000000; unset = every present)",e);
+    if(e&&*e){ if(!frame_line_parse(e,&frame_line_every)){ kh_warn("frame log interval disabled: expected 1..1000000"); frame_line_every=1; }
         if(frame_line_every>1) fprintf(stderr,"kh: gfx: KHNMC_GFX_FRAME_LINE_EVERY=%llu: the per-present line `kh: gfx frame=` is printed for present 1 and every %llu-th present only\n",(unsigned long long)frame_line_every,(unsigned long long)frame_line_every); }
     if(!kh_gfx_vkd3d_on){ e=getenv("KHNMC_GFX_VKD3D_LOG_REPEATS");          /* review C43 n=2: with the vkd3d backend kh_vklog_setup reads it (gfx_vkd3d.c); without it there is no vkd3d log, and that is said */
-        if(e&&*e){ u64 n=0; if(!vklog_parse(e,&n)) kh_fatal(NULL,"gfx-vkd3d-log-value: KHNMC_GFX_VKD3D_LOG_REPEATS=%s (a number of lines per vkd3d log site, 1..1000000; unset = vkd3d writes its log itself, every line)",e);
+        if(e&&*e){
             fprintf(stderr,"kh: gfx vkd3d log: KHNMC_GFX_VKD3D_LOG_REPEATS=%s is set, but this run has no vkd3d backend (KHNMC_GFX): there is no vkd3d log to filter\n",e); } }
     e=getenv("KHNMC_GFX_HITCH");                                            /* TASK43: the frame-time counter of the first field presents */
-    if(e&&*e){ if(!hitch_parse(e,&hitch.want,&hitch.ms)) kh_fatal(NULL,"gfx-hitch-value: KHNMC_GFX_HITCH=%s (N or N:MS: the first N presents after the field came up, intervals above MS milliseconds; N 1..10000000, MS 1..10000, default 25)",e);
-        fprintf(stderr,"kh: gfx: KHNMC_GFX_HITCH: the Present-to-Present intervals above %.0f ms are counted over the first %llu presents after the field came up\n",hitch.ms,(unsigned long long)hitch.want); }
+    if(e&&*e){ if(!hitch_parse(e,&hitch.want,&hitch.ms)){ kh_warn("hitch counter disabled: invalid frame count or threshold"); hitch.want=0; }
+        else fprintf(stderr,"kh: gfx: KHNMC_GFX_HITCH: the Present-to-Present intervals above %.0f ms are counted over the first %llu presents after the field came up\n",hitch.ms,(unsigned long long)hitch.want); }
     { extern void kh_app_test_init(void); kh_app_test_init(); }                /* TASK41: KHNMC_TEST_GATE / KHNMC_TEST_SUSPEND (nothing when unset) */
     C_factory=kh_com_class("dxgi:IDXGIFactory4",44,STRICT,h_factory); C_adapter=kh_com_class("dxgi:IDXGIAdapter3",24,STRICT,h_adapter); C_output=kh_com_class("dxgi:IDXGIOutput",24,STRICT,h_output);
     C_swap=kh_com_class("dxgi:IDXGISwapChain3",44,STRICT,h_swap); C_dev=kh_com_class("d3d12:ID3D12Device",48,STRICT,h_dev); C_queue=kh_com_class("d3d12:ID3D12CommandQueue",20,STRICT,h_queue);

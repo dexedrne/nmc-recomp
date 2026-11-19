@@ -79,7 +79,8 @@ static void show_options(NSString *error){
     NSMutableString *text=[NSMutableString stringWithString:@"Options\n\n"];
     int first=MAX(0,MIN(selected_option-2,kh_setting_menu_count()-5));
     for(int i=first;i<MIN(first+5,kh_setting_menu_count());i++){
-        [text appendFormat:@"%@%@   %@\n",i==selected_option?@"▶  ":@"     ",@(kh_options[i].label),option_value(i)];
+        const char *reason=kh_setting_unavailable(i);
+        [text appendFormat:@"%@%@   %@\n",i==selected_option?@"▶  ":@"     ",@(kh_options[i].label),reason?[NSString stringWithFormat:@"Unavailable (%s)",reason]:option_value(i)];
     }
     [text appendFormat:@"\n%@\nD-pad to select and change   •   Circle to close",
      error ?: (kh_setting_action(selected_option)?@"Cross to execute when play resumes":kh_setting_live(selected_option)?@"Applies immediately":@"Applies on the next launch")];
@@ -89,6 +90,7 @@ static void show_options(NSString *error){
     options_label.text=text;
 }
 static void adjust_option(int direction){
+    if(kh_setting_unavailable(selected_option)) return;
     const struct kh_option *o=&kh_options[selected_option];
     NSString *current=option_value(selected_option),*value;
     if(o->choices){
@@ -122,7 +124,7 @@ static BOOL options_input(unsigned short buttons){
             kh_app_resume(KH_APP_RESUME_BOUND_MS);
         }else if((down&0x1000) && kh_setting_action(selected_option)){
             int result=kh_setting_set(kh_options[selected_option].name,option_value(selected_option).UTF8String);
-            if(result==-2) show_options(@"Enable KHNMC_SAVESTATE=1 for interactive play with the frames clock and null or WAV audio.");
+            if(result==-2) show_options(@(kh_setting_unavailable(selected_option) ?: "Unavailable"));
             else if(result) show_options(@"A command is already queued");
             else show_options(@"Queued. Circle to resume.");
         }else if(down&3){

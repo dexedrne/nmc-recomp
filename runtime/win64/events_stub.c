@@ -57,9 +57,9 @@ static int shape_is_stub(const u8 *d,size_t n){
 }
 static void load_template(KCtx *g){
     const char *root=getenv("KHNMC_DATA"); if(!root) root="data";
-    char dir[4096]; if(!kh_resolve_ci(root,"ard/us",dir,sizeof dir)) kh_fatal(g,"events-stub-template: KHNMC_EVENTS=stub needs the mod's empty event, and the tree %s has no ard/us",root);
+    char dir[4096]; if(!kh_resolve_ci(root,"ard/us",dir,sizeof dir)) return;
     struct dirent **list=NULL; int n=scandir(dir,&list,NULL,alphasort);
-    if(n<0) kh_fatal(g,"events-stub-template: cannot list %s (%s)",dir,strerror(errno));
+    if(n<0) return;
     for(int i=0;i<n&&!have_tmpl;i++){
         const char *nm=list[i]->d_name; size_t l=strlen(nm); if(l<5||strcasecmp(nm+l-4,".ard")) continue;
         char p[4500]; snprintf(p,sizeof p,"%s/%s",dir,nm); FILE *f=fopen(p,"rb"); if(!f) continue;
@@ -75,15 +75,18 @@ static void load_template(KCtx *g){
         free(b); fclose(f);
     }
     for(int i=0;i<n;i++) free(list[i]); free(list);
-    if(!have_tmpl) kh_fatal(g,"events-stub-template: KHNMC_EVENTS=stub needs the mod's empty event (a %d-byte entry of type 22: project, setup, start, end frame, fade), and no area file in %s holds one",STUB_LEN,dir);
+
 }
 static void init(KCtx *g){
     const char *e=getenv("KHNMC_EVENTS"); int m;
     if(!e||!*e||!strcmp(e,"real")) m=M_REAL;
     else if(!strcmp(e,"stub")) m=M_STUB;
     else if(!strcmp(e,"stub+music")) m=M_STUB_MUSIC;
-    else kh_fatal(g,"events-mode: KHNMC_EVENTS=%s is not a mode (stub, stub+music, real)",e);
-    if(m!=M_REAL){ load_template(g); fprintf(stderr,"kh: events stub: KHNMC_EVENTS=%s: every event entry is answered with the mod's %d-byte empty scene (taken from %s)%s\n",
+    else { kh_warn("events-mode: KHNMC_EVENTS=%s is not a mode; using real",e); m=M_REAL; }
+    if(m!=M_REAL){
+        load_template(g);
+        if(!have_tmpl){kh_warn("events-stub-template: no area file in the data tree provides the required template; using real"); mode=M_REAL; return;}
+        fprintf(stderr,"kh: events stub: KHNMC_EVENTS=%s: every event entry is answered with the mod's %d-byte empty scene (taken from %s)%s\n",
                                               e,STUB_LEN,tmpl_from,m==M_STUB_MUSIC?" plus the entry's own music commands":""); }
     mode=m;
 }
@@ -393,9 +396,9 @@ int kh_events_stub_selftest(KCtx *g){
     if(!kh_fork_ok()) kh_selftest_not_run("events stub","the named fatals events-mode, events-stub-template and events-stub (4 children)",9);
     else {
         char out[16384]; int rc;
-        setenv("KHNMC_EVENTS","none",1); kh_events_stub_test_reset(); rc=in_child(g,gr,out,sizeof out); T(rc==3); T(strstr(out,"events-mode: KHNMC_EVENTS=none is not a mode")!=NULL);
+        setenv("KHNMC_EVENTS","none",1); kh_events_stub_test_reset(); rc=in_child(g,gr,out,sizeof out); T(rc==99); T(strstr(out,"events-mode: KHNMC_EVENTS=none is not a mode")!=NULL);
         setenv("KHNMC_EVENTS","stub",1); snprintf(p,sizeof p,"%s/ard/us/bb00.ard",dir); write_ard(p,stub,ls,21);   /* same bytes, but not an event entry */
-        kh_events_stub_test_reset(); rc=in_child(g,gr,out,sizeof out); T(rc==3); T(strstr(out,"events-stub-template:")!=NULL&&strstr(out,"no area file in")!=NULL);
+        kh_events_stub_test_reset(); rc=in_child(g,gr,out,sizeof out); T(rc==99); T(strstr(out,"events-stub-template:")!=NULL&&strstr(out,"no area file in")!=NULL);
         write_ard(p,stub,ls,22); kh_events_stub_test_reset();
         u64 gb=ga_alloc(64,16); memset(hp(g,gb),0,64); wr16(g,gb,3); wr16(g,gb+2,1);                                /* a command of 3 bytes */
         rc=in_child(g,gb,out,sizeof out); T(rc==3); T(strstr(out,"events-stub: the event entry at guest")!=NULL&&strstr(out,"not an event")!=NULL);

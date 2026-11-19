@@ -212,10 +212,12 @@ static u32 wait_object(KCtx *g,u64 h,u32 ms,int *frame_wait){
     int k=0; KWaitObj *w=h_get_ref(h,&k); if(!w){ kh_set_last_error(6); return 0xFFFFFFFFu; }
     int vsync=kh_vclock_sync&&me, vcl=-1; u64 vdl=0;                                  /* the idle mark from the start; virtual time-outs once the clock steps */
     if(vsync&&kh_vclock_stepped()&&ms!=0xFFFFFFFFu&&ms){ vdl=kh_vclock_now_ns()+(u64)ms*1000000ull; vcl=kh_vclock_deadline_add(vdl); vc_vwaits++; }
+    int host_cut=kh_cut_enabled&&!kh_vclock_on;
+    if(host_cut&&ms!=UINT32_MAX) vdl=kh_vclock_now_ns()+(u64)ms*1000000;
     struct timespec dl; if(ms!=0xFFFFFFFFu) abs_deadline(&dl,ms);
     struct KhPendingWait pending={.object=w,.handle=h,.frame_wait=frame_wait?*frame_wait:0,
                                   .deadline_client=vcl,.timeout_ms=ms,.deadline=vdl};
-    int restorable=kh_cut_enabled&&kh_cut_wait_owner==KH_CUT_HANDLE&&(ms==UINT32_MAX||vcl>=0);
+    int restorable=kh_cut_enabled&&kh_cut_wait_owner==KH_CUT_HANDLE&&(ms==UINT32_MAX||vcl>=0||host_cut);
     u32 res=0; u64 waited=0;
     pthread_mutex_t *m;
     pthread_cond_t *cv;
@@ -251,6 +253,14 @@ bind:
             if(kh_vclock_now_ns()>=vdl){ pthread_mutex_unlock(m); int due=kh_vclock_deadline_due(vcl,vdl); pthread_mutex_lock(m);
                 if(due){ if(!(th?th->done:wobj_try(w,k,me,pending.generation,pending.blocked))) res=0x102; break; } }
             struct timespec d2; abs_deadline(&d2,1); kh_cond_wait_until(cv,m,&d2); continue; }
+        if(host_cut&&ms!=UINT32_MAX){
+            u64 now=kh_vclock_now_ns();
+            if(now>=vdl){ res=0x102; break; }
+            u64 left=vdl-now;
+            struct timespec poll;
+            kh_mono_deadline_ms(&poll,(unsigned)((left>10000000?10000000:left)+999999)/1000000);
+            kh_cond_wait_until(cv,m,&poll); continue;
+        }
         if(ms==0xFFFFFFFFu&&kh_cut_enabled){ struct timespec poll; abs_deadline(&poll,10); kh_cond_wait_until(cv,m,&poll); continue; }
         if(ms==0xFFFFFFFFu){ struct timespec d2; abs_deadline(&d2,10000); rc=kh_cond_wait_until(cv,m,&d2);
             if(rc==ETIMEDOUT){ waited+=10; if(kh_verbose||(waited%60==0)) fprintf(stderr,"kh: thread %u ('%s') waiting %llus on handle %llx kind %d (site rva %llx)\n",me->tid,me->name,(unsigned long long)waited,(unsigned long long)h,k,(unsigned long long)(rd64(g,KH_RSP(g))-GS_BASE)); } }
@@ -415,10 +425,11 @@ static void cs_enter(KCtx *g,u64 cs){
     SYNC_CHAOS();
     KThread *ct=cur_thread(); u64 me=ct->tid; u64 *own=(u64*)XL(g,cs+0x10);
     if(__atomic_load_n(own,__ATOMIC_RELAXED)==me){ wr32(g,cs+0xC,rd32(g,cs+0xC)+1); return; }
+    int track_wait=kh_vclock_sync||kh_cut_enabled;
     int spins=0;
     for(;;){ u64 z=0; if(__atomic_compare_exchange_n(own,&z,me,0,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)) break;
-        if(++spins<200) KH_CPU_RELAX(); else if(spins<2000) sched_yield(); else { if(spins==2000&&kh_vclock_sync){ atomic_store(&ct->vc_csown,(unsigned long long*)own); atomic_store(&ct->vc_state,3); kh_vclock_idle(2); } struct timespec ts={0,50000}; nanosleep(&ts,0); } }
-    if(spins>=2000&&kh_vclock_sync) kh_vclock_idle(0);
+        if(++spins<200) KH_CPU_RELAX(); else if(spins<2000) sched_yield(); else { if(spins==2000&&track_wait){ atomic_store(&ct->vc_csown,(unsigned long long*)own); atomic_store(&ct->vc_state,3); kh_vclock_idle(2); } struct timespec ts={0,50000}; nanosleep(&ts,0); } }
+    if(spins>=2000&&track_wait) kh_vclock_idle(0);
     wr32(g,cs+0xC,1);
     if(kh_cut_enabled) cut_cs_acquired(cs);
 }
@@ -589,7 +600,7 @@ static u64 thread_create(KCtx *g,u64 stack_size,u64 start,u64 param,int suspende
      * pthread that is never joined keeps its 48 MiB host stack mapping for good (review 2026-11-16: address space and VMA count grew with
      * every worker the engine ended).  t->pt is therefore only valid while !t->done (nothing uses it after creation). */
     pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at,48ull<<20); pthread_attr_setdetachstate(&at,PTHREAD_CREATE_DETACHED);
-    int ordered_boot=kh_cut_enabled&&!suspended&&(start==GS_BASE+0x44ea80||start==GS_BASE+0x44d850||start==GS_BASE+0xfab10);
+    int ordered_boot=kh_cut_enabled&&kh_vclock_on&&!suspended&&(start==GS_BASE+0x44ea80||start==GS_BASE+0x44d850||start==GS_BASE+0xfab10);
     if(ordered_boot) atomic_store(&t->cut_boot_wait,1);
     int rc=pthread_create(&t->pt,&at,thread_main,t); pthread_attr_destroy(&at);
     if(rc){ kh_warn("pthread_create failed: %d",rc); h_close(t->handle); tlist_remove(t); return 0; }

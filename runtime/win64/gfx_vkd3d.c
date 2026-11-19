@@ -92,13 +92,10 @@ int kh_gfx_wrap_on;                        /* 1 = ... and the game sees it throu
 /* ---- backend compiled out ------------------------------------------------------------------------------------------------ */
 #define NOT_BUILT(what) kh_fatal(g,"gfx-vkd3d-not-built: %s reached but the vkd3d backend is not compiled into this binary",what)
 void kh_gfx_vkd3d_init(void){
-    kh_fatal(NULL,"gfx-vkd3d-not-built: KHNMC_GFX=vkd3d was requested but the vkd3d backend is not compiled into this binary. "
-                  "Rebuild with GFX_VKD3D=1 (the Makefile enables it when $(VKD3D_PREFIX)/lib/libvkd3d.so exists; default prefix /home/user/work/khnmc-deps/vkd3d/usr)");
+    kh_warn("KHNMC_GFX=vkd3d disabled: graphics backend not built; using null");
 }
 void kh_gfx_wrap_init(void){
-    kh_fatal(NULL,"gfx-vkd3d-not-built: KHNMC_GFX=vkd3dw was requested but the vkd3d backend is not compiled into this binary. "
-                  "Rebuild with GFX_VKD3D=1 (the Makefile enables it on Linux when $(VKD3D_PREFIX)/lib/libvkd3d.so exists; on macOS it is off unless "
-                  "`make GFX_VKD3D=1` is given, which links vkd3d's static libraries from $(VKD3D_LIBDIR))");
+    kh_warn("KHNMC_GFX=vkd3dw disabled: graphics backend not built; using null");
 }
 void kh_vkd3d_create_device(KCtx *g){ NOT_BUILT("D3D12CreateDevice"); }
 void kh_vkd3d_serialize_rootsig(KCtx *g){ NOT_BUILT("D3D12SerializeRootSignature"); }
@@ -150,33 +147,35 @@ static void bundle_classes(void){ C_balloc=kh_com_class("vkd3d:BundleAllocator",
 #define U(x) ((u64)(uintptr_t)(x))
 
 /* ---- start-up: driver selection, native ranges, dump configuration --------------------------------------------------------- */
-static void driver_setup(void){
+static HRESULT instance_get(void);
+static int driver_setup(void){
     const char *d=getenv("KHNMC_GFX_DRIVER");
 #if KH_IOS_PATHS && !defined(__linux__)
     /* TASK36 (plan step 1): an Apple app build (KH_IOS_PATHS on Darwin) has exactly one Vulkan implementation, MoltenVK, linked into the
      * program; it is the default there.  On LINUX the CPU-only policy below stays exactly as it is, KH_IOS_PATHS or not (the plan
      * said "under KH_IOS_PATHS"; that would have made a Linux IOS_PATHS build pick the system driver = the real GPU). */
-    if(!d||!*d){ drv_system=1; fprintf(stderr,"kh: gfx vkd3d: Apple app build: the system's Vulkan implementation (MoltenVK) is the default driver\n"); return; }
+    if(!d||!*d){ drv_system=1; fprintf(stderr,"kh: gfx vkd3d: Apple app build: the system's Vulkan implementation (MoltenVK) is the default driver\n"); return 1; }
 #endif
     if(d&&!strcmp(d,"system")){
         drv_system=1;
         fprintf(stderr,"kh: gfx vkd3d: KHNMC_GFX_DRIVER=system: the SYSTEM Vulkan drivers (GPU) are used; the Vulkan environment is left as it is\n");
-        return;
+        return 1;
     }
     if(d&&*d&&strcmp(d,"lavapipe")) kh_fatal(NULL,"gfx-driver-unknown: KHNMC_GFX_DRIVER=%s (use 'lavapipe' = CPU, the default, or 'system')",d);
 #if !defined(__linux__)
     /* the CPU driver is selected through its Linux manifest; elsewhere the runtime does not pick a driver on its own (macOS: the Vulkan
      * implementation is MoltenVK, a GPU driver on Metal), so using the system's Vulkan is an explicit choice there, as it is on Linux */
-    kh_fatal(NULL,"gfx-driver-no-cpu-driver: the CPU Vulkan driver (lavapipe) is selected through its Linux manifest %s and this is not a Linux build. "
-                  "Run with KHNMC_GFX_DRIVER=system to use the system's Vulkan implementation (macOS: MoltenVK, a GPU driver)",LVP_ICD);
+    kh_warn("Vulkan backend disabled: CPU driver unavailable on this platform");
+    return 0;
 #endif
     FILE *f=fopen(LVP_ICD,"r");
-    if(!f) kh_fatal(NULL,"gfx-lavapipe-missing: the lavapipe Vulkan driver manifest %s cannot be opened (%s); install the CPU Vulkan driver (vulkan-swrast)",LVP_ICD,strerror(errno));
+    if(!f){ kh_warn("Vulkan backend disabled: cannot open CPU driver manifest %s",LVP_ICD); return 0; }
     char buf[2048]; size_t n=fread(buf,1,sizeof buf-1,f); buf[n]=0; fclose(f);
     if(!strstr(buf,"libvulkan_lvp")) kh_fatal(NULL,"gfx-lavapipe-missing: %s does not name libvulkan_lvp (not the lavapipe manifest)",LVP_ICD);
     if(setenv("VK_DRIVER_FILES",LVP_ICD,1)||unsetenv("VK_ICD_FILENAMES")||unsetenv("VK_ADD_DRIVER_FILES")||setenv("VK_LOADER_LAYERS_DISABLE","~implicit~",1)||setenv("LP_NUM_THREADS","4",0))
         kh_fatal(NULL,"gfx-driver-env: cannot set the Vulkan driver environment (%s)",strerror(errno));
     fprintf(stderr,"kh: gfx vkd3d: CPU Vulkan driver selected by the runtime: VK_DRIVER_FILES=%s, implicit layers disabled, LP_NUM_THREADS=%s\n",getenv("VK_DRIVER_FILES"),getenv("LP_NUM_THREADS"));
+    return 1;
 }
 #if KH_GFX_TRAMP
 static int phdr_cb(struct dl_phdr_info *info,size_t size,void *data){
@@ -194,68 +193,80 @@ static const KhPcProvider gw_pc_prov;      /* TASK43: defined with the gipa wrap
 static char video_path[1024]; static int video_scale, video_from_field, video_exit; static u64 video_from, video_lead, video_max;
 static void video_setup(void){
     const char *e=getenv("KHNMC_GFX_VIDEO"); if(!e||!*e) return;
-    if(!kh_vclock_on) kh_fatal(NULL,"gfx-video-needs-frames-clock: KHNMC_GFX_VIDEO writes one picture per virtual vblank and needs KHNMC_CLOCK=frames; on the host clock the pictures would have no fixed cadence");
-    if(snprintf(video_path,sizeof video_path,"%s",e)>=(int)sizeof video_path-8) kh_fatal(NULL,"gfx-video: KHNMC_GFX_VIDEO is too long");
-    e=getenv("KHNMC_GFX_VIDEO_FRAMES"); char *end=NULL; if(!e||!*e||(video_max=strtoull(e,&end,10),*end)||!video_max) kh_fatal(NULL,"gfx-video-frames: KHNMC_GFX_VIDEO_FRAMES=%s must be the number of pictures to write (a positive integer)",e?e:"(unset)");
-    e=getenv("KHNMC_GFX_VIDEO_SCALE"); video_scale=1; if(e&&*e){ if(!strcmp(e,"2")) video_scale=2; else if(strcmp(e,"1")) kh_fatal(NULL,"gfx-video-scale: KHNMC_GFX_VIDEO_SCALE=%s (1 = full size, 2 = mean of 2x2 blocks)",e); }
+    if(!kh_vclock_on){ kh_warn("KHNMC_GFX_VIDEO disabled: recording requires the frames clock"); return; }
+    if(snprintf(video_path,sizeof video_path,"%s",e)>=(int)sizeof video_path-8) goto invalid;
+    e=getenv("KHNMC_GFX_VIDEO_FRAMES"); char *end=NULL; if(!e||!*e||(video_max=strtoull(e,&end,10),*end)||!video_max) goto invalid;
+    e=getenv("KHNMC_GFX_VIDEO_SCALE"); video_scale=1; if(e&&*e){ if(!strcmp(e,"2")) video_scale=2; else if(strcmp(e,"1")) goto invalid; }
     e=getenv("KHNMC_GFX_VIDEO_FROM");
-    if(e&&!strncmp(e,"field",5)){ video_from_field=1; if(e[5]=='+'&&e[6]){ video_lead=strtoull(e+6,&end,10); if(*end) kh_fatal(NULL,"gfx-video-from: KHNMC_GFX_VIDEO_FROM=%s (field or field+<vblanks>)",e); } else if(e[5]) kh_fatal(NULL,"gfx-video-from: KHNMC_GFX_VIDEO_FROM=%s (field or field+<vblanks>)",e); }
-    else if(e&&*e){ video_from=strtoull(e,&end,10); if(*end) kh_fatal(NULL,"gfx-video-from: KHNMC_GFX_VIDEO_FROM=%s (a virtual vblank number, field, or field+<vblanks>)",e); }
+    if(e&&!strncmp(e,"field",5)){ video_from_field=1; if(e[5]=='+'&&e[6]){ video_lead=strtoull(e+6,&end,10); if(*end) goto invalid; } else if(e[5]) goto invalid; }
+    else if(e&&*e){ video_from=strtoull(e,&end,10); if(*end) goto invalid; }
     e=getenv("KHNMC_GFX_VIDEO_EXIT"); video_exit=e&&*e=='1';
     /* The stream may be a FIFO.  A reader that goes away must end in the named fatal of video_vblank ("gfx-video-write: short
      * write"), with the exit reports, not in a silent death by SIGPIPE (review 2026-11-17).  Only for a run that writes a video
      * stream: every other run keeps the default, so `khnmc ... | head` still ends when the reader does. */
     { struct sigaction ign; memset(&ign,0,sizeof ign); ign.sa_handler=SIG_IGN; sigaction(SIGPIPE,&ign,0); }
     kh_vclock_on_vblank(video_vblank);
+    return;
+invalid:
+    video_path[0]=0; video_max=0;
+    kh_warn("video recording disabled: invalid path, frame count, scale or starting frame");
 }
 /* KHNMC_GFX=vkd3d: the trampoline bridge */
 void kh_gfx_vkd3d_init(void){
 #if KH_GFX_TRAMP
-    driver_setup();
+    if(!driver_setup() || FAILED(instance_get())) return;
     int n=0; dl_iterate_phdr(phdr_cb,&n);
     if(n<3) kh_fatal(NULL,"gfx-vkd3d-libs: found %d executable segment(s) of libvkd3d*, expected the three libraries libvkd3d, libvkd3d-utils, libvkd3d-shader",n);
     kh_gfxc_init_common("vkd3d (D3D12 on Vulkan), trampoline bridge: host objects, Windows-ABI calls");
 #else
-    kh_fatal(NULL,"gfx-vkd3d-needs-identity: KHNMC_GFX=vkd3d hands host vkd3d objects to the lifted code and calls them through the Windows-ABI trampoline; "
-                  "that exists only on x86-64 with the identity address model, and this binary was built with KH_XLATE_MODE=%d for %s. Use KHNMC_GFX=vkd3dw (the wrapped bridge)",KH_XLATE_MODE,
-#if defined(__x86_64__)
-                  "x86-64"
-#elif defined(__aarch64__)
-                  "arm64"
-#else
-                  "another architecture"
-#endif
-                  );
+    kh_warn("KHNMC_GFX=vkd3d disabled: this build lacks the native trampoline; using null");
 #endif
 }
 /* KHNMC_GFX=vkd3dw: the wrapped bridge (gfx_wrap.c) on the same vkd3d device, swap chain and frame output */
 void kh_gfx_wrap_init(void){
-    driver_setup();
+    if(!driver_setup() || FAILED(instance_get())) return;
     kh_wrap_classes();
     kh_gfx_wrap_on=1;
     kh_gfxc_init_common("vkd3d (D3D12 on Vulkan), WRAPPED bridge: guest-side COM objects, no Windows-ABI call");
 }
+static FILE *open_frame_log(const char *key,char *path,size_t size){
+    const char *v=getenv(key);
+    if(!v || !*v) return NULL;
+    FILE *f=snprintf(path,size,"%s",v)<(int)size?fopen(path,"w"):NULL;
+    if(!f){ kh_warn("%s disabled: output path unavailable",key); path[0]=0; }
+    return f;
+}
 /* what both bridges configure: frame dumps, the video stream, the trace switch, the fiber host stack, the bundle recorder classes */
 void kh_gfxc_init_common(const char *label){
     const char *e=getenv("KHNMC_GFX_DUMP");
-    if(e&&*e){ if(snprintf(dump_dir,sizeof dump_dir,"%s",e)>=(int)sizeof dump_dir) kh_fatal(NULL,"gfx-dump-dir: KHNMC_GFX_DUMP is too long");
-        if(mkdir(dump_dir,0755)&&errno!=EEXIST) kh_fatal(NULL,"gfx-dump-dir: cannot create %s (%s)",dump_dir,strerror(errno)); }
-    e=getenv("KHNMC_GFX_DUMP_EVERY");
-    if(e&&*e){ char *end; unsigned long long v=strtoull(e,&end,10); if(*end||!v) kh_fatal(NULL,"gfx-dump-every: KHNMC_GFX_DUMP_EVERY=%s is not a positive integer",e); dump_every=v; }
-    e=getenv("KHNMC_GFX_DUMP_FROM"); if(e&&*e){ char *end; dump_from=strtoull(e,&end,10); if(*end) kh_fatal(NULL,"gfx-dump-window: KHNMC_GFX_DUMP_FROM=%s is not a present number",e); }
-    e=getenv("KHNMC_GFX_DUMP_TO"); if(e&&*e){ char *end; dump_to=strtoull(e,&end,10); if(*end||dump_to<dump_from) kh_fatal(NULL,"gfx-dump-window: KHNMC_GFX_DUMP_TO=%s is not a present number at or after KHNMC_GFX_DUMP_FROM=%llu",e,P(dump_from)); }
+    if(e&&*e){
+        struct stat st;
+        if(snprintf(dump_dir,sizeof dump_dir,"%s",e)>=(int)sizeof dump_dir ||
+           (mkdir(dump_dir,0755) && errno!=EEXIST) || stat(dump_dir,&st) ||
+           !S_ISDIR(st.st_mode) || access(dump_dir,W_OK)){
+            kh_warn("frame dump disabled: directory unavailable"); dump_dir[0]=0;
+        }
+    }
+    const char *dump_keys[]={"KHNMC_GFX_DUMP_EVERY","KHNMC_GFX_DUMP_FROM","KHNMC_GFX_DUMP_TO"};
+    u64 *dump_values[]={&dump_every,&dump_from,&dump_to};
+    for(unsigned i=0;i<3;i++){
+        e=getenv(dump_keys[i]); if(!e || !*e) continue;
+        char *end; errno=0; u64 value=strtoull(e,&end,10);
+        if(*e<'0' || *e>'9' || *end || errno || (!i && !value) || (i==2 && value<dump_from)){
+            kh_warn("frame dump disabled: invalid %s",dump_keys[i]); dump_dir[0]=0; break;
+        }
+        *dump_values[i]=value;
+    }
     e=getenv("KHNMC_GFX_BACKBUFFERS"); bb_mode_env=BB_OWN;                  /* TASK36: own VkImages (default), general, committed */
     if(e&&*e){ if(!strcmp(e,"own")) bb_mode_env=BB_OWN; else if(!strcmp(e,"general")) bb_mode_env=BB_GENERAL; else if(!strcmp(e,"committed")) bb_mode_env=BB_COMMITTED;
         else kh_fatal(NULL,"gfx-backbuffers-mode: KHNMC_GFX_BACKBUFFERS=%s (own = our VkImages, PRESENT = TRANSFER_SRC; general = our VkImages, PRESENT = GENERAL; committed = vkd3d's resources, the old path)",e); }
     e=getenv("KHNMC_GFX_TEST_MEMORY_AVAILABLE_MIB");                     /* review X38 n=2: TESTS ONLY, a reading for the gfx-memory-low soft stop */
     if(e&&*e){ char *end; unsigned long long v=strtoull(e,&end,10); if(*end||e[0]<'0'||e[0]>'9'||v>(1ull<<40)) kh_fatal(NULL,"gfx-memory-test: KHNMC_GFX_TEST_MEMORY_AVAILABLE_MIB=%s is not a number of MiB",e); memlow_test=(long long)v; }
-    e=getenv("KHNMC_GFX_HASHLOG");
-    if(e&&*e){ if(snprintf(hash_path,sizeof hash_path,"%s",e)>=(int)sizeof hash_path) kh_fatal(NULL,"gfx-hashlog: KHNMC_GFX_HASHLOG is too long");
-        hash_f=fopen(hash_path,"w"); if(!hash_f) kh_fatal(NULL,"gfx-hashlog: cannot create %s (%s)",hash_path,strerror(errno));
+    hash_f=open_frame_log("KHNMC_GFX_HASHLOG",hash_path,sizeof hash_path);
+    if(hash_f){
         setvbuf(hash_f,NULL,_IOLBF,0); fprintf(hash_f,"present\tgame_frame\tvblank\trgb_hash\tbgra_hash\tdraws_total\twidth\theight\n"); }
-    e=getenv("KHNMC_GFX_BANDLOG");                                          /* task 40 (the fill mode's GPU checks): per present, the 16:9 band and the strips */
-    if(e&&*e){ if(snprintf(band_path,sizeof band_path,"%s",e)>=(int)sizeof band_path) kh_fatal(NULL,"gfx-bandlog: KHNMC_GFX_BANDLOG is too long");
-        band_f=fopen(band_path,"w"); if(!band_f) kh_fatal(NULL,"gfx-bandlog: cannot create %s (%s)",band_path,strerror(errno));
+    band_f=open_frame_log("KHNMC_GFX_BANDLOG",band_path,sizeof band_path);
+    if(band_f){
         setvbuf(band_f,NULL,_IOLBF,0);
         fprintf(band_f,"present\tgame_frame\twidth\theight\tband_top_row\tband_rows\tband_hash\ttop_hash\tbottom_hash\tband_nonblack_pct\ttop_nonblack_pct\tbottom_nonblack_pct\tband_mean\ttop_mean\tbottom_mean\tedge_top\tedge_bottom\tband_step_p95\tedge_window_rows\tedge_top_max\tedge_bottom_max\n"); }
     video_setup();
@@ -603,7 +614,7 @@ static HRESULT instance_get(void){
     /* TASK36 (plan step 1): the Vulkan implementation is LINKED into the program (Apple: MoltenVK's static library, no loader; a Linux
      * test build links the loader with -lvulkan).  Nothing is loaded at run time, so a named library is an error, not a silent no-op. */
     if(!vk_gipa){ const char *named=getenv("KHNMC_GFX_VULKAN_LIB");
-        if(named&&*named) kh_fatal(NULL,"gfx-vulkan-lib-static: KHNMC_GFX_VULKAN_LIB=%s, but this build links its Vulkan implementation (KH_GFX_VULKAN_STATIC): there is no library to load",named);
+        if(named&&*named) kh_warn("Vulkan library override disabled: using linked implementation");
         vk_gipa=vkGetInstanceProcAddr; vk_lib_name="the program's own vkGetInstanceProcAddr (KH_GFX_VULKAN_STATIC: linked, not loaded)"; vk_lib_from=""; }
 #else
     if(!vk_gipa){ char why[512]; why[0]=0; void *lib=NULL;
@@ -615,32 +626,34 @@ static HRESULT instance_get(void){
         if(!named){ named=KH_GFX_VULKAN_LIB; from="the build's KH_GFX_VULKAN_LIB; "; }
 #endif
         if(named){
-            if(named[0]!='/') kh_fatal(NULL,"gfx-vulkan-lib-path: the Vulkan library was named as '%s' (%s): it must be an absolute path (a bare name would be searched like any other library)",named,from);
-            lib=dlopen(named,RTLD_NOW|RTLD_LOCAL);
-            if(!lib){ const char *e=dlerror(); kh_fatal(NULL,"gfx-vulkan-loader: the Vulkan library %s (%s) cannot be loaded: %s",named,from,e?e:"no reason given"); }
-            vk_lib_name=named; vk_lib_from=from; }
+            if(named[0]=='/') lib=dlopen(named,RTLD_NOW|RTLD_LOCAL);
+            if(lib && !dlsym(lib,"vkGetInstanceProcAddr")){ dlclose(lib); lib=NULL; }
+            if(lib){ vk_lib_name=named; vk_lib_from=from; }
+            else kh_warn("Vulkan library override disabled: expected an available absolute path to a Vulkan loader");
+        }
         for(size_t i=0;!lib&&i<sizeof vk_lib_names/sizeof*vk_lib_names;i++){ lib=dlopen(vk_lib_names[i],RTLD_NOW|RTLD_LOCAL);
             if(lib) vk_lib_name=vk_lib_names[i]; else { const char *e=dlerror(); size_t l=strlen(why); snprintf(why+l,sizeof why-l,"%s%s",l?"; ":"",e?e:vk_lib_names[i]); } }
-        if(!lib) kh_fatal(NULL,"gfx-vulkan-loader: no Vulkan library of this OS can be loaded (%s). KHNMC_GFX_VULKAN_LIB=<absolute path> names one outright",why);
+        if(!lib){ kh_warn("Vulkan backend disabled: loader unavailable (%s)",why); return E_FAIL; }
         vk_gipa=(PFN_vkGetInstanceProcAddr)dlsym(lib,"vkGetInstanceProcAddr");
-        if(!vk_gipa) kh_fatal(NULL,"gfx-vulkan-loader: %s has no vkGetInstanceProcAddr",vk_lib_name); }
+        if(!vk_gipa){ kh_warn("Vulkan backend disabled: %s has no vkGetInstanceProcAddr",vk_lib_name); dlclose(lib); return E_FAIL; } }
 #endif
+    if(!vk_gipa(NULL,"vkCreateInstance")){ kh_warn("Vulkan backend disabled: loader lacks vkCreateInstance"); return E_FAIL; }
     struct vkd3d_application_info app; memset(&app,0,sizeof app); app.type=VKD3D_STRUCTURE_TYPE_APPLICATION_INFO; app.application_name="khnmc"; app.api_version=VKD3D_API_VERSION_2_1;
     struct vkd3d_optional_instance_extensions_info oie; memset(&oie,0,sizeof oie); oie.type=VKD3D_STRUCTURE_TYPE_OPTIONAL_INSTANCE_EXTENSIONS_INFO; oie.next=&app;
     oie.extensions=opt_inst_ext; oie.extension_count=(uint32_t)(sizeof opt_inst_ext/sizeof*opt_inst_ext);
     struct vkd3d_instance_create_info ici; memset(&ici,0,sizeof ici); ici.type=VKD3D_STRUCTURE_TYPE_INSTANCE_CREATE_INFO; ici.next=&oie; ici.pfn_signal_event=sig_event; ici.wchar_size=2;
     ici.pfn_vkGetInstanceProcAddr=kh_vk_gipa_wrap;
     HRESULT hr=vkd3d_create_instance(&ici,&vk_inst);
-    if(FAILED(hr)){ vk_inst=NULL; fprintf(stderr,"kh: gfx vkd3d: vkd3d_create_instance FAILED hr=0x%08x (Vulkan library %s, VK_DRIVER_FILES=%s)\n",(unsigned)hr,vk_lib_name,getenv("VK_DRIVER_FILES")?getenv("VK_DRIVER_FILES"):"(unset)"); return hr; }
+    if(FAILED(hr)){ vk_inst=NULL; kh_warn("Vulkan backend disabled: vkd3d_create_instance failed hr=0x%08x (Vulkan library %s, VK_DRIVER_FILES=%s)",(unsigned)hr,vk_lib_name,getenv("VK_DRIVER_FILES")?getenv("VK_DRIVER_FILES"):"(unset)"); return hr; }
     /* every physical device the instance can see must be a CPU implementation unless the system driver was asked for; the two functions
      * come from the instance vkd3d created, through the library vkd3d uses */
     VkInstance vi=vkd3d_instance_get_vk_instance(vk_inst);
     PFN_vkEnumeratePhysicalDevices enum_pd=(PFN_vkEnumeratePhysicalDevices)vk_gipa(vi,"vkEnumeratePhysicalDevices");
     PFN_vkGetPhysicalDeviceProperties props=(PFN_vkGetPhysicalDeviceProperties)vk_gipa(vi,"vkGetPhysicalDeviceProperties");
-    if(!enum_pd||!props) kh_fatal(NULL,"gfx-vulkan-loader: %s gives no vkEnumeratePhysicalDevices / vkGetPhysicalDeviceProperties for the instance",vk_lib_name);
+    if(!enum_pd||!props){ kh_warn("Vulkan backend disabled: loader lacks physical device queries"); goto unavailable; }
     fprintf(stderr,"kh: gfx vkd3d: Vulkan library %s (%sits vkGetInstanceProcAddr is handed to vkd3d behind the gipa wrapper)\n",vk_lib_name,vk_lib_from);
     VkPhysicalDevice pd[16]; uint32_t n=16; VkResult vr=enum_pd(vi,&n,pd);
-    if((vr!=VK_SUCCESS&&vr!=VK_INCOMPLETE)||!n) kh_fatal(NULL,"gfx-vulkan-devices: vkEnumeratePhysicalDevices result %d, %u device(s)",(int)vr,n);
+    if((vr!=VK_SUCCESS&&vr!=VK_INCOMPLETE)||!n){ kh_warn("Vulkan backend disabled: physical device query returned %d, %u devices",(int)vr,n); goto unavailable; }
     for(uint32_t i=0;i<n;i++){ VkPhysicalDeviceProperties p; memset(&p,0,sizeof p); props(pd[i],&p);
         fprintf(stderr,"kh: gfx vkd3d: Vulkan physical device %u/%u: '%s' type=%s vendor=0x%x device=0x%x api=%u.%u.%u\n",i+1,n,p.deviceName,pd_type(p.deviceType),p.vendorID,p.deviceID,
                 VK_API_VERSION_MAJOR(p.apiVersion),VK_API_VERSION_MINOR(p.apiVersion),VK_API_VERSION_PATCH(p.apiVersion));
@@ -648,6 +661,9 @@ static HRESULT instance_get(void){
             kh_fatal(NULL,"gfx-driver-not-cpu: the Vulkan instance reports '%s' (type %s), not a CPU driver, although lavapipe was selected. Refusing to create a device on it.",p.deviceName,pd_type(p.deviceType));
         if(i==0) snprintf(vk_dev_name,sizeof vk_dev_name,"%s (%s)",p.deviceName,pd_type(p.deviceType)); }
     return S_OK;
+unavailable:
+    vkd3d_instance_decref(vk_inst); vk_inst=NULL; gw_instance=VK_NULL_HANDLE;
+    return E_FAIL;
 }
 
 /* method names by vtable slot: KHNMC_GFX_TRACE=1, the wrapped bridge's per-method counts and its named fatals */

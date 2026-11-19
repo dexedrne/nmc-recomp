@@ -15,6 +15,8 @@ const char *kh_look_root(void);
 int kh_scene_path(const char *rel,char *host,size_t cap);
 enum { KH_FILE_LOOK = 2 }; /* A selected overlay file must open successfully. */
 int kh_look_enabled(void);
+int kh_look_pack_ready(void);
+int kh_scene_pack_ready(void);
 int kh_player_asset_key(const char *canonical);
 int kh_look_key(const char *rel);
 int kh_look_available(const char *rel,char *host,size_t cap);

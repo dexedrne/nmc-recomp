@@ -101,6 +101,13 @@ static float turbo_speed=7.5f;
 static unsigned long long mp_probe;
 static int test_log;
 int kh_setting_action(int i){return i>=kh_option_count-DEBUG_COUNT-STATE_ACTIONS && i<kh_option_count;}
+static const char *unavailable[sizeof kh_options/sizeof *kh_options];
+const char *kh_setting_unavailable(int i){
+    if(i<0 || i>=kh_option_count) return "Unknown option";
+    int first=kh_option_count-DEBUG_COUNT-STATE_ACTIONS;
+    if(i>=first && i<first+STATE_ACTIONS) return kh_cut_menu_unavailable();
+    return unavailable[i];
+}
 int kh_setting_menu_count(void){return kh_option_count-(debug_enabled?(allow_reset?0:1):DEBUG_COUNT);}
 static _Atomic double values[COUNT]={0,0,1,1};
 double kh_live_setting_value(int i){ return atomic_load(&values[i]); }
@@ -239,6 +246,7 @@ static int kh_save_live_option(const char *,const char *,int,double);
 int kh_setting_set(const char *name,const char *value){
     double v; int i=validate(name,value,&v);
     if(i<0) return -1;
+    if(kh_setting_unavailable(i)) return -2;
     if(kh_setting_action(i)){
         int debug_start=kh_option_count-DEBUG_COUNT;
         if(i<debug_start) return kh_cut_menu_request(i==debug_start-1,(int)v);
@@ -279,6 +287,54 @@ void kh_settings_init(void){
 #if !KH_IOS_PATHS
     load_saved_options();
 #endif
+    /* Older phone configs use the shorter spelling. */
+    const char *present=getenv("KHNMC_PRESENT");
+    if(present && *present && !getenv("KHNMC_GFX_PRESENT"))
+        setenv("KHNMC_GFX_PRESENT",present,0);
+    static const struct { const char *key,*choices; } switches[]={
+        {"KHNMC_ASPECT","pc|fill"},{"KHNMC_ASPECT_LOG","0|1|2"},
+        {"KHNMC_TITLE_LAYOUT","portrait|band"},{"KHNMC_INPUT","host|script"},
+        {"KHNMC_MOVIES","end|fail"},{"KHNMC_DIFFICULTY","0|1|2|3"},
+        {"KHNMC_THEATER_UNLOCK","0|1"},{"KHNMC_APP_LIFE","on|off"},
+        {"KHNMC_DISPLAY","timer60"},{"KHNMC_GFX","null|vkd3dw|vkd3d"},
+        {"KHNMC_GFX_DRIVER","system|lavapipe"},{"KHNMC_GFX_BACKBUFFERS","own|general|committed"},
+        {"KHNMC_GFX_PRESENT","off|headless|layer"},{"KHNMC_GFX_PRESENT_FIT","aspect|stretch"},
+    };
+    for(size_t i=0;i<sizeof switches/sizeof *switches;i++){
+        const char *v=getenv(switches[i].key),*p=switches[i].choices;
+        if(!v || !*v) continue;
+        while(*p){
+            size_t n=strcspn(p,"|");
+            if(strlen(v)==n && !strncmp(p,v,n)) break;
+            p+=n; if(*p) p++;
+        }
+        if(!*p){
+            kh_warn("%s disabled: expected %s",switches[i].key,switches[i].choices);
+            unsetenv(switches[i].key);
+        }
+    }
+    for(int i=0;i<kh_option_count-DEBUG_COUNT-STATE_ACTIONS;i++){
+        const char *key=kh_options[i].name,*v=getenv(key);
+        if(!v) continue;
+        double n;
+        const char *reason=NULL;
+        if(!strncmp(key,"KHNMC_TWEAK_",12) && kh_options[i].choices){
+            if(strcasecmp(v,"on") && strcasecmp(v,"true") && strcmp(v,"1") &&
+               strcasecmp(v,"off") && strcasecmp(v,"false") && strcmp(v,"0"))
+                reason="Expected on or off";
+        }else if(validate(key,v,&n)<0) reason="Invalid configured value";
+        else if(i==LOOK && n && !kh_look_pack_ready()) reason="Xion asset pack incomplete";
+        else if(!strcmp(key,"KHNMC_SCENE_ROXAS") && n && !kh_scene_pack_ready()) reason="Scene asset pack incomplete";
+        if(!reason && (!strcmp(key,"KHNMC_FOV_ZOOM") || !strncmp(key,"KHNMC_HUD_SCALE_",16))){
+            const char *aspect=getenv("KHNMC_ASPECT");
+            if(!aspect || strcmp(aspect,"fill")) reason="Requires fill aspect";
+        }
+        if(reason){
+            kh_warn("%s disabled: %s",key,reason);
+            unavailable[i]=reason;
+            unsetenv(key);
+        }
+    }
     extern int kh_tweak_boolean(KCtx *,const char *,int);
     debug_enabled=kh_tweak_boolean(NULL,"KHNMC_TWEAK_DEBUG_DEBUG_ON",0);
     allow_reset=kh_tweak_boolean(NULL,"KHNMC_TWEAK_DEBUG_SOFT_RESET",0);
@@ -293,12 +349,6 @@ void kh_settings_init(void){
     for(int i=0;i<COUNT;i++){
         const char *name=kh_options[i].name,*v=getenv(name);
         if(v){double n; if(validate(name,v,&n)<0) kh_fatal(NULL,"setting-value: %s=%s",name,v); values[i]=n;}
-    }
-    for(int i=COUNT;i<kh_option_count;i++){
-        const char *key=kh_options[i].name,*v=getenv(key);
-        if(strncmp(key,"KHNMC_TWEAK_",12) || !v) continue;
-        if(kh_options[i].choices){ extern int kh_tweak_boolean(KCtx *,const char *,int); kh_tweak_boolean(NULL,key,0); }
-        else {double n; if(validate(key,v,&n)<0 || (strstr(key,"_DMG") && n!=floor(n))) kh_fatal(NULL,"tweak-value: %s=%s",key,v);}
     }
     const char *spec=getenv("KHNMC_TEST_SETTINGS");
     if(!spec) return;
@@ -371,8 +421,11 @@ const u8 *kh_look_notice(void){
     u64 state=atomic_load(&notice);
     if(!state) return NULL;
     int ready=atomic_load(&font_ready);
-    if(!ready) return NULL;
-    if(ready<0) kh_fatal(NULL,"look-notice-system-font-unavailable");
+    if(ready<=0){
+        if(ready==-1 && atomic_compare_exchange_strong(&font_ready,&ready,-2))
+            kh_warn("appearance notices disabled: unsupported system font");
+        return NULL;
+    }
     u64 now=kh_host_ns();
     /* A stick click during boot may arrive before the game loads its font. */
     if(state<=3){
@@ -554,7 +607,7 @@ static void look_frame(KCtx *g,int target,u64 frame){
     line=target?"Xion":"Roxas";
     notice_index=target?0:1;
     if(kh_save_live_option("KHNMC_PLAYER_LOOK",target?"xion":"roxas",LOOK,target))
-        kh_fatal(g,"look-settings-save");
+        kh_warn("appearance changed for this session: unable to save setting");
     last_switch=frame;
 feedback:
     if(refresh) return;
@@ -572,7 +625,7 @@ void kh_settings_frame(KCtx *g,uint64_t frame){
     int action=kh_stick_action(frame);
     atomic_store(&kh_hide_hud,action==CHORD_HOLD && values[HUD_COMBO]!=0);
     int target=atomic_exchange(&look_request,-1);
-    if(action==CHORD_CLICK) target=!kh_look_enabled();
+    if(action==CHORD_CLICK && !unavailable[LOOK]) target=!kh_look_enabled();
     if(g && (target>=0 || last_switch)) look_frame(g,target,frame);
     if(mp_probe && frame==mp_probe){
         KhPlayerSheet p;

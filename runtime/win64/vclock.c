@@ -77,6 +77,29 @@ static int stuck_record; static u64 n_stuck_recorded;  /* selftest only: a stuck
 
 u64 kh_host_ns(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (u64)ts.tv_sec*1000000000ull+(u64)ts.tv_nsec; }
 
+/* In real-time play, guest deadlines share a monotonic epoch that stops at a
+ * cut. The OS clock still drives display hardware and rendezvous timeouts. */
+static pthread_mutex_t host_clock_m=PTHREAD_MUTEX_INITIALIZER;
+static u64 host_anchor,guest_anchor=1;
+static int host_paused;
+static u64 host_guest_now(void){
+    pthread_mutex_lock(&host_clock_m);
+    u64 now=kh_host_ns();
+    if(!host_anchor) host_anchor=now;
+    u64 guest=guest_anchor+(host_paused?0:now-host_anchor);
+    pthread_mutex_unlock(&host_clock_m);
+    return guest;
+}
+void kh_cut_clock_pause(int pause){
+    if(!kh_cut_enabled||kh_vclock_on) return;
+    pthread_mutex_lock(&host_clock_m);
+    u64 now=kh_host_ns();
+    if(!host_paused&&host_anchor) guest_anchor+=now-host_anchor;
+    host_anchor=now;
+    host_paused=pause;
+    pthread_mutex_unlock(&host_clock_m);
+}
+
 static pthread_mutex_t vm=PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t vcv; static pthread_once_t vonce=PTHREAD_ONCE_INIT;
 static _Atomic int stepped;                         /* 0 = the virtual clock is the host clock, 1 = moved by virtual vblanks only */
 static _Atomic u64 v_now;                           /* ns, valid when stepped */
@@ -140,14 +163,14 @@ void kh_vclock_init(void){
     pthread_once(&vonce,vc_once);
     const char *e=getenv("KHNMC_CLOCK");
     if(!e||!*e||!strcmp(e,"host")) return;
-    if(strcmp(e,"frames")) kh_fatal(NULL,"clock-mode-unknown: KHNMC_CLOCK=%s (known: host = the host's clock, the default; frames = a virtual 60 Hz display drives every guest clock)",e);
+    if(strcmp(e,"frames")){ kh_warn("clock-mode-unknown: KHNMC_CLOCK=%s; using host clock",e); return; }
     kh_vclock_on=1;
     { const char *lg=getenv("KHNMC_CLOCK_LOG"); gate_log=lg&&*lg=='1'; }
     { const char *sy=getenv("KHNMC_CLOCK_SYNC"); kh_vclock_sync=1;                     /* TASK28: deterministic by default */
-      if(sy&&*sy){ if(!strcmp(sy,"all")) kh_vclock_sync=1; else if(!strcmp(sy,"timers")) kh_vclock_sync=0; else kh_fatal(NULL,"clock-sync-unknown: KHNMC_CLOCK_SYNC=%s (known: all = the clock moves only while every guest thread waits, the default; timers = only the winmm timers and the mixer are ordered clock clients)",sy); }
+      if(sy&&*sy){ if(!strcmp(sy,"all")) kh_vclock_sync=1; else if(!strcmp(sy,"timers")) kh_vclock_sync=0; else kh_warn("clock-sync-unknown: KHNMC_CLOCK_SYNC=%s; using all",sy); }
       if(kh_vclock_sync) fprintf(stderr,"kh: vclock: KHNMC_CLOCK_SYNC=all: the virtual clock moves only while every guest thread waits; Sleep and wait time-outs are on the virtual clock\n"); }
     const char *pc=getenv("KHNMC_CLOCK_PACE");
-    if(pc&&!strcmp(pc,"free")) pace_ns=0; else if(pc&&*pc&&strcmp(pc,"realtime")) kh_fatal(NULL,"clock-pace-unknown: KHNMC_CLOCK_PACE=%s (known: realtime = never faster than a real %llu Hz display, the default; free = as fast as the host allows)",pc,VC_HZ);
+    if(pc&&!strcmp(pc,"free")) pace_ns=0; else if(pc&&*pc&&strcmp(pc,"realtime")) kh_warn("clock-pace-unknown: KHNMC_CLOCK_PACE=%s; using realtime",pc);
     fprintf(stderr,"kh: vclock: KHNMC_CLOCK=frames: QueryPerformanceCounter / timeGetTime / winmm timers / the audio device clock follow a virtual %llu Hz display from the first WaitForVBlank on (1/%llu s per call; host time before that); pace=%s\n",VC_HZ,VC_HZ,pace_ns?"realtime (never faster than the host clock)":"free");
 }
 void kh_vclock_idle(int on){
@@ -158,7 +181,8 @@ void kh_vclock_idle(int on){
 int kh_vclock_deadline_add(u64 dl){ int id=kh_vclock_client_add_prio("timed-wait",dl,1<<28); kh_vclock_client_set_key(id,1<<28,cur_thread(),1); return id; }
 void kh_vclock_deadline_drop(int id){ kh_vclock_client_drop(id); }
 int kh_vclock_vsleep(u32 ms){
-    if(!kh_vclock_sync||!atomic_load(&stepped)||!cur_thread()) return 0;
+    int host=kh_cut_enabled&&!kh_vclock_on&&kh_cut_wait_owner==KH_CUT_SLEEP;
+    if(!cur_thread()||(!host&&(!kh_vclock_sync||!atomic_load(&stepped)))) return 0;
     u64 dl=kh_vclock_now_ns()+(u64)ms*1000000ull; int id=kh_vclock_client_add_prio("sleep",dl,1<<28); kh_vclock_client_set_key(id,1<<28,cur_thread(),0); n_vsleeps++;
     if(kh_cut_enabled) (void)kh_vclock_timer_wait(id,dl);
     else kh_vclock_client_wait(id,dl);                                                        /* ordered after the mixer and the timers of that instant, the guest quiet */
@@ -191,6 +215,7 @@ int kh_vclock_deadline_due(int id,u64 dl){
     return go;
 }
 u64 kh_vclock_now_ns(void){
+    if(kh_cut_enabled&&!kh_vclock_on) return host_guest_now();
     if(atomic_load(&stepped)) return atomic_load(&v_now);
     u64 h=kh_host_ns(); return atomic_load(&stepped)?atomic_load(&v_now):h;
 }
@@ -199,7 +224,8 @@ u64 kh_vclock_vblanks(void){ return atomic_load(&n_vblank); }
  * the clock), so the host-time floor is not wanted on top of it: with it the clock could fall behind the device (loads) and never catch
  * up.  Unless KHNMC_CLOCK_PACE was given explicitly, the pace becomes free.  Returns 1 when it changed the pace. */
 int kh_vclock_pace_by_device(void){ const char *pc=getenv("KHNMC_CLOCK_PACE"); if(!kh_vclock_on||(pc&&*pc)) return 0; pace_ns=0; return 1; }
-u64 kh_vclock_origin(void){ return atomic_load(&stepped)?v_t0:0; }   /* virtual time of the first virtual vblank (0 = not stepped yet) */
+void kh_cut_host_vblank(void){ atomic_fetch_add(&n_vblank,1); }
+u64 kh_vclock_origin(void){ if(kh_cut_enabled&&!kh_vclock_on) return 1; return atomic_load(&stepped)?v_t0:0; }   /* virtual time of the first virtual vblank (0 = not stepped yet) */
 int kh_vclock_stepped(void){ return atomic_load(&stepped); }
 /* review of task 28: a clock client created before the first WaitForVBlank (the audio mixer, a winmm timer) waits here before it fixes its
  * grid, so that the grid's phase against the vblanks does not depend on the host (8 of 100 one-CPU starts created the mixer before the
@@ -217,6 +243,17 @@ void kh_vclock_wait_until(u64 t){
     if(kh_vclock_sync){ kh_vclock_idle(1); kh_vclock_wait_until_raw(t); kh_vclock_idle(0); return; }
     kh_vclock_wait_until_raw(t);
 }
+/* Re-read the registered deadline after thaw. A slot can rewind both
+ * the guest clock and the worker's next wakeup. */
+static u64 host_client_wait(int id,const char *site){
+    for(;;){
+        if(atomic_load(&kh_cut_requested)) kh_cut_poll(site,NULL);
+        u64 due=kh_clock_client_deadline(id), now=host_guest_now();
+        if(now>=due) return due;
+        u64 ns=due-now;
+        host_sleep_until(kh_host_ns()+(ns>10000000?10000000:ns));
+    }
+}
 static u64 wait_until_raw(u64 t,int client){
     for(;;){
         if(!atomic_load(&stepped)){ u64 h=kh_host_ns(); if(h>=t) return t; host_sleep_until(t-h>50000000ull?h+50000000ull:t); continue; }
@@ -232,6 +269,7 @@ static u64 wait_until_raw(u64 t,int client){
 }
 void kh_vclock_wait_until_raw(u64 t){ (void)wait_until_raw(t,-1); }
 u64 kh_cut_mix_wait(int client,u64 due){
+    if(!kh_vclock_on&&client>=0) return host_client_wait(client,"clock-deadline");
     kh_vclock_idle(1);
     due=wait_until_raw(due,client);
     kh_vclock_idle(0);
@@ -269,6 +307,7 @@ static u64 client_wait(int id,u64 t,int registered){
 void kh_vclock_client_wait(int id,u64 t){ (void)client_wait(id,t,0); }
 u64 kh_vclock_timer_wait(int id,u64 due){ return client_wait(id,due,1); }
 static u64 client_wait_raw(int id,u64 t,int registered){
+    if(kh_cut_enabled&&!kh_vclock_on&&registered) return host_client_wait(id,"clock-client");
     for(;;){
         if(!atomic_load(&stepped)){ u64 h=kh_host_ns(); if(h>=t) return t; host_sleep_until(t-h>50000000ull?h+50000000ull:t); continue; }
         pthread_mutex_lock(&vm);
@@ -395,11 +434,33 @@ struct KhClockSlot *kh_clock_capture(void){
         .presents=presents_seen,.ticks=ticks_seen,.frames=frames_seen,.how=last_how,
         .sem={frame_sem_h[0],frame_sem_h[1]},.releases=frame_releases,.taken=frame_taken,
         .in_wait=frame_in_wait,.rest=frame_rest,.calibrated=frame_rest_ok};
+    if(kh_cut_enabled&&!kh_vclock_on) s->now=host_guest_now();
     memcpy(s->clients,clients,sizeof clients);
     pthread_mutex_unlock(&vm);
     return s;
 }
+/* A sleeper can re-enter its wait in a different free client slot between
+ * saves. Each parked worker still owns its live slot index. */
+static int saved_host_client(struct KhClockSlot *s,const VClient *live){
+    for(int i=0;i<MAXCLIENTS;i++){
+        VClient *saved=&s->clients[i];
+        if(saved->used&&saved->keyth==live->keyth&&saved->keyseq==live->keyseq&&
+           !strcmp(saved->name,live->name)) return i;
+    }
+    return -1;
+}
 const char *kh_clock_validate(struct KhClockSlot *s){
+    if(kh_cut_enabled&&!kh_vclock_on){
+        int live=0,saved=0;
+        for(int i=0;i<MAXCLIENTS;i++){
+            if(clients[i].used){
+                if(saved_host_client(s,&clients[i])<0) return "savestate-clock-client-binding";
+                live++;
+            }
+            saved+=s->clients[i].used;
+        }
+        return live==saved?NULL:"savestate-clock-client-set";
+    }
     if(v_t0!=s->origin||stepped!=s->stepped) return "savestate-clock-origin";
     for(int i=0;i<MAXCLIENTS;i++){
         VClient *a=&s->clients[i],*b=&clients[i];
@@ -411,11 +472,22 @@ const char *kh_clock_validate(struct KhClockSlot *s){
 }
 void kh_clock_restore(struct KhClockSlot *s){
     pthread_mutex_lock(&vm);
-    v_now=s->now; n_vblank=s->vblank; presents_seen=s->presents; ticks_seen=s->ticks;
+    if(kh_cut_enabled&&!kh_vclock_on){
+        pthread_mutex_lock(&host_clock_m);
+        guest_anchor=s->now; host_anchor=kh_host_ns();
+        pthread_mutex_unlock(&host_clock_m);
+    }else v_now=s->now;
+    n_vblank=s->vblank; presents_seen=s->presents; ticks_seen=s->ticks;
     frames_seen=s->frames; last_how=s->how; frame_sem_h[0]=s->sem[0]; frame_sem_h[1]=s->sem[1];
     frame_releases=s->releases; frame_taken=s->taken; frame_in_wait=s->in_wait;
     frame_rest=s->rest; frame_rest_ok=s->calibrated;
-    memcpy(clients,s->clients,sizeof clients);
+    if(kh_cut_enabled&&!kh_vclock_on){
+        for(int i=0;i<MAXCLIENTS;i++) if(clients[i].used){
+            int saved=saved_host_client(s,&clients[i]);
+            if(saved<0) kh_fatal(NULL,"savestate-clock-client-binding");
+            clients[i].due=s->clients[saved].due;
+        }
+    }else memcpy(clients,s->clients,sizeof clients);
     for(int i=0;i<MAXCLIENTS;i++) if(clients[i].quiet_wait) clients[i].quiet_since=kh_host_ns();
     pthread_mutex_unlock(&vm);
 }
@@ -675,11 +747,38 @@ int kh_vclock_selftest(KCtx *g){
       VCHECK((u32)st_imp(g,rt_imp_winmm__timeKillEvent,id)==0); kh_vclock_test_vblank(g); { struct timespec ts={0,20000000}; nanosleep(&ts,0); }
       kh_vclock_test_end(); kh_vclock_on=on0; }
     /* 8. KHNMC_CLOCK values */
-    if(!kh_fork_ok()) kh_selftest_not_run("vclock","KHNMC_CLOCK=bogus and frames with KHNMC_CLOCK_PACE=warp (named fatals at start-up)",2);   /* iOS: no fork (host_env.c) */
-    else { pid_t pid=kh_fork(); if(pid==0){ setenv("KHNMC_CLOCK","bogus",1); if(!freopen("/dev/null","w",stderr)){} kh_vclock_init(); _exit(0); }
-      int stt=0; VCHECK(pid>0&&waitpid(pid,&stt,0)==pid&&WIFEXITED(stt)&&WEXITSTATUS(stt)!=0);             /* unknown mode: named fatal, not a silent host clock */
-      pid=kh_fork(); if(pid==0){ setenv("KHNMC_CLOCK","frames",1); setenv("KHNMC_CLOCK_PACE","warp",1); if(!freopen("/dev/null","w",stderr)){} kh_vclock_init(); _exit(0); }
-      stt=0; VCHECK(pid>0&&waitpid(pid,&stt,0)==pid&&WIFEXITED(stt)&&WEXITSTATUS(stt)!=0); }
+    if(!kh_fork_ok()) kh_selftest_not_run("vclock","startup fallbacks and host clock rewind",3);
+    else {
+        pid_t pid=kh_fork();
+        if(pid==0){ kh_vclock_on=0; setenv("KHNMC_CLOCK","bogus",1); kh_vclock_init(); _exit(kh_vclock_on); }
+        int stt=0; VCHECK(pid>0&&waitpid(pid,&stt,0)==pid&&WIFEXITED(stt)&&WEXITSTATUS(stt)==0);
+        pid=kh_fork();
+        if(pid==0){
+            setenv("KHNMC_CLOCK","frames",1); setenv("KHNMC_CLOCK_PACE","warp",1);
+            setenv("KHNMC_CLOCK_SYNC","bogus",1); pace_ns=1000000000ull/VC_HZ;
+            kh_vclock_init(); _exit(!(kh_vclock_on&&kh_vclock_sync&&pace_ns==1000000000ull/VC_HZ));
+        }
+        VCHECK(pid>0&&waitpid(pid,&stt,0)==pid&&WIFEXITED(stt)&&WEXITSTATUS(stt)==0);
+        pid=kh_fork();
+        if(pid==0){
+            kh_vclock_on=0; kh_cut_enabled=1; kh_cut_host_vblank();
+            kh_cut_clock_pause(1);
+            u64 elapsed=kh_cut_elapsed_ns(), tick=kh_vclock_vblanks();
+            struct KhClockSlot *slot=kh_clock_capture();
+            kh_cut_clock_pause(0);
+            host_sleep_until(kh_host_ns()+2000000);
+            kh_cut_host_vblank();
+            int advanced=kh_cut_elapsed_ns()>elapsed&&kh_vclock_vblanks()==tick+1;
+            kh_cut_clock_pause(1);
+            kh_clock_restore(slot);
+            host_sleep_until(kh_host_ns()+2000000);
+            int restored=kh_cut_elapsed_ns()==elapsed&&kh_vclock_vblanks()==tick;
+            kh_cut_clock_pause(0);
+            free(slot);
+            _exit(!(advanced&&restored));
+        }
+        VCHECK(pid>0&&waitpid(pid,&stt,0)==pid&&WIFEXITED(stt)&&WEXITSTATUS(stt)==0);
+    }
     fprintf(stderr,"kh: vclock selftest: %d checks, %d failures\n",checks,fails);
     return fails;
 }

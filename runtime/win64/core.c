@@ -600,7 +600,7 @@ void utf8_to_gw(KCtx *g,u64 dst,size_t cap,const char *s){
 static _Atomic u64 det_tick;
 /* oracle mode (KH_DET=1): every clock read returns the next value of a counter, so a run is reproducible and the Unicorn oracle can mirror it */
 u64 kh_det_tick(void){ return atomic_fetch_add(&det_tick,1)+1; }
-u64 kh_now_ns(void){ if(ga_deterministic) return 1000000000ull+kh_det_tick()*100000ull; if(kh_vclock_on) return kh_vclock_now_ns(); struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (u64)ts.tv_sec*1000000000ull+(u64)ts.tv_nsec; }
+u64 kh_now_ns(void){ if(ga_deterministic) return 1000000000ull+kh_det_tick()*100000ull; if(kh_vclock_on||kh_cut_enabled) return kh_vclock_now_ns(); struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (u64)ts.tv_sec*1000000000ull+(u64)ts.tv_nsec; }
 u64 kh_qpc(void){ if(kh_cut_enabled) return 10000000ull+kh_cut_elapsed_ns()/100; return kh_now_ns()/100; }
 
 /* ======================================================================================================================

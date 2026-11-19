@@ -47,6 +47,27 @@ int kh_audio_out_selftest(void){
     CHECK(kh_audio_ring_push(pass, 480) == 0 && kh_audio_ring_push(pass, 480) == 0 && kh_audio_ring_push(pass, 480) == -1 && kh_audio_ring_fill() == 960);
     CHECK(kh_audio_ring_push(NULL, 64) == 0 && kh_audio_ring_fill() == 1024);           /* NULL = silence */
     CHECK(kh_audio_out_pull(out, 1024) == 1024 && out[0] == 0.5f && out[1919] == 0.5f && out[1920] == 0.0f && out[2047] == 0.0f);
+    /* Quiesce an attached device while the mixer is between passes. The tail
+     * uses only the last delivered sample; a negative post-load signal proves
+     * the 479 queued positive frames never leak into the restored output. */
+    CHECK(kh_audio_out_start()==0);
+    kh_audio_out_attach_device(1);
+    CHECK(kh_audio_ring_push(pass,480)==0 && kh_audio_out_pull(out,1)==1);
+    kh_audio_out_cut_pause();
+    CHECK(kh_audio_ring_started() && kh_audio_ring_fill()==0);
+    CHECK(kh_audio_out_pull(out,32)==0 && out[0]==0.5f*63/64 && out[63]==0.25f);
+    CHECK(kh_audio_out_pull(out,64)==0 && out[0]==0.5f*31/64 && out[127]==0.0f);
+    kh_audio_out_cut_resume();
+    CHECK(kh_audio_out_pull(out,16)==0 && out[0]==0);
+    for(unsigned i=0;i<960;i++) pass[i]=-0.5f;
+    CHECK(kh_audio_ring_push(pass,480)==0 && kh_audio_out_pull(out,128)==128);
+    CHECK(out[0]==-0.5f/64 && out[127]==-0.5f && out[255]==-0.5f);
+    /* No callback during a short cut: crossfade directly from the old sample. */
+    kh_audio_out_cut_pause(); kh_audio_out_cut_resume();
+    CHECK(kh_audio_ring_push(NULL,480)==0 && kh_audio_out_pull(out,64)==64);
+    CHECK(out[0]==-0.5f*63/64 && out[127]==0.0f);
+    kh_audio_out_stop();
+    kh_audio_out_attach_device(0);
     /* threads: every frame once and in order, the wrap included */
     kh_audio_ring_setup(1, 1024, 640); CHECK(kh_audio_out_start() == 0 && kh_audio_ring_started() == 1);
     atomic_store(&prod_done, 0); pthread_t th; pthread_create(&th, NULL, producer, NULL);

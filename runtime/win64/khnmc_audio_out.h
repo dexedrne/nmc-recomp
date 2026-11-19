@@ -10,7 +10,7 @@
  *   start    kh_audio_out_start(): the device is about to pull.  From then on the MIXER FOLLOWS THE DEVICE (policy below).
  *   pull     kh_audio_out_pull(buf, frames): copies `frames` frames into buf; whatever the ring does not hold is written as zeros (an
  *            UNDERRUN: counted, in events and in frames).  Returns the frames that came from the mix.  Any `frames` value is accepted
- *            (one call is split at the ring's end internally).  Real-time safe: two atomic loads, memcpy, two atomic stores.
+ *            (one call is split at the ring's end internally).  During a save/load cut, missing frames ramp to silence over up to 64 samples. The render path uses bounded sample work and atomics.
  *   stop     kh_audio_out_stop(): the device stopped pulling (app in background, route change, end of run).
  *   counters kh_audio_out_stats(): frames produced / pulled / delivered, underruns, overruns, fill level extremes.
  *
@@ -81,6 +81,10 @@ extern void (*kh_audio_pull_ready)(void);
 void     kh_audio_out_attach_device(int on);                      /* the real device (iOS: CoreAudio) is attached / detached: while attached the ring cannot be rebuilt (named fatal) */
 int      kh_audio_out_start(void);                                   /* 0 ok; -1: KHNMC_AUDIO=pull is not the selected backend */
 void     kh_audio_out_stop(void);
+/* The save/load barrier has parked the producer. Drop queued output and let
+ * the live callback ramp to silence and back on the next timeline. */
+void kh_audio_out_cut_pause(void);
+void kh_audio_out_cut_resume(void);
 uint32_t kh_audio_out_pull(float *interleaved, uint32_t frames);    /* real-time safe: no lock, no allocation, no system call */
 void     kh_audio_out_format(KhAudioOutFormat *f);
 void     kh_audio_out_stats(KhAudioOutStats *s);

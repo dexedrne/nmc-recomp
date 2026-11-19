@@ -6,7 +6,9 @@ int kh_setting_set(const char *name,const char *value);
 void kh_settings_init(void);
 int kh_setting_menu_count(void);
 int kh_setting_action(int index);
+const char *kh_setting_unavailable(int index);
 int kh_cut_menu_request(int load,int slot);
+const char *kh_cut_menu_unavailable(void);
 const char *kh_cut_menu_status(void);
 float kh_drop_chance(float chance);
 struct kh_option {

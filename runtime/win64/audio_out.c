@@ -10,6 +10,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
+#include <sched.h>
 #include <errno.h>
 #include "kh_compat.h"
 
@@ -22,6 +23,13 @@ static float *ring;                         /* cap * 2 floats; allocated by kh_a
 static uint32_t cap, mask; static _Atomic uint32_t target;      /* target: set before start (kh_audio_out_set_target), read by the mixer */
 static _Atomic uint64_t wpos, rpos;
 static _Atomic int enabled, started;
+/* One consumer. The low bits protect rpos during a cut, the upper bits count
+ * completed cuts so even two callbacks straddling an entire restore crossfade. */
+enum { READING=1, PAUSED=2, FADE_FRAMES=64 };
+static _Atomic unsigned cut_gate;
+static unsigned seen_gate, fade_left;
+static int await_mix;
+static float last_sample[2], fade_from[2];  /* consumer-owned */
 /* producer-side counters */
 static _Atomic uint64_t c_produced, c_overruns, c_overrun_frames, c_stopped, c_starts, c_stops;
 static _Atomic uint32_t c_max_fill;
@@ -45,6 +53,8 @@ static void ring_setup_locked(int enable, uint32_t ring_frames, uint32_t target_
     uint32_t c = 1; while(c < ring_frames) c <<= 1;
     if(c != cap || !ring){ free(ring); ring = calloc((size_t)c * KH_AUDIO_OUT_CHANNELS, sizeof(float)); if(!ring){ fprintf(stderr, "kh: FATAL: audio-out: ring allocation of %u frames failed\n", c); abort(); } cap = c; mask = c - 1; }
     atomic_store_explicit(&target, target_frames < cap ? target_frames : cap, RLX);
+    atomic_store(&cut_gate, 0); seen_gate=fade_left=0; await_mix=0;
+    memset(last_sample,0,sizeof last_sample);
     atomic_store(&wpos, 0); atomic_store(&rpos, 0); atomic_store(&started, 0);
     atomic_store(&c_produced, 0); atomic_store(&c_overruns, 0); atomic_store(&c_overrun_frames, 0); atomic_store(&c_stopped, 0); atomic_store(&c_starts, 0); atomic_store(&c_stops, 0); atomic_store(&c_max_fill, 0);
     atomic_store(&c_pulled, 0); atomic_store(&c_delivered, 0); atomic_store(&c_underruns, 0); atomic_store(&c_underrun_frames, 0); atomic_store(&c_pulls, 0); atomic_store(&c_min_fill, 0); atomic_store(&c_min_valid, 0);
@@ -74,11 +84,33 @@ void kh_audio_ring_note(int overrun_frames, int stopped_pass){
 /* ---- device side --------------------------------------------------------------------------------------------------------------- */
 int kh_audio_out_start(void){ if(!atomic_load(&enabled)) return -1; atomic_fetch_add(&c_starts, 1); atomic_store(&started, 1); return 0; }
 void kh_audio_out_stop(void){ if(atomic_load(&started)) atomic_fetch_add(&c_stops, 1); atomic_store(&started, 0); }
+/* Called only with the producer parked. New callbacks render a short ramp to
+ * silence. Only a callback already copying the ring can delay the discard. */
+void kh_audio_out_cut_pause(void){
+    if(!atomic_load(&enabled)) return;
+    atomic_fetch_or(&cut_gate,PAUSED);
+    while(atomic_load(&cut_gate)&READING) sched_yield();
+    uint64_t write=atomic_load(&wpos), read=atomic_exchange(&rpos,write);
+    fprintf(stderr,"kh: savestate-audio-cut attached=%d started=%d dropped=%llu frames\n",
+            atomic_load(&device_attached),atomic_load(&started),(unsigned long long)(write-read));
+}
+void kh_audio_out_cut_resume(void){
+    if(atomic_load(&enabled)) atomic_fetch_add(&cut_gate,PAUSED);
+}
 uint32_t kh_audio_out_pull(float *out, uint32_t frames){
     uint32_t got = 0;
-    if(ring && atomic_load_explicit(&enabled, RLX)){
+    unsigned gate=atomic_load(&cut_gate);
+    int reading=!(gate&PAUSED) && atomic_compare_exchange_strong(&cut_gate,&gate,gate|READING);
+    if(reading && ring && atomic_load_explicit(&enabled, RLX)){
         uint64_t r = atomic_load_explicit(&rpos, RLX), w = atomic_load_explicit(&wpos, memory_order_acquire);
         uint32_t have = (uint32_t)(w - r); got = have < frames ? have : frames;
+        /* Allow the first restored slice to fill before starting its fade-in. */
+        if(gate!=seen_gate || await_mix){
+            uint32_t quantum=KH_AUDIO_OUT_RATE/100;
+            uint32_t mark=atomic_load_explicit(&target,RLX);
+            uint32_t attainable=mark>quantum?mark-quantum+1:1;
+            if(have<(frames<attainable?frames:attainable)) got=0;
+        }
         if(atomic_load_explicit(&c_min_valid, RLX)){ if(have < atomic_load_explicit(&c_min_fill, RLX)) atomic_store_explicit(&c_min_fill, have, RLX); }
         else if(atomic_load_explicit(&started, RLX) && atomic_load_explicit(&c_produced, RLX)){ atomic_store_explicit(&c_min_fill, have, RLX); atomic_store_explicit(&c_min_valid, 1, RLX); }
         uint32_t at = (uint32_t)(r & mask), first = cap - at < got ? cap - at : got;
@@ -91,6 +123,21 @@ uint32_t kh_audio_out_pull(float *out, uint32_t frames){
         atomic_fetch_add_explicit(&c_underruns, 1, RLX); atomic_fetch_add_explicit(&c_underrun_frames, frames - got, RLX);
     }
     atomic_fetch_add_explicit(&c_pulls, 1, RLX); atomic_fetch_add_explicit(&c_pulled, frames, RLX); atomic_fetch_add_explicit(&c_delivered, got, RLX);
+    if(frames){
+        if(gate!=seen_gate || (await_mix && got)){
+            seen_gate=gate;
+            await_mix=!got;
+            fade_left=FADE_FRAMES;
+            memcpy(fade_from,last_sample,sizeof fade_from);
+        }
+        for(uint32_t i=0;i<frames && fade_left;i++,fade_left--){
+            float previous=(float)(fade_left-1)/FADE_FRAMES;
+            for(unsigned c=0;c<2;c++)
+                out[2*i+c]=previous*fade_from[c]+(1.0f-previous)*out[2*i+c];
+        }
+        memcpy(last_sample,out+2*(size_t)(frames-1),sizeof last_sample);
+    }
+    if(reading) atomic_fetch_and(&cut_gate,~(unsigned)READING);
     return got;
 }
 /* review of task 28: up to the ring minus one pass (was: below the ring, which refused 2 x 4096 = 8192 in the 8192-frame ring of then) */
@@ -145,13 +192,22 @@ static void *sim_main(void *arg){
 int kh_audio_simdev_start(const char *path, uint32_t seed){
     snprintf(sim_path, sizeof sim_path, "%s", path);
     sim_wav = kmx_wav_open(path, KH_AUDIO_OUT_RATE, KH_AUDIO_OUT_CHANNELS); if(!sim_wav) return -1;
-    char gp[1200]; snprintf(gp, sizeof gp, "%s.gaps", path); sim_gaps = fopen(gp, "w"); if(!sim_gaps) return -1;
+    char gp[1200]; snprintf(gp, sizeof gp, "%s.gaps", path); sim_gaps = fopen(gp, "w"); if(!sim_gaps) goto failed;
     fprintf(sim_gaps, "# underrun gaps of the simulated device: <device frame where zeros begin> <zero frames>\n");
     sim_seed = seed ? seed : 0x2545f491u; sim_pos = 0; atomic_store(&sim_quit, 0); atomic_store(&sim_running, 1);
     pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at, 1u << 20);
+    kh_audio_out_attach_device(1);
     int rc = pthread_create(&sim_th, &at, sim_main, NULL); pthread_attr_destroy(&at);
-    if(rc){ atomic_store(&sim_running, 0); return -1; }
+    if(rc){ kh_audio_out_attach_device(0); atomic_store(&sim_running, 0); errno=rc; goto failed; }
     return 0;
+failed:
+    {
+        int err=errno;
+        if(sim_gaps){ fclose(sim_gaps); sim_gaps=NULL; }
+        kmx_wav_close(sim_wav,NULL); sim_wav=NULL;
+        errno=err;
+        return -1;
+    }
 }
 int kh_audio_simdev_finish(FILE *rep){
     if(!sim_wav) return 0;
@@ -159,6 +215,7 @@ int kh_audio_simdev_finish(FILE *rep){
     uint32_t left = kh_audio_ring_fill(), drained = 0;                                         /* the end of the run: what is still queued is delivered too */
     while(left){ uint32_t n = left > 1024 ? 1024 : left; sim_take(n); left -= n; drained += n; }
     kh_audio_out_stop();
+    kh_audio_out_attach_device(0);
     KmxWavStats ws; int rc = kmx_wav_close(sim_wav, &ws); sim_wav = NULL; if(sim_gaps){ if(fclose(sim_gaps)) rc = -1; sim_gaps = NULL; }
     if(rep) fprintf(rep, "kh: audio-out: simulated device: %llu frames received into %s (%.2f s), callbacks by size 128:%llu 256:%llu 441:%llu 480:%llu 512:%llu 1024:%llu, late calls %llu (worst %.1f ms behind its due time), burst calls %llu, %u frames drained from the ring at the end\n",
                     (unsigned long long)sim_pos, sim_path, (double)sim_pos / KH_AUDIO_OUT_RATE, (unsigned long long)sim_size_calls[0], (unsigned long long)sim_size_calls[1], (unsigned long long)sim_size_calls[2],

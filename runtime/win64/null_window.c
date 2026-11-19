@@ -126,6 +126,16 @@ int kh_window_apply_size(u32 w,u32 h){
 void kh_seam_window_init(void){
     const char *e=getenv("KH_WIN"); if(e) sscanf(e,"%dx%d",&win_w,&win_h);
     const char *screen=getenv("KHNMC_SCREEN");
+    if(screen && *screen){
+        int w=0,h=0;
+        if(!strcmp(screen,"layer")){
+            u32 lw=0,lh=0; kh_present_layer_size(&lw,&lh); w=lw; h=lh;
+        }else kh_screen_parse(screen,&w,&h);
+        if(w<800 || h<600 || w>16384 || h>16384 || (e && *e)){
+            kh_warn("KHNMC_SCREEN disabled: need a usable drawable of at least 800x600 and no KH_WIN override");
+            screen=NULL;
+        }
+    }
     resize_schedule=getenv("KHNMC_TEST_RESIZE");
     scripted_resize=resize_schedule&&*resize_schedule;
     resize_offset=resize_frame=0;

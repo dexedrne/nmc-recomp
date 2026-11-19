@@ -4,7 +4,7 @@
 /* Import entry still has its return address on the guest stack. Match the entire
  * chain to this thread's kh_call sentinel before discarding any C activation. */
 #define SUCCESSORS(X) X(44f710) X(44d960) X(979a2) X(97cfa) X(97d4f) X(fb0e0) X(fab61) X(fe87c) X(fddde) \
-    X(130056) X(1300ff) X(15472f) X(128c4f) X(129119) X(fddab) X(15edf5) X(3a0d8c) \
+    X(130056) X(1300ff) X(15472f) X(128c4f) X(1288cf) X(128f3e) X(129119) X(fddab) X(15edf5) X(3a0d8c) \
     X(105479) X(14f4ac) X(14373f) X(4392de)
 #define DECL(site) void kh_resume_##site(KCtx *);
 SUCCESSORS(DECL)
@@ -21,6 +21,8 @@ static const struct Chain chains[]={
     {0xfddd0,0x80,KH_CUT_SLEEP,{AT(0,fe87c),AT(0x50,fddde)}},
     {0xfddd0,0x80,KH_CUT_HANDLE,{AT(0,130056),AT(0x50,fddde)}},
     {0xfddd0,0x80,KH_CUT_HANDLE,{AT(0,1300ff),AT(0x50,fddde)}},
+    {0x129110,0x220,KH_CUT_VBLANK,{AT(0,1288cf),AT(0x1f0,129119)}},
+    {0x129110,0x220,KH_CUT_VBLANK,{AT(0,128f3e),AT(0x1f0,129119)}},
     {0x129110,0x250,KH_CUT_RELEASE,{AT(0,15472f),AT(0x30,128c4f),AT(0x220,129119)}},
     {0x16c9b0,0xf0,KH_CUT_HANDLE,{AT(0,fddab),AT(0x30,15edf5),AT(0x60,3a0d8c),
         {0x90,0x15ed58,NULL},{0xc0,0x16c9bd,NULL}}},

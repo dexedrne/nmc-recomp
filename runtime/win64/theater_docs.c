@@ -18,19 +18,20 @@ static pthread_mutex_t visit_mutex=PTHREAD_MUTEX_INITIALIZER;
 static int visit_fd=-1;
 static char visits[KH_TMP_MAX];
 
-static void remove_visit(char *path){
+static int remove_visit(char *path){
     char *paths[]={path,NULL};
     FTS *tree=fts_open(paths,FTS_PHYSICAL|FTS_NOCHDIR,NULL);
-    if(!tree) kh_fatal(NULL,"theater-documents-cleanup-open");
+    if(!tree) return 0;
+    int ok=1;
     FTSENT *e;
     for(;;){
         errno=0; e=fts_read(tree);
-        if(!e){ if(errno) kh_fatal(NULL,"theater-documents-cleanup-read"); break; }
+        if(!e){ if(errno) ok=0; break; }
         if(e->fts_info==FTS_D) continue;
         if((e->fts_info==FTS_DP?rmdir(e->fts_path):unlink(e->fts_path))!=0)
-            kh_fatal(NULL,"theater-documents-cleanup: %s",strerror(errno));
+            ok=0;
     }
-    if(fts_close(tree)) kh_fatal(NULL,"theater-documents-cleanup-close");
+    return !fts_close(tree) && ok;
 }
 static DIR *lock_visits(void);
 void kh_theater_docs_end(void){
@@ -38,7 +39,8 @@ void kh_theater_docs_end(void){
     atomic_store(&enabled,0);
     if(visit_fd>=0){
         DIR *dir=lock_visits();
-        remove_visit(overlay);
+        if(!dir) kh_fatal(NULL,"theater-documents-registry-lock");
+        if(!remove_visit(overlay)) kh_fatal(NULL,"theater-documents-cleanup");
         close(visit_fd); visit_fd=-1; *overlay=0;
         closedir(dir);
     }
@@ -50,39 +52,43 @@ static DIR *lock_visits(void){
     int fd=open(visits,O_RDONLY|O_DIRECTORY|O_NOFOLLOW);
     struct stat st;
     if(fd<0 || fstat(fd,&st) || st.st_uid!=geteuid() || (st.st_mode&077) ||
-       flock(fd,LOCK_EX)) kh_fatal(NULL,"theater-documents-registry-lock");
+       flock(fd,LOCK_EX)){ if(fd>=0) close(fd); return NULL; }
     DIR *dir=fdopendir(fd);
-    if(!dir) kh_fatal(NULL,"theater-documents-registry-open");
+    if(!dir) close(fd);
     return dir;
 }
-void kh_theater_docs_init(int create){
+int kh_theater_docs_init(int create){
     char leaf[64];
     snprintf(leaf,sizeof leaf,"khnmc-theater-%lu",(unsigned long)geteuid());
     kh_tmp_path(visits,sizeof visits,leaf);
-    if(create){ if(mkdir(visits,0700)&&errno!=EEXIST) kh_fatal(NULL,"theater-documents-registry-create"); }
-    else if(access(visits,F_OK)&&errno==ENOENT) return;
+    if(create){ if(mkdir(visits,0700)&&errno!=EEXIST){ kh_warn("Theater disabled: cannot create private directory"); return 0; } }
+    else if(access(visits,F_OK)&&errno==ENOENT) return 1;
     DIR *dir=lock_visits();
+    if(!dir){ kh_warn("Theater disabled: private directory unavailable"); return 0; }
+    int ok=1;
     for(;;){
         errno=0;
         struct dirent *e=readdir(dir);
-        if(!e){ if(errno) kh_fatal(NULL,"theater-documents-registry-read"); break; }
+        if(!e){ if(errno) ok=0; break; }
         if(strncmp(e->d_name,"visit-",6) || strlen(e->d_name)!=12) continue;
         int fd=openat(dirfd(dir),e->d_name,O_RDONLY|O_DIRECTORY|O_NOFOLLOW);
-        if(fd<0){ if(errno==ENOENT) continue; kh_fatal(NULL,"theater-documents-visit-open"); }
+        if(fd<0){ if(errno==ENOENT) continue; ok=0; break; }
         if(!flock(fd,LOCK_EX|LOCK_NB)){
             char path[KH_TMP_MAX];
-            if(snprintf(path,sizeof path,"%s/%s",visits,e->d_name)>=(int)sizeof path) kh_fatal(NULL,"theater-documents-path");
-            remove_visit(path);
-        }else if(errno!=EWOULDBLOCK) kh_fatal(NULL,"theater-documents-visit-lock");
+            if(snprintf(path,sizeof path,"%s/%s",visits,e->d_name)>=(int)sizeof path || !remove_visit(path)) ok=0;
+        }else if(errno!=EWOULDBLOCK) ok=0;
         close(fd);
     }
     closedir(dir);
+    if(!ok) kh_warn("Theater disabled: stale visit directory unavailable");
+    return ok;
 }
 
 void kh_theater_docs_begin(void){
     pthread_mutex_lock(&visit_mutex);
     if(*overlay) kh_fatal(NULL,"theater-documents-busy");
     DIR *dir=lock_visits();
+    if(!dir) kh_fatal(NULL,"theater-documents-registry-lock");
     if(snprintf(overlay,sizeof overlay,"%s/visit-XXXXXX",visits)>=(int)sizeof overlay) kh_fatal(NULL,"theater-documents-path");
     if(!mkdtemp(overlay)) kh_fatal(NULL,"theater-documents-create: %s",strerror(errno));
     visit_fd=open(overlay,O_RDONLY|O_DIRECTORY|O_NOFOLLOW);

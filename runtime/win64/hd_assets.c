@@ -145,13 +145,25 @@ int kh_look_key(const char *rel){
     return kh_player_asset_key(key);
 }
 
-int kh_player_asset_key(const char *key){
-    static const struct { const char *stem; int face; } keys[]={
+static const struct { const char *stem; int face; } keys[]={
         {"P_EX100",36},{"P_EX100_BTLF",47},{"P_EX100_MAGF",38},{"P_EX100_KH1F",47},
         {"P_EX100_TRIF",5},{"P_EX100_ULTF",41},{"P_EX100_HTLF",3},{"P_EX101",36},
         {"P_EX101_BTLF",47},{"P_EX110_BTLF",0},{"P_EX121",36},{"P_EX100_WI",36},
         {"P_EX100_WI_MAGF",38},{"P_EX100_WI_KH1F",39},{"P_EX100_WI_ULTF",41}
     };
+int kh_look_pack_ready(void){
+    char rel[128],host[4096];
+    for(size_t i=0;i<sizeof keys/sizeof *keys;i++){
+        snprintf(rel,sizeof rel,"obj/%s.mdlx",keys[i].stem);
+        if(!kh_look_available(rel,host,sizeof host)) return 0;
+        snprintf(rel,sizeof rel,"obj/%s.a.us",keys[i].stem);
+        if(!kh_look_available(rel,host,sizeof host)) return 0;
+        snprintf(rel,sizeof rel,"remastered/obj/%s.a.us/-%d.dds",keys[i].stem,keys[i].face);
+        if(!kh_look_available(rel,host,sizeof host)) return 0;
+    }
+    return 1;
+}
+int kh_player_asset_key(const char *key){
     int hd=!strncasecmp(key,"remastered/",11);
     const char *obj=key+(hd?11:0);
     if(strncasecmp(obj,"obj/",4)) return 0;

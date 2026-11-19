@@ -405,6 +405,9 @@ static void vs_register(KhVsync *v){ pthread_mutex_lock(&v->m); if(!v->registere
 void kh_vsync_register(void){ pthread_once(&vs_once,vs_proc_init); vs_register(&vs_proc);
     fprintf(stderr,"kh: vsync: a display tick source is registered: WaitForVBlank (host clock) now waits for its ticks (period %llu ns; time-out 2 periods, then the last tick's grid)\n",P_(vs_proc.period_ns)); }
 void kh_vsync_tick(uint64_t host_ns){ pthread_once(&vs_once,vs_proc_init); vs_tick(&vs_proc,host_ns); }
+/* Display-link ticks continue while disk I/O holds the guest. Consume them as
+ * a baseline so the first post-cut wait is for the next physical tick. */
+void kh_vsync_forget_ticks(void){ vs_forget_thread(&vs_proc); }
 int  kh_vsync_wait(void){ pthread_once(&vs_once,vs_proc_init); return vs_wait(&vs_proc); }
 static _Atomic u64 vs_virtual_calls;                              /* lock-free: the frames-clock path keeps its exact behaviour */
 void kh_vsync_note_virtual(void){ atomic_fetch_add(&vs_virtual_calls,1); }
@@ -417,10 +420,11 @@ void kh_vsync_init(void){
     pthread_once(&vs_once,vs_proc_init);
     const char *e=getenv("KHNMC_DISPLAY"); if(!e||!*e) return;
     if(strcmp(e,"timer60")) kh_fatal(NULL,"display-source-unknown: KHNMC_DISPLAY=%s (known: timer60 = a host thread that ticks on absolute 16.667 ms deadlines, the Linux stand-in for the display link)",e);
-    vs_source="timer60"; kh_vsync_register();
     pthread_t t; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at,PTHREAD_CREATE_DETACHED);
-    if(pthread_create(&t,&at,timer60_main,NULL)) kh_fatal(NULL,"display-source-thread: KHNMC_DISPLAY=timer60: the tick thread cannot be started");
+    int error=pthread_create(&t,&at,timer60_main,NULL);
     pthread_attr_destroy(&at);
+    if(error){ kh_warn("timer60 disabled: %s",strerror(error)); return; }
+    vs_source="timer60"; kh_vsync_register();
     fprintf(stderr,"kh: vsync: KHNMC_DISPLAY=timer60: tick thread started (absolute 16.667 ms deadlines)%s\n",kh_vclock_on?"; KHNMC_CLOCK=frames answers WaitForVBlank with its virtual vblank, the ticks are counted as ignored":"");
 }
 void kh_vsync_report(FILE *f){
@@ -491,13 +495,15 @@ void kh_present_init(int backend_on){
     const char *e=getenv("KHNMC_GFX_PRESENT"); int m=0;
     if(e&&*e){ if(!strcmp(e,"off")) m=0; else if(!strcmp(e,"headless")) m=1; else if(!strcmp(e,"layer")) m=2;
         else kh_fatal(NULL,"gfx-present-mode: KHNMC_GFX_PRESENT=%s (off, headless = VK_EXT_headless_surface, layer = the shell's CAMetalLayer)",e); }
-    if(m&&!backend_on){
-#ifdef KH_GFX_VKD3D
-        kh_fatal(NULL,"gfx-present-needs-backend: KHNMC_GFX_PRESENT=%s needs the vkd3d graphics backend (KHNMC_GFX=vkd3dw or vkd3d), which this run does not use (KHNMC_GFX is null or unset): there would be no picture",e);
-#else
-        kh_fatal(NULL,"gfx-present-needs-backend: KHNMC_GFX_PRESENT=%s needs the vkd3d graphics backend, which is not compiled into this binary (GFX_VKD3D=0, as in every IOS_PATHS=1 build): there would be no picture",e);
+    const char *reason=NULL;
+    if(m && !backend_on) reason="no active Vulkan backend";
+#ifndef VK_USE_PLATFORM_METAL_EXT
+    else if(m==2) reason="Metal layers unavailable on this platform";
 #endif
-    }
+    else if(m==2 && !atomic_load(&sh_layer_calls)) reason="no layer supplied by shell";
+    const char *buffers=getenv("KHNMC_GFX_BACKBUFFERS");
+    if(m && !reason && buffers && !strcmp(buffers,"committed")) reason="requires image-backed buffers";
+    if(reason){ kh_warn("KHNMC_GFX_PRESENT=%s disabled: %s",e,reason); m=0; }
     sh_env_mode=m==1?"headless":m==2?"layer":e&&*e?"off":"off (unset)";
     atomic_store(&sh_tick_mode,m==2);                                        /* TASK41: the shell's display link ticks only for a layer run */
     if(!m){ static const char *const ks[]={"KHNMC_GFX_PRESENT_SIZE","KHNMC_GFX_PRESENT_FIT","KHNMC_GFX_PRESENT_CHECK","KHNMC_GFX_PRESENT_TOL"};
@@ -588,20 +594,29 @@ static const char *const mode_names[]={"off","headless","layer"};
 static int pr_env_mode, pr_env_fit; static u32 pr_env_w, pr_env_h;      /* what the environment said (a selftest override goes back to it) */
 static void settings(void){
     pthread_mutex_lock(&pm_g); if(pr_mode>=0){ pthread_mutex_unlock(&pm_g); return; }
-    const char *e=getenv("KHNMC_GFX_PRESENT"); int m=0;
-    if(e&&*e){ if(!strcmp(e,"off")) m=0; else if(!strcmp(e,"headless")) m=1; else if(!strcmp(e,"layer")) m=2;
-        else { pthread_mutex_unlock(&pm_g); kh_fatal(NULL,"gfx-present-mode: KHNMC_GFX_PRESENT=%s (off, headless = VK_EXT_headless_surface, layer = the shell's CAMetalLayer)",e); } }
-#ifndef VK_USE_PLATFORM_METAL_EXT
-    if(m==2){ pthread_mutex_unlock(&pm_g); kh_fatal(NULL,"gfx-present-layer-unavailable: KHNMC_GFX_PRESENT=layer needs VK_EXT_metal_surface and a CAMetalLayer from the iOS/macOS shell; this build has no Metal surface (use headless)"); }
-#endif
+    const char *e;
+    int m=!strcmp(sh_env_mode,"layer")?2:!strcmp(sh_env_mode,"headless")?1:0;
     e=getenv("KHNMC_GFX_PRESENT_SIZE");
-    if(e&&*e){ unsigned w=0,h=0; char x=0; if(sscanf(e,"%u%c%u",&w,&x,&h)!=3||(x!='x'&&x!='X')||!w||!h||w>16384||h>16384){ pthread_mutex_unlock(&pm_g); kh_fatal(NULL,"gfx-present-size: KHNMC_GFX_PRESENT_SIZE=%s (WxH, 1..16384)",e); } pr_w=w; pr_h=h; }
-    e=getenv("KHNMC_GFX_PRESENT_FIT"); pr_fit=0;
-    if(e&&*e){ if(!strcmp(e,"aspect")) pr_fit=0; else if(!strcmp(e,"stretch")) pr_fit=1; else { pthread_mutex_unlock(&pm_g); kh_fatal(NULL,"gfx-present-fit: KHNMC_GFX_PRESENT_FIT=%s (aspect = black bars, stretch)",e); } }
+    if(e&&*e){
+        unsigned w=0,h=0; char x,extra;
+        if(sscanf(e,"%u%c%u%c",&w,&x,&h,&extra)!=3 || (x!='x'&&x!='X') || !w || !h || w>16384 || h>16384)
+            kh_warn("present size override disabled: expected WxH, 1..16384");
+        else { pr_w=w; pr_h=h; }
+    }
+    e=getenv("KHNMC_GFX_PRESENT_FIT"); pr_fit=e && !strcmp(e,"stretch");
     e=getenv("KHNMC_GFX_PRESENT_CHECK"); pr_check=0;
-    if(e&&*e){ char *end; long v=strtol(e,&end,10); if(*end||v<0){ pthread_mutex_unlock(&pm_g); kh_fatal(NULL,"gfx-present-check: KHNMC_GFX_PRESENT_CHECK=%s (n = every n-th present, 0 = off)",e); } pr_check=(int)v; }
+    if(e&&*e){
+        char *end; long v=strtol(e,&end,10);
+        if(*end || v<0 || v>INT32_MAX) kh_warn("present check disabled: invalid interval");
+        else pr_check=(int)v;
+    }
     e=getenv("KHNMC_GFX_PRESENT_TOL");
-    if(e&&*e){ double a,b; char c; if(sscanf(e,"%lf,%lf%c",&a,&b,&c)!=2||a<0||b<0){ pthread_mutex_unlock(&pm_g); kh_fatal(NULL,"gfx-present-tol: KHNMC_GFX_PRESENT_TOL=%s (max,mean in levels)",e); } pr_tol_max=a; pr_tol_mean=b; }
+    if(e&&*e){
+        double a,b; char c;
+        if(sscanf(e,"%lf,%lf%c",&a,&b,&c)!=2 || !isfinite(a) || !isfinite(b) || a<0 || b<0)
+            kh_warn("present tolerance override disabled: expected max,mean in levels");
+        else { pr_tol_max=a; pr_tol_mean=b; }
+    }
     e=getenv("KHNMC_TEST_MARKER_HOLD");                                       /* TASK41: present:N:ms (the SIGSTOP test) */
     if(e&&*e){ unsigned long long a=0; unsigned b=0; char c=0; if(sscanf(e,"present:%llu:%u%c",&a,&b,&c)!=2||!a||!b||b>60000){ pthread_mutex_unlock(&pm_g); kh_fatal(NULL,"gfx-present-test-hold: KHNMC_TEST_MARKER_HOLD=%s (present:N:ms, N >= 1, ms 1..60000)",e); }
         if(!m){ pthread_mutex_unlock(&pm_g); kh_fatal(NULL,"gfx-present-test-hold: KHNMC_TEST_MARKER_HOLD=%s needs the presenter (KHNMC_GFX_PRESENT=headless or layer)",e); }
@@ -786,6 +801,11 @@ static void swapchain_build(KhPresenter *p){
 }
 KhPresenter *kh_present_attach(ID3D12Device *dev,ID3D12CommandQueue *q,const KhPresentBuffers *bb){
     settings(); if(!pr_mode) return NULL;
+    if(!kh_gfxc_pres_ext.surface || !kh_gfxc_pres_ext.swapchain ||
+       (pr_mode==1 && !kh_gfxc_pres_ext.headless) || (pr_mode==2 && (!pr_layer || !kh_gfxc_pres_ext.metal))){
+        kh_warn("KHNMC_GFX_PRESENT=%s disabled: required Vulkan surface unavailable",mode_names[pr_mode]);
+        pr_mode=pr_env_mode=0; atomic_store(&sh_tick_mode,0); return NULL;
+    }
     KhPresenter *p=calloc(1,sizeof *p); if(!p) kh_fatal(NULL,"gfx-present: out of memory");
     pthread_mutex_init(&p->m,NULL); p->vk=kh_vk_for(dev); p->dev=dev; p->queue=q; ID3D12Device_AddRef(dev); ID3D12CommandQueue_AddRef(q);
     p->mode=pr_mode; p->fit=pr_fit; p->check=pr_check; p->family=vkd3d_get_vk_queue_family_index(q); p->bb=*bb; p->general=bb->general; p->stale=1; p->stale_reason=RC_FIRST;

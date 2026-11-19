@@ -147,9 +147,9 @@ static int pc_decide(const char *env,const char *(*caches)(void),int backend,int
 void kh_pc_init(int vkd3d_backend_on){
     const char *e=getenv("KHNMC_GFX_PIPECACHE"), *m=getenv("KHNMC_GFX_PIPECACHE_MAX_MB");
     PcConf c; memset(&c,0,sizeof c); c.cap=KH_PC_DEFAULT_CAP; pc_backend=vkd3d_backend_on;
-    if(m&&*m){ c.cap=pc_cap_parse(m); if(!c.cap) kh_fatal(NULL,"pipecache-cap-value: KHNMC_GFX_PIPECACHE_MAX_MB=%s (a whole number of MiB, 1..1024; default %llu)",m,P_(KH_PC_DEFAULT_CAP>>20)); }
+    if(m&&*m){ c.cap=pc_cap_parse(m); if(!c.cap){ kh_warn("pipeline cache disabled: invalid capacity"); return; } }
     int k=pc_decide(e,kh_host_caches_dir,vkd3d_backend_on,kh_run_is_selftest,&c);
-    if(k==PCI_PATH_LONG) kh_fatal(NULL,"pipecache-path: the pipeline cache's path is too long (KHNMC_GFX_PIPECACHE of %zu bytes, or the caches directory)",e?strlen(e):(size_t)0);
+    if(k==PCI_PATH_LONG){ kh_warn("pipeline cache disabled: path too long"); return; }
     if(k==PCI_OFF) fprintf(stderr,"kh: gfx pipeline cache: KHNMC_GFX_PIPECACHE=off: no disk pipeline cache in this run\n");
     if(k==PCI_NO_BACKEND) fprintf(stderr,"kh: gfx pipeline cache: KHNMC_GFX_PIPECACHE=%s is set, but this run has no vkd3d backend (KHNMC_GFX): no pipeline cache is loaded or saved\n",c.path);
     if(k==PCI_SELFTEST) fprintf(stderr,"kh: gfx pipeline cache: %s (%s) is NOT used in a --selftest run (the selftest's own cache tests write into the scratch directory)\n",c.path,c.src);
@@ -157,7 +157,7 @@ void kh_pc_init(int vkd3d_backend_on){
     pthread_mutex_lock(&pm); pc=pc_run=c; pthread_mutex_unlock(&pm);
     fprintf(stderr,"kh: gfx pipeline cache: file %s (%s), cap %llu MiB: read when vkd3d creates its VkPipelineCache, written only while the game is parked at the suspend gate or at exit\n",c.path,c.src,P_(c.cap>>20));
     { const char *rs=getenv("KHNMC_GFX_PIPECACHE_RESET");
-      if(rs&&*rs){ if(strcmp(rs,"1")) kh_fatal(NULL,"pipecache-reset-value: KHNMC_GFX_PIPECACHE_RESET=%s (1 = remove the cache file at start-up: this run is then a first run)",rs);
+      if(rs&&*rs){ if(strcmp(rs,"1")){ kh_warn("pipeline cache reset disabled: expected 1"); return; }
           char why[256]; int r=pc_reset(c.path,why,sizeof why);
           if(r<0) fprintf(stderr,"kh: gfx pipeline cache: pipecache-reset-failed: KHNMC_GFX_PIPECACHE_RESET=1, but %s could NOT be removed (%s): this run reads it as it is\n",c.path,why);
           else fprintf(stderr,"kh: gfx pipeline cache: KHNMC_GFX_PIPECACHE_RESET=1: %s: this run starts with an empty cache and writes a new file\n",r?"the file was removed":"there was no file"); } }

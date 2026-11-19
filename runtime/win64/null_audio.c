@@ -28,6 +28,7 @@
 static int C_xa2,C_src,C_sub,C_mast,C_xapo,C_enum,C_device,C_client;
 #define XA2_E_INVALID 0x88960001u
 /* ---- mode, log ---- */
+extern int kh_run_is_selftest;
 static int soft_mode, soft_manual;                 /* soft_manual: tests drive the passes, no clock thread, no WAV */
 static int out_pull, out_pulltest;                 /* KHNMC_AUDIO=pull / pull-test:<file> */
 static int apply_mode;                             /* KHNMC_AUDIO_APPLY: 0 = stamped (default with KHNMC_CLOCK=frames), 1 = immediate */
@@ -50,7 +51,7 @@ static char wav_path[1024];
 static FILE *alog_f; static int alog_init, alog_all; static pthread_mutex_t alog_m=PTHREAD_MUTEX_INITIALIZER;   /* alog_all: KHNMC_AUDIOLOG_ALL=1, no per-kind line limits (TASK28) */
 static void alog(const char *fmt,...){
     pthread_mutex_lock(&alog_m);
-    if(!alog_init){ alog_init=1; const char *a=getenv("KHNMC_AUDIOLOG_ALL"); alog_all=a&&*a=='1'; const char *p=getenv("KHNMC_AUDIOLOG"); if(p&&*p){ alog_f=fopen(p,"a"); if(!alog_f) kh_fatal(NULL,"audio: cannot open KHNMC_AUDIOLOG %s",p); setvbuf(alog_f,NULL,_IOLBF,0); } }
+    if(!alog_init){ alog_init=1; const char *a=getenv("KHNMC_AUDIOLOG_ALL"); alog_all=a&&*a=='1'; const char *p=getenv("KHNMC_AUDIOLOG"); if(p&&*p){ alog_f=fopen(p,"a"); if(!alog_f) kh_warn("KHNMC_AUDIOLOG disabled: cannot open %s",p); else setvbuf(alog_f,NULL,_IOLBF,0); } }
     if(alog_f){ if(kh_vclock_on) fprintf(alog_f,"[v=%llu vbl=%llu] ",(unsigned long long)kh_vclock_now_ns(),(unsigned long long)kh_vclock_vblanks());   /* frames clock: every line carries the virtual time and vblank */
         KThread *me=cur_thread(); if(me) fprintf(alog_f,"{%s} ",me->name);                                                 /* TASK28: the calling thread */
         va_list ap; va_start(ap,fmt); vfprintf(alog_f,fmt,ap); va_end(ap); fputc('\n',alog_f); }
@@ -298,7 +299,9 @@ unsigned kh_cut_audio_graph(unsigned *buffers,unsigned *commands){
     }
     return voices;
 }
+static u64 quanta_origin;  /* host output position can rewind while lifetime statistics continue */
 struct KhAudioSlot {
+    u64 output_quanta;
     struct KhStreamSlot *streams;
     Voice *bindings;
     SoftEngine *engines;
@@ -380,6 +383,7 @@ static void discard_audio(Voice *v,SoftEngine *e){
 struct KhAudioSlot *kh_audio_capture(void){
     struct KhAudioSlot *s=calloc(1,sizeof *s);
     if(!s) kh_fatal(NULL,"savestate-mixer-memory");
+    s->output_quanta=st_quanta-quanta_origin;
     clone_audio(bound_voices,engines,s);
     s->streams=kh_stream_capture();
     s->nformats=nfmts; memcpy(s->formats,fmts,sizeof fmts);
@@ -390,6 +394,7 @@ struct KhAudioSlot *kh_audio_capture(void){
 void kh_audio_restore(struct KhAudioSlot *s){
     struct KhAudioSlot restored={0};
     clone_audio(s->bindings,s->engines,&restored);
+    if(!kh_vclock_on) quanta_origin=st_quanta-s->output_quanta;
     kh_stream_restore(s->streams);
     discard_audio(bound_voices,engines);
     bound_voices=restored.bindings; engines=restored.engines;
@@ -521,12 +526,20 @@ static void sleep_until_ns(u64 t){ struct timespec d={(time_t)(t/1000000000ull),
 static int pull_stalled;                           /* the device stopped consuming without kh_audio_out_stop: passes are dropped until it does */
 static _Atomic u64 st_pull_waits, st_pull_wait_ns;
 /* before a pass: SINK_RING when there is room below the target fill (waiting for the device to make it), else what to do with the pass */
+static int host_mix_cut(void){
+    if(!kh_cut_enabled || !atomic_load(&kh_cut_requested)) return 0;
+    kh_cut_wait_owner=KH_CUT_MIXER;
+    kh_cut_poll("clock-deadline",NULL);
+    kh_cut_wait_owner=0;
+    return 1;
+}
 static int pull_sink(void){
     if(!kh_audio_ring_started()) return SINK_RING_STOPPED;
     KhAudioOutFormat f; kh_audio_out_format(&f);
     if(pull_stalled){ if(kh_audio_ring_fill()+f.quantum_frames<=f.target_frames) pull_stalled=0; else return SINK_RING_OVERRUN; }
     u64 t0=0;
     for(;;){
+        if(!kh_vclock_on && kh_cut_enabled && atomic_load(&kh_cut_requested)) return SINK_RING_STOPPED;
         if(atomic_load(&mix_quit)||atomic_load(&ring_closed)) return SINK_RING_STOPPED;
         if(!kh_audio_ring_started()) return SINK_RING_STOPPED;
         u32 fill=kh_audio_ring_fill();
@@ -585,6 +598,7 @@ static void mix_thread_pull(KCtx *g){
     for(;;){
         if(atomic_load(&mix_quit)) break;
         int sink=pull_sink();
+        if(host_mix_cut()){ t0=mono_ns(); n=0; continue; }
         if(sink==SINK_RING){ u64 h=mono_ns(); soft_quantum(g,UINT64_MAX,SINK_RING); u64 dur=mono_ns()-h; st_pass_ns+=dur; if(dur>st_max_pass_ns) st_max_pass_ns=dur; t0=mono_ns(); n=0; continue; }
         u64 due=t0+(++n)*10000000ull,now=mono_ns();
         if(now<due){ if(due-now>10000000ull) due=now+10000000ull; sleep_until_ns(due); }
@@ -600,6 +614,7 @@ static void mix_thread(KCtx *g){
         u64 t0=mono_ns(),n=0,last=0;
         for(;;){
             if(atomic_load(&mix_quit)) break;
+            if(host_mix_cut()){ t0=mono_ns(); n=0; last=0; continue; }
             u64 due=t0+n*10000000ull,now=mono_ns();
             if(now<due) sleep_until_ns(due);
             else if(now-due>1000000000ull){
@@ -662,9 +677,9 @@ static void soft_engine_new(KCtx *g,u64 obj){
     pthread_mutex_lock(&soft_m); e->next=engines; engines=e; int start=!e->manual&&!clock_started; if(start) clock_started=1; pthread_mutex_unlock(&soft_m);
     if(start){
         pthread_mutex_lock(&wav_m);
-        if(wav_path[0]&&!wav){ wav=kmx_wav_open(wav_path,48000,2); if(!wav) kh_fatal(g,"audio: cannot create the WAV file %s: %s",wav_path,strerror(errno)); }
+        if(wav_path[0]&&!wav){ wav=kmx_wav_open(wav_path,48000,2); if(!wav){ kh_warn("audio WAV output disabled: cannot create %s: %s",wav_path,strerror(errno)); wav_path[0]=0; } }
         pthread_mutex_unlock(&wav_m);
-        static int simdev_started; if(out_pulltest&&!simdev_started){ simdev_started=1; if(kh_audio_simdev_start(pulltest_path,0x2545f491u)) kh_fatal(g,"audio: cannot start the simulated device writing %s: %s",pulltest_path,strerror(errno)); }
+        static int simdev_started; if(out_pulltest&&!kh_run_is_selftest&&!simdev_started){ simdev_started=1; if(kh_audio_simdev_start(pulltest_path,0x2545f491u)){ kh_warn("audio simulated device disabled: cannot start output to %s: %s",pulltest_path,strerror(errno)); out_pulltest=0; } }
         if(!kh_spawn_hostfn_thread(g,"xa2-mix",mix_thread,0)) kh_fatal(g,"audio: cannot start the mixer thread");
         kh_warn("audio: software XAudio2 started: 48000 Hz stereo, 10 ms passes, device clock = %s%s, output = %s%s%s; XAudio2 calls apply %s",
                 out_pull?"the pull device's consumption":kh_vclock_on?"virtual display clock (KHNMC_CLOCK=frames)":"host clock",out_pull&&kh_vclock_on?" (passes on the virtual clock, paced by the device)":"",
@@ -951,22 +966,23 @@ void kh_seam_audio_init(void){
         if(!strcmp(mode,"pull")){ soft_mode=1; out_pull=1; }
         else if(!strncmp(mode,"pull-test:",10)&&mode[10]&&strlen(mode+10)+9<sizeof wav_path){ soft_mode=1; out_pull=1; out_pulltest=1; snprintf(pulltest_path,sizeof pulltest_path,"%s",mode+10); snprintf(wav_path,sizeof wav_path,"%s.mix.wav",mode+10); }
         else if(!strncmp(mode,"wav:",4)&&mode[4]&&strlen(mode+4)<sizeof wav_path){ snprintf(wav_path,sizeof wav_path,"%s",mode+4); soft_mode=1; }
-        else { fprintf(stderr,"kh: FATAL: KHNMC_AUDIO=%s not understood (use: null | wav:<file> | pull | pull-test:<file>)\n",mode); fflush(stdout); kh_host_exit(2); }
+        else kh_warn("KHNMC_AUDIO=%s invalid; using null audio",mode);
     }
-    if(out_pull){ kh_audio_ring_setup(1,KH_AUDIO_OUT_RING_FRAMES,KH_AUDIO_OUT_TARGET_FRAMES); if(!out_pulltest&&kh_audio_pull_ready){ extern int kh_run_is_selftest;
+    if(out_pull){ kh_audio_ring_setup(1,KH_AUDIO_OUT_RING_FRAMES,KH_AUDIO_OUT_TARGET_FRAMES); if(!out_pulltest&&kh_audio_pull_ready){
         /* never a real device in a selftest run: the tests push their own signals (sample counters far above full scale) through this
          * same ring and rebuild it; on the iPhone that reached the speaker as loud noise (2026-11-18) */
         if(kh_run_is_selftest) fprintf(stderr,"kh: audio: selftest run: the audio device is NOT started (the tests drive the pull ring themselves)\n");
         else kh_audio_pull_ready(); } if(kh_vclock_pace_by_device()) fprintf(stderr,"kh: audio: KHNMC_AUDIO=%s with KHNMC_CLOCK=frames: the device paces the virtual clock (KHNMC_CLOCK_PACE=free implied; set it to realtime to keep the host-time floor as well)\n",mode); }                                   /* ring 16384 frames (341 ms; room for a target of 2 x 4096-frame slices), target fill 2048 (43 ms): above one 1024-frame callback + two passes */
     { const char *pl=getenv("KHNMC_AUDIO_PEAKLOG"); if(pl&&*pl){ char path[1024]; snprintf(path,sizeof path,"%s",pl); char *c=strrchr(path,','); if(c){ *c=0; peak_thr=(float)atof(c+1); if(!(peak_thr>0.0f)) peak_thr=1.0f; }
-        peak_f=fopen(path,"w"); if(!peak_f){ fprintf(stderr,"kh: FATAL: KHNMC_AUDIO_PEAKLOG: cannot create %s\n",path); fflush(stdout); kh_host_exit(2); } } }
+        peak_f=fopen(path,"w"); if(!peak_f) kh_warn("KHNMC_AUDIO_PEAKLOG disabled: cannot create %s",path); } }
     { const char *a=getenv("KHNMC_AUDIO_APPLY");
       if(a&&*a){ if(!strcmp(a,"stamped")) apply_mode=0; else if(!strcmp(a,"immediate")) apply_mode=1;
-          else { fprintf(stderr,"kh: FATAL: KHNMC_AUDIO_APPLY=%s not understood (stamped = with KHNMC_CLOCK=frames, calls apply at the first pass after their virtual instant, the default; immediate = when they are made, the behaviour before TASK28)\n",a); fflush(stdout); kh_host_exit(2); } } }
+          else kh_warn("KHNMC_AUDIO_APPLY=%s invalid; using default timing",a); } }
     { const char *e=getenv("KHNMC_AUDIO_WAV_GAIN_DB"); if(e&&*e){ char *end; double db=strtod(e,&end);
-        if(*end||!(db<=0.0)||db<-60.0){ fprintf(stderr,"kh: FATAL: KHNMC_AUDIO_WAV_GAIN_DB=%s not understood (a gain in dB from -60 to 0)\n",e); fflush(stdout); kh_host_exit(2); }
-        wav_gain_db=db; wav_gain=(float)pow(10.0,db/20.0);
-        if(out_pull&&db!=0.0){ fprintf(stderr,"kh: FATAL: KHNMC_AUDIO_WAV_GAIN_DB applies to WAV files only; with KHNMC_AUDIO=%s the ring and the file would differ\n",mode); fflush(stdout); kh_host_exit(2); } } }
+        if(*end||!(db<=0.0)||db<-60.0) kh_warn("KHNMC_AUDIO_WAV_GAIN_DB=%s outside -60..0; using unity gain",e);
+        else if(out_pull&&db!=0.0) kh_warn("KHNMC_AUDIO_WAV_GAIN_DB disabled: pull output requires unity gain");
+        else { wav_gain_db=db; wav_gain=(float)pow(10.0,db/20.0); }
+    } }
     C_enum=kh_com_class("xa2:IMMDeviceEnumerator",8,COM_STRICT,h_device);
     C_device=kh_com_class("xa2:IMMDevice",7,COM_STRICT,h_device);
     C_client=kh_com_class("xa2:IAudioClient",15,COM_STRICT,h_device);
@@ -1055,11 +1071,12 @@ void kh_audio_report(FILE *f){
 }
 
 #include "rewind.h"
-u64 kh_audio_output_frame(void){ return st_quanta*480; }
+u64 kh_audio_output_frame(void){ return (st_quanta-quanta_origin)*480; }
 
 #include "slot_disk.h"
 void kh_disk_mixer(KhRecords *,KmxEngine *);
 void kh_disk_audio(KhRecords *r,struct KhAudioSlot *s){
+    if(!kh_vclock_on) KH_VALUE(r,s->output_quanta);
     kh_disk_streams(r,s->streams);
     KH_RECORD(r,s->nformats); KH_RECORD(r,s->neffects);
     KH_VALUE(r,s->formats); KH_VALUE(r,s->effects);

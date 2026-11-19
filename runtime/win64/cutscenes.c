@@ -18,11 +18,13 @@
 #endif
 
 /* f_2b3400 is the only caller. It uses AL to expose the Theater title row. */
+static int theater_unlock_disabled;
+void kh_theater_disable_unlock(void){ theater_unlock_disabled=1; }
 void orig_f_2b73f0(KCtx *g);
 void f_2b73f0(KCtx *g){
     orig_f_2b73f0(g);
     const char *unlock=getenv("KHNMC_THEATER_UNLOCK");
-    if(unlock && !strcmp(unlock,"1")) SET_RAX(g,1);
+    if(!theater_unlock_disabled && unlock && !strcmp(unlock,"1")) SET_RAX(g,1);
 }
 
 /* The picker calls this predicate for chapter and scene progress words. */
@@ -30,7 +32,7 @@ void orig_f_2b9690(KCtx *g);
 void f_2b9690(KCtx *g){
     orig_f_2b9690(g);
     const char *unlock=getenv("KHNMC_THEATER_UNLOCK"), *mode=getenv("KHNMC_CUTSCENES");
-    if(unlock && !strcmp(unlock,"1") && mode && !strcmp(mode,"theater")) SET_RAX(g,1);
+    if(!theater_unlock_disabled && unlock && !strcmp(unlock,"1") && mode && !strcmp(mode,"theater")) SET_RAX(g,1);
 }
 
 static const char reviewed_digest[]="155fa7e650a5ba0fed00bfc49555aea940446ca1a11b3645d5b314521ba90ef6";
@@ -89,14 +91,17 @@ static u32 entry_size(KCtx *g,u32 name){
 }
 static int key_cmp(const char *a,const char *an,const char *b,const char *bn){ int c=memcmp(a,b,4); return c?c:memcmp(an,bn,4); }
 static void pack_fatal(KCtx *g,const char *why){ kh_fatal(g,"cutscenes-pack: %s: %s",pack_path,why); }
-static void load_pack(KCtx *g,int mode){
+static int load_pack(KCtx *g,int mode){
     int theater=mode==C_THEATER;
     const char *name=theater?"theater-events.khtr":"story-events.khcs";
     const char *e=getenv(theater?"KHNMC_THEATER_PACK":"KHNMC_CUTSCENES_PACK");
     if(e&&*e) snprintf(pack_path,sizeof pack_path,"%s",e);
     else { const char *root=getenv("KHNMC_DATA"); if(!root||!*root) root="data";
            if(!kh_resolve_ci(root,name,pack_path,sizeof pack_path)) snprintf(pack_path,sizeof pack_path,"%s/%s",root,name); }
-    FILE *f=fopen(pack_path,"rb"); if(!f){ char w[200]; snprintf(w,sizeof w,"cannot open it (%s)",strerror(errno)); pack_fatal(g,w); }
+    FILE *f=fopen(pack_path,"rb"); if(!f){
+        kh_warn("cutscenes-pack: %s: cannot open it (%s); cutscenes disabled",pack_path,strerror(errno));
+        return 0;
+    }
     struct stat st; if(fstat(fileno(f),&st)||st.st_size<16||(u64)st.st_size>PACK_MAX){ fclose(f); pack_fatal(g,"not a file of 16 bytes .. 64 MiB"); }
     pack_len=(size_t)st.st_size; pack=malloc(pack_len); if(!pack){ fclose(f); pack_fatal(g,"out of memory"); }
     if(fread(pack,1,pack_len,f)!=pack_len){ fclose(f); pack_fatal(g,"short read"); }
@@ -122,27 +127,39 @@ static void load_pack(KCtx *g,int mode){
     char digest[65]; digest_hex(pack,pack_len,digest);
     if(strcmp(digest,theater?theater_digest:expected_digest)) pack_fatal(g,"reviewed manifest SHA-256 mismatch");
     fprintf(stderr,"kh: cutscenes: KHNMC_CUTSCENES=%s: %u original scenes from %s (%zu bytes) replace the mod's stub where the game asks for them\n",getenv("KHNMC_CUTSCENES"),nrec,pack_path,pack_len);
+    return 1;
 }
 static void cinit(KCtx *g){
     const char *e=getenv("KHNMC_CUTSCENES"); int m;
     if(!e||!*e||!strcmp(e,"nmc")) m=C_NMC;
     else if(!strcmp(e,"story")) m=C_STORY;
     else if(!strcmp(e,"theater")) m=C_THEATER;
-    else kh_fatal(g,"cutscenes-mode: KHNMC_CUTSCENES=%s is not a mode (nmc = the mod's empty scenes, the default; story = reviewed story scenes; theater = reviewed scenes during isolated replay)",e);
+    else { kh_warn("cutscenes-mode: KHNMC_CUTSCENES=%s is not a mode; using nmc",e); m=C_NMC; }
     if(m!=C_NMC){ const char *ev=getenv("KHNMC_EVENTS");
-        if(ev&&*ev&&strcmp(ev,"real")) kh_fatal(g,"cutscenes-mode: KHNMC_CUTSCENES=%s and KHNMC_EVENTS=%s contradict each other (the one restores scenes, the other empties them): unset one",e,ev);
-        if(m==C_STORY) load_pack(g,m); }
-    const char *d=getenv("KHNMC_CUTSCENES_SAVEDUMP");
-    if(d&&*d){ snprintf(dump_dir,sizeof dump_dir,"%s",d); if(mkdir(dump_dir,0755)&&errno!=EEXIST) kh_fatal(g,"cutscenes-savedump: cannot make %s (%s)",dump_dir,strerror(errno)); dump_on=1;
-        char path[4300]; snprintf(path,sizeof path,"%s/live.log",dump_dir);
-        live_log=fopen(path,"w"); if(!live_log) kh_fatal(g,"cutscenes-savedump: cannot open %s",path);
+        if(ev && (!strcmp(ev,"stub") || !strcmp(ev,"stub+music"))){
+            kh_warn("cutscenes-mode: KHNMC_CUTSCENES=%s and KHNMC_EVENTS=%s contradict; cutscenes disabled",e,ev);
+            m=C_NMC;
+        }else if(m==C_STORY && !load_pack(g,m)) m=C_NMC;
     }
-    else dump_on=0;
+    const char *d=getenv("KHNMC_CUTSCENES_SAVEDUMP");
+    dump_on=0;
+    if(d&&*d){
+        char path[4300];
+        if(snprintf(dump_dir,sizeof dump_dir,"%s",d)<(int)sizeof dump_dir &&
+           (!mkdir(dump_dir,0755)||errno==EEXIST)){
+            snprintf(path,sizeof path,"%s/live.log",dump_dir);
+            live_log=fopen(path,"w");
+        }
+        if(live_log) dump_on=1;
+        else kh_warn("cutscenes save dump disabled: directory unavailable");
+    }
     cmode=m;
 }
-void kh_theater_pack_init(KCtx *g){
+int kh_theater_pack_init(KCtx *g){
     if(cmode==C_UNSET) cinit(g);
-    if(cmode==C_THEATER && !pack) load_pack(g,C_THEATER);
+    if(cmode==C_THEATER && !pack && !load_pack(g,C_THEATER)) cmode=C_NMC;
+    if(cmode!=C_THEATER) kh_theater_disable_unlock();
+    return cmode==C_THEATER;
 }
 /* selftest only */
 void kh_cutscenes_test_reset(void){
@@ -330,6 +347,7 @@ static int tree_check(KCtx *g,const char *root,const char *packp){
     if(!root||!*root||!packp||!*packp||!kh_resolve_ci(root,"ard/us",dir,sizeof dir)){
         fprintf(stderr,"kh: cutscenes tree check: not run: it needs KHNMC_DATA (a tree with ard/us) and KHNMC_CUTSCENES_PACK\n"); return 0; }
     setenv("KHNMC_CUTSCENES","story",1); setenv("KHNMC_CUTSCENES_PACK",packp,1); kh_cutscenes_test_reset(); cinit(g);
+    if(!pack) return 1;
     int tc=0,tb=0;
     unsigned catalog_count=(pack_len-catalog_offset-124)/8;
     for(unsigned i=0;i<catalog_count;i++){
@@ -353,6 +371,7 @@ static int tree_check(KCtx *g,const char *root,const char *packp){
 }
 int kh_cutscenes_selftest(KCtx *g){
     checks=bad=0;
+    int old_unlock_disabled=theater_unlock_disabled; theater_unlock_disabled=0;
     const char *keys[]={"KHNMC_DATA","KHNMC_CUTSCENES","KHNMC_CUTSCENES_PACK","KHNMC_EVENTS","KHNMC_CUTSCENES_SAVEDUMP","KHNMC_THEATER_UNLOCK"}; enum{NK=6}; char *old[NK];
     for(int i=0;i<NK;i++){ const char *v=getenv(keys[i]); old[i]=v?strdup(v):NULL; unsetenv(keys[i]); }
     u64 gate=GS_BASE+0xb1d778;
@@ -450,10 +469,10 @@ int kh_cutscenes_selftest(KCtx *g){
     if(!kh_fork_ok()) kh_selftest_not_run("cutscenes","the named fatals cutscenes-mode and cutscenes-pack (11 children)",22);
     else {
         char out[16384]; int rc;
-        setenv("KHNMC_CUTSCENES","Story",1); kh_cutscenes_test_reset(); rc=child(g,gs,NM("406"),out,sizeof out); T(rc==3); T(strstr(out,"cutscenes-mode: KHNMC_CUTSCENES=Story is not a mode")!=NULL);
-        setenv("KHNMC_CUTSCENES","story",1); setenv("KHNMC_EVENTS","stub",1); kh_cutscenes_test_reset(); rc=child(g,gs,NM("406"),out,sizeof out); T(rc==3); T(strstr(out,"cutscenes-mode: KHNMC_CUTSCENES=story and KHNMC_EVENTS=stub contradict")!=NULL);
+        setenv("KHNMC_CUTSCENES","Story",1); kh_cutscenes_test_reset(); rc=child(g,gs,NM("406"),out,sizeof out); T(rc==99); T(strstr(out,"cutscenes-mode: KHNMC_CUTSCENES=Story is not a mode")!=NULL);
+        setenv("KHNMC_CUTSCENES","story",1); setenv("KHNMC_EVENTS","stub",1); kh_cutscenes_test_reset(); rc=child(g,gs,NM("406"),out,sizeof out); T(rc==99); T(strstr(out,"cutscenes-mode: KHNMC_CUTSCENES=story and KHNMC_EVENTS=stub contradict")!=NULL);
         unsetenv("KHNMC_EVENTS");
-        setenv("KHNMC_CUTSCENES_PACK","/nonexistent/x.khcs",1); kh_cutscenes_test_reset(); rc=child(g,gs,NM("406"),out,sizeof out); T(rc==3); T(strstr(out,"cutscenes-pack: /nonexistent/x.khcs: cannot open it")!=NULL);
+        setenv("KHNMC_CUTSCENES_PACK","/nonexistent/x.khcs",1); kh_cutscenes_test_reset(); rc=child(g,gs,NM("406"),out,sizeof out); T(rc==99); T(strstr(out,"cutscenes-pack: /nonexistent/x.khcs: cannot open it")!=NULL);
         snprintf(p,sizeof p,"%s/bad.khcs",dir); setenv("KHNMC_CUTSCENES_PACK",p,1);
         static const char *want[8]={NULL,"fails its checksum","not a KHCS pack","is not an event entry","is not after the one before it","has class 7","manifest SHA-256 mismatch","entry count mismatch"};
         for(int k=1;k<=7;k++){ write_pack(p,tr,3,k); kh_cutscenes_test_reset(); rc=child(g,gs,NM("406"),out,sizeof out); T(rc==3); T(strstr(out,"cutscenes-pack:")&&strstr(out,want[k])); }
@@ -471,6 +490,7 @@ int kh_cutscenes_selftest(KCtx *g){
     catalog_offset=old_catalog; c_missing=old_missing;
     cmode=sv_mode; dump_on=sv_dump; pack=sv_pack; pack_len=sv_len; recs=sv_recs; nrec=sv_n; guest=sv_guest; dump_n=sv_dn; memcpy(dump_dir,sv_dir,sizeof sv_dir);
     c_lookup=sv_c[0]; c_none=sv_c[1]; c_real=sv_c[2]; c_stub=sv_c[3]; c_restored=sv_c[4]; c_kept=sv_c[5]; c_noplace=sv_c[6]; c_dumps=sv_c[7];
+    theater_unlock_disabled=old_unlock_disabled;
     fprintf(stderr,"kh: cutscenes selftest: %d checks, %d failures\n",checks,bad); return bad+tbad;
 }
 

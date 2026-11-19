@@ -108,6 +108,13 @@ int kh_scene_path(const char *rel,char *host,size_t cap){
            !stat(host,&st) && S_ISREG(st.st_mode) && st.st_size>0 && st.st_size<=INT_MAX && !access(host,R_OK);
 }
 
+int kh_scene_pack_ready(void){
+    char host[4096];
+    for(size_t i=0;i<sizeof scene_files/sizeof *scene_files;i++)
+        if(!kh_scene_path(scene_files[i],host,sizeof host)) return 0;
+    return 1;
+}
+
 void kh_scene_pack_begin(void){
     if(scene_pack) return;
     pthread_mutex_lock(&files_lock);

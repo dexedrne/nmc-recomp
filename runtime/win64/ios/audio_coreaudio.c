@@ -12,7 +12,7 @@
  *   - the unit's input scope, element 0, takes the ring's format: 48000 Hz, 2 channels, float32, interleaved (packed).  The unit
  *     converts to the hardware's rate and layout itself (an iPhone's hardware rate is 48 kHz; on 44.1 kHz routes it resamples);
  *   - the render callback runs on the unit's real-time thread and calls kh_audio_out_pull(buffer, frames) and nothing else: no lock,
- *     no allocation, no Objective-C, no logging.  A pull that found nothing sets kAudioUnitRenderAction_OutputIsSilence;
+ *     no allocation, no Objective-C, no logging. ;
  *   - the ring's target fill is raised to twice the largest slice the device may ask for, so one slice never empties the ring by
  *     itself: the unit's kAudioUnitProperty_MaximumFramesPerSlice, and on iOS at least KH_AUDIO_OUT_MAX_SLICE (4096: iOS uses slices
  *     of up to 4096 frames while the screen is locked, whatever the property said before; from memory, unverified).  That is a
@@ -47,7 +47,11 @@ static OSStatus kh_render(void *ref, AudioUnitRenderActionFlags *flags, const Au
     float *dst = (float *)io->mBuffers[0].mData;
     UInt32 cap = io->mBuffers[0].mDataByteSize / (UInt32)(sizeof(float) * KH_AUDIO_OUT_CHANNELS);
     if(frames > cap) frames = cap;
-    if(kh_audio_out_pull(dst, frames) == 0){ if(flags) *flags |= kAudioUnitRenderAction_OutputIsSilence; return noErr; }
+    /* A cut can output a short fade even when no frames came from the ring. */
+    if(!kh_audio_out_pull(dst, frames) && (!frames || (dst[0]==0.0f && dst[1]==0.0f))){
+        if(flags) *flags |= kAudioUnitRenderAction_OutputIsSilence;
+        return noErr;
+    }
     /* before the speaker (2026-11-18: a test signal of sample counters reached the iPhone speaker as loud noise): a block with a NaN
      * or a sample beyond 4.0 (12 dB over full scale: no game mix comes near that) is not a game mix: it is muted whole and counted
      * (review r9: clamping such a block only turned it into full-scale noise); otherwise every sample is clamped to [-1, 1] */

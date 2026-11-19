@@ -13,6 +13,8 @@ entries = (
     (19, 'fdd90', 'fddab', 'rt_imp_kernel32__WaitForSingleObject(g);'),
     (20, 'fe720', 'fe87c', 'f_fd9a0(g);'),
     (20, '105420', '105479', 'f_579bf0(g);'),
+    (23, '1287d0', '1288cf', 'kh_dispatch(g,t3);'),
+    (23, '1287d0', '128f3e', 'kh_dispatch(g,t3);'),
     (23, '1287d0', '128c4f', 'kh_dispatch(g,t14);'),
     (23, '129110', '129119', 'f_1287d0(g);'),
     (24, '130030', '130056', 'f_fddc0(g);'),

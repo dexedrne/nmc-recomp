@@ -27,15 +27,15 @@ void kh_autosave_init(void){
     slots=0; indicator=0; atomic_store(&indicator_until,0);
     const char *e=getenv("KHNMC_AUTOSAVE");
     if(!e || !*e || !strcmp(e,"0")) return;
-    if(strcmp(e,"1")) kh_fatal(NULL,"autosave-mode: expected 0 or 1");
+    if(strcmp(e,"1")){ kh_warn("autosave disabled: KHNMC_AUTOSAVE expects 0 or 1"); return; }
     e=getenv("KHNMC_AUTOSAVE_INDICATOR");
-    if(e && strcmp(e,"0") && strcmp(e,"1")) kh_fatal(NULL,"autosave-indicator: expected 0 or 1");
+    if(e && strcmp(e,"0") && strcmp(e,"1")) kh_warn("autosave indicator disabled: expected 0 or 1");
     indicator=!e || !strcmp(e,"1");
     e=getenv("KHNMC_AUTOSAVE_SLOTS");
     char *end;
     long count=e ? strtol(e,&end,10) : 3;
     if((e && (*end || end==e)) || count<1 || count>INT_MAX)
-        kh_fatal(NULL,"autosave-slots: expected a positive slot count");
+        { kh_warn("autosave disabled: expected a positive slot count"); return; }
     slots=(int)count;
 
 }

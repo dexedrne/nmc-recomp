@@ -1,6 +1,7 @@
 #include "slot_disk.h"
 #include <sys/stat.h>
 #include "settings.h"
+#include "khnmc_audio_out.h"
 #include "gfx_present.h"
 #include "route_state.h"
 #include "autosave.h"
@@ -306,9 +307,16 @@ static void disk_owners(struct SessionSlot *s,KhRecords *r){
             sync,files,r->position);
 }
 const char *kh_cut_menu_status(void){ return atomic_exchange(&menu_status,NULL); }
+static const char *cut_disabled="Enable KHNMC_SAVESTATE for interactive slots";
+const char *kh_cut_menu_unavailable(void){
+    if(!kh_cut_enabled) return cut_disabled;
+    if(scripted) return "Script controls the save slots";
+    if(atomic_load(&theater_reserved)) return "Theater replay in progress";
+    return NULL;
+}
 int kh_cut_menu_request(int load,int slot){
     if(slot<1||slot>3) return -1;
-    if(!kh_cut_enabled||scripted||atomic_load(&theater_reserved)) return -2;
+    if(kh_cut_menu_unavailable()) return -2;
     int empty=0;
     return atomic_compare_exchange_strong(&menu_request,&empty,load?slot+3:slot)?0:-1;
 }
@@ -358,40 +366,70 @@ void kh_cut_init(void){
     const char *enable=getenv("KHNMC_SAVESTATE"), *trigger=getenv("KHNMC_TEST_SAVESTATE");
     const char *mode=getenv("KHNMC_CUTSCENES");
     theater_enabled=mode&&!strcmp(mode,"theater");
-    kh_theater_docs_init(theater_enabled);
-    if(theater_enabled && trigger) kh_fatal(NULL,"theater-scripted-slot-conflict");
+    int requested_theater=theater_enabled;
+    if(theater_enabled && trigger){
+        kh_warn("Theater replay disabled: scripted save trigger active");
+        theater_enabled=0;
+    }
+    if(theater_enabled) theater_enabled=kh_theater_pack_init(NULL);
+    if(!kh_theater_docs_init(theater_enabled)) theater_enabled=0;
+    if(requested_theater&&!theater_enabled) kh_theater_disable_unlock();
     if(theater_enabled && (!enable||!strcmp(enable,"0"))) enable="1";
     if(!enable||!strcmp(enable,"0")) return;
-    if(strcmp(enable,"1")) kh_fatal(NULL,"savestate-switch: expected 0 or 1");
-
     extern int kh_gfx_wrap_on;
-    if((kh_gfx_vkd3d_on&&!kh_gfx_wrap_on)||!kh_vclock_sync||ga_deterministic) kh_fatal(NULL,"savestate-profile: requires null or wrapped graphics and frames clock with sync=all");
-    const char *audio=getenv("KHNMC_AUDIO");
-    if(audio&&*audio&&strcmp(audio,"null")&&strncmp(audio,"wav:",4))
-        kh_fatal(NULL,"savestate-profile: external audio device active");
-    kh_cut_reserve_boot_object();
-    kh_cut_enabled=1;
+    const char *reason=NULL;
+    if(strcmp(enable,"1")) reason="KHNMC_SAVESTATE expects 0 or 1";
+    else if(kh_gfx_vkd3d_on&&!kh_gfx_wrap_on) reason="Use wrapped or null graphics";
+    else if(ga_spread_on()) reason="Incompatible spread allocator";
+    else if(ga_deterministic) reason="Incompatible deterministic allocator";
+    else if(kh_vclock_on&&!kh_vclock_sync) reason="Frames clock needs sync=all";
+    if(reason){
+        if(theater_enabled) kh_theater_disable_unlock();
+        cut_disabled=reason;
+        theater_enabled=0;
+        kh_warn("Save states and isolated Theater disabled: %s",reason);
+        return;
+    }
     scripted=trigger!=NULL;
     const char *boot=getenv("KHNMC_BOOT_SLOT");
     if(boot&&*boot){
-        if(scripted || boot[0]<'1'||boot[0]>'3'||boot[1]) kh_fatal(NULL,"savestate-boot-slot: expected 1..3 without a scripted slot trigger");
-        if(kh_gfx_vkd3d_on) kh_fatal(NULL,"savestate-cold-gpu-objects");
-        if(kh_cut_menu_request(1,boot[0]-'0')) kh_fatal(NULL,"savestate-boot-slot-request");
-        take_menu_request(1);
-        if(!trigger_head) kh_fatal(NULL,"savestate-boot-slot-path");
-        struct SessionSlot *resident=NULL;
-        load_started=kh_host_ns();
-        const char *err=open_slot(menu_path,&resident,&disk_header,&disk_pad,&disk_docs,&bootstrap);
-        if(!err) err=kh_slot_docs_begin(&disk_docs);
-        if(err) kh_fatal(NULL,"%s: %s",err,menu_path);
-        if(!kh_pad_bootstrap(&disk_pad)) kh_fatal(NULL,"savestate-cold-input-prefix");
-        startup_docs=disk_docs; disk_docs=(KhBootDocs){0};
-        trigger_head->frame=disk_header.frame; opened=1;
-        fprintf(stderr,"kh: savestate-cold-bootstrap request=boot target=%llu\n",(unsigned long long)disk_header.frame);
-    }else{
-        const char *err=kh_slot_docs_capture(&startup_docs);
-        if(err) kh_fatal(NULL,"%s",err);
+        const char *err=NULL;
+        if(scripted || boot[0]<'1'||boot[0]>'3'||boot[1]) err="expected slot 1..3 without a scripted trigger";
+        else if(kh_gfx_vkd3d_on) err="savestate-cold-gpu-objects";
+        else if(!kh_vclock_on) err="cold replay requires the frames clock";
+        else{
+            atomic_store(&menu_request,boot[0]-'0'+3);
+            take_menu_request(1);
+            struct SessionSlot *resident=NULL;
+            load_started=kh_host_ns();
+            err=trigger_head?open_slot(menu_path,&resident,&disk_header,&disk_pad,&disk_docs,&bootstrap):"savestate-boot-slot-path";
+            if(!err) err=kh_slot_docs_begin(&disk_docs);
+            if(!err && !kh_pad_bootstrap(&disk_pad)) err="savestate-cold-input-prefix";
+        }
+        if(err){
+            close_load();
+            trigger_head=NULL;
+            atomic_store(&menu_request,0);
+            atomic_store(&menu_status,err);
+            kh_warn("Boot slot skipped: %s",err);
+        }else{
+            startup_docs=disk_docs; disk_docs=(KhBootDocs){0};
+            trigger_head->frame=disk_header.frame; opened=1;
+            fprintf(stderr,"kh: savestate-cold-bootstrap request=boot target=%llu\n",(unsigned long long)disk_header.frame);
+        }
     }
+    if(!opened){
+        const char *err=kh_slot_docs_capture(&startup_docs);
+        if(err){
+            free(startup_docs.data); startup_docs=(KhBootDocs){0};
+            if(theater_enabled) kh_theater_disable_unlock();
+            cut_disabled=err; theater_enabled=0;
+            kh_warn("Save states and isolated Theater disabled: %s",err);
+            return;
+        }
+    }
+    kh_cut_reserve_boot_object();
+    kh_cut_enabled=1;
     if(!trigger) return;
     char *storage=strdup(trigger), *spec=storage;
     if(!spec) kh_fatal(NULL,"savestate-trigger-memory");
@@ -447,7 +485,8 @@ void kh_cut_poll(const char *site,pthread_mutex_t *held){
         static const struct { const char *site,*name; } waits[]={
             [KH_CUT_SLEEP]={"clock-client","sleeper"}, [KH_CUT_HANDLE]={"handle-wait","handle"},
             [KH_CUT_RELEASE]={"wake-handoff","handoff"}, [KH_CUT_SHELL]={"shell-loop","shell"},
-            [KH_CUT_TIMER]={"clock-client","timer"}, [KH_CUT_MIXER]={"clock-deadline","mixer"}
+            [KH_CUT_TIMER]={"clock-client","timer"}, [KH_CUT_MIXER]={"clock-deadline","mixer"},
+            [KH_CUT_VBLANK]={"display-tick","vblank"}
         };
         if(kh_cut_wait_owner&&!strcmp(waits[kh_cut_wait_owner].site,site))
             p.owner=waits[kh_cut_wait_owner].name;
@@ -547,12 +586,26 @@ static int game_chain_known(KCtx *g){
         rd64(g,sp+0x90)==GS_BASE+0x14ecde&&rd64(g,sp+0xe0)==GS_BASE+0x121f09&&
         rd64(g,sp+0x160)==GS_BASE+0x127ed9&&rd64(g,game_entry_sp)==0x7ff7ffff0000ull;
 }
+static void slot_digest(KCtx *g,const char *op,const char *slot){
+    unsigned char sum[32];
+    KhPlayerSheet player;
+    float x=0,y=0,z=0;
+    kh_route_player_pos(g,&x,&y,&z,NULL);
+    kh_route_player_sheet(g,&player);
+    game_digest(hp(g,GS_BASE+0x9a98b0),0x10fc0,sum);
+    fprintf(stderr,"kh: slot-digest %s %s frame=%llu world=%d area=%d pos=%a,%a,%a hp=%d sample=%llu tick=%llu qpc=%llu sha256=",
+        op,slot,(unsigned long long)(kh_game_frames()+1),kh_route_world(g),kh_route_area(g),
+        x,y,z,player.hp,(unsigned long long)kh_audio_output_frame(),(unsigned long long)kh_vclock_vblanks(),
+        (unsigned long long)kh_qpc());
+    for(unsigned j=0;j<sizeof sum;j++) fprintf(stderr,"%02x",sum[j]);
+    fputc('\n',stderr);
+}
 void kh_cut_frame(KCtx *g,u64 frame){
     extern _Atomic u64 gfx_presents;
     extern size_t kh_phase_files_seen(void);
     if(!trigger_head && theater_enabled) theater_frame(g,frame);
     if(!trigger_head && !atomic_load(&theater_reserved)) take_menu_request(frame);
-    if(theater_enabled && !trigger_head && !getenv("KHNMC_TEST_THEATER_HASH")) return;
+    if((theater_enabled||!kh_vclock_on) && !trigger_head && !getenv("KHNMC_TEST_THEATER_HASH")) return;
     int due=trigger_head&&frame>=trigger_head->frame;
     if(due&&!at_dispatch&&game_chain_known(g)) longjmp(*game_dispatch,1);
     unsigned char digest[32];
@@ -581,6 +634,7 @@ void kh_cut_frame(KCtx *g,u64 frame){
             err=open_slot(slot,&session,&disk_header,&disk_pad,&disk_docs,&bootstrap);
             if(!err && !session){
                 if(kh_gfx_vkd3d_on) err="savestate-cold-gpu-objects";
+                else if(!kh_vclock_on) err="savestate-cold-host-clock";
                 else if(disk_docs.size!=startup_docs.size ||
                    (disk_docs.size&&memcmp(disk_docs.data,startup_docs.data,disk_docs.size))) err="savestate-cold-startup-documents";
                 else if(!kh_pad_bootstrap(&disk_pad)) err="savestate-cold-input-prefix";
@@ -632,6 +686,7 @@ retry_cut:
         nanosleep(&nap,NULL);
         pthread_mutex_lock(&mutex);
     }
+    if(!missing) kh_cut_clock_pause(1);
     int sync_test=trigger_head->op==SYNC_SAVE||trigger_head->op==SYNC_CHECK;
     int save=trigger_head->op==SAVE||load||sync_test;
     const char *sync_error=NULL;
@@ -693,6 +748,8 @@ retry_cut:
             }
         }
         if(save&&gate_ok&&!stream_busy&&!blocker_site&&at_dispatch){
+            kh_audio_out_cut_pause();
+            if(load && getenv("KHNMC_TEST_SLOT_DIGEST")) slot_digest(g,"before",slot);
             if(!sync_test){
                 if(!load||cold){
                     candidate=calloc(1,sizeof *candidate);
@@ -703,7 +760,7 @@ retry_cut:
                 if(load&&!cold&&!theater) sync_error=read_resident(session);
                 if(!sync_error) sync_error=session_check(session,load&&!cold,n);
                 if(!sync_error&&(!load||cold)) qsort(session->points,session->nthreads,sizeof *session->points,point_order);
-                if(!sync_error&&(load||kh_gfx_vkd3d_on)){
+                if(!sync_error&&(load||kh_gfx_vkd3d_on||!kh_vclock_on)){
                     committing=kh_cut_gate_commit(epoch);
                     if(!committing) sync_error="savestate-lifecycle-changed";
                     else if(load&&getenv("KHNMC_TEST_SAVESTATE_HASH")){
@@ -750,6 +807,7 @@ retry_cut:
                         extern void kh_cut_arena_census(KCtx *,void (*)(KCtx *,u64,u64));
                         kh_cut_arena_census(g,report_extent);
                     }
+                    if(getenv("KHNMC_TEST_SLOT_DIGEST")) slot_digest(g,load?"load":"save",slot);
                     voices=kh_cut_audio_graph(&buffers,&commands);
                     fprintf(stderr,"kh: savestate-%s at=%llu resumed-frame=%llu sample=%llu voices=%u buffers=%u commands=%u\n",
                         load?"loaded":"captured",(unsigned long long)frame,(unsigned long long)(kh_game_frames()+1),
@@ -781,6 +839,11 @@ retry_cut:
             }
             }
         }
+        if(!kh_vclock_on && candidate && !load && !theater && !sync_error){
+            sync_error=publish_slot(candidate);
+            if(!sync_error) candidate=NULL;
+        }
+        if(save&&gate_ok&&!stream_busy&&!blocker_site&&at_dispatch) kh_audio_out_cut_resume();
         if(!save&&!completed&&gate_ok){
             extern void kh_cut_arena_census(KCtx *,void (*)(KCtx *,u64,u64));
             if(census){
@@ -803,6 +866,7 @@ retry_cut:
         if(committing) kh_cut_gate_committed_end(epoch);
         else{ lifecycle_changed=!kh_cut_gate_end(epoch); gate_ok=gate_ok&&!lifecycle_changed; }
     }
+    if(!missing) kh_cut_clock_pause(0);
     atomic_store(&kh_cut_requested,0);
     pthread_cond_broadcast(&resume);
     while(parks) pthread_cond_wait(&resume,&mutex);

@@ -33,7 +33,7 @@ static void init(void){
     const char *e=getenv("KHNMC_MUSICLOG");
     if(!e||!*e){ on=0; return; }
     if(!strcmp(e,"stderr")){ out=stderr; on=1; return; }
-    out=fopen(e,"w"); if(!out) kh_fatal(NULL,"music-log: cannot create KHNMC_MUSICLOG=%s (%s)",e,strerror(errno));
+    out=fopen(e,"w"); if(!out){ kh_warn("music log disabled: %s (%s)",e,strerror(errno)); on=0; return; }
     on=1;
 }
 static void read_state(KCtx *g,MState *m){
