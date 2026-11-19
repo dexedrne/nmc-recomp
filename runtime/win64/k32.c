@@ -309,3 +309,12 @@ IMP(ole32,PropVariantClear){ SET_RAX(g,0); }
 IMP(ole32,CoCreateInstance){ if(kh_audio_cocreate(g)) return; kh_warn("CoCreateInstance(clsid %08x-%04x...) -> REGDB_E_CLASSNOTREG (site rva 0x%llx)",rd32(g,A0(g)),rd16(g,A0(g)+4),(unsigned long long)(guest_return_addr(g)-GS_BASE)); if(ARG(g,4)) wr64(g,ARG(g,4),0); SET_RAX(g,0x80040154u); }
 IMP(oleaut32,SysAllocString){ u64 s=A0(g); if(!s){ SET_RAX(g,0); return; } size_t n=gw_len(g,s); u64 b=ga_alloc_src(4+2*n+2,16,GA_SRC_HEAP); wr32(g,b,(u32)(2*n)); memcpy(hp(g,b+4),hp(g,s),2*n+2); SET_RAX(g,b+4); }
 IMP(oleaut32,SysFreeString){ if(A0(g)) ga_free(A0(g)-4); }
+
+#include "rewind.h"
+void kh_rewind_mapping(KhRecords *r,void **object){
+    if(r->loading){
+        *object=malloc(sizeof(KMap));
+        if(!*object) kh_fatal(NULL,"savestate-mapping-memory");
+    }
+    kh_record(r,*object,sizeof(KMap));
+}

@@ -1969,3 +1969,67 @@ int kh_input_route33_selftest(KCtx *g){
 #undef WCHECK
     return fails;
 }
+
+#include "rewind.h"
+void kh_rewind_input(KhRecords *r){
+    KH_RECORD(r,game_frames);
+    KH_RECORD(r,last_pad);
+    KH_RECORD(r,packet);
+    KH_RECORD(r,route_pad);
+    KH_RECORD(r,step_base);
+    KH_RECORD(r,cur_step);
+    KH_RECORD(r,step_phase);
+    KH_RECORD(r,step_t0);
+    KH_RECORD(r,step_anchor);
+    KH_RECORD(r,route_done);
+    KH_RECORD(r,sel_from);
+    KH_RECORD(r,sel_until);
+    KH_RECORD(r,sel_dir);
+    KH_RECORD(r,sel_v0);
+    KH_RECORD(r,goto_best);
+    KH_RECORD(r,goto_d);
+    KH_RECORD(r,goto_x);
+    KH_RECORD(r,goto_z);
+    KH_RECORD(r,goto_cam);
+    KH_RECORD(r,goto_tx);
+    KH_RECORD(r,goto_tz);
+    KH_RECORD(r,goto_best_at);
+    KH_RECORD(r,goto_seen);
+    KH_RECORD(r,goto_have_cam);
+    KH_RECORD(r,goto_lx);
+    KH_RECORD(r,goto_ly);
+    KH_RECORD(r,fight_a);
+    KH_RECORD(r,fight_enemies);
+    KH_RECORD(r,fight_presses);
+    KH_RECORD(r,fight_pages);
+    KH_RECORD(r,skip_btn);
+    KH_RECORD(r,skip_hold);
+    KH_RECORD(r,skip_gap);
+    KH_RECORD(r,skip_starts);
+    KH_RECORD(r,skip_skips);
+    KH_RECORD(r,skip_moves);
+    KH_RECORD(r,skip_pages);
+    KH_RECORD(r,talk_run);
+    KH_RECORD(r,talk_presses);
+    KH_RECORD(r,talk_msg);
+    KH_RECORD(r,goto_noobj);
+    KH_RECORD(r,react_presses);
+    KH_RECORD(r,react_seen);
+    KH_RECORD(r,goto_ox);
+    KH_RECORD(r,goto_oz);
+    KH_RECORD(r,react_landing);
+    KH_RECORD(r,react_open);
+    KH_RECORD(r,react_shut);
+    KH_RECORD(r,react_why);
+    KH_RECORD(r,warp_watching);
+    KH_RECORD(r,warp_seq);
+    KH_RECORD(r,last_script_frame);
+    KH_RECORD(r,hold_shift);
+    KH_RECORD(r,hold_released);
+    KH_RECORD(r,clock_sf0);
+    KH_RECORD(r,clock_gf0);
+    KH_RECORD(r,host_pad_on);
+    KH_RECORD(r,host_pad);
+    KH_RECORD(r,host_latched);
+    kh_record(r,steps,nsteps*sizeof *steps);
+}

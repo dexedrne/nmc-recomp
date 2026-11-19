@@ -1088,3 +1088,74 @@ int kh_winpath_w(KCtx *g,u64 w,char *out,size_t cap){ char u[2048]; gw_to_utf8(g
 /* last error */
 void kh_set_last_error(u32 e){ KThread *t=cur_thread(); if(t) t->lasterr=(int)e; }
 u32 kh_get_last_error(void){ KThread *t=cur_thread(); return t?(u32)t->lasterr:0; }
+
+#include "rewind.h"
+/* The allocator owns the page runs on the host. Small-block free links, raw
+ * sample bytes, decoder objects and XAPO history are in the guest ranges. */
+void kh_rewind_arena(KhRecords *r){
+    kh_record_pages(r,(void *)XLG(GS_BASE),arena_lo-GS_BASE);
+    for(int i=0;i<nzones;i++){
+        Zone *z=&zones[i];
+        u64 limit=z->commit;
+        KH_RECORD(r,limit);
+        if(r->loading && limit!=z->commit){
+            if(limit>z->commit) zone_commit(z,limit);
+            else{
+                host_discard(limit,z->commit-limit);
+                if(mprotect((void *)XLG(limit),z->commit-limit,PROT_NONE)) kh_fatal(NULL,"savestate-arena-decommit");
+            }
+            z->commit=limit;
+        }
+        KH_RECORD(r,z->bump); KH_RECORD(r,z->freelist);
+        KH_RECORD(r,z->live); KH_RECORD(r,z->parked); KH_RECORD(r,z->runfree); KH_RECORD(r,z->nblocks);
+        size_t n=0;
+        for(Run *p=z->runs;p;p=p->next) n++;
+        KH_RECORD(r,n);
+        if(r->loading){
+            while(z->runs){ Run *p=z->runs; z->runs=p->next; free(p); }
+        }
+        Run **tail=&z->runs;
+        while(n--){
+            if(r->loading){
+                *tail=calloc(1,sizeof **tail);
+                if(!*tail) kh_fatal(NULL,"savestate-arena-run-memory");
+            }
+            KH_RECORD(r,(*tail)->lo); KH_RECORD(r,(*tail)->size); tail=&(*tail)->next;
+        }
+        kh_record_pages(r,(void *)XLG(z->lo),limit-z->lo);
+    }
+    kh_record(r,win_live,nwin*GA_NSRC*sizeof *win_live);
+    KH_RECORD(r,alloc_count);
+}
+const char *kh_rewind_handles_check(void){
+    for(unsigned i=1;i<MAXH;i++){
+        int k=htab[i].kind;
+        if(k&&!sync_kind(k)&&k!=HK_MAPPING&&k!=HK_HEAP) return "savestate-open-host-handle";
+    }
+    return NULL;
+}
+void kh_rewind_handles(KhRecords *r){
+    void kh_rewind_mapping(KhRecords *,void **);
+    unsigned count=0;
+    for(unsigned i=1;i<MAXH;i++) if(htab[i].kind==HK_MAPPING||htab[i].kind==HK_HEAP){
+        count++;
+        if(r->loading){ free(htab[i].obj); htab[i]=(HEnt){0}; }
+    }
+    KH_RECORD(r,count);
+    unsigned next=1;
+    while(count--){
+        unsigned index=next;
+        if(!r->loading) while(htab[index].kind!=HK_MAPPING&&htab[index].kind!=HK_HEAP) index++;
+        KH_RECORD(r,index);
+        HEnt *h=&htab[index];
+        KH_RECORD(r,h->kind);
+        if(h->kind==HK_MAPPING) kh_rewind_mapping(r,&h->obj);
+        else{
+            size_t n=r->loading?0:strlen(h->obj)+1;
+            KH_RECORD(r,n);
+            if(r->loading&&!(h->obj=malloc(n))) kh_fatal(NULL,"savestate-registry-memory");
+            kh_record(r,h->obj,n);
+        }
+        next=index+1;
+    }
+}

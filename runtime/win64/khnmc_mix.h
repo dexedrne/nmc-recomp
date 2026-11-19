@@ -95,6 +95,12 @@ typedef struct {
 } KmxStats;
 
 KmxEngine *kmx_engine_create(const KmxHost *host, void *user, uint32_t device_rate);
+/* Quiescent same-session graph. Audio data, guest effect state and processing
+ * allocations retain their arena addresses and must be restored with the arena.
+ * bind returns the new voice user (index -1) or effect user. NULL retains users. */
+typedef void *(*KmxCloneBinding)(void *engine_user,void *old_voice_user,KmxVoice *voice,int effect_index);
+KmxEngine *kmx_clone_graph(KmxEngine *,void *engine_user,KmxCloneBinding bind);
+void kmx_discard_graph(KmxEngine *);
 void kmx_engine_destroy(KmxEngine *e);                 /* destroys every remaining voice (voice_free is called for each) */
 void kmx_engine_set_callbacks(KmxEngine *e, int on);   /* engine pass callbacks; turning off waits for a running one */
 void kmx_engine_start(KmxEngine *e);

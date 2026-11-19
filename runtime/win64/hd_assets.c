@@ -508,14 +508,16 @@ HdTable *kh_hd_begin(KCtx *g,const char *root,const char *rel_in,const unsigned 
     unsigned b=ci_hash(rel)&1023; HdTable *t;
     int look=kh_look_key(rel);
     for(t=buckets[b];t;t=t->next) if(t->look==look&&t->fsize==n&&key_eq(t->key,rel)) break;
-    if(t){ st_cache_hit++; pthread_mutex_unlock(&hd_lock); cur_table=t; return prev; }
-    cfg_load(g,root);
-    if(hd_build(root,rel,bytes,n,&t,err,sizeof err)){ pthread_mutex_unlock(&hd_lock); kh_fatal(g,"hd assets: %s",err); }
-    t->key=strdup(rel); t->fsize=n; if(!t->key) kh_fatal(g,"hd assets: out of memory");
+    if(t&&t->gent){ st_cache_hit++; pthread_mutex_unlock(&hd_lock); cur_table=t; return prev; }
+    if(!t){
+        cfg_load(g,root);
+        if(hd_build(root,rel,bytes,n,&t,err,sizeof err)){ pthread_mutex_unlock(&hd_lock); kh_fatal(g,"hd assets: %s",err); }
+        t->key=strdup(rel); t->fsize=n; if(!t->key) kh_fatal(g,"hd assets: out of memory");
+        t->next=buckets[b]; buckets[b]=t;
+    }
     t->gent=ga_calloc((u64)(t->n?t->n:1),0x30); if(!t->gent) kh_fatal(g,"hd assets: guest arena exhausted for %d entries of %s",t->n,rel);
     for(int i=0;i<t->n;i++){ u64 e=t->gent+0x30ull*(u64)i;
         memcpy(hp(g,e),t->e[i].name,32); wr32(g,e+0x24,t->e[i].orig); wr32(g,e+0x28,(u32)t->e[i].gsize); wr32(g,e+0x2c,(u32)-2); }
-    t->next=buckets[b]; buckets[b]=t;
     st_built++; st_rule[t->rule]++; st_entries_listed+=(u64)t->n; st_truncated+=(u64)t->truncated; st_unserved+=(u64)t->unserved;
     st_src[SRC_MOD]+=(u64)t->n_mod; st_src[SRC_VANILLA]+=(u64)t->n_van; st_src[SRC_NULL]+=(u64)t->n_null; st_trim+=(u64)t->n_trim; st_modsize+=(u64)t->n_modsize;
     for(int i=0;i<t->n;i++) if(t->e[i].orig==0xffffffffu) st_orig_minus1++;
@@ -1024,4 +1026,24 @@ int kh_hd_selftest(KCtx *g){
 #undef FAILS
     nftw(dir,rm_cb,16,FTW_DEPTH|FTW_PHYS);
     fprintf(stderr,"kh: hd selftest: %d checks, %d failures\n",checks,bad); return bad;
+}
+
+#include "rewind.h"
+/* Table metadata lives for the session. A guest entry array lives on just one
+ * timeline. A cached table without its array materializes it on the next hit. */
+void kh_rewind_hd(KhRecords *r){
+    size_t count=0;
+    for(unsigned i=0;i<1024;i++) for(HdTable *t=buckets[i];t;t=t->next){
+        if(r->loading) t->gent=0; else count+=(t->gent!=0);
+    }
+    KH_RECORD(r,count);
+    if(r->loading){
+        while(count--){
+            HdTable *t; KH_RECORD(r,t); KH_RECORD(r,t->gent);
+        }
+    }else{
+        for(unsigned i=0;i<1024;i++) for(HdTable *t=buckets[i];t;t=t->next) if(t->gent){
+            KH_RECORD(r,t); KH_RECORD(r,t->gent);
+        }
+    }
 }

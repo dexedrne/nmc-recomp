@@ -609,3 +609,9 @@ void kh_mod_hooks_b_dump(void){
     fprintf(stderr,"kh: mod B 31dd70 custom rows confirmed: 0x200=%llu 0x201=%llu 0x202=%llu 0x203=%llu 0x204=%llu\n",(unsigned long long)atomic_load(&c_menu_custom[0]),(unsigned long long)atomic_load(&c_menu_custom[1]),
         (unsigned long long)atomic_load(&c_menu_custom[2]),(unsigned long long)atomic_load(&c_menu_custom[3]),(unsigned long long)atomic_load(&c_menu_custom[4]));
 }
+
+#include "rewind.h"
+void kh_rewind_mod(KhRecords *r){
+    KH_RECORD(r,names_va);
+    KH_RECORD(r,lists_va);
+}

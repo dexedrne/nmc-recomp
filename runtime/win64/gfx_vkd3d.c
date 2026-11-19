@@ -79,6 +79,7 @@
 #endif
 #endif
 #include "khnmc_rt.h"
+#include "rewind.h"
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
@@ -765,16 +766,28 @@ static void post_create_rootsig(KCtx *g,const u64 *a,const u64 *stk,u64 rax){
 
 /* ---- bundles: recorded by us, replayed on the direct command list at ExecuteBundle --------------------------------------------- */
 typedef struct { u8 slot; u32 blob, blen; u64 a[5]; } BCmd;                    /* a[] = rdx, r8, r9, first two stack arguments; blob = copied pointee */
-typedef struct Bundle { u64 obj; int open; BCmd *cmd; u32 n,cap; u8 *blob; u32 bn,bcap; } Bundle;
+typedef struct Bundle { u64 obj; int open,arena; BCmd *cmd; u32 n,cap; u8 *blob; u32 bn,bcap; } Bundle;
 #define B_PTR 32                               /* guest bundle object: host Bundle* */
 #define NOBLOB 0xffffffffu
 static Bundle *bundle_of(KCtx *g,u64 o){ return (Bundle*)(uintptr_t)rd64(g,o+B_PTR); }
+/* Bundle objects store a native pointer in guest RAM. Its allocation and both
+ * growing arrays must rewind with that pointer when checkpoints are enabled. */
+static void *bundle_resize(void *p,size_t size,int arena){
+    if(!arena){
+        if(!size){ free(p); return NULL; }
+        return realloc(p,size);
+    }
+    u64 old=p?(uintptr_t)p-gs_bias:0;
+    if(!size){ ga_free(old); return NULL; }
+    u64 addr=ga_realloc(old,size);
+    return addr?(void *)(uintptr_t)(gs_bias+addr):NULL;
+}
 static void bundle_rec(KCtx *g,Bundle *b,int slot,u64 a0,u64 a1,u64 a2,u64 a3,u64 a4,u64 ptr,u32 len){
     if(!b->open) kh_fatal(g,"gfx-bundle-closed: ID3D12GraphicsCommandList method slot %d called on a bundle that is closed (no Reset since Close)",slot);
-    if(b->n==b->cap){ b->cap=b->cap?b->cap*2:32; b->cmd=realloc(b->cmd,sizeof(BCmd)*b->cap); if(!b->cmd) kh_fatal(g,"gfx-bundle: out of memory"); }
+    if(b->n==b->cap){ b->cap=b->cap?b->cap*2:32; b->cmd=bundle_resize(b->cmd,sizeof(BCmd)*b->cap,b->arena); if(!b->cmd) kh_fatal(g,"gfx-bundle: out of memory"); }
     BCmd *c=&b->cmd[b->n++]; c->slot=(u8)slot; c->a[0]=a0; c->a[1]=a1; c->a[2]=a2; c->a[3]=a3; c->a[4]=a4; c->blob=NOBLOB; c->blen=len;
     if(ptr&&len){ u32 need=(len+15)&~15u;
-        if(b->bn+need>b->bcap){ b->bcap=(b->bn+need)*2+256; b->blob=realloc(b->blob,b->bcap); if(!b->blob) kh_fatal(g,"gfx-bundle: out of memory"); }
+        if(b->bn+need>b->bcap){ b->bcap=(b->bn+need)*2+256; b->blob=bundle_resize(b->blob,b->bcap,b->arena); if(!b->blob) kh_fatal(g,"gfx-bundle: out of memory"); }
         memcpy(b->blob+b->bn,hp(g,ptr),len); c->blob=b->bn; b->bn+=need; }
 }
 /* what a bundle records for an interface argument: the REAL object (the wrapped bridge's game passes the guest object that wraps it) */
@@ -787,7 +800,7 @@ static int h_balloc(KCtx *g,u64 o,int s,const char *c){ (void)c;
 static int h_bundle(KCtx *g,u64 o,int s,const char *c){ (void)c; Bundle *b=bundle_of(g,o);
     switch(s){
     case 2: { int last=0; u64 r=kh_com_ref_drop(g,o,&last); SET_RAX(g,r);                 /* atomic, as AddRef (com.c; review U35 n=4) */
-              if(last){ free(b->cmd); free(b->blob); free(b); wr64(g,o,0); wr64(g,o+B_PTR,0); ga_free(o); atomic_fetch_sub(&n_bundles_live,1); } return 1; }   /* Release: the recording dies with the last reference */
+              if(last){ bundle_resize(b->cmd,0,b->arena); bundle_resize(b->blob,0,b->arena); bundle_resize(b,0,b->arena); wr64(g,o,0); wr64(g,o+B_PTR,0); ga_free(o); atomic_fetch_sub(&n_bundles_live,1); } return 1; }   /* Release: the recording dies with the last reference */
     case 3: case 4: case 5: case 6: SET_RAX(g,0); return 1;                     /* private data, SetName */
     case 8: SET_RAX(g,D3D12_COMMAND_LIST_TYPE_BUNDLE); return 1;                /* GetType */
     case 9: if(!b->open){ fprintf(stderr,"kh: gfx vkd3d: bundle 0x%llx: Close on a closed bundle -> E_FAIL\n",P(o)); SET_RAX(g,(u32)E_FAIL); return 1; }
@@ -813,13 +826,14 @@ static int h_bundle(KCtx *g,u64 o,int s,const char *c){ (void)c; Bundle *b=bundl
 /* ID3D12Device::CreateCommandAllocator(BUNDLE): our allocator object */
 u64 kh_gfxc_bundle_allocator_new(KCtx *g){ u64 o=kh_com_obj(C_balloc,0); if(!o) kh_fatal(g,"gfx-bundle: out of memory"); return o; }
 /* ID3D12Device::CreateCommandList(BUNDLE, allocator, initial pipeline state): our recorder object; a bundle starts open, like every list */
-u64 kh_gfxc_bundle_new(KCtx *g,u64 al,u64 pso){
+static u64 bundle_new(KCtx *g,u64 al,u64 pso,int arena){
     if(!GA_OK(al)||rd64(g,al)!=kh_com_vtbl(C_balloc)) kh_fatal(g,"gfx-bundle-allocator: CreateCommandList(BUNDLE) with allocator 0x%llx, which is not a bundle allocator",P(al));
-    u64 o=kh_com_obj(C_bundle,16); Bundle *b=calloc(1,sizeof *b); if(!o||!b) kh_fatal(g,"gfx-bundle: out of memory");
-    b->obj=o; b->open=1; wr64(g,o+B_PTR,U(b)); if(pso) bundle_rec(g,b,25,b_real(g,pso,WK_PSO,"CreateCommandList(BUNDLE): initial pipeline state"),0,0,0,0,0,0);
+    u64 o=kh_com_obj(C_bundle,16); Bundle *b=bundle_resize(NULL,sizeof *b,arena); if(!o||!b) kh_fatal(g,"gfx-bundle: out of memory");
+    *b=(Bundle){.obj=o,.open=1,.arena=arena}; wr64(g,o+B_PTR,U(b)); if(pso) bundle_rec(g,b,25,b_real(g,pso,WK_PSO,"CreateCommandList(BUNDLE): initial pipeline state"),0,0,0,0,0,0);
     atomic_fetch_add(&n_bundles_made,1); atomic_fetch_add(&n_bundles_live,1);
     return o;
 }
+u64 kh_gfxc_bundle_new(KCtx *g,u64 al,u64 pso){ return bundle_new(g,al,pso,kh_cut_enabled); }
 int kh_gfxc_is_bundle(KCtx *g,u64 o){ return o&&GA_OK(o)&&rd64(g,o)==kh_com_vtbl(C_bundle); }
 /* ID3D12GraphicsCommandList::ExecuteBundle(l = REAL direct list, bo = our recorder): replay the recording on the list */
 void kh_gfxc_bundle_replay(KCtx *g,ID3D12GraphicsCommandList *l,u64 bo){
@@ -1740,6 +1754,21 @@ int kh_gfxc_selftest_pure(KCtx *g){
           TP(st_slot(g,bl,2)==1 && kh_gfxc_is_bundle(g,bl) && n_bundles_live==live); TP(st_slot(g,bl,2)==0 && n_bundles_live==live-1);
           TP(st_slot(g,al,2)==1 && rd64(g,al)==kh_com_vtbl(C_balloc)); TP(st_slot(g,al,2)==0); }
       ga_free(stk); }
+    /* Releasing a bundle on both branches used to free the same native command array twice. */
+    if(!ga_spread_on()){
+        u64 al=kh_gfxc_bundle_allocator_new(g), bl=bundle_new(g,al,0,1);
+        Bundle *b=bundle_of(g,bl);
+        bundle_rec(g,b,12,1,2,3,4,0,al,8);
+        KhRecords cut={0};
+        kh_records_begin(&cut,0); kh_rewind_arena(&cut); kh_records_end(&cut);
+        TP(st_slot(g,bl,2)==0);
+        kh_records_begin(&cut,1); kh_rewind_arena(&cut); kh_records_end(&cut);
+        b=bundle_of(g,bl);
+        TP(b->n==1&&b->cmd[0].a[3]==4&&b->bn==16&&!memcmp(b->blob,hp(g,al),8));
+        atomic_fetch_add(&n_bundles_live,1);
+        TP(st_slot(g,bl,2)==0); TP(st_slot(g,al,2)==0);
+        kh_records_free(&cut);
+    }
     /* n=2: a fence completion is SetEvent on the game's event: two completions before either of two blocked waiters of an auto-reset
      * event has run release both (one blocked waiter per SetEvent, as on Windows) and leave the event reset */
     { u64 ev=kh_mk_event_h(0,0); FWait w[2]; for(int i=0;i<2;i++){ w[i].h=ev; atomic_store(&w[i].res,0xdeadu); atomic_store(&w[i].done,0); kh_spawn_hostfn_thread(g,"gfx_selftest_fence_waiter",st_fence_waiter,(u64)(uintptr_t)&w[i]); }

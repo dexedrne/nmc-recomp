@@ -764,3 +764,34 @@ int kh_gfx_selftest(KCtx *g){
     if(kh_gfx_vkd3d_on) fail+=kh_gfx_vkd3d_selftest(g);                       /* KHNMC_GFX=vkd3d / vkd3dw ./khnmc --selftest: device, clear, present, image dump */
     return fail;
 }
+
+#include "rewind.h"
+void kh_rewind_gfx(KhRecords *r){
+    KH_RECORD(r,gfx_presents);
+    KH_RECORD(r,gfx_draws);
+    KH_RECORD(r,gfx_clears);
+    KH_RECORD(r,gfx_barriers);
+    KH_RECORD(r,gfx_execs);
+    KH_RECORD(r,gfx_copies);
+    KH_RECORD(r,gfx_psos);
+    KH_RECORD(r,gfx_resources);
+    KH_RECORD(r,gfx_buffers_bytes);
+    KH_RECORD(r,gfx_bundles);
+    KH_RECORD(r,gfx_pso_binds);
+    KH_RECORD(r,res_ids);
+    KH_RECORD(r,heap_ids);
+    KH_RECORD(r,gfx_res_freed);
+    KH_RECORD(r,gfx_buffers_freed_bytes);
+    KH_RECORD(r,gfx_buffers_freed);
+    KH_RECORD(r,tx_res);
+    KH_RECORD(r,tx_res_bytes);
+    KH_RECORD(r,tx_up);
+    KH_RECORD(r,tx_up_bytes);
+    KH_RECORD(r,tx_distinct_up);
+    KH_RECORD(r,tx_rtds);
+    KH_RECORD(r,tx_sized);
+    KH_RECORD(r,tx_up_sized);
+    KH_RECORD(r,tx_up_total_bytes);
+    KH_RECORD(r,tx_up_calls);
+    KH_RECORD(r,tx_other_up);
+}

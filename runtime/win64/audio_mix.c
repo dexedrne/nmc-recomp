@@ -890,6 +890,69 @@ int kmx_engine_pass_at(KmxEngine *e, void *ctx, uint64_t instant, const float **
     return KMX_OK;
 }
 
+/* At a parked cut the guest arena owns all sample bytes and processing buffers.
+ * Rebind host identities, preserving the addresses XAPOs see in that arena. */
+static void *copy_array(const void *src,size_t count,size_t size){
+    if(!src || !count) return NULL;
+    void *dst=xcalloc(count,size);
+    memcpy(dst,src,count*size);
+    return dst;
+}
+static KmxVoice *clone_ref(KmxEngine *from,KmxEngine *to,KmxVoice *v){
+    if(!v) return NULL;
+    for(uint32_t i=0;i<from->nvoices;i++) if(from->voices[i]==v) return to->voices[i];
+    fprintf(stderr,"kmx: savestate-mixer-dangling-voice\n"); abort();
+}
+KmxEngine *kmx_clone_graph(KmxEngine *src,void *user,KmxCloneBinding bind){
+    LOCK(src);
+    if(src->in_pass||src->ngrave){ UNLOCK(src); return NULL; }
+    KmxEngine *e=kmx_engine_create(&src->host,user,src->rate);
+    e->running=src->running; e->callbacks=src->callbacks; e->deferred=src->deferred;
+    e->next_id=src->next_id; e->peaks=src->peaks; e->st=src->st;
+    e->cvoices=e->nvoices=src->nvoices; e->voices=xcalloc(e->nvoices,sizeof *e->voices);
+    for(uint32_t i=0;i<e->nvoices;i++){
+        KmxVoice *s=src->voices[i], *v=copy_array(s,1,sizeof *v);
+        e->voices[i]=v; v->e=e;
+        v->win=copy_array(s->win,4*s->in_ch,sizeof(float));
+        v->ad_cache=copy_array(s->ad_cache,(size_t)s->fmt.samples_per_block*s->in_ch,sizeof(int16_t));
+        v->pend=copy_array(s->pend,s->npend,sizeof *s->pend); v->cpend=v->npend;
+        v->fx=copy_array(s->fx,s->nfx,sizeof *s->fx);
+        if(bind){
+            v->user=bind(user,s->user,v,-1);
+            for(uint32_t j=0;j<v->nfx;j++) v->fx[j].user=bind(user,s->user,v,(int)j);
+        }
+        v->sends=copy_array(s->sends,s->nsends,sizeof *s->sends);
+        for(uint32_t j=0;j<v->nsends;j++){
+            Send *d=&v->sends[j];
+            d->matrix=copy_array(d->matrix,(size_t)d->msrc*d->mdst,sizeof(float));
+            d->prev=copy_array(d->prev,d->nprev,sizeof(float));
+        }
+    }
+    for(uint32_t i=0;i<e->nvoices;i++) for(uint32_t j=0;j<e->voices[i]->nsends;j++){
+        Send *s=&e->voices[i]->sends[j]; s->dest=clone_ref(src,e,s->dest);
+    }
+    e->master=clone_ref(src,e,src->master);
+    e->nops=e->cops=src->nops-src->ophead;
+    if(e->nops) e->ops=copy_array(src->ops+src->ophead,e->nops,sizeof *e->ops);
+    for(uint32_t i=0;i<e->nops;i++){
+        Op *o=&e->ops[i];
+        o->v=clone_ref(src,e,o->v); o->dest=clone_ref(src,e,o->dest);
+        o->vals=copy_array(o->vals,(size_t)o->a*(o->kind==OP_MATRIX?o->b:1),sizeof(float));
+        o->blob=copy_array(o->blob,o->b,1);
+    }
+    UNLOCK(src);
+    return e;
+}
+/* Dispose only native graph storage. Guest buffers and COM lifetimes belong to
+ * the independently restored arena. No callbacks or guest frees at a cut. */
+void kmx_discard_graph(KmxEngine *e){
+    e->host.voice_free=NULL;
+    for(uint32_t i=0;i<e->nvoices;i++){
+        KmxVoice *v=e->voices[i]; v->a=v->b=v->mix=NULL;
+    }
+    kmx_engine_destroy(e);
+}
+
 /* ---- WAV writer ------------------------------------------------------------------------------------------------------------------- */
 struct KmxWav { int fd; uint32_t rate, ch; uint64_t data_bytes; KmxWavStats st; int16_t *tmp; uint32_t ctmp; };
 static void put32(uint8_t *p, uint32_t v){ p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); }

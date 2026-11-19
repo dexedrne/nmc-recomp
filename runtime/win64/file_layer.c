@@ -438,3 +438,9 @@ int kh_file_selftest(KCtx *g){
       else { ga_free(b1); ga_free(b2); } }
     fprintf(stderr,"kh: file selftest: %d checks, %d failures\n",checks,bad); return bad;
 }
+
+#include "rewind.h"
+void kh_rewind_files(KhRecords *r){
+    KH_RECORD(r,real_packages);
+    KH_RECORD(r,scene_pack);
+}

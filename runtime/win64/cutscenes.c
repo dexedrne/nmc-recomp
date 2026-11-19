@@ -421,3 +421,6 @@ int kh_cutscenes_selftest(KCtx *g){
     c_lookup=sv_c[0]; c_none=sv_c[1]; c_real=sv_c[2]; c_stub=sv_c[3]; c_restored=sv_c[4]; c_kept=sv_c[5]; c_noplace=sv_c[6]; c_dumps=sv_c[7];
     fprintf(stderr,"kh: cutscenes selftest: %d checks, %d failures\n",checks,bad); return bad+tbad;
 }
+
+#include "rewind.h"
+void kh_rewind_cutscenes(KhRecords *r){ if(guest) kh_record(r,guest,nrec*sizeof *guest); }

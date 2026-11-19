@@ -1,4 +1,4 @@
-#include "savestate.h"
+#include "rewind.h"
 #include "settings.h"
 #include "gfx_present.h"
 #include "route_state.h"
@@ -19,7 +19,7 @@
 int kh_cut_enabled;
 _Thread_local unsigned kh_cut_callback_depth;
 _Atomic int kh_cut_requested;
-enum CutOperation { FREEZE, CENSUS, SAVE, LOAD, SYNC_SAVE, SYNC_CHECK };
+enum CutOperation { FREEZE, CENSUS, HASH, SAVE, LOAD, SYNC_SAVE, SYNC_CHECK };
 static struct Trigger {
     struct Trigger *next;
     u64 frame;
@@ -28,7 +28,7 @@ static struct Trigger {
 } *trigger_head;
 static pthread_mutex_t mutex=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t resume=PTHREAD_COND_INITIALIZER;
-static struct Park { struct Park *next; KThread *thread; const char *site,*owner; void *callers[64]; int depth,stream; struct KhPendingWait *pending; } *parks;
+static struct Park { struct Park *next; KThread *thread; const char *site,*owner; void *callers[64]; int depth,stream; struct KhPendingWait *pending; u32 *rng; } *parks;
 static unsigned generation, completed, missed;
 static FILE *oracle; /* CPU comparison evidence only; never accepted as a playable slot. */
 static int oracle_failed;
@@ -39,6 +39,110 @@ static struct Trigger menu_trigger;
 static char menu_path[4096];
 static int scripted;
 static struct KhSyncSlot *test_kernel;
+static struct KhAudioSlot *test_audio;
+
+struct SessionSlot {
+    char *path;
+    unsigned char key[16];
+    KhRecords records;
+    struct KhSyncSlot *sync;
+    struct KhAudioSlot *audio;
+    struct KhCrtFiles *files;
+    unsigned nthreads;
+    struct ThreadPoint { KThread *t; const char *site; u64 successor; } *points;
+    struct SessionSlot *next;
+};
+static struct SessionSlot *slots;
+static void discard_slot(struct SessionSlot *s){
+    if(!s) return;
+    kh_records_free(&s->records);
+    if(s->sync) kh_sync_discard(s->sync);
+    kh_audio_discard(s->audio); kh_crt_files_discard(s->files);
+    free(s->points); free(s->path); free(s);
+}
+static struct SessionSlot **slot_at(const char *path){
+    struct SessionSlot **p=&slots;
+    while(*p&&strcmp((*p)->path,path)) p=&(*p)->next;
+    return p;
+}
+static const char *open_slot(const char *path,struct SessionSlot **out){
+    FILE *f=fopen(path,"rb");
+    if(!f) return "savestate-load-open";
+    unsigned char header[8],key[16]; const char *err=NULL;
+    if(fread(header,1,sizeof header,f)!=sizeof header) err="savestate-load-truncated";
+    else if(!memcmp(header,"KHCPU01\n",8)) err="savestate-load-cpu-only";
+    else if(memcmp(header,"KHSES01\n",8)) err="savestate-load-format";
+    else if(fread(key,1,sizeof key,f)!=sizeof key) err="savestate-load-truncated";
+    else if(fgetc(f)!=EOF) err="savestate-load-format";
+    else{
+        struct SessionSlot *s=*slot_at(path);
+        if(s&&!memcmp(key,s->key,sizeof key)) *out=s; else err="savestate-load-session";
+    }
+    if(ferror(f)) err="savestate-load-read";
+    fclose(f); return err;
+}
+static const char *publish_slot(struct SessionSlot *s){
+    FILE *random=fopen("/dev/urandom","rb");
+    if(!random) return "savestate-session-key";
+    int ok=fread(s->key,1,sizeof s->key,random)==sizeof s->key;
+    fclose(random);
+    if(!ok) return "savestate-session-key";
+    char *tmp=NULL;
+    if(asprintf(&tmp,"%s.XXXXXX",s->path)<0) return "savestate-slot-memory";
+    int fd=mkstemp(tmp);
+    if(fd<0){ free(tmp); return "savestate-slot-create"; }
+    unsigned char marker[24]="KHSES01\n";
+    memcpy(marker+8,s->key,sizeof s->key);
+    ok=write(fd,marker,sizeof marker)==sizeof marker&&!fsync(fd);
+    if(close(fd)) ok=0;
+    if(ok) ok=rename(tmp,s->path)==0;
+    if(!ok) unlink(tmp);
+    free(tmp);
+    if(!ok) return "savestate-slot-publish";
+    struct SessionSlot **where=slot_at(s->path), *old=*where;
+    s->next=old?old->next:NULL; *where=s; discard_slot(old);
+    return NULL;
+}
+static const char *session_check(struct SessionSlot *s,int load,unsigned workers){
+    if(ga_spread_on()) return "savestate-arena-spread";
+    const char *err=kh_rewind_handles_check();
+    if(!err) err=kh_rewind_crt_check();
+    if(!err) err=kh_rewind_fiber_check(load);
+    if(err) return err;
+    if(load&&s->nthreads!=workers+1) return "savestate-thread-set";
+    struct Park *p=NULL;
+    for(unsigned i=0;i<=workers;i++){
+        KThread *t=p?p->thread:cur_thread();
+        const char *site=p?p->site:"game";
+        if(t->cur_fiber) return "savestate-active-fiber";
+        if(load){
+            unsigned j=0; while(j<s->nthreads&&s->points[j].t!=t) j++;
+            if(j==s->nthreads) return "savestate-thread-set";
+            if(strcmp(s->points[j].site,site)||s->points[j].successor!=rd64(t->g,KH_RSP(t->g)))
+                return "savestate-worker-successor";
+        }else s->points[i]=(struct ThreadPoint){t,site,rd64(t->g,KH_RSP(t->g))};
+        p=i?p->next:parks;
+    }
+    return NULL;
+}
+static void session_records(struct SessionSlot *s,int load){
+    KhRecords *r=&s->records; kh_records_begin(r,load);
+    for(unsigned i=0;i<s->nthreads;i++){
+        KThread *t=s->points[i].t;
+        u32 *rng;
+        if(t==cur_thread()) rng=kh_rewind_rng();
+        else{
+            struct Park *p=parks; while(p->thread!=t) p=p->next;
+            rng=p->rng;
+        }
+        KH_RECORD(r,*t->g); KH_RECORD(r,t->lasterr); KH_RECORD(r,t->last_error);
+        KH_RECORD(r,*rng);
+    }
+    kh_rewind_arena(r); kh_rewind_fibers(r); kh_rewind_handles(r); kh_rewind_crt(r);
+    kh_rewind_gfx(r); kh_rewind_input(r); kh_rewind_route(r); kh_rewind_phase(r);
+    kh_rewind_warp(r); kh_rewind_hd(r); kh_rewind_mod(r); kh_rewind_maps(r);
+    kh_rewind_ids(r); kh_rewind_files(r); kh_rewind_cutscenes(r); kh_records_end(r);
+}
 
 const char *kh_cut_menu_status(void){ return atomic_exchange(&menu_status,NULL); }
 int kh_cut_menu_request(int load,int slot){
@@ -97,6 +201,7 @@ void kh_cut_init(void){
     if(!spec) kh_fatal(NULL,"savestate-trigger-memory");
     struct Trigger **tail=&trigger_head;
     u64 previous=0;
+    int after_load=0;
     while(spec){
         char *next=strstr(spec,",frame:");
         if(next) *next++=0;
@@ -104,18 +209,20 @@ void kh_cut_init(void){
         char *end;
         errno=0;
         u64 frame=strtoull(spec+6,&end,10);
-        if(errno||frame<=previous||*end!=':') goto invalid;
+        if(errno||(!frame||frame<previous||(frame==previous&&!after_load))||*end!=':') goto invalid;
         previous=frame;
         const char *operation=end+1;
         struct Trigger *item=calloc(1,sizeof *item);
         if(!item) kh_fatal(NULL,"savestate-trigger-memory");
         if(!strcmp(operation,"freeze")) item->op=FREEZE;
+        else if(!strcmp(operation,"hash")) item->op=HASH;
         else if(!strcmp(operation,"sync-save")) item->op=SYNC_SAVE;
         else if(!strcmp(operation,"sync-check")) item->op=SYNC_CHECK;
         else if(!strncmp(operation,"census:",7)&&operation[7]) item->op=CENSUS;
         else if(!strncmp(operation,"save:",5)&&operation[5]) item->op=SAVE;
         else if(!strncmp(operation,"load:",5)&&operation[5]) item->op=LOAD;
         else goto invalid;
+        after_load=item->op==LOAD;
         item->frame=frame;
         if(item->op==CENSUS||item->op==SAVE||item->op==LOAD){
             item->slot=strdup(strchr(operation,':')+1);
@@ -139,7 +246,7 @@ void kh_cut_poll(const char *site,pthread_mutex_t *held){
     pthread_mutex_lock(&mutex);
     if(atomic_load(&kh_cut_requested)){
         struct Park p={parks,cur_thread(),site};
-        p.pending=kh_cut_pending;
+        p.rng=kh_rewind_rng(); p.pending=kh_cut_pending;
         p.stream=kh_cut_on_stream();
         static const struct { const char *site,*name; } waits[]={
             [KH_CUT_SLEEP]={"clock-client","sleeper"}, [KH_CUT_HANDLE]={"handle-wait","handle"},
@@ -264,20 +371,14 @@ void kh_cut_frame(KCtx *g,u64 frame){
     int census=trigger_head->op==CENSUS;
     const char *slot=trigger_head->slot;
 
-    if(trigger_head->op==LOAD){
-        FILE *f=fopen(slot,"rb");
-        const char *error="savestate-load-open";
-        if(f){
-            char header[8];
-            size_t size=fread(header,1,sizeof header,f);
-            if(ferror(f)) error="savestate-load-read";
-            else if(size<sizeof header) error="savestate-load-truncated";
-            else if(!memcmp(header,"KHCPU01\n",8)) error="savestate-load-cpu-only";
-            else error="savestate-load-format";
-            fclose(f);
+    int load=trigger_head->op==LOAD;
+    struct SessionSlot *session=NULL,*candidate=NULL;
+    if(load){
+        const char *err=open_slot(slot,&session);
+        if(err){
+            if(trigger_head==&menu_trigger){ finish_menu(err); return; }
+            kh_fatal(g,"%s: %s",err,slot);
         }
-        if(trigger_head==&menu_trigger){ finish_menu(error); return; }
-        kh_fatal(g,"%s: %s",error,slot);
     }
     KThread *threads[4096];
     u64 start=kh_host_ns(),epoch;
@@ -303,7 +404,7 @@ void kh_cut_frame(KCtx *g,u64 frame){
         pthread_mutex_lock(&mutex);
     }
     int sync_test=trigger_head->op==SYNC_SAVE||trigger_head->op==SYNC_CHECK;
-    int save=trigger_head->op==SAVE||sync_test;
+    int save=trigger_head->op==SAVE||load||sync_test;
     const char *sync_error=NULL;
     unsigned blocker_tid=0;
     u64 blocker_start=0,blocker_return=0;
@@ -311,7 +412,7 @@ void kh_cut_frame(KCtx *g,u64 frame){
     struct KhPendingWait *waits[4096];
     KThread *wait_threads[4096];
     unsigned wait_count=0,voices=0,buffers=0,commands=0;
-    int gate_ok=0,stream_busy=0;
+    int gate_ok=0,stream_busy=0,committing=0;
     char *tmp=NULL;
     int fd=-1;
     if(!missing&&kh_cut_gate_begin(&epoch)){
@@ -361,22 +462,61 @@ void kh_cut_frame(KCtx *g,u64 frame){
             }
         }
         if(save&&gate_ok&&!stream_busy&&!blocker_site&&at_dispatch){
+            if(!sync_test){
+                if(!load){
+                    candidate=calloc(1,sizeof *candidate);
+                    if(!candidate||!(candidate->points=calloc(n+1,sizeof *candidate->points))||
+                       !(candidate->path=strdup(slot))) kh_fatal(g,"savestate-slot-memory");
+                    candidate->nthreads=n+1; session=candidate;
+                }
+                sync_error=session_check(session,load,n);
+                if(!sync_error&&load){
+                    committing=kh_cut_gate_commit(epoch);
+                    if(!committing) sync_error="savestate-lifecycle-changed";
+                    else if(getenv("KHNMC_TEST_SAVESTATE_HASH")){
+                        extern void kh_cut_arena_census(KCtx *,void (*)(KCtx *,u64,u64));
+                        kh_cut_arena_census(g,report_extent);
+                    }
+                }
+                if(!sync_error){
+                    if(load) sync_error=kh_sync_restore(session->sync,waits,wait_threads,wait_count);
+                    else{
+                        session->sync=kh_sync_capture(waits,wait_threads,wait_count);
+                        session->audio=kh_audio_capture(); session->files=kh_crt_files_capture();
+                    }
+                }
+                if(!sync_error){
+                    session_records(session,load);
+                    if(load){ kh_audio_restore(session->audio); kh_crt_files_restore(session->files); }
+                    voices=kh_cut_audio_graph(&buffers,&commands);
+                    fprintf(stderr,"kh: savestate-%s at=%llu resumed-frame=%llu sample=%llu voices=%u buffers=%u commands=%u\n",
+                        load?"loaded":"captured",(unsigned long long)frame,(unsigned long long)(kh_game_frames()+1),
+                        (unsigned long long)kh_audio_output_frame(),voices,buffers,commands);
+                }
+            }else{
+            struct KhAudioSlot *audio=kh_audio_capture();
             voices=kh_cut_audio_graph(&buffers,&commands);
             struct KhSyncSlot *kernel=kh_sync_capture(waits,wait_threads,wait_count);
             fprintf(stderr,"kh: savestate-sync-captured waiters=%u\n",wait_count);
             if(trigger_head->op==SYNC_SAVE){
                 if(test_kernel) kh_sync_discard(test_kernel);
                 test_kernel=kernel;
+                kh_audio_discard(test_audio); test_audio=audio;
             }else{
                 if(trigger_head->op==SYNC_CHECK){
                     sync_error=test_kernel?kh_sync_restore(test_kernel,waits,wait_threads,wait_count):"savestate-sync-test-empty";
                     if(!sync_error){
+                        kh_audio_restore(test_audio);
+                        unsigned aq,ac,av=kh_cut_audio_graph(&aq,&ac);
+                        fprintf(stderr,"kh: savestate-mixer-restored voices=%u buffers=%u commands=%u\n",av,aq,ac);
+                        kh_audio_restore(audio);
                         const char *rollback=kh_sync_restore(kernel,waits,wait_threads,wait_count);
                         if(rollback) kh_fatal(g,"savestate-sync-test-rollback: %s",rollback);
                         fprintf(stderr,"kh: savestate-sync-test restored both cuts at frame %llu\n",(unsigned long long)frame);
                     }
                 }
-                kh_sync_discard(kernel);
+                kh_sync_discard(kernel); kh_audio_discard(audio);
+            }
             }
         }
         if(!save&&!completed&&gate_ok){
@@ -397,8 +537,9 @@ void kh_cut_frame(KCtx *g,u64 frame){
             }
             kh_route_map_report(g,stderr,"savestate candidate");
         }
-        if(gate_ok&&!save) kh_cut_rebuild_fibers();
-        gate_ok=kh_cut_gate_end(epoch)&&gate_ok;
+        if(gate_ok&&!save&&trigger_head->op!=HASH) kh_cut_rebuild_fibers();
+        if(committing) kh_cut_gate_committed_end();
+        else gate_ok=kh_cut_gate_end(epoch)&&gate_ok;
     }
     atomic_store(&kh_cut_requested,0);
     pthread_cond_broadcast(&resume);
@@ -413,6 +554,7 @@ void kh_cut_frame(KCtx *g,u64 frame){
     free(tmp);
     if(oracle_failed) kh_fatal(g,"savestate-census-io: could not publish CPU comparison file");
     if(stream_busy||missing||!gate_ok){
+        discard_slot(candidate);
         if(cs_waiter) kh_warn("savestate-critical-section: tid=%u still acquiring at frame %llu",cs_waiter,(unsigned long long)frame);
         if(++missed==4){
             const char *reason=cs_waiter?"savestate-critical-section-timeout":stream_busy?"savestate-stream-drain-timeout":"savestate-cut-refused";
@@ -425,22 +567,22 @@ void kh_cut_frame(KCtx *g,u64 frame){
     }
     completed++;
     missed=0;
-    if(sync_error) kh_fatal(g,"%s: sync checkpoint at frame %llu",sync_error,(unsigned long long)frame);
-    if(save&&(!sync_test||blocker_site||!at_dispatch)){
+    if(candidate){
+        if(!sync_error) sync_error=publish_slot(candidate);
+        if(sync_error) discard_slot(candidate);
+    }
+    if(sync_error&&trigger_head==&menu_trigger){ finish_menu(sync_error); return; }
+    if(sync_error) kh_fatal(g,"%s: checkpoint at frame %llu",sync_error,(unsigned long long)frame);
+    if(save&&(blocker_site||!at_dispatch)){
         const char *error;
         char detail[256];
         if(!at_dispatch){
             error="savestate-game-continuation";
             snprintf(detail,sizeof detail,"unsupported frame caller %llx",(unsigned long long)rd64(g,KH_RSP(g)));
-        }else if(blocker_site){
+        }else{
             error="savestate-worker-continuation";
             snprintf(detail,sizeof detail,"tid=%u start=%llx wait=%s guest-return=%llx",blocker_tid,
                      (unsigned long long)blocker_start,blocker_site,(unsigned long long)blocker_return);
-        }else{
-            error=voices||commands?"savestate-mixer-graph":"savestate-host-state";
-            if(voices||commands)
-                snprintf(detail,sizeof detail,"sync-waits=%u live-voices=%u queued-buffers=%u deferred-calls=%u",wait_count,voices,buffers,commands);
-            else snprintf(detail,sizeof detail,"guest contexts, allocator and files require coordinated restore");
         }
         if(trigger_head==&menu_trigger){
             kh_warn("%s: %s slot=%s",error,detail,slot);
@@ -449,6 +591,7 @@ void kh_cut_frame(KCtx *g,u64 frame){
         }
         kh_fatal(g,"%s: %s slot=%s",error,detail,slot?slot:"sync-test");
     }
+    if(trigger_head==&menu_trigger){ finish_menu(load?"State loaded":"State saved"); return; }
     if(completed==(trigger_head->op==FREEZE?20:1)){
         struct Trigger *done=trigger_head;
         trigger_head=done->next;

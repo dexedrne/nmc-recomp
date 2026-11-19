@@ -273,3 +273,10 @@ int kh_idtable_selftest(KCtx *g){
     fprintf(stderr,"kh: idtable selftest: %d checks, %d failures\n",checks,fails);
     return fails;
 }
+
+#include "rewind.h"
+void kh_rewind_ids(KhRecords *r){
+    KH_RECORD(r,slot_info);
+    KH_RECORD(r,hint);
+    KH_RECORD(r,c_game_frame);
+}

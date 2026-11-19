@@ -649,3 +649,9 @@ void kh_route_state_tick(KCtx *g,u64 n){
 }
 void kh_route_state_test_reset(void){ fc_prev=kh_phase_field_cmds(); fc_frame=0; }     /* selftest only */
 void kh_route_state_test_set_field_cmds(u64 per_frame){ fc_frame=per_frame; }          /* selftest only */
+
+#include "rewind.h"
+void kh_rewind_route(KhRecords *r){
+    KH_RECORD(r,fc_prev);
+    KH_RECORD(r,fc_frame);
+}

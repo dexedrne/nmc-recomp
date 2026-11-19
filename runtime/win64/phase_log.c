@@ -91,9 +91,10 @@ void kh_phase_file(KCtx *g,const char *path){
     seen[nseen]=strdup(path); if(!seen[nseen]) kh_fatal(g,"phase log: path allocation failed"); nseen++;
     pthread_mutex_unlock(&phase_lock);
 }
+static u64 prev_draws,prev_clears,prev_psos;
 void kh_phase_present(KCtx *g,u64 present,u64 draws,u64 clears,u64 psos){
     if(present%60) return;
-    static u64 prev_draws,prev_clears,prev_psos;
+
     const char *path=getenv("KHNMC_PHASELOG"); if(!path) path="phase.log";
     pthread_mutex_lock(&phase_lock);
     FILE *f=fopen(path,"a"); if(!f) kh_fatal(g,"phase log: cannot append %s",path);
@@ -105,4 +106,36 @@ void kh_phase_present(KCtx *g,u64 present,u64 draws,u64 clears,u64 psos){
     if(fclose(f)||failed) kh_fatal(g,"phase log: write failed %s",path);
     prev_draws=draws; prev_clears=clears; prev_psos=psos;
     pthread_mutex_unlock(&phase_lock);
+}
+
+#include "rewind.h"
+void kh_rewind_phase(KhRecords *r){
+    KH_RECORD(r,prev_draws);
+    KH_RECORD(r,prev_clears);
+    KH_RECORD(r,prev_psos);
+    KH_RECORD(r,reported);
+    KH_RECORD(r,field_cmds_total);
+    KH_RECORD(r,damage_hits);
+    KH_RECORD(r,damage_last_frame);
+    KH_RECORD(r,entries);
+    KH_RECORD(r,initial_alive);
+    KH_RECORD(r,title_depth);
+    KH_RECORD(r,newgame_depth);
+    KH_RECORD(r,initial_state);
+    KH_RECORD(r,initial_choice);
+    KH_RECORD(r,initial_first);
+    size_t count=nseen;
+    KH_RECORD(r,count);
+    if(r->loading){
+        while(nseen) free(seen[--nseen]);
+        free(seen); seen=calloc(count,sizeof *seen);
+        if(count&&!seen) kh_fatal(NULL,"savestate-phase-memory");
+        nseen=count;
+    }
+    for(size_t i=0;i<count;i++){
+        size_t len=r->loading?0:strlen(seen[i])+1;
+        KH_RECORD(r,len);
+        if(r->loading && !(seen[i]=malloc(len))) kh_fatal(NULL,"savestate-phase-path-memory");
+        kh_record(r,seen[i],len);
+    }
 }

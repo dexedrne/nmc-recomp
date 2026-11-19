@@ -278,21 +278,44 @@ IMP(CRTS,fseek){ FILE *f=file_of(g,A0(g)); SET_RAX(g,(u32)(f?fseek(f,(long)(s32)
 IMP(CRTS,ftell){ FILE *f=file_of(g,A0(g)); SET_RAX(g,(u32)(f?(s32)ftell(f):-1)); }
 IMP(CRTS,__stdio_common_vfprintf){ /* (opts, FILE*, fmt, locale, arglist) */
     FILE *f=file_of(g,A1(g)); int need; char *b=malloc(65536); kh_vformat(g,b,65536,gstr(g,A2(g)),ARG(g,4),0,&need); if(f) fwrite(b,1,need<65536?(size_t)need:65535,f); free(b); SET_RAX(g,(u32)need); }
-/* low-level io: host fds are handed out directly */
+/* Low-level CRT descriptors are guest-visible host numbers. Loose audio
+ * streams have a separate offset-based table in stream_layer.c. */
+typedef struct { int fd,used; char *path; } CutFile;
+static CutFile cut_fds[MAXF]; static pthread_mutex_t cut_fm=PTHREAD_MUTEX_INITIALIZER;
+static int cut_fd_new(int fd,const char *path){
+    if(!kh_cut_enabled) return fd;
+    pthread_mutex_lock(&cut_fm);
+    int i=3; while(i<MAXF&&cut_fds[i].used) i++;
+    if(i==MAXF) kh_fatal(NULL,"savestate-crt-descriptor-table-full");
+    cut_fds[i]=(CutFile){fd,1,path?strdup(path):NULL};
+    if(path&&!cut_fds[i].path) kh_fatal(NULL,"savestate-crt-path-memory");
+    pthread_mutex_unlock(&cut_fm); return i;
+}
+static int cut_fd(int i){
+    if(!kh_cut_enabled||i<3) return i;
+    pthread_mutex_lock(&cut_fm);
+    int fd=i<MAXF&&cut_fds[i].used?cut_fds[i].fd:-1;
+    pthread_mutex_unlock(&cut_fm); return fd;
+}
 static int conv_oflag(int o){ int r=0; switch(o&3){ case 0: r=O_RDONLY; break; case 1: r=O_WRONLY; break; default: r=O_RDWR; } if(o&8) r|=O_APPEND; if(o&0x100) r|=O_CREAT; if(o&0x200) r|=O_TRUNC; if(o&0x400) r|=O_EXCL; return r; }
 int kh_movie_open_fd(KCtx *g);                      /* task 44 (runtime/null_mf.c): the header read of Movie::open gets a stand-in, the file is not opened */
 IMP(CRTS,_sopen_dispatch){ char p[2048]; kh_winpath(gstr(g,A0(g)),p,sizeof p); u64 pfh=ARG(g,4);
-    { int mfd=kh_movie_open_fd(g); if(mfd>=0){ if(!pfh){ close(mfd); kh_set_errno(g,EINVAL); SET_RAX(g,EINVAL); return; } wr32(g,pfh,(u32)mfd); SET_RAX(g,0); return; } }
+    { int mfd=kh_movie_open_fd(g); if(mfd>=0){ if(!pfh){ close(mfd); kh_set_errno(g,EINVAL); SET_RAX(g,EINVAL); return; } wr32(g,pfh,(u32)cut_fd_new(mfd,NULL)); SET_RAX(g,0); return; } }
     int fd=open(p,conv_oflag((int)A1(g)),0644);
     if(kh_verbose||strstr(p,".hed")||strstr(p,".pkg")||(fd<0&&nopenfail++<60)) fprintf(stderr,"kh: file: _sopen(\"%s\" -> \"%s\", oflag=%x) = %d%s\n",gstr(g,A0(g)),p,(unsigned)A1(g),fd,fd<0?" FAILED":"");
     if(fd<0){ int en=errno; kh_set_errno(g,en); if(pfh) wr32(g,pfh,(u32)-1); SET_RAX(g,(u32)en); kh_set_last_error(2); return; }
     /* _sopen_dispatch always returns errno_t; arg 6 selects validation, not the return ABI. */
     if(!pfh){ close(fd); kh_set_errno(g,EINVAL); SET_RAX(g,EINVAL); return; }
-    wr32(g,pfh,(u32)fd); SET_RAX(g,0); }
-IMP(CRTS,_close){ SET_RAX(g,(u32)close((int)A0(g))); }
-IMP(CRTS,_read){ SET_RAX(g,(u32)(s32)read((int)A0(g),hp(g,A1(g)),(unsigned)A2(g))); }
-IMP(CRTS,_write){ SET_RAX(g,(u32)(s32)write((int)A0(g),hp(g,A1(g)),(unsigned)A2(g))); }
-IMP(CRTS,_lseeki64){ SET_RAX(g,(u64)lseek((int)A0(g),(off_t)(s64)A1(g),(int)A2(g))); }
+    wr32(g,pfh,(u32)cut_fd_new(fd,p)); SET_RAX(g,0); }
+IMP(CRTS,_close){ int i=(int)A0(g);
+    if(!kh_cut_enabled||i<3){ SET_RAX(g,(u32)close(i)); return; }
+    pthread_mutex_lock(&cut_fm);
+    int rc=-1;
+    if(i<MAXF&&cut_fds[i].used){ rc=close(cut_fds[i].fd); free(cut_fds[i].path); cut_fds[i]=(CutFile){0}; }
+    pthread_mutex_unlock(&cut_fm); SET_RAX(g,(u32)rc); }
+IMP(CRTS,_read){ SET_RAX(g,(u32)(s32)read(cut_fd((int)A0(g)),hp(g,A1(g)),(unsigned)A2(g))); }
+IMP(CRTS,_write){ SET_RAX(g,(u32)(s32)write(cut_fd((int)A0(g)),hp(g,A1(g)),(unsigned)A2(g))); }
+IMP(CRTS,_lseeki64){ SET_RAX(g,(u64)lseek(cut_fd((int)A0(g)),(off_t)(s64)A1(g),(int)A2(g))); }
 
 /* ======================================================================================================================
  * startup / runtime services (UCRT runtime dll)
@@ -354,3 +377,48 @@ IMPN(MSVCP,__Xbad_function_call_std__YAXXZ){ kh_fatal(g,"std::_Xbad_function_cal
 IMPN(MSVCP,__Xlength_error_std__YAXPEBD_Z){ kh_fatal(g,"std::_Xlength_error(\"%s\")",gstr(g,A0(g))); }
 IMP(MSVCP,___ExceptionPtrCopy__YAXPEAXPEBX_Z){ wr64(g,A0(g),rd64(g,A1(g))); }
 IMP(MSVCP,___ExceptionPtrDestroy__YAXPEAX_Z){ }
+
+#include "rewind.h"
+u32 *kh_rewind_rng(void){ return &holdrand; }
+
+const char *kh_rewind_crt_check(void){
+    for(int i=3;i<MAXF;i++) if(cut_fds[i].used){
+        int fd=cut_fds[i].fd,mode=fcntl(fd,F_GETFL); struct stat st;
+        if(!cut_fds[i].path||mode<0||(mode&O_ACCMODE)!=O_RDONLY||fstat(fd,&st)||!S_ISREG(st.st_mode)||
+           lseek(fd,0,SEEK_CUR)<0) return "savestate-crt-nonseekable-or-writable";
+    }
+    for(unsigned i=3;i<MAXF;i++) if(ftab[i]) return "savestate-crt-open-file";
+    return NULL;
+}
+void kh_rewind_crt(KhRecords *r){
+    KH_RECORD(r,fblk); KH_RECORD(r,cut_requests_used); KH_RECORD(r,cut_boot_object); KH_RECORD(r,cut_boot_table);
+}
+
+struct KhCrtFiles { unsigned n; struct SavedFd { int id,fd; off_t offset; char *path; } files[]; };
+struct KhCrtFiles *kh_crt_files_capture(void){
+    unsigned n=0;
+    for(int i=3;i<MAXF;i++) n+=cut_fds[i].used;
+    struct KhCrtFiles *s=calloc(1,sizeof *s+n*sizeof s->files[0]);
+    if(!s) kh_fatal(NULL,"savestate-crt-file-memory");
+    for(int i=3;i<MAXF;i++) if(cut_fds[i].used){
+        struct SavedFd *f=&s->files[s->n++];
+        *f=(struct SavedFd){i,fcntl(cut_fds[i].fd,F_DUPFD_CLOEXEC,3),lseek(cut_fds[i].fd,0,SEEK_CUR),strdup(cut_fds[i].path)};
+        if(f->fd<0||f->offset<0||!f->path) kh_fatal(NULL,"savestate-crt-pin");
+    }
+    return s;
+}
+void kh_crt_files_restore(struct KhCrtFiles *s){
+    for(int i=3;i<MAXF;i++) if(cut_fds[i].used){
+        close(cut_fds[i].fd); free(cut_fds[i].path); cut_fds[i]=(CutFile){0};
+    }
+    for(unsigned i=0;i<s->n;i++){
+        struct SavedFd *f=&s->files[i];
+        int fd=fcntl(f->fd,F_DUPFD_CLOEXEC,3);
+        char *path=strdup(f->path);
+        if(fd<0||!path||lseek(fd,f->offset,SEEK_SET)!=f->offset) kh_fatal(NULL,"savestate-crt-rebind");
+        cut_fds[f->id]=(CutFile){fd,1,path};
+    }
+}
+void kh_crt_files_discard(struct KhCrtFiles *s){
+    if(s){ for(unsigned i=0;i<s->n;i++){close(s->files[i].fd); free(s->files[i].path);} free(s); }
+}

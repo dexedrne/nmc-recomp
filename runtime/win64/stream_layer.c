@@ -11,6 +11,7 @@
  * Every open is written to KHNMC_FILELOG as `HIT STREAM <size> <path>` or `MISS NONE -1 <path>`. */
 #include "khnmc_rt.h"
 #include "kh_look.h"
+#include "savestate.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -22,10 +23,11 @@ void kh_file_log_entry(KCtx *g,const char *path,const char *source,long long siz
 int kh_file_package_fallback(const char *path);
 
 #define MAXSTREAM 64
-static struct { int fd; long long size; unsigned long long reads, bytes; char name[96]; } streams[MAXSTREAM];
+typedef struct { int fd, guest; long long size; unsigned long long reads, bytes; char name[96]; } Stream;
+static Stream streams[MAXSTREAM];
 static pthread_mutex_t sm=PTHREAD_MUTEX_INITIALIZER;
 static _Atomic u64 st_open, st_miss, st_reads, st_bytes, st_short, st_close, st_package;
-static int find_stream(int fd){ for(int i=0;i<MAXSTREAM;i++) if(streams[i].fd==fd&&fd>0) return i; return -1; }
+static int find_stream(int fd){ for(int i=0;i<MAXSTREAM;i++) if(streams[i].guest==fd&&fd>0) return i; return -1; }
 
 void f_106da0(KCtx *g){                                   /* OpenStream */
     const char *path=gstr(g,A1(g)); char host[4096]; struct stat st; int fd=-1;
@@ -39,13 +41,14 @@ void f_106da0(KCtx *g){                                   /* OpenStream */
     if(fd>0){
         pthread_mutex_lock(&sm); int slot=-1; for(int i=0;i<MAXSTREAM;i++) if(streams[i].fd<=0){ slot=i; break; }
         if(slot<0){ pthread_mutex_unlock(&sm); kh_fatal(g,"stream layer: more than %d open streams",MAXSTREAM); }
-        streams[slot].fd=fd; streams[slot].size=st.st_size; streams[slot].reads=streams[slot].bytes=0;
+        int guest=kh_cut_enabled?0x4000+slot:fd;
+        streams[slot].guest=guest; streams[slot].fd=fd; streams[slot].size=st.st_size; streams[slot].reads=streams[slot].bytes=0;
         const char *base=strrchr(path,'/'); const char *b2=strrchr(path,'\\'); if(b2&&(!base||b2>base)) base=b2;
         snprintf(streams[slot].name,sizeof streams[slot].name,"%s",base?base+1:path);
         pthread_mutex_unlock(&sm);
         st_open++; kh_file_log_entry(g,path,"STREAM",st.st_size);
         fprintf(stderr,"kh: stream open fd=%d size=%lld %s\n",fd,(long long)st.st_size,path);
-        SET_RAX(g,(u32)fd); KH_RET(g); return;
+        SET_RAX(g,(u32)guest); KH_RET(g); return;
     }
     if(kh_file_package_fallback(path)){                   /* real packages registered: let the game's own package code try */
         char keep[1024]; snprintf(keep,sizeof keep,"%s",path);
@@ -60,11 +63,11 @@ void f_106da0(KCtx *g){                                   /* OpenStream */
 }
 void f_106fa0(KCtx *g){                                   /* ReadStream(this, fd, dst, offset, len) */
     int fd=(s32)A1(g); u64 dst=A2(g); s64 off=(s32)A3(g); u32 len=(u32)A4(g);
-    pthread_mutex_lock(&sm); int i=find_stream(fd); pthread_mutex_unlock(&sm);
+    pthread_mutex_lock(&sm); int i=find_stream(fd); int host=i>=0?streams[i].fd:-1; pthread_mutex_unlock(&sm);
     if(i<0){ orig_f_106fa0(g); return; }                  /* an fd of the package path */
     if(off<0||(len&&(!GA_OK(dst)||!GA_OK(dst+len-1)))) kh_fatal(g,"stream layer: ReadStream(fd=%d, dst=%llx, offset=%lld, len=%u) is out of range",fd,(unsigned long long)dst,(long long)off,len);
     size_t got=0;
-    while(got<len){ ssize_t k=pread(fd,(char*)hp(g,dst)+got,len-got,(off_t)(off+(s64)got)); if(k<0){ if(errno==EINTR) continue; kh_fatal(g,"stream layer: read error on fd %d: %s",fd,strerror(errno)); } if(!k) break; got+=(size_t)k; }
+    while(got<len){ ssize_t k=pread(host,(char*)hp(g,dst)+got,len-got,(off_t)(off+(s64)got)); if(k<0){ if(errno==EINTR) continue; kh_fatal(g,"stream layer: read error on fd %d: %s",fd,strerror(errno)); } if(!k) break; got+=(size_t)k; }
     pthread_mutex_lock(&sm); i=find_stream(fd); if(i>=0){ streams[i].reads++; streams[i].bytes+=got; } pthread_mutex_unlock(&sm);
     st_reads++; st_bytes+=got; if(got<len) st_short++;    /* a short read at the end of the file is what _read returns too */
     SET_RAX(g,(u32)got); KH_RET(g);
@@ -74,8 +77,8 @@ void f_106b40(KCtx *g){                                   /* CloseStream(this, f
     pthread_mutex_lock(&sm); int i=find_stream(fd);
     if(i<0){ pthread_mutex_unlock(&sm); orig_f_106b40(g); return; }
     fprintf(stderr,"kh: stream close fd=%d %s reads=%llu bytes=%llu of %lld\n",fd,streams[i].name,streams[i].reads,streams[i].bytes,streams[i].size);
-    streams[i].fd=0; pthread_mutex_unlock(&sm);
-    st_close++; SET_RAX(g,(u32)close(fd)); KH_RET(g);
+    int host=streams[i].fd; streams[i]=(Stream){0}; pthread_mutex_unlock(&sm);
+    st_close++; SET_RAX(g,(u32)close(host)); KH_RET(g);
 }
 void kh_stream_report(FILE *f){
     if(!st_open&&!st_miss&&!st_package) return;
@@ -84,6 +87,34 @@ void kh_stream_report(FILE *f){
     pthread_mutex_lock(&sm);
     for(int i=0;i<MAXSTREAM;i++) if(streams[i].fd>0) fprintf(f,"kh: streams: still open fd=%d %s reads=%llu bytes=%llu of %lld\n",streams[i].fd,streams[i].name,streams[i].reads,streams[i].bytes,streams[i].size);
     pthread_mutex_unlock(&sm);
+}
+/* All loose reads are pread at a guest-supplied offset. Pin the open file
+ * description, so a later CloseStream cannot invalidate a saved stream. */
+struct KhStreamSlot { Stream streams[MAXSTREAM]; };
+static void copy_streams(Stream *dst,const Stream *src){
+    for(int i=0;i<MAXSTREAM;i++){
+        dst[i]=src[i];
+        if(src[i].guest){
+            dst[i].fd=fcntl(src[i].fd,F_DUPFD_CLOEXEC,3);
+            if(dst[i].fd<0) kh_fatal(NULL,"savestate-stream-dup: %s",strerror(errno));
+        }
+    }
+}
+static void close_streams(Stream *s){
+    for(int i=0;i<MAXSTREAM;i++) if(s[i].guest) close(s[i].fd);
+}
+struct KhStreamSlot *kh_stream_capture(void){
+    struct KhStreamSlot *s=malloc(sizeof *s);
+    if(!s) kh_fatal(NULL,"savestate-stream-memory");
+    copy_streams(s->streams,streams); return s;
+}
+void kh_stream_restore(struct KhStreamSlot *s){
+    Stream restored[MAXSTREAM];
+    copy_streams(restored,s->streams);
+    close_streams(streams); memcpy(streams,restored,sizeof streams);
+}
+void kh_stream_discard(struct KhStreamSlot *s){
+    if(s){ close_streams(s->streams); free(s); }
 }
 /* synthetic tree: open (case-insensitive, BasePath prefix), read at offsets, short read at the end, close, miss, traversal */
 int kh_stream_selftest(KCtx *g){
@@ -112,6 +143,17 @@ int kh_stream_selftest(KCtx *g){
     TEST(fcntl(fd,F_GETFD)==-1&&find_stream(fd)<0);
     f=fopen(lp,"r"); char line[4096]; int hits=0,miss=0; while(f&&fgets(line,sizeof line,f)){ if(!strncmp(line,"HIT STREAM 1000 ",16)) hits++; if(!strncmp(line,"MISS NONE -1 ",13)) miss++; } if(f) fclose(f);
     TEST(hits==2&&miss==2);
+    int previous_cut=kh_cut_enabled; kh_cut_enabled=1;
+    int guest=(s32)kh_call(g,GS_BASE+0x106da0,GS_BASE+0x79cfc0,name,0,0);
+    TEST(guest>0);
+    struct KhStreamSlot *saved=kh_stream_capture();
+    TEST(kh_call(g,GS_BASE+0x106b40,GS_BASE+0x79cfc0,guest,0,0)==0);
+    TEST(unlink(path)==0);
+    kh_stream_restore(saved);
+    TEST(kh_call5(g,GS_BASE+0x106fa0,GS_BASE+0x79cfc0,guest,buf,501,3)==3&&rd8(g,buf+2)==(503&255));
+    kh_stream_discard(saved);
+    TEST(kh_call(g,GS_BASE+0x106b40,GS_BASE+0x79cfc0,guest,0,0)==0);
+    kh_cut_enabled=previous_cut;
     ga_free(name); ga_free(missing); ga_free(parent); ga_free(buf);
     if(root) setenv("KHNMC_DATA",root,1); else unsetenv("KHNMC_DATA");
     if(log) setenv("KHNMC_FILELOG",log,1); else unsetenv("KHNMC_FILELOG");

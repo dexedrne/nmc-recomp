@@ -493,3 +493,13 @@ int kh_warp_selftest(KCtx *g){
 #undef WCHECK
     return fails;
 }
+
+#include "rewind.h"
+void kh_rewind_warp(KhRecords *r){
+    KH_RECORD(r,rec_block);
+    KH_RECORD(r,W);
+    KH_RECORD(r,warps_requested);
+    KH_RECORD(r,warps_field);
+    KH_RECORD(r,warps_jumped);
+    KH_RECORD(r,warps_failed);
+}

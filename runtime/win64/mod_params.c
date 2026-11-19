@@ -334,3 +334,15 @@ void kh_mod_params_dump(void){
     for(int w=0;w<2;w++) fprintf(stderr,"kh: mod params map%d(%s) size=%zu inserts=%llu overwrites=%llu restores=%llu inactive-absent=%llu\n",w,w?"resist byte 65":"min HP 64",
         kh_mod_params_map_size(w),(unsigned long long)map_inserts[w],(unsigned long long)map_overwrites[w],(unsigned long long)map_restores[w],(unsigned long long)map_absent_inactive[w]);
 }
+
+#include "rewind.h"
+void kh_rewind_maps(KhRecords *r){
+    for(unsigned i=0;i<2;i++){
+        Map *m=&maps[i]; KH_RECORD(r,m->n);
+        if(m->n>m->cap){
+            MapEnt *p=realloc(m->e,m->n*sizeof *p); if(!p) kh_fatal(NULL,"savestate-actor-map-memory");
+            m->e=p; m->cap=m->n;
+        }
+        kh_record(r,m->e,m->n*sizeof *m->e);
+    }
+}

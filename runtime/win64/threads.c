@@ -1321,3 +1321,42 @@ int kh_sync_vclock_selftest(KCtx *g){
     fprintf(stderr,"kh: sync vclock selftest: %d checks, %d failures\n",checks,fails);
     return fails;
 }
+
+#include "rewind.h"
+const char *kh_rewind_fiber_check(int loading){
+    for(KFiber *f=cut_fibers;f;f=f->cut_next){
+        if(f->owner||f->is_thread_fiber) return "savestate-active-fiber";
+        if(!loading&&!cut_rebuild_fiber(f)) return "savestate-fiber-continuation";
+    }
+    return NULL;
+}
+void kh_rewind_fibers(KhRecords *r){
+    size_t count=0;
+    for(KFiber *f=cut_fibers;f;f=f->cut_next) count++;
+    KH_RECORD(r,count);
+    if(r->loading){
+        while(cut_fibers){
+            KFiber *f=cut_fibers; cut_fibers=f->cut_next;
+            fiber_stack_note(f->gstack_lo,0,0);
+            munmap(f->hstack,f->hsize); free(f->g); free(f);
+        }
+    }
+    KFiber **next=&cut_fibers;
+    for(size_t i=0;i<count;i++){
+        if(r->loading){
+            *next=calloc(1,sizeof **next);
+            if(!*next) kh_fatal(NULL,"savestate-fiber-memory");
+            (*next)->g=kh_new_ctx();
+        }
+        KFiber *f=*next;
+        KH_RECORD(r,f->start); KH_RECORD(r,f->param); KH_RECORD(r,f->gstack_lo);
+        KH_RECORD(r,f->handle); KH_RECORD(r,f->hsize); KH_RECORD(r,f->gstack_sz); KH_RECORD(r,*f->g);
+        if(r->loading){
+            f->hstack=mmap(NULL,f->hsize,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE,-1,0);
+            if(f->hstack==MAP_FAILED) kh_fatal(NULL,"savestate-fiber-stack-memory");
+            if(!cut_rebuild_fiber(f)) kh_fatal(NULL,"savestate-fiber-record");
+            fiber_stack_note(f->gstack_lo,f->gstack_sz,f->start);
+        }
+        next=&f->cut_next;
+    }
+}

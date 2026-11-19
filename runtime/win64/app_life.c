@@ -70,6 +70,17 @@ int kh_cut_gate_begin(u64 *epoch){
     pthread_mutex_unlock(&lm);
     return ok;
 }
+/* Keep a lifecycle transition from invalidating a load after it mutates guest RAM. */
+int kh_cut_gate_commit(u64 epoch){
+    pthread_mutex_lock(&lm);
+    if(atomic_load(&l_epoch)==epoch&&cut_life_seq==l_seq) return 1;
+    pthread_mutex_unlock(&lm);
+    return 0;
+}
+void kh_cut_gate_committed_end(void){
+    kh_gfx_gate_clear();
+    pthread_mutex_unlock(&lm);
+}
 int kh_cut_gate_end(u64 epoch){
     pthread_mutex_lock(&lm);
     int ok=atomic_load(&l_epoch)==epoch;

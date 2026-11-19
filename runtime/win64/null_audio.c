@@ -298,6 +298,109 @@ unsigned kh_cut_audio_graph(unsigned *buffers,unsigned *commands){
     }
     return voices;
 }
+struct KhAudioSlot {
+    struct KhStreamSlot *streams;
+    Voice *bindings;
+    SoftEngine *engines;
+    FmtStat formats[64];
+    XapoStat effects[32];
+    int nformats,neffects;
+    u64 iid_xapo,iid_params;
+};
+static void *audio_copy(const void *p,size_t size){
+    if(!p||!size) return NULL;
+    void *r=malloc(size);
+    if(!r) kh_fatal(NULL,"savestate-mixer-memory");
+    memcpy(r,p,size); return r;
+}
+static void *rebind_voice(void *user,void *old,KmxVoice *mv,int effect){
+    SoftEngine *engine=user;
+    for(SoftVoice *v=engine->voices;v;v=v->next){
+        if(v->obj!=((SoftVoice *)old)->obj) continue;
+        if(effect<0){ v->mv=mv; return v; }
+        if((u32)effect<v->nfx) return &v->fx[effect];
+        break;
+    }
+    kh_fatal(NULL,"savestate-mixer-binding");
+}
+static void clone_audio(Voice *bindings,SoftEngine *src,struct KhAudioSlot *slot){
+    Voice **next=&slot->bindings;
+    for(Voice *v=bindings;v;v=v->next){
+        Voice *d=*next=audio_copy(v,sizeof *v);
+        d->effects=audio_copy(v->effects,v->count*sizeof *v->effects);
+        for(u32 i=0;i<v->count;i++) d->effects[i].params=audio_copy(v->effects[i].params,v->effects[i].size);
+        Matrix **mnext=&d->matrices;
+        for(Matrix *m=v->matrices;m;m=m->next){
+            Matrix *dm=*mnext=audio_copy(m,sizeof *m);
+            dm->values=audio_copy(m->values,(size_t)m->src*m->dst*sizeof(float));
+            mnext=&dm->next;
+        }
+        d->soft=NULL; next=&d->next;
+    }
+    SoftEngine **enext=&slot->engines;
+    for(SoftEngine *e=src;e;e=e->next){
+        if(e->inuse) kh_fatal(NULL,"savestate-mixer-engine-busy");
+        SoftEngine *d=*enext=audio_copy(e,sizeof *e);
+        SoftVoice **vnext=&d->voices;
+        for(SoftVoice *v=e->voices;v;v=v->next){
+            SoftVoice *dv=*vnext=audio_copy(v,sizeof *v);
+            dv->eng=d; dv->prevp=vnext; vnext=&dv->next;
+            dv->fx=audio_copy(v->fx,v->nfx*sizeof *v->fx);
+            for(u32 i=0;i<v->nfx;i++) dv->fx[i].blob=audio_copy(v->fx[i].blob,v->fx[i].blob_size);
+            Voice *binding=slot->bindings;
+            while(binding&&binding->object!=dv->obj) binding=binding->next;
+            if(!binding||binding->soft) kh_fatal(NULL,"savestate-mixer-duplicate-or-missing-binding");
+            binding->soft=dv;
+        }
+        d->mx=kmx_clone_graph(e->mx,d,rebind_voice);
+        if(!d->mx) kh_fatal(NULL,"savestate-mixer-pass-active");
+        enext=&d->next;
+    }
+}
+static void discard_audio(Voice *v,SoftEngine *e){
+    while(v){
+        Voice *next=v->next;
+        clear_effects(v);
+        while(v->matrices){
+            Matrix *m=v->matrices; v->matrices=m->next; free(m->values); free(m);
+        }
+        free(v); v=next;
+    }
+    while(e){
+        SoftEngine *next=e->next;
+        kmx_discard_graph(e->mx);
+        while(e->voices){
+            SoftVoice *s=e->voices; e->voices=s->next;
+            for(u32 i=0;i<s->nfx;i++) free(s->fx[i].blob);
+            free(s->fx); free(s);
+        }
+        free(e); e=next;
+    }
+}
+struct KhAudioSlot *kh_audio_capture(void){
+    struct KhAudioSlot *s=calloc(1,sizeof *s);
+    if(!s) kh_fatal(NULL,"savestate-mixer-memory");
+    clone_audio(bound_voices,engines,s);
+    s->streams=kh_stream_capture();
+    s->nformats=nfmts; memcpy(s->formats,fmts,sizeof fmts);
+    s->neffects=nxapos; memcpy(s->effects,xapos,sizeof xapos);
+    s->iid_xapo=g_iid_xapo; s->iid_params=g_iid_params;
+    return s;
+}
+void kh_audio_restore(struct KhAudioSlot *s){
+    struct KhAudioSlot restored={0};
+    clone_audio(s->bindings,s->engines,&restored);
+    kh_stream_restore(s->streams);
+    discard_audio(bound_voices,engines);
+    bound_voices=restored.bindings; engines=restored.engines;
+    nfmts=s->nformats; memcpy(fmts,s->formats,sizeof fmts);
+    nxapos=s->neffects; memcpy(xapos,s->effects,sizeof xapos);
+    g_iid_xapo=s->iid_xapo; g_iid_params=s->iid_params;
+}
+void kh_audio_discard(struct KhAudioSlot *s){
+    if(s){ kh_stream_discard(s->streams); discard_audio(s->bindings,s->engines); free(s); }
+}
+
 static u32 soft_set_chain(KCtx *g,SoftVoice *sv,u64 chain){
     u32 n=chain?rd32(g,chain):0; u64 desc=n?rd64(g,chain+4):0;
     if(n>64||(n&&!desc)) return XA2_E_INVALID;
@@ -950,3 +1053,6 @@ void kh_audio_report(FILE *f){
         if(wav_gain!=1.0f) fprintf(f,"kh: audio: wav gain %.2f dB (x%.4f) applied to the file (KHNMC_AUDIO_WAV_GAIN_DB); the figures below are after it\n",wav_gain_db,(double)wav_gain);
         fprintf(f,"kh: audio: wav %s: %llu frames (%.2f s) 48000 Hz 16-bit stereo, peak=%.4f (%.1f dBFS) rms=%.5f (%.1f dBFS) clipped samples=%llu non-silent=%.2f s\n",wav_path,ULL(ws.frames),sec,(double)ws.peak,ws.peak>0?20.0*log10((double)ws.peak):-999.0,rms,rms>0?20.0*log10(rms):-999.0,ULL(ws.clipped_samples),(double)ws.nonsilent_frames/48000.0); }
 }
+
+#include "rewind.h"
+u64 kh_audio_output_frame(void){ return st_quanta*480; }

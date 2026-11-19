@@ -650,9 +650,51 @@ static void test_wav(void){
     CHECK(kmx_wav_open("/nonexistent-dir/x.wav", 48000, 2) == NULL);
 }
 
+static void test_graph_replay(void){
+    KmxEngine *e=kmx_engine_create(&thost,NULL,48000);
+    KmxVoice *master,*sub,*source;
+    KmxFormat f=pcm_fmt(1,44100,16);
+    int16_t data[4000];
+    for(size_t i=0;i<4000;i++) data[i]=(int16_t)(i*173u);
+    KmxBuffer buf=mkbuf(data,sizeof data,KMX_END_OF_STREAM,42);
+    buf.loop_begin=200; buf.loop_length=600; buf.loop_count=2;
+    CHECK(kmx_voice_create_master(e,1,48000,0,NULL,&master)==KMX_OK);
+    CHECK(kmx_voice_create_submix(e,1,48000,0,1,NULL,&sub)==KMX_OK);
+    CHECK(kmx_voice_set_outputs(sub,NULL,NULL,0,1)==KMX_OK);
+    CHECK(kmx_voice_create_source(e,&f,0,2,&buf,1,&source)==KMX_OK);
+    CHECK(kmx_voice_set_outputs(source,&sub,NULL,1,0)==KMX_OK);
+    CHECK(kmx_source_submit(source,&buf)==KMX_OK);
+    kmx_engine_start(e); kmx_source_start(source); pass(e,NULL,1);
+    kmx_engine_set_deferred(e,1);
+    float gain=0.25f;
+    CHECK(kmx_voice_set_matrix(source,sub,1,1,&gain)==KMX_OK);
+    KmxEngine *saved=kmx_clone_graph(e,NULL,NULL);
+    CHECK(saved!=NULL);
+    enum { N=12 };
+    float reference[N][480],out[480]; Ev events[256];
+    nev=0;
+    for(int i=0;i<N;i++) pass(e,reference[i],1);
+    int count=nev;
+    CHECK(count>0 && count<256 && count_ev(KMX_EV_STREAM_END,&buf)==1);
+    if(count>=256) abort();
+    memcpy(events,evlog,count*sizeof *events);
+    for(int cycle=0;cycle<10;cycle++){
+        KmxEngine *restored=kmx_clone_graph(saved,NULL,NULL);
+        CHECK(kmx_engine_pending(restored)==1);
+        nev=0;
+        for(int i=0;i<N;i++){
+            pass(restored,out,1);
+            CHECK(!memcmp(out,reference[i],sizeof out));
+        }
+        CHECK(nev==count && !memcmp(evlog,events,count*sizeof *events));
+        kmx_discard_graph(restored);
+    }
+    kmx_discard_graph(saved); kmx_engine_destroy(e);
+}
+
 int kh_audio_mix_selftest(void){
     fails = checks = 0; hook = NULL;
-    test_adpcm(); test_formats(); test_playback_order(); test_queue_loops(); test_reentrancy(); test_routing(); test_ramp(); test_resample(); test_effects();
+    test_graph_replay(); test_adpcm(); test_formats(); test_playback_order(); test_queue_loops(); test_reentrancy(); test_routing(); test_ramp(); test_resample(); test_effects();
     uint64_t h1 = scenario(), h2 = scenario(); CHECK(h1 == h2);
     test_wav();
     test_hidden(); test_deferred(); test_deferred_chain(); test_deferred_race();
