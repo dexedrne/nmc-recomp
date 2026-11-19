@@ -101,6 +101,9 @@ u16 kh_input_buttons(void){
 void orig_f_105e10(KCtx *g);
 void f_105e10(KCtx *g){
     if(kh_cut_enabled) kh_cut_frame(g,atomic_load(&game_frames)+1);
+    kh_game_frame_step(g);
+}
+void kh_game_frame_step(KCtx *g){
     u64 n=atomic_fetch_add(&game_frames,1)+1;
     extern void kh_settings_frame(KCtx *,uint64_t); kh_settings_frame(g,n);
     extern void kh_retry_frame(KCtx *); kh_retry_frame(g);

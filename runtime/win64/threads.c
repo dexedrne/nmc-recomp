@@ -544,7 +544,7 @@ IMPN(K32,ExitProcess){ extern void kh_exit_process(int); kh_exit_process((int)A0
 
 /* ---- fibers ---------------------------------------------------------------------------------------------------------- */
 u64 kh_fiber_host_stack=2ull<<20;            /* host stack of a fiber (lazily committed); the vkd3d backend raises it because native graphics code runs on it */
-struct KFiber { KFiber *cut_next; KCtx *g; void *hstack; size_t hsize; void *sp; u64 start, param, handle, gstack_lo, gstack_sz; KThread *owner; int is_thread_fiber, finished; };
+struct KFiber { KFiber *cut_next; KCtx *g; void *hstack; size_t hsize; void *sp; u64 start, param, handle, gstack_lo, gstack_sz; KThread *owner; int is_thread_fiber, finished; KhFn resume_task; };
 #define FIBER_MAGIC 0x46494245ull
 static int fiber_teb_swap=1;                          /* 0 only inside the selftest's demonstration of the hazard */
 /* guest stacks by address, for reports (ga_describe): threads from the thread list, fibers from this small table */
@@ -601,18 +601,59 @@ static void cut_forget_fiber(KFiber *f){
     *p=f->cut_next;
     pthread_mutex_unlock(&cut_fiber_m);
 }
-void kh_cut_fiber_report(void){
+/* The guest stack still holds each lifted return address. At a quiescent
+ * cut, replace only a complete, recognised chain on an inactive fiber. */
+void kh_resume_13552f(KCtx *),kh_resume_14f65b(KCtx *),kh_resume_13522e(KCtx *);
+void kh_resume_157334(KCtx *),kh_resume_2cbc2a(KCtx *),kh_resume_2cc31a(KCtx *);
+void kh_resume_1503c8(KCtx *),kh_resume_1e0351(KCtx *),kh_resume_154d8b(KCtx *);
+
+static int cut_rebuild_fiber(KFiber *f){
+    static const struct { u32 ret, frame_size; KhFn resume; } tasks[]={
+        {0x157334,0x28,kh_resume_157334},{0x2cbc2a,0x78,kh_resume_2cbc2a},
+        {0x2cc31a,0x38,kh_resume_2cc31a},{0x1503c8,0x28,kh_resume_1503c8},
+        {0x1e0351,0x38,kh_resume_1e0351},{0x154d8b,0x98,kh_resume_154d8b},
+    };
+    if(f->is_thread_fiber||f->owner||f->start!=GS_BASE+0x135220) return 0;
+    KCtx *g=f->g;
+    u64 sp=KH_RSP(g),end=f->gstack_lo+f->gstack_sz;
+    if(sp<f->gstack_lo||sp>end||end-sp<0x38||rd64(g,sp)!=GS_BASE+0x13552f) return 0;
+    u64 caller=rd64(g,sp+0x30);
+    for(size_t i=0;i<sizeof tasks/sizeof tasks[0];i++){
+        if(caller!=GS_BASE+tasks[i].ret) continue;
+        u64 outer=sp+0x38+tasks[i].frame_size;
+        if(outer>end||end-outer<0x68||rd64(g,outer)!=GS_BASE+0x14f65b||
+           rd64(g,outer+0x30)!=GS_BASE+0x13522e||rd64(g,outer+0x60)!=0x7ff7ffff0000ull) return 0;
+        f->resume_task=tasks[i].resume;
+        f->sp=make_frame((char*)f->hstack+f->hsize,f);
+        return 1;
+    }
+    return 0;
+}
+void kh_cut_rebuild_fibers(void){
+    unsigned rebuilt=0,total=0;
     pthread_mutex_lock(&cut_fiber_m);
     for(KFiber *f=cut_fibers;f;f=f->cut_next){
+        total++;
+        rebuilt+=cut_rebuild_fiber(f);
         u64 sp=KH_RSP(f->g);
         fprintf(stderr,"kh: savestate-fiber handle=%llx owner=%u start=%llx rsp=%llx return=%llx\n",
                 (unsigned long long)f->handle,f->owner?f->owner->tid:0,(unsigned long long)f->start,
                 (unsigned long long)sp,(unsigned long long)(GA_OK(sp)?rd64(f->g,sp):0));
     }
+    fprintf(stderr,"kh: savestate-fiber-rebuild replaced=%u registered=%u\n",rebuilt,total);
     pthread_mutex_unlock(&cut_fiber_m);
 }
 void kh_fiber_main(KFiber *f){
-    KCtx *g=f->g; (void)kh_call(g,f->start,f->param,0,0,0);
+    KCtx *g=f->g;
+    if(f->resume_task){
+        KhFn task=f->resume_task;
+        f->resume_task=NULL;
+        KH_RET(g);             /* complete the suspended SwitchToFiber import */
+        kh_resume_13552f(g);
+        task(g);
+        kh_resume_14f65b(g);
+        kh_resume_13522e(g);
+    }else (void)kh_call(g,f->start,f->param,0,0,0);
     kh_fatal(g,"fiber start routine 0x%llx returned (Windows would ExitThread)",(unsigned long long)f->start);
 }
 u64 kh_fiber_create(KCtx *g,u64 stack_size,u64 start,u64 param){

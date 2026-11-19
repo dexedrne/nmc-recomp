@@ -158,7 +158,7 @@ RTSRC += $(ROOT)/runtime/ios/audio_coreaudio.c
 CFLAGS += -DKH_AUDIO_COREAUDIO=1
 COREAUDIO_LDFLAGS = -framework AudioToolbox -framework CoreFoundation
 endif
-RTOBJ = $(O)/cheat_drop.o $(patsubst $(ROOT)/runtime/%.c,$(O)/%.o,$(RTSRC))
+RTOBJ = $(O)/savestate_entries.o $(O)/cheat_drop.o $(patsubst $(ROOT)/runtime/%.c,$(O)/%.o,$(RTSRC))
 LIFTOBJ = $(O)/khrt_cpu.o $(O)/khrt_rcp_tab.o $(O)/rt_libm.o $(O)/kh_table.o $(O)/rt_imports_default.o $(O)/nep_stubs.o
 # link-time entry probes (runtime/gxwrap.c): ld --wrap on Linux, renamed definitions + generated forwarders with HOOKMODE=rename
 WRAP_FNS = 11d070 11d0a0 124060 10e860 11c150 127ed0 129110
@@ -467,6 +467,11 @@ endif
 all: $(O)/hook_link.ok
 $(O)/hook_link.ok: $(BIN) tools/check_hook_link.py
 	python3 tools/check_hook_link.py --bin $(BIN) --objs $(RTOBJ) $(LIFTOBJ) $(HOOK_OBJ) --hooks $(HOOKS_UNIQ) --wrap $(WRAP_FNS) $(if $(HOOK_OBJ),--forwarders $(HOOK_OBJ)) $(if $(filter 1,$(HOOK_STRICT)),--strict) && touch $@
+$(O)/savestate_entries.c: tools/savestate_entries.py $(addprefix $(SHARDS_DIR)/shard_,0022.c 0023.c 0024.c 0026.c 0027.c 0038.c 0058.c)
+	@mkdir -p $(O)
+	python3 $< $(SHARDS_DIR) > $@.new && mv $@.new $@
+$(O)/savestate_entries.o: $(O)/savestate_entries.c
+	$(CC) $(LIFT_CFLAGS) -c $< -o $@
 $(O)/cheat_drop.c: $(addprefix $(SHARDS_DIR)/shard_,0051.c 0076.c 0079.c 0081.c 0083.c 0085.c 0087.c 0103.c) tools/tweak_lift.py
 	@mkdir -p $(O)
 	python3 tools/tweak_lift.py $(SHARDS_DIR) > $@.new && mv $@.new $@

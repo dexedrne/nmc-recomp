@@ -22,7 +22,24 @@ static u64 kh_cmdline_ga;
 /* ======================================================================================================================
  * heap (malloc family -> guest arena)
  * ==================================================================================================================== */
-IMP(CRTH,malloc){ SET_RAX(g,ga_alloc_src(A0(g),16,GA_SRC_CRT)); }
+/* Reserve the first f_501480 object before the timing thread can claim its
+ * size class. f_439064 calls malloc via a tail jump, with a 0x28-byte frame. */
+static _Atomic u64 cut_boot_object;
+void kh_cut_reserve_boot_object(void){
+    u64 p=ga_alloc_src(80,16,GA_SRC_CRT);
+    if(!p) kh_fatal(NULL,"savestate-boot-reservation: 80-byte object");
+    atomic_store(&cut_boot_object,p);
+}
+IMP(CRTH,malloc){
+    u64 p=0;
+    if(kh_cut_enabled&&A0(g)==80&&atomic_load(&cut_boot_object)&&
+       rd64(g,KH_RSP(g))==GS_BASE+0x439083&&
+       rd64(g,KH_RSP(g)+0x30)==GS_BASE+0x5014bf){
+        p=atomic_exchange(&cut_boot_object,0);
+        if(p) fprintf(stderr,"kh: savestate-boot-object caller=5014bf guest=%llx\n",(unsigned long long)p);
+    }
+    SET_RAX(g,p?p:ga_alloc_src(A0(g),16,GA_SRC_CRT));
+}
 IMP(CRTH,calloc){ SET_RAX(g,ga_calloc_src(A0(g),A1(g),GA_SRC_CRT)); }
 IMP(CRTH,realloc){ SET_RAX(g,ga_realloc(A0(g),A1(g))); }
 IMP(CRTH,free){ ga_free(A0(g)); }
