@@ -39,3 +39,8 @@ struct KhCrtFiles;
 struct KhCrtFiles *kh_crt_files_capture(void);
 void kh_crt_files_restore(struct KhCrtFiles *);
 void kh_crt_files_discard(struct KhCrtFiles *);
+
+struct KhGpuCut;
+const char *kh_gpu_cut_check(struct KhGpuCut **,int load);
+void kh_gpu_cut_free(struct KhGpuCut *);
+void kh_gpu_cut_apply(struct KhGpuCut *,int load);

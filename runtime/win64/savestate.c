@@ -16,6 +16,7 @@
 #define game_digest SHA256
 #endif
 
+extern int kh_gfx_vkd3d_on;
 int kh_cut_enabled;
 _Thread_local unsigned kh_cut_callback_depth;
 _Atomic int kh_cut_requested;
@@ -45,6 +46,7 @@ struct SessionSlot {
     char *path;
     unsigned char key[16];
     KhRecords records;
+    struct KhGpuCut *gpu;
     struct KhSyncSlot *sync;
     struct KhAudioSlot *audio;
     struct KhCrtFiles *files;
@@ -55,6 +57,7 @@ struct SessionSlot {
 static struct SessionSlot *slots;
 static void discard_slot(struct SessionSlot *s){
     if(!s) return;
+    kh_gpu_cut_free(s->gpu);
     kh_records_free(&s->records);
     if(s->sync) kh_sync_discard(s->sync);
     kh_audio_discard(s->audio); kh_crt_files_discard(s->files);
@@ -138,6 +141,7 @@ static void session_records(struct SessionSlot *s,int load){
         KH_RECORD(r,*t->g); KH_RECORD(r,t->lasterr); KH_RECORD(r,t->last_error);
         KH_RECORD(r,*rng);
     }
+    kh_gpu_cut_apply(s->gpu,load);
     kh_rewind_arena(r); kh_rewind_fibers(r); kh_rewind_handles(r); kh_rewind_crt(r);
     kh_rewind_gfx(r); kh_rewind_input(r); kh_rewind_route(r); kh_rewind_phase(r);
     kh_rewind_warp(r); kh_rewind_hd(r); kh_rewind_mod(r); kh_rewind_maps(r);
@@ -188,8 +192,9 @@ void kh_cut_init(void){
     const char *enable=getenv("KHNMC_SAVESTATE"), *trigger=getenv("KHNMC_TEST_SAVESTATE");
     if(!enable||!strcmp(enable,"0")) return;
     if(strcmp(enable,"1")) kh_fatal(NULL,"savestate-switch: expected 0 or 1");
-    extern int kh_gfx_vkd3d_on;
-    if(kh_gfx_vkd3d_on||!kh_vclock_sync||ga_deterministic) kh_fatal(NULL,"savestate-profile: requires null graphics and frames clock with sync=all");
+
+    extern int kh_gfx_wrap_on;
+    if((kh_gfx_vkd3d_on&&!kh_gfx_wrap_on)||!kh_vclock_sync||ga_deterministic) kh_fatal(NULL,"savestate-profile: requires null or wrapped graphics and frames clock with sync=all");
     const char *audio=getenv("KHNMC_AUDIO");
     if(audio&&*audio&&strcmp(audio,"null")&&strncmp(audio,"wav:",4))
         kh_fatal(NULL,"savestate-profile: external audio device active");
@@ -470,14 +475,15 @@ void kh_cut_frame(KCtx *g,u64 frame){
                     candidate->nthreads=n+1; session=candidate;
                 }
                 sync_error=session_check(session,load,n);
-                if(!sync_error&&load){
+                if(!sync_error&&(load||kh_gfx_vkd3d_on)){
                     committing=kh_cut_gate_commit(epoch);
                     if(!committing) sync_error="savestate-lifecycle-changed";
-                    else if(getenv("KHNMC_TEST_SAVESTATE_HASH")){
+                    else if(load&&getenv("KHNMC_TEST_SAVESTATE_HASH")){
                         extern void kh_cut_arena_census(KCtx *,void (*)(KCtx *,u64,u64));
                         kh_cut_arena_census(g,report_extent);
                     }
                 }
+                if(!sync_error) sync_error=kh_gpu_cut_check(&session->gpu,load);
                 if(!sync_error){
                     if(load) sync_error=kh_sync_restore(session->sync,waits,wait_threads,wait_count);
                     else{

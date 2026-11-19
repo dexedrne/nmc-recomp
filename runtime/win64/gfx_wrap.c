@@ -69,8 +69,12 @@
 #include <time.h>
 #include <sys/wait.h>
 
+#include "rewind.h"
 #ifndef KH_GFX_VKD3D
 #include "khnmc_app.h"
+const char *kh_gpu_cut_check(struct KhGpuCut **slot,int load){ return NULL; }
+void kh_gpu_cut_apply(struct KhGpuCut *slot,int load){}
+void kh_gpu_cut_free(struct KhGpuCut *slot){}
 int kh_wrap_selftest_pure(KCtx *g){ (void)g; fprintf(stderr,"kh: gfx wrap selftest: SKIPPED (the vkd3d backend is not compiled into this binary)\n"); return 0; }
 int kh_gfx_queues_drain(unsigned slices,unsigned slice_ms,KhDrainResult *r){ (void)slices;(void)slice_ms; memset(r,0,sizeof *r); return 1; }   /* TASK41: no backend, no queue */
 #else
@@ -121,7 +125,51 @@ static const char *mname(int kind,int s){ return s>=0&&s<wk[kind].nnames?wk[kind
 #define W_KIND   48
 #define W_EXTRA  24
 #define W_MAGIC  0x57524150766b6433ull
-typedef struct { void *real; u64 obj; int kind; } WEnt;
+struct CutView {
+    struct CutView *next;
+    u64 handle, serial[2];
+    ID3D12Resource *res[2];
+    int method,has_desc;
+    union {
+        D3D12_CONSTANT_BUFFER_VIEW_DESC cbv;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav;
+        D3D12_RENDER_TARGET_VIEW_DESC rtv;
+        D3D12_DEPTH_STENCIL_VIEW_DESC dsv;
+        D3D12_SAMPLER_DESC sampler;
+    } d;
+};
+static void free_views(struct CutView *v){
+    while(v){ struct CutView *next=v->next; free(v); v=next; }
+}
+static struct CutView *copy_views(const struct CutView *v){
+    struct CutView *out=NULL;
+    for(;v;v=v->next){
+        struct CutView *n=malloc(sizeof *n);
+        if(!n) kh_fatal(NULL,"savestate-descriptor-memory");
+        *n=*v; n->next=out; out=n;
+    }
+    return out;
+}
+typedef struct {
+    void *real;
+    u64 obj;
+    int kind, inactive, list_open;
+    unsigned pins,owned,maps;
+    u64 event_target;
+    IUnknown *backing;
+    ID3D12Resource *query_buffer;
+    u64 epoch,serial,first,length,list_revision,private_revision;
+    struct CutView *views;
+    D3D12_DESCRIPTOR_HEAP_TYPE view_type;
+    D3D12_COMMAND_LIST_TYPE type;
+    D3D12_RESOURCE_STATES state, *sub;
+    UINT nsub;
+    D3D12_RESOURCE_BARRIER *barriers;
+    size_t nbar, capacity;
+} WEnt;
+static u64 gpu_epoch,gpu_serial,gpu_revision;
+static pthread_mutex_t cut_submit_lock=PTHREAD_MUTEX_INITIALIZER;
 static WEnt *wt; static u32 wt_cap, wt_n; static pthread_mutex_t wm=PTHREAD_MUTEX_INITIALIZER;
 static u32 wt_hash(const void *p){ u64 x=U(p); x^=x>>33; x*=0xff51afd7ed558ccdull; x^=x>>33; return (u32)x; }
 static WEnt *wt_find(const void *real){ if(!wt_cap) return NULL; u32 m=wt_cap-1,i=wt_hash(real)&m; while(wt[i].real){ if(wt[i].real==real) return &wt[i]; i=(i+1)&m; } return NULL; }
@@ -129,7 +177,7 @@ static void wt_put(KCtx *g,void *real,u64 obj,int kind){
     if((wt_n+1)*2>wt_cap){ u32 nc=wt_cap?wt_cap*2:1024; WEnt *nt=calloc(nc,sizeof *nt); if(!nt) kh_fatal(g,"gfx-wrap-table: out of memory for %u wrapper entries",nc);
         for(u32 k=0;k<wt_cap;k++) if(wt[k].real){ u32 i=wt_hash(wt[k].real)&(nc-1); while(nt[i].real) i=(i+1)&(nc-1); nt[i]=wt[k]; }
         free(wt); wt=nt; wt_cap=nc; }
-    u32 m=wt_cap-1,i=wt_hash(real)&m; while(wt[i].real) i=(i+1)&m; wt[i].real=real; wt[i].obj=obj; wt[i].kind=kind; wt_n++;
+    u32 m=wt_cap-1,i=wt_hash(real)&m; while(wt[i].real) i=(i+1)&m; wt[i]=(WEnt){.real=real,.obj=obj,.kind=kind,.serial=++gpu_serial}; wt_n++;
 }
 static void wt_del(WEnt *e){                   /* linear probing: close the gap */
     u32 m=wt_cap-1,i=(u32)(e-wt),j=i;
@@ -143,7 +191,7 @@ static u64 w_get(KCtx *g,void *real,int kind,int fresh){
     if(!real) return 0;
     pthread_mutex_lock(&wm);
     WEnt *e=wt_find(real); u64 o;
-    if(e){
+    if(e&&e->obj){
         if(e->kind!=kind){ int k=e->kind; pthread_mutex_unlock(&wm); kh_fatal(g,"gfx-wrap-kind: real object %p is known as %s but is now handed out as %s",real,wk[k].iface,wk[kind].iface); }
         if(fresh&&real_refs(real)==1){ u64 old=e->obj; pthread_mutex_unlock(&wm);
             kh_fatal(g,"gfx-wrap-stale: a new %s was created at %p while guest object 0x%llx still stands for an earlier object at that address (it was never released through the bridge)",wk[kind].iface,real,P(old)); }
@@ -151,11 +199,19 @@ static u64 w_get(KCtx *g,void *real,int kind,int fresh){
     } else {
         o=kh_com_obj(C_w[kind],W_EXTRA); if(!o){ pthread_mutex_unlock(&wm); kh_fatal(g,"gfx-wrap-table: no guest memory for a %s wrapper",wk[kind].iface); }
         wr64(g,o+W_REAL,U(real)); wr64(g,o+W_COOKIE,U(real)^o^W_MAGIC); wr32(g,o+W_KIND,(u32)kind);
-        wt_put(g,real,o,kind); atomic_fetch_add(&n_made[kind],1);
+        if(e){ e->obj=o; e->serial=++gpu_serial; } else wt_put(g,real,o,kind); atomic_fetch_add(&n_made[kind],1);
     }
+    if(kh_cut_enabled) wt_find(real)->owned++;
     pthread_mutex_unlock(&wm); return o;
 }
-u64 kh_wrap_obj(KCtx *g,void *real,int kind){ return w_get(g,real,kind,0); }
+u64 kh_wrap_obj(KCtx *g,void *real,int kind){
+    u64 obj=w_get(g,real,kind,0);
+    if(kh_cut_enabled&&obj&&kind==WK_RESOURCE){
+        /* GetBuffer returns a single-subresource swap-chain image. */
+        pthread_mutex_lock(&wm); wt_find(real)->nsub=1; pthread_mutex_unlock(&wm);
+    }
+    return obj;
+}
 static u64 w_lookup(const void *real){ pthread_mutex_lock(&wm); WEnt *e=wt_find(real); u64 o=e?e->obj:0; pthread_mutex_unlock(&wm); return o; }
 /* ---- TASK41 (IOS-GRAPHICS-PLAN step 11): the queue registry ----------------------------------------------------------------------
  * Every command queue the game creates through this bridge (ID3D12Device::CreateCommandQueue, slot 8) is registered; the suspend drain
@@ -183,17 +239,38 @@ static void qreg_count(ID3D12CommandQueue *q,int what){
     pthread_mutex_lock(&qreg_m); for(int i=0;i<nqreg;i++) if(qreg[i].q==q){ if(what==0) qreg[i].execs++; else if(what==1) qreg[i].signals++; else qreg[i].waits++; break; } pthread_mutex_unlock(&qreg_m);
 }
 /* caller holds wm: the real object is gone, so is its guest object */
+static void forget_entry(WEnt *e){
+    if(e->kind==WK_LIST) kh_gfxc_track_drop(U(e->backing?e->backing:e->real));
+    if(e->pins&&e->kind==WK_RESOURCE) while(e->maps){ D3D12_RANGE none={0,0}; ID3D12Resource_Unmap((ID3D12Resource*)e->real,0,&none); e->maps--; }
+    if(e->query_buffer) ID3D12Resource_Release(e->query_buffer);
+    if(e->backing) IUnknown_Release(e->backing);
+    free(e->barriers); if(!e->pins){ free(e->sub); free_views(e->views); }
+    if(e->pins) *e=(WEnt){.real=e->real,.kind=e->kind,.pins=e->pins,.views=e->views,.view_type=e->view_type,.private_revision=e->private_revision,.state=e->state,.sub=e->sub,.nsub=e->nsub,.inactive=e->inactive};
+    else wt_del(e);
+}
 static void w_kill(KCtx *g,WEnt *e){
-    u64 o=e->obj; int kind=e->kind; void *real=e->real; wt_del(e);
+    u64 o=e->obj; int kind=e->kind; void *real=e->real; forget_entry(e);
     wr64(g,o,0); wr64(g,o+16,0); wr64(g,o+W_REAL,0); wr64(g,o+W_COOKIE,0); ga_free(o); atomic_fetch_add(&n_dead[kind],1);
-    if(kind==WK_LIST) kh_gfxc_track_drop(U(real));
     if(kind==WK_QUEUE) qreg_drop(real);
+}
+unsigned kh_wrap_buffer_pins(void *real){
+    pthread_mutex_lock(&wm); WEnt *e=wt_find(real); unsigned pins=e?e->pins:0;
+    pthread_mutex_unlock(&wm); return pins;
+}
+void kh_wrap_retire_buffer(KCtx *g,void *real){
+    pthread_mutex_lock(&wm); WEnt *e=wt_find(real);
+    if(e&&e->obj){
+        if(e->owned) kh_fatal(g,"savestate-swap-outstanding-buffer");
+        w_kill(g,e);
+    }
+    pthread_mutex_unlock(&wm);
 }
 /* Release through the guest object.  The table lock is held across the real Release: a new object that vkd3d places at the same address
  * cannot be wrapped before the old entry is gone. */
 static u32 w_release(KCtx *g,u64 o,void *real){
     pthread_mutex_lock(&wm);
     ULONG r=IUnknown_Release((IUnknown*)real);
+    if(kh_cut_enabled){ WEnt *e=wt_find(real); if(!e||!e->owned) kh_fatal(g,"savestate-gpu-release"); e->owned--; r-=e->pins; }
     if(!r){ WEnt *e=wt_find(real); if(!e||e->obj!=o){ pthread_mutex_unlock(&wm); kh_fatal(g,"gfx-wrap-table: guest object 0x%llx released its real object %p, which the table does not map to it",P(o),real); } w_kill(g,e); }
     else wr64(g,o+16,r);
     pthread_mutex_unlock(&wm); return r;
@@ -203,7 +280,8 @@ u32 kh_wrap_release_real(KCtx *g,void *real){
     if(!real) return 0;
     pthread_mutex_lock(&wm);
     ULONG r=IUnknown_Release((IUnknown*)real);
-    if(!r){ WEnt *e=wt_find(real); if(e) w_kill(g,e); }
+    WEnt *e=wt_find(real);
+    if(e&&e->obj){ r-=e->pins; if(!r) w_kill(g,e); }
     pthread_mutex_unlock(&wm); return r;
 }
 
@@ -323,8 +401,11 @@ static void w_unknown(KCtx *g,u64 o,void *real,int kind,int s){
         if(!pp){ SET_RAX(g,(u32)E_POINTER); return; }
         HRESULT hr=IUnknown_QueryInterface(u,iidp(g,A1(g),"QueryInterface"),&out);
         if(SUCCEEDED(hr)&&out&&out!=real) kh_fatal(g,"gfx-wrap-qi-identity: %s %p answers QueryInterface with another pointer (%p); the wrapped bridge keeps one guest object per real pointer",wk[kind].iface,real,out);
+        if(kh_cut_enabled&&SUCCEEDED(hr)&&out){ pthread_mutex_lock(&wm); wt_find(real)->owned++; pthread_mutex_unlock(&wm); }
         wr64(g,pp,SUCCEEDED(hr)&&out?o:0); SET_RAX(g,(u32)hr); return; }             /* the same guest object, one more REAL reference */
-    if(s==1){ ULONG r=IUnknown_AddRef(u); wr64(g,o+16,r); SET_RAX(g,r); return; }
+    if(s==1){ ULONG r=IUnknown_AddRef(u);
+        if(kh_cut_enabled){ pthread_mutex_lock(&wm); WEnt *e=wt_find(real); e->owned++; r-=e->pins; pthread_mutex_unlock(&wm); }
+        wr64(g,o+16,r); SET_RAX(g,r); return; }
     SET_RAX(g,w_release(g,o,real));
 }
 /* ID3D12Object slots 3..6 and ID3D12DeviceChild::GetDevice (slot 7) */
@@ -348,7 +429,185 @@ static int feature_is_plain(u32 f){ switch(f){ case D3D12_FEATURE_D3D12_OPTIONS:
     case D3D12_FEATURE_FORMAT_INFO: case D3D12_FEATURE_GPU_VIRTUAL_ADDRESS_SUPPORT: case D3D12_FEATURE_SHADER_MODEL: case D3D12_FEATURE_D3D12_OPTIONS1: case D3D12_FEATURE_ROOT_SIGNATURE:
     case D3D12_FEATURE_ARCHITECTURE1: case D3D12_FEATURE_D3D12_OPTIONS2: case D3D12_FEATURE_SHADER_CACHE: case D3D12_FEATURE_D3D12_OPTIONS3: case D3D12_FEATURE_D3D12_OPTIONS4: case D3D12_FEATURE_D3D12_OPTIONS5: return 1; }
     return 0; }
+/* State changes belong to queue submission. Recording a list or resetting it
+ * without submitting must not change the resource seen at a frame cut. */
+static void cut_barriers(ID3D12GraphicsCommandList *list,UINT n,const D3D12_RESOURCE_BARRIER *b){
+    pthread_mutex_lock(&wm);
+    WEnt *e=wt_find(list);
+    if(e->nbar+n>e->capacity){
+        size_t cap=(e->nbar+n)*2;
+        void *a=realloc(e->barriers,cap*sizeof *b);
+        if(!a) kh_fatal(NULL,"savestate-barrier-memory");
+        e->barriers=a; e->capacity=cap;
+    }
+    if(n) memcpy(e->barriers+e->nbar,b,n*sizeof *b);
+    e->nbar+=n;
+    pthread_mutex_unlock(&wm);
+}
+static void cut_submit(UINT n,ID3D12CommandList *const *lists){
+    pthread_mutex_lock(&wm);
+    for(UINT i=0;i<n;i++){
+        WEnt *l=wt_find(lists[i]);
+        for(size_t j=0;j<l->nbar;j++){
+            D3D12_RESOURCE_BARRIER *b=l->barriers+j;
+            if(b->Type==D3D12_RESOURCE_BARRIER_TYPE_ALIASING){
+                WEnt *before=wt_find(b->Aliasing.pResourceBefore),*after=wt_find(b->Aliasing.pResourceAfter);
+                if(before) before->inactive=1;
+                if(after) after->inactive=0;
+            }
+            if(b->Type!=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION||b->Flags==D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY) continue;
+            WEnt *e=wt_find(b->Transition.pResource);
+            if(!e) kh_fatal(NULL,"savestate-barrier-resource");
+            UINT k=b->Transition.Subresource;
+            if(k==D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES){
+                e->state=b->Transition.StateAfter; free(e->sub); e->sub=NULL;
+            }else{
+                if(k>=e->nsub) kh_fatal(NULL,"savestate-barrier-subresource: %u of %u",k,e->nsub);
+                if(!e->sub){
+                    e->sub=malloc(e->nsub*sizeof *e->sub);
+                    if(!e->sub) kh_fatal(NULL,"savestate-barrier-memory");
+                    for(UINT z=0;z<e->nsub;z++) e->sub[z]=e->state;
+                }
+                e->sub[k]=b->Transition.StateAfter;
+            }
+        }
+    }
+    pthread_mutex_unlock(&wm);
+}
+static void cut_resource(void *res,const D3D12_RESOURCE_DESC *rd,D3D12_RESOURCE_STATES state){
+    pthread_mutex_lock(&wm);
+    WEnt *e=wt_find(res);
+    e->state=state;
+    e->nsub=rd->MipLevels*(rd->Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE3D?1:rd->DepthOrArraySize);
+    if(rd->Format==DXGI_FORMAT_D32_FLOAT_S8X24_UINT||rd->Format==DXGI_FORMAT_D24_UNORM_S8_UINT) e->nsub*=2;
+    pthread_mutex_unlock(&wm);
+}
+static void *cut_backing(void *canonical){
+    if(!kh_cut_enabled||!canonical) return canonical;
+    pthread_mutex_lock(&wm);
+    WEnt *e=wt_find(canonical);
+    void *real=e&&e->backing?e->backing:canonical;
+    pthread_mutex_unlock(&wm);
+    return real;
+}
+/* The driver exposes opaque descriptor handles. Keep the arguments used to
+ * populate each live heap so a load can call the device on the same handles. */
+static struct CutView *cut_view(u64 h,int create){
+    for(u32 i=0;i<wt_cap;i++){
+        WEnt *e=wt+i;
+        if(!e->obj||e->kind!=WK_DHEAP||h<e->first||h-e->first>=e->length) continue;
+        struct CutView **v=&e->views;
+        while(*v&&(*v)->handle!=h) v=&(*v)->next;
+        if(create&&!*v){
+            *v=calloc(1,sizeof **v); if(!*v) kh_fatal(NULL,"savestate-descriptor-memory");
+            (*v)->handle=h;
+        }
+        return *v;
+    }
+    kh_fatal(NULL,"savestate-descriptor-heap: handle %llx",P(h));
+    return NULL;
+}
+static void set_view(struct CutView *dst,const struct CutView *src){
+    struct CutView *next=dst->next; u64 handle=dst->handle;
+    if(src) *dst=*src; else memset(dst,0,sizeof *dst);
+    dst->handle=handle; dst->next=next;
+}
+static void cut_views(KCtx *g,ID3D12Device *d,int s){
+    pthread_mutex_lock(&wm);
+    if(s<=22){
+        static const size_t bytes[]={sizeof(D3D12_CONSTANT_BUFFER_VIEW_DESC),sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC),
+            sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC),sizeof(D3D12_RENDER_TARGET_VIEW_DESC),
+            sizeof(D3D12_DEPTH_STENCIL_VIEW_DESC),sizeof(D3D12_SAMPLER_DESC)};
+        unsigned arg=s==17||s==22?1:s==19?3:2;
+        struct CutView v={.method=s};
+        if(ARG(g,arg)){ v.has_desc=1; memcpy(&v.d,hp(g,ARG(g,arg)),bytes[s-17]); }
+        for(unsigned j=1;j<arg;j++) if(ARG(g,j)){
+            v.res[j-1]=RES(ARG(g,j),"checkpoint descriptor");
+            WEnt *e=wt_find(v.res[j-1]); v.serial[j-1]=e->serial;
+        }
+        set_view(cut_view(ARG(g,arg+1),1),&v);
+    }else if(s==24){
+        UINT step=ID3D12Device_GetDescriptorHandleIncrementSize(d,ARG(g,4));
+        for(UINT i=0;i<(UINT)A1(g);i++)
+            set_view(cut_view(A2(g)+(u64)i*step,1),cut_view(A3(g)+(u64)i*step,0));
+    }else{
+        UINT step=ID3D12Device_GetDescriptorHandleIncrementSize(d,ARG(g,7));
+        UINT dest=0,src=0,di=0,si=0;
+        while(dest<(UINT)A1(g)&&src<(UINT)ARG(g,4)){
+            UINT nd=A3(g)?rd32(g,A3(g)+4ull*dest):1,ns=ARG(g,6)?rd32(g,ARG(g,6)+4ull*src):1;
+            if(di==nd){ dest++; di=0; continue; }
+            if(si==ns){ src++; si=0; continue; }
+            set_view(cut_view(rd64(g,A2(g)+8ull*dest)+(u64)di++*step,1),
+                     cut_view(rd64(g,ARG(g,5)+8ull*src)+(u64)si++*step,0));
+        }
+    }
+    pthread_mutex_unlock(&wm);
+}
+/* An unused slot may have acquired a view of a resource on the discarded
+ * branch. Replace that binding even though no defined guest read depends on it. */
+static void clear_view(ID3D12Device *d,D3D12_DESCRIPTOR_HEAP_TYPE type,u64 handle){
+    D3D12_CPU_DESCRIPTOR_HANDLE h=cpuh(handle);
+    if(type==D3D12_DESCRIPTOR_HEAP_TYPE_RTV){
+        D3D12_RENDER_TARGET_VIEW_DESC v={.Format=DXGI_FORMAT_R8G8B8A8_UNORM,.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D};
+        ID3D12Device_CreateRenderTargetView(d,NULL,&v,h);
+    }else if(type==D3D12_DESCRIPTOR_HEAP_TYPE_DSV){
+        D3D12_DEPTH_STENCIL_VIEW_DESC v={.Format=DXGI_FORMAT_D32_FLOAT,.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2D};
+        ID3D12Device_CreateDepthStencilView(d,NULL,&v,h);
+    }else if(type==D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER){
+        D3D12_SAMPLER_DESC v={.AddressU=D3D12_TEXTURE_ADDRESS_MODE_CLAMP,.AddressV=D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            .AddressW=D3D12_TEXTURE_ADDRESS_MODE_CLAMP,.MaxAnisotropy=1,.ComparisonFunc=D3D12_COMPARISON_FUNC_ALWAYS};
+        ID3D12Device_CreateSampler(d,&v,h);
+    }else{
+        D3D12_SHADER_RESOURCE_VIEW_DESC v={.Format=DXGI_FORMAT_R8G8B8A8_UNORM,.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D,
+            .Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+        v.Texture2D.MipLevels=1;
+        ID3D12Device_CreateShaderResourceView(d,NULL,&v,h);
+    }
+}
+static void restore_views(ID3D12Device *d,D3D12_DESCRIPTOR_HEAP_TYPE type,const struct CutView *v){
+    for(;v;v=v->next){
+        int stale=0;
+        for(unsigned i=0;i<2;i++) if(v->res[i]){
+            WEnt *e=wt_find(v->res[i]);
+            if(!e||!e->obj||e->serial!=v->serial[i]) stale=1;
+        }
+        if(stale||!v->method){ clear_view(d,type,v->handle); continue; }
+        const void *desc=v->has_desc?&v->d:NULL;
+        D3D12_CPU_DESCRIPTOR_HANDLE h=cpuh(v->handle);
+        switch(v->method){
+        case 0: break;
+        case 17: ID3D12Device_CreateConstantBufferView(d,desc,h); break;
+        case 18: ID3D12Device_CreateShaderResourceView(d,v->res[0],desc,h); break;
+        case 19: ID3D12Device_CreateUnorderedAccessView(d,v->res[0],v->res[1],desc,h); break;
+        case 20: ID3D12Device_CreateRenderTargetView(d,v->res[0],desc,h); break;
+        case 21: ID3D12Device_CreateDepthStencilView(d,v->res[0],desc,h); break;
+        case 22: ID3D12Device_CreateSampler(d,desc,h); break;
+        default: kh_fatal(NULL,"savestate-descriptor-method");
+        }
+    }
+}
+/* A query heap has no API to write a saved result back. Resolve each timestamp
+ * once at EndQuery into an ordinary GPU buffer. Guest resolves copy from that
+ * buffer, so old and newly recorded lists both observe its restored bytes. */
+static void cut_transition(ID3D12GraphicsCommandList *,ID3D12Resource *,D3D12_RESOURCE_STATES,
+                           D3D12_RESOURCE_STATES,UINT);
+static ID3D12Resource *query_buffer(ID3D12QueryHeap *q){
+    pthread_mutex_lock(&wm); WEnt *e=wt_find(q);
+    ID3D12Resource *r=e->query_buffer; pthread_mutex_unlock(&wm);
+    return r;
+}
+static void make_query_buffer(KCtx *g,ID3D12Device *d,void *heap,const D3D12_QUERY_HEAP_DESC *desc){
+    if(desc->Type!=D3D12_QUERY_HEAP_TYPE_TIMESTAMP) return;
+    D3D12_HEAP_PROPERTIES h={.Type=D3D12_HEAP_TYPE_DEFAULT,.CreationNodeMask=1,.VisibleNodeMask=1};
+    D3D12_RESOURCE_DESC rd={.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER,.Width=8ull*desc->Count,
+        .Height=1,.DepthOrArraySize=1,.MipLevels=1,.SampleDesc.Count=1,.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR};
+    ID3D12Resource *r=NULL;
+    if(FAILED(ID3D12Device_CreateCommittedResource(d,&h,D3D12_HEAP_FLAG_NONE,&rd,D3D12_RESOURCE_STATE_COPY_DEST,
+             NULL,&IID_ID3D12Resource,(void**)&r))) kh_fatal(g,"savestate-gpu-query-buffer");
+    pthread_mutex_lock(&wm); wt_find(heap)->query_buffer=r; pthread_mutex_unlock(&wm);
+}
 static int w_dev(KCtx *g,ID3D12Device *d,int s){
+    if(kh_cut_enabled&&s>=17&&s<=24) cut_views(g,d,s);
     switch(s){
     case 7: SET_RAX(g,ID3D12Device_GetNodeCount(d)); return 1;
     case 8: { D3D12_COMMAND_QUEUE_DESC qd; u64 pp=A3(g); void *out=NULL;         /* CreateCommandQueue(desc, riid, **pp) */
@@ -357,7 +616,9 @@ static int w_dev(KCtx *g,ID3D12Device *d,int s){
         w_out(g,pp,hr,out,WK_QUEUE); return 1; }
     case 9: { u32 type=(u32)A1(g); u64 pp=A3(g); void *out=NULL;                 /* CreateCommandAllocator(type, riid, **pp): vkd3d has no bundles, ours is the recorder's */
         if(type==D3D12_COMMAND_LIST_TYPE_BUNDLE){ if(!pp) kh_fatal(g,"gfx-bundle: CreateCommandAllocator(BUNDLE) without a result pointer"); wr64(g,pp,kh_gfxc_bundle_allocator_new(g)); SET_RAX(g,0); return 1; }
-        HRESULT hr=ID3D12Device_CreateCommandAllocator(d,(D3D12_COMMAND_LIST_TYPE)type,iidp(g,A2(g),"CreateCommandAllocator"),pp?&out:NULL); w_out(g,pp,hr,out,WK_ALLOCATOR); return 1; }
+        HRESULT hr=ID3D12Device_CreateCommandAllocator(d,(D3D12_COMMAND_LIST_TYPE)type,iidp(g,A2(g),"CreateCommandAllocator"),pp?&out:NULL); w_out(g,pp,hr,out,WK_ALLOCATOR);
+        if(kh_cut_enabled&&out){ pthread_mutex_lock(&wm); wt_find(out)->type=type; pthread_mutex_unlock(&wm); }
+        return 1; }
     case 10: { WX x; wx_init(&x,g); u64 pp=A3(g); void *out=NULL;                /* CreateGraphicsPipelineState(desc, riid, **pp) */
         const D3D12_GRAPHICS_PIPELINE_STATE_DESC *pd=x_pso(&x,A1(g));
         HRESULT hr=ID3D12Device_CreateGraphicsPipelineState(d,pd,iidp(g,A2(g),"CreateGraphicsPipelineState"),pp?&out:NULL);
@@ -368,9 +629,9 @@ static int w_dev(KCtx *g,ID3D12Device *d,int s){
         wx_done(&x); atomic_fetch_add(&gfx_psos,1); w_out(g,pp,hr,out,WK_PSO); return 1; }
     case 12: { u32 type=(u32)A2(g); u64 al=A3(g), pso=ARG(g,4), riid=ARG(g,5), pp=ARG(g,6); void *out=NULL;   /* CreateCommandList(node, type, allocator, pso, riid, **pp) */
         if(type==D3D12_COMMAND_LIST_TYPE_BUNDLE){ if(!pp) kh_fatal(g,"gfx-bundle: CreateCommandList(BUNDLE) without a result pointer"); wr64(g,pp,kh_gfxc_bundle_new(g,al,pso)); SET_RAX(g,0); return 1; }
-        HRESULT hr=ID3D12Device_CreateCommandList(d,(UINT)A1(g),(D3D12_COMMAND_LIST_TYPE)type,(ID3D12CommandAllocator*)kh_wrap_real(g,al,WK_ALLOCATOR,"CreateCommandList: allocator"),
+        HRESULT hr=ID3D12Device_CreateCommandList(d,(UINT)A1(g),(D3D12_COMMAND_LIST_TYPE)type,(ID3D12CommandAllocator*)cut_backing(kh_wrap_real(g,al,WK_ALLOCATOR,"CreateCommandList: allocator")),
                                                   (ID3D12PipelineState*)kh_wrap_real(g,pso,WK_PSO,"CreateCommandList: initial pipeline state"),iidp(g,riid,"CreateCommandList"),pp?&out:NULL);
-        w_out(g,pp,hr,out,WK_LIST); return 1; }
+        w_out(g,pp,hr,out,WK_LIST); if(kh_cut_enabled&&out){ pthread_mutex_lock(&wm); wt_find(out)->list_open=1; pthread_mutex_unlock(&wm); } return 1; }
     case 13: { u32 feat=(u32)A1(g); u64 pd=A2(g); u32 size=(u32)A3(g); HRESULT hr;   /* CheckFeatureSupport(feature, data, size) */
         if(feat==D3D12_FEATURE_FEATURE_LEVELS){ if(size!=sizeof(D3D12_FEATURE_DATA_FEATURE_LEVELS)||!pd){ SET_RAX(g,(u32)E_INVALIDARG); return 1; }
             WX x; wx_init(&x,g); D3D12_FEATURE_DATA_FEATURE_LEVELS *f=x_feature_levels(&x,pd); hr=ID3D12Device_CheckFeatureSupport(d,feat,f,size);
@@ -381,7 +642,15 @@ static int w_dev(KCtx *g,ID3D12Device *d,int s){
         else kh_fatal(g,"gfx-wrap-feature: ID3D12Device::CheckFeatureSupport(feature %u, %u bytes): this feature's structure has no translation in the wrapped bridge",feat,size);
         SET_RAX(g,(u32)hr); return 1; }
     case 14: { D3D12_DESCRIPTOR_HEAP_DESC hd; u64 pp=A3(g); void *out=NULL;      /* CreateDescriptorHeap(desc, riid, **pp) */
-        HRESULT hr=ID3D12Device_CreateDescriptorHeap(d,CP(hd,A1(g)),iidp(g,A2(g),"CreateDescriptorHeap"),pp?&out:NULL); w_out(g,pp,hr,out,WK_DHEAP); return 1; }
+        HRESULT hr=ID3D12Device_CreateDescriptorHeap(d,CP(hd,A1(g)),iidp(g,A2(g),"CreateDescriptorHeap"),pp?&out:NULL); w_out(g,pp,hr,out,WK_DHEAP);
+        if(kh_cut_enabled&&out){
+            pthread_mutex_lock(&wm); WEnt *e=wt_find(out);
+            e->view_type=hd.Type;
+            e->first=ID3D12DescriptorHeap_GetCPUDescriptorHandleForHeapStart((ID3D12DescriptorHeap*)out).ptr;
+            e->length=(u64)hd.NumDescriptors*ID3D12Device_GetDescriptorHandleIncrementSize(d,hd.Type);
+            pthread_mutex_unlock(&wm);
+        }
+        return 1; }
     case 15: SET_RAX(g,ID3D12Device_GetDescriptorHandleIncrementSize(d,(D3D12_DESCRIPTOR_HEAP_TYPE)(u32)A1(g))); return 1;
     case 16: { u64 blob=A2(g), size=A3(g), pp=ARG(g,5); void *out=NULL;          /* CreateRootSignature(node, blob, size, riid, **pp) */
         HRESULT hr=ID3D12Device_CreateRootSignature(d,(UINT)A1(g),blob?hp(g,blob):NULL,(SIZE_T)size,iidp(g,ARG(g,4),"CreateRootSignature"),pp?&out:NULL);
@@ -405,12 +674,16 @@ static int w_dev(KCtx *g,ID3D12Device *d,int s){
     case 26: { u64 ret=A1(g); D3D12_HEAP_PROPERTIES r=ID3D12Device_GetCustomHeapProperties(d,(UINT)A2(g),(D3D12_HEAP_TYPE)(u32)A3(g)); memcpy(hp(g,ret),&r,sizeof r); SET_RAX(g,ret); return 1; }
     case 27: { D3D12_HEAP_PROPERTIES hprops; D3D12_RESOURCE_DESC rd; D3D12_CLEAR_VALUE cv; u64 pp=ARG(g,7); void *out=NULL;   /* CreateCommittedResource(heap props, heap flags, desc, state, clear, riid, **pp) */
         HRESULT hr=ID3D12Device_CreateCommittedResource(d,CP(hprops,A1(g)),(D3D12_HEAP_FLAGS)(u32)A2(g),CP(rd,A3(g)),(D3D12_RESOURCE_STATES)(u32)ARG(g,4),CP(cv,ARG(g,5)),iidp(g,ARG(g,6),"CreateCommittedResource"),pp?&out:NULL);
-        atomic_fetch_add(&gfx_resources,1); if(SUCCEEDED(hr)&&A3(g)) kh_gfxc_census_resource(&rd); w_out(g,pp,hr,out,WK_RESOURCE); return 1; }
+        atomic_fetch_add(&gfx_resources,1); if(SUCCEEDED(hr)&&A3(g)) kh_gfxc_census_resource(&rd); w_out(g,pp,hr,out,WK_RESOURCE);
+        if(kh_cut_enabled&&out){ D3D12_RESOURCE_DESC actual=ID3D12Resource_GetDesc((ID3D12Resource*)out); cut_resource(out,&actual,ARG(g,4)); }
+        return 1; }
     case 28: { D3D12_HEAP_DESC hd; u64 pp=A3(g); void *out=NULL;                 /* CreateHeap(desc, riid, **pp) */
         HRESULT hr=ID3D12Device_CreateHeap(d,CP(hd,A1(g)),iidp(g,A2(g),"CreateHeap"),pp?&out:NULL); w_out(g,pp,hr,out,WK_HEAP); return 1; }
     case 29: { D3D12_RESOURCE_DESC rd; D3D12_CLEAR_VALUE cv; u64 pp=ARG(g,7); void *out=NULL;                          /* CreatePlacedResource(heap, offset, desc, state, clear, riid, **pp) */
         HRESULT hr=ID3D12Device_CreatePlacedResource(d,(ID3D12Heap*)kh_wrap_real(g,A1(g),WK_HEAP,"CreatePlacedResource: heap"),A2(g),CP(rd,A3(g)),(D3D12_RESOURCE_STATES)(u32)ARG(g,4),CP(cv,ARG(g,5)),iidp(g,ARG(g,6),"CreatePlacedResource"),pp?&out:NULL);
-        atomic_fetch_add(&gfx_resources,1); if(SUCCEEDED(hr)&&A3(g)) kh_gfxc_census_resource(&rd); w_out(g,pp,hr,out,WK_RESOURCE); return 1; }
+        atomic_fetch_add(&gfx_resources,1); if(SUCCEEDED(hr)&&A3(g)) kh_gfxc_census_resource(&rd); w_out(g,pp,hr,out,WK_RESOURCE);
+        if(kh_cut_enabled&&out){ D3D12_RESOURCE_DESC actual=ID3D12Resource_GetDesc((ID3D12Resource*)out); cut_resource(out,&actual,ARG(g,4)); }
+        return 1; }
     case 31: { u64 ph=ARG(g,5); HANDLE h=NULL;                                   /* CreateSharedHandle(object, attributes, access, name, *handle) */
         if(A2(g)) kh_fatal(g,"gfx-wrap-security-attributes: ID3D12Device::CreateSharedHandle with SECURITY_ATTRIBUTES at 0x%llx: the structure embeds a pointer and vkd3d's headers do not define it; not translated",P(A2(g)));
         HRESULT hr=ID3D12Device_CreateSharedHandle(d,(ID3D12DeviceChild*)kh_wrap_real(g,A1(g),-1,"CreateSharedHandle: object"),NULL,(DWORD)A3(g),ARG(g,4)?(const WCHAR*)hp(g,ARG(g,4)):NULL,ph?&h:NULL);
@@ -430,7 +703,9 @@ static int w_dev(KCtx *g,ID3D12Device *d,int s){
         if(L) memcpy(hp(g,pl),L,sizeof *L*(size_t)num); if(R) memcpy(hp(g,pr),R,4ull*num); if(RS) memcpy(hp(g,prs),RS,8ull*num); if(pt) wr64(g,pt,total);
         wx_done(&x); return 1; }
     case 39: { D3D12_QUERY_HEAP_DESC qd; u64 pp=A3(g); void *out=NULL;           /* CreateQueryHeap(desc, riid, **pp) */
-        HRESULT hr=ID3D12Device_CreateQueryHeap(d,CP(qd,A1(g)),iidp(g,A2(g),"CreateQueryHeap"),pp?&out:NULL); w_out(g,pp,hr,out,WK_QHEAP); return 1; }
+        HRESULT hr=ID3D12Device_CreateQueryHeap(d,CP(qd,A1(g)),iidp(g,A2(g),"CreateQueryHeap"),pp?&out:NULL); w_out(g,pp,hr,out,WK_QHEAP);
+        if(kh_cut_enabled&&out) make_query_buffer(g,d,out,&qd);
+        return 1; }
     }
     return 0;
 }
@@ -443,7 +718,14 @@ static int w_queue(KCtx *g,ID3D12CommandQueue *q,int s){
     case 10: { u32 n=(u32)A1(g); WX x; wx_init(&x,g);                            /* ExecuteCommandLists(count, lists) */
         ID3D12CommandList *const *ls=(ID3D12CommandList*const*)x_ifaces(&x,A2(g),n,WK_LIST,"ExecuteCommandLists");
         kh_gfx_gate_enter("game queue: ID3D12CommandQueue::ExecuteCommandLists"); kh_gfx_gate_assert_admitted("game queue: ID3D12CommandQueue::ExecuteCommandLists");
-        ID3D12CommandQueue_ExecuteCommandLists(q,n,ls); kh_gfx_gate_leave();
+        if(kh_cut_enabled){
+            pthread_mutex_lock(&cut_submit_lock);
+            cut_submit(n,ls);
+            for(UINT i=0;i<n;i++) ((ID3D12CommandList**)ls)[i]=cut_backing(ls[i]);
+        }
+        ID3D12CommandQueue_ExecuteCommandLists(q,n,ls);
+        if(kh_cut_enabled) pthread_mutex_unlock(&cut_submit_lock);
+        kh_gfx_gate_leave();
         wx_done(&x); atomic_fetch_add(&gfx_execs,1); qreg_count(q,0); return 1; }
     case 14: { ID3D12Fence *f=(ID3D12Fence*)kh_wrap_real(g,A1(g),WK_FENCE,"ID3D12CommandQueue::Signal");
         kh_gfx_gate_enter("game queue: ID3D12CommandQueue::Signal"); kh_gfx_gate_assert_admitted("game queue: ID3D12CommandQueue::Signal");
@@ -458,14 +740,56 @@ static int w_queue(KCtx *g,ID3D12CommandQueue *q,int s){
     }
     return 0;
 }
-static int w_alloc(KCtx *g,ID3D12CommandAllocator *a,int s){ if(s==8){ SET_RAX(g,(u32)ID3D12CommandAllocator_Reset(a)); return 1; } return 0; }
-static int w_list(KCtx *g,ID3D12GraphicsCommandList *l,int s){
+static int w_alloc(KCtx *g,ID3D12CommandAllocator *a,int s){
+    if(s!=8) return 0;
+    if(kh_cut_enabled&&gpu_epoch){
+        pthread_mutex_lock(&wm); WEnt *e=wt_find(a);
+        if(e->epoch!=gpu_epoch){
+            ID3D12Device *dev=NULL; ID3D12CommandAllocator *next=NULL;
+            HRESULT hr=ID3D12CommandAllocator_GetDevice(a,&IID_ID3D12Device,(void**)&dev);
+            if(SUCCEEDED(hr)) hr=ID3D12Device_CreateCommandAllocator(dev,e->type,&IID_ID3D12CommandAllocator,(void**)&next);
+            if(dev) ID3D12Device_Release(dev);
+            if(SUCCEEDED(hr)){
+                if(e->backing) IUnknown_Release(e->backing);
+                e->backing=(IUnknown*)next; e->epoch=gpu_epoch;
+            }
+            pthread_mutex_unlock(&wm); SET_RAX(g,(u32)hr); return 1;
+        }
+        pthread_mutex_unlock(&wm); a=cut_backing(a);
+    }
+    SET_RAX(g,(u32)ID3D12CommandAllocator_Reset(a)); return 1;
+}
+static int w_list(KCtx *g,ID3D12GraphicsCommandList *canonical,int s){
+    ID3D12GraphicsCommandList *l=cut_backing(canonical);
+    if(kh_cut_enabled&&s!=8){
+        pthread_mutex_lock(&wm); wt_find(canonical)->list_revision=++gpu_revision; pthread_mutex_unlock(&wm);
+    }
     switch(s){
     case 8: SET_RAX(g,(u32)ID3D12GraphicsCommandList_GetType(l)); return 1;
-    case 9: SET_RAX(g,(u32)ID3D12GraphicsCommandList_Close(l)); return 1;
-    case 10: { HRESULT hr=ID3D12GraphicsCommandList_Reset(l,(ID3D12CommandAllocator*)kh_wrap_real(g,A1(g),WK_ALLOCATOR,"ID3D12GraphicsCommandList::Reset: allocator"),
-                                                          (ID3D12PipelineState*)kh_wrap_real(g,A2(g),WK_PSO,"ID3D12GraphicsCommandList::Reset: initial pipeline state"));
-        if(SUCCEEDED(hr)) kh_gfxc_track_reset(g,U(l)); SET_RAX(g,(u32)hr); return 1; }
+    case 9: { HRESULT hr=ID3D12GraphicsCommandList_Close(l);
+        if(kh_cut_enabled&&SUCCEEDED(hr)){ pthread_mutex_lock(&wm); wt_find(canonical)->list_open=0; pthread_mutex_unlock(&wm); }
+        SET_RAX(g,(u32)hr); return 1; }
+    case 10: {
+        ID3D12CommandAllocator *a=cut_backing(kh_wrap_real(g,A1(g),WK_ALLOCATOR,"Reset: allocator"));
+        ID3D12PipelineState *p=kh_wrap_real(g,A2(g),WK_PSO,"Reset: pipeline");
+        HRESULT hr;
+        if(kh_cut_enabled) pthread_mutex_lock(&wm);
+        WEnt *e=kh_cut_enabled?wt_find(canonical):NULL;
+        if(e&&gpu_epoch!=e->epoch&&!e->list_open){
+            ID3D12Device *dev=NULL; ID3D12GraphicsCommandList *next=NULL;
+            hr=ID3D12GraphicsCommandList_GetDevice(l,&IID_ID3D12Device,(void**)&dev);
+            if(SUCCEEDED(hr)) hr=ID3D12Device_CreateCommandList(dev,0,ID3D12GraphicsCommandList_GetType(l),a,p,&IID_ID3D12GraphicsCommandList,(void**)&next);
+            if(dev) ID3D12Device_Release(dev);
+            if(SUCCEEDED(hr)){
+                kh_gfxc_track_drop(U(l));
+                if(e->backing) IUnknown_Release(e->backing);
+                l=next; e->backing=(IUnknown*)next; e->epoch=gpu_epoch;
+            }
+        }else hr=ID3D12GraphicsCommandList_Reset(l,a,p);
+        if(e&&SUCCEEDED(hr)){ e->nbar=0; e->list_open=1; }
+        if(kh_cut_enabled) pthread_mutex_unlock(&wm);
+        if(SUCCEEDED(hr)) kh_gfxc_track_reset(g,U(l));
+        SET_RAX(g,(u32)hr); return 1; }
     case 11: ID3D12GraphicsCommandList_ClearState(l,(ID3D12PipelineState*)kh_wrap_real(g,A1(g),WK_PSO,"ClearState")); return 1;
     case 12: ID3D12GraphicsCommandList_DrawInstanced(l,(UINT)A1(g),(UINT)A2(g),(UINT)A3(g),(UINT)ARG(g,4)); atomic_fetch_add(&gfx_draws,1); return 1;
     case 13: ID3D12GraphicsCommandList_DrawIndexedInstanced(l,(UINT)A1(g),(UINT)A2(g),(UINT)A3(g),(INT)ARG(g,4),(UINT)ARG(g,5)); atomic_fetch_add(&gfx_draws,1); return 1;
@@ -483,6 +807,7 @@ static int w_list(KCtx *g,ID3D12GraphicsCommandList *l,int s){
     case 24: ID3D12GraphicsCommandList_OMSetStencilRef(l,(UINT)A1(g)); return 1;
     case 25: ID3D12GraphicsCommandList_SetPipelineState(l,(ID3D12PipelineState*)kh_wrap_real(g,A1(g),WK_PSO,"SetPipelineState")); atomic_fetch_add(&gfx_pso_binds,1); return 1;
     case 26: { u32 n=(u32)A1(g); WX x; wx_init(&x,g); D3D12_RESOURCE_BARRIER *b=x_barriers(&x,A2(g),n);                /* ResourceBarrier(count, barriers) */
+        if(kh_cut_enabled) cut_barriers(canonical,n,b);
         ID3D12GraphicsCommandList_ResourceBarrier(l,n,b); atomic_fetch_add(&gfx_barriers,n); kh_gfxc_census_barriers(b,n); wx_done(&x); return 1; }
     case 27: kh_gfxc_bundle_replay(g,l,A1(g)); return 1;                          /* ExecuteBundle: the recording is replayed here (vkd3d has no bundles) */
     case 28: { u32 n=(u32)A1(g); WX x; wx_init(&x,g); void **h=x_ifaces(&x,A2(g),n,WK_DHEAP,"SetDescriptorHeaps");      /* SetDescriptorHeaps(count, heaps) */
@@ -503,8 +828,23 @@ static int w_list(KCtx *g,ID3D12GraphicsCommandList *l,int s){
         if(!A2(g)) kh_fatal(g,"gfx-wrap-desc: ClearRenderTargetView without a colour"); memcpy(col,hp(g,A2(g)),16);
         ID3D12GraphicsCommandList_ClearRenderTargetView(l,cpuh(A1(g)),col,nr,x_copy(&x,ARG(g,4),sizeof(D3D12_RECT)*(size_t)nr)); wx_done(&x); atomic_fetch_add(&gfx_clears,1); return 1; }
     case 52: ID3D12GraphicsCommandList_BeginQuery(l,(ID3D12QueryHeap*)kh_wrap_real(g,A1(g),WK_QHEAP,"BeginQuery"),(D3D12_QUERY_TYPE)(u32)A2(g),(UINT)A3(g)); return 1;
-    case 53: ID3D12GraphicsCommandList_EndQuery(l,(ID3D12QueryHeap*)kh_wrap_real(g,A1(g),WK_QHEAP,"EndQuery"),(D3D12_QUERY_TYPE)(u32)A2(g),(UINT)A3(g)); return 1;
-    case 54: ID3D12GraphicsCommandList_ResolveQueryData(l,(ID3D12QueryHeap*)kh_wrap_real(g,A1(g),WK_QHEAP,"ResolveQueryData"),(D3D12_QUERY_TYPE)(u32)A2(g),(UINT)A3(g),(UINT)ARG(g,4),RES(ARG(g,5),"ResolveQueryData: destination"),ARG(g,6)); return 1;
+    case 53: {
+        ID3D12QueryHeap *q=kh_wrap_real(g,A1(g),WK_QHEAP,"EndQuery");
+        UINT idx=(UINT)A3(g);
+        ID3D12GraphicsCommandList_EndQuery(l,q,(D3D12_QUERY_TYPE)A2(g),idx);
+        ID3D12Resource *r=kh_cut_enabled?query_buffer(q):NULL;
+        if(r) ID3D12GraphicsCommandList_ResolveQueryData(l,q,(D3D12_QUERY_TYPE)A2(g),idx,1,r,8ull*idx);
+        return 1; }
+    case 54: {
+        ID3D12QueryHeap *q=kh_wrap_real(g,A1(g),WK_QHEAP,"ResolveQueryData");
+        ID3D12Resource *dst=RES(ARG(g,5),"ResolveQueryData: destination");
+        ID3D12Resource *r=kh_cut_enabled?query_buffer(q):NULL;
+        if(r){
+            cut_transition(l,r,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+            ID3D12GraphicsCommandList_CopyBufferRegion(l,dst,ARG(g,6),r,8ull*(UINT)A3(g),8ull*(UINT)ARG(g,4));
+            cut_transition(l,r,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+        }else ID3D12GraphicsCommandList_ResolveQueryData(l,q,(D3D12_QUERY_TYPE)A2(g),(UINT)A3(g),(UINT)ARG(g,4),dst,ARG(g,6));
+        return 1; }
     }
     return 0;
 }
@@ -513,8 +853,10 @@ static int w_res(KCtx *g,ID3D12Resource *r,int s){
     case 8: { D3D12_RANGE rg; void *p=NULL; u64 pp=A3(g);                         /* Map(subresource, read range, **data): the game gets host - bias */
         HRESULT hr=ID3D12Resource_Map(r,(UINT)A1(g),CP(rg,A2(g)),pp?&p:NULL);
         if(pp) wr64(g,pp,SUCCEEDED(hr)?host_to_guest(g,p,"ID3D12Resource::Map"):0);
+        if(kh_cut_enabled&&SUCCEEDED(hr)){ pthread_mutex_lock(&wm); wt_find(r)->maps++; pthread_mutex_unlock(&wm); }
         atomic_fetch_add(&n_maps,1); SET_RAX(g,(u32)hr); return 1; }
-    case 9: { D3D12_RANGE rg; ID3D12Resource_Unmap(r,(UINT)A1(g),CP(rg,A2(g))); return 1; }
+    case 9: { D3D12_RANGE rg; ID3D12Resource_Unmap(r,(UINT)A1(g),CP(rg,A2(g)));
+        if(kh_cut_enabled){ pthread_mutex_lock(&wm); WEnt *e=wt_find(r); if(e->maps) e->maps--; pthread_mutex_unlock(&wm); } return 1; }
     case 10: { u64 ret=A1(g); D3D12_RESOURCE_DESC d=ID3D12Resource_GetDesc(r); memcpy(hp(g,ret),&d,sizeof d); SET_RAX(g,ret); return 1; }     /* struct result through the hidden pointer */
     case 11: SET_RAX(g,ID3D12Resource_GetGPUVirtualAddress(r)); return 1;
     case 12: { D3D12_BOX box; SET_RAX(g,(u32)ID3D12Resource_WriteToSubresource(r,(UINT)A1(g),CP(box,A2(g)),A3(g)?hp(g,A3(g)):NULL,(UINT)ARG(g,4),(UINT)ARG(g,5))); return 1; }
@@ -536,7 +878,10 @@ static int w_dheap(KCtx *g,ID3D12DescriptorHeap *h,int s){
 static int w_fence(KCtx *g,ID3D12Fence *f,int s){
     switch(s){
     case 8: SET_RAX(g,ID3D12Fence_GetCompletedValue(f)); return 1;
-    case 9: SET_RAX(g,(u32)ID3D12Fence_SetEventOnCompletion(f,A1(g),(HANDLE)(uintptr_t)A2(g))); return 1;     /* the HANDLE is an id of OUR handle table (pfn_signal_event) */
+    case 9: {
+        HRESULT hr=ID3D12Fence_SetEventOnCompletion(f,A1(g),(HANDLE)(uintptr_t)A2(g));
+        if(kh_cut_enabled&&SUCCEEDED(hr)&&A2(g)){ pthread_mutex_lock(&wm); WEnt *e=wt_find(f); if(e->event_target<A1(g)) e->event_target=A1(g); pthread_mutex_unlock(&wm); }
+        SET_RAX(g,(u32)hr); return 1; }     /* the HANDLE is an id of OUR handle table (pfn_signal_event) */
     case 10: { /* TASK36 / TASK41: a CPU signal can make vkd3d submit the queued work of a blocked queue (plan fact 11): while a queue may
                 * be blocked it is an ADMISSION (waits while the gate is set, holds quiesce while it runs); otherwise it is not gated */
         int adm=kh_gfx_gate_enter_if_may_block("game: ID3D12Fence::Signal (a queue may be blocked)");
@@ -562,7 +907,11 @@ static int w_call(KCtx *g,u64 o,int s,int kind){
     if(__builtin_expect(kh_native_trace,0)) fprintf(stderr,"kh: wrap t%u %s::%s(%llx [real %p], %llx, %llx, %llx | %llx, %llx, %llx, %llx)\n",cur_thread()?cur_thread()->tid:0,wk[kind].iface,mname(kind,s),P(o),r,
                                                     P(A1(g)),P(A2(g)),P(A3(g)),P(ARG(g,4)),P(ARG(g,5)),P(ARG(g,6)),P(ARG(g,7)));
     if(s<3) w_unknown(g,o,r,kind,s);
-    else if(kind!=WK_BLOB&&s<8&&w_object(g,r,kind,s)){ }
+    else if(kind!=WK_BLOB&&s<8&&w_object(g,r,kind,s)){
+        if(kh_cut_enabled&&(s==4||s==5)&&SUCCEEDED((HRESULT)KH_RAX(g))){
+            pthread_mutex_lock(&wm); wt_find(r)->private_revision=++gpu_revision; pthread_mutex_unlock(&wm);
+        }
+    }
     else switch(kind){
         case WK_DEVICE: ok=w_dev(g,(ID3D12Device*)r,s); break;
         case WK_QUEUE: ok=w_queue(g,(ID3D12CommandQueue*)r,s); break;
@@ -652,6 +1001,285 @@ int kh_gfx_queues_drain(unsigned slices,unsigned slice_ms,KhDrainResult *r){
     for(int i=0;i<n;i++){ if(fs[i]) ID3D12Fence_Release(fs[i]); kh_wrap_release_real(drain_g,qs[i]); }
     return r->drained==r->queues;
 }
+/* Captured with guest workers parked and the lifecycle gate set.
+ * Slot copies are private COM resources, never handed to the guest. */
+struct CutResource {
+    ID3D12Resource *resource, *copy;
+
+    size_t size;
+    void *mapped;
+    D3D12_RESOURCE_STATES state,*sub;
+    UINT nsub;
+    int inactive,private_resource;
+};
+struct KhGpuCut {
+    struct CutResource *res;
+    size_t count;
+    KhRecords cpu;
+    struct KhSwapGeneration *swap;
+    ID3D12Resource *buffers[3];
+    ID3D12Device *device;
+    ID3D12CommandQueue *queue;
+    ID3D12CommandAllocator *alloc;
+    ID3D12GraphicsCommandList *list;
+    size_t nobjects;
+    WEnt *objects;
+    u64 made[WK_N],dead[WK_N];
+};
+static void *cut_dup(const void *p,size_t n){
+    if(!p||!n) return NULL;
+    void *out=malloc(n);
+    if(!out) kh_fatal(NULL,"savestate-gpu-slot-memory");
+    memcpy(out,p,n); return out;
+}
+static void save_objects(struct KhGpuCut *c){
+    c->objects=calloc(wt_n,sizeof *c->objects);
+    if(!c->objects) kh_fatal(NULL,"savestate-gpu-slot-memory");
+    for(u32 i=0;i<wt_cap;i++){
+        WEnt *e=wt+i;
+        if(!e->obj) continue;
+        WEnt *s=&c->objects[c->nobjects++];
+        *s=*e;
+        s->sub=cut_dup(e->sub,e->nsub*sizeof *e->sub);
+        s->views=copy_views(e->views);
+        s->barriers=cut_dup(e->barriers,e->nbar*sizeof *e->barriers);
+        s->capacity=s->nbar;
+        if(e->query_buffer) ID3D12Resource_AddRef(e->query_buffer);
+        if(e->backing) IUnknown_AddRef(e->backing);
+        IUnknown_AddRef((IUnknown*)e->real); e->pins++;
+    }
+    gpu_epoch++;
+}
+static void restore_objects(struct KhGpuCut *c){
+    /* Change the guest's own references only. Driver references, slot pins
+     * and the swap chain's references have independent lifetimes. */
+    void **present=calloc(wt_n,sizeof *present);
+    if(!present) kh_fatal(NULL,"savestate-gpu-slot-memory");
+    size_t n=0;
+    for(u32 i=0;i<wt_cap;i++) if(wt[i].obj) present[n++]=wt[i].real;
+    for(size_t i=0;i<n;i++){
+        WEnt *e=wt_find(present[i]),*s=NULL;
+        for(size_t j=0;j<c->nobjects;j++) if(c->objects[j].real==e->real){ s=c->objects+j; break; }
+        unsigned wanted=s?s->owned:0;
+        while(e->owned>wanted){ IUnknown_Release((IUnknown*)e->real); e->owned--; }
+        if(!s) forget_entry(e);
+    }
+    free(present);
+    for(size_t j=0;j<c->nobjects;j++){
+        WEnt *s=c->objects+j,*e=wt_find(s->real);
+        if(!e||!e->pins) kh_fatal(NULL,"savestate-gpu-pin");
+        while(e->owned<s->owned){ IUnknown_AddRef((IUnknown*)e->real); e->owned++; }
+        if(s->kind==WK_RESOURCE){
+            ID3D12Resource *res=s->real;
+            while(e->maps>s->maps){ D3D12_RANGE none={0,0}; ID3D12Resource_Unmap(res,0,&none); e->maps--; }
+            while(e->maps<s->maps){ void *p; if(FAILED(ID3D12Resource_Map(res,0,NULL,&p))) kh_fatal(NULL,"savestate-gpu-remap"); e->maps++; }
+        }
+        unsigned pins=e->pins;
+        /* Keep the current image states until the restore copy has run. */
+        D3D12_RESOURCE_STATES state=e->state,*sub=e->sub;
+        int inactive=e->inactive;
+        if(e->query_buffer) ID3D12Resource_Release(e->query_buffer);
+        if(e->backing) IUnknown_Release(e->backing);
+        for(const struct CutView *v=e->views;v;v=v->next){
+            const struct CutView *saved=s->views;
+            while(saved&&saved->handle!=v->handle) saved=saved->next;
+            if(!saved) clear_view(c->device,e->view_type,v->handle);
+        }
+        free_views(e->views); free(e->barriers);
+        *e=*s; e->pins=pins; e->state=state; e->sub=sub; e->inactive=inactive;
+        if(e->query_buffer) ID3D12Resource_AddRef(e->query_buffer);
+        if(e->backing) IUnknown_AddRef(e->backing);
+        e->views=copy_views(s->views);
+        e->barriers=cut_dup(s->barriers,s->nbar*sizeof *s->barriers);
+    }
+    for(size_t i=0;i<c->nobjects;i++) restore_views(c->device,c->objects[i].view_type,c->objects[i].views);
+    gpu_epoch++;
+}
+void kh_gpu_cut_free(struct KhGpuCut *c){
+    if(!c) return;
+    if(c->list) ID3D12GraphicsCommandList_Release(c->list);
+    if(c->alloc) ID3D12CommandAllocator_Release(c->alloc);
+    for(size_t i=0;i<c->count;i++){
+        struct CutResource *r=c->res+i;
+        if(r->mapped){ D3D12_RANGE none={0,0}; ID3D12Resource_Unmap(r->resource,0,&none); }
+        if(r->copy) ID3D12Resource_Release(r->copy);
+        free(r->sub);
+    }
+    pthread_mutex_lock(&wm);
+    for(size_t i=0;i<c->nobjects;i++){
+        WEnt *s=c->objects+i,*e=wt_find(s->real);
+        if(!e||!e->pins) kh_fatal(NULL,"savestate-gpu-pin");
+        if(s->query_buffer) ID3D12Resource_Release(s->query_buffer);
+        if(s->backing) IUnknown_Release(s->backing);
+        IUnknown_Release((IUnknown*)s->real);
+        if(!--e->pins&&!e->obj){ free(e->sub); free_views(e->views); wt_del(e); }
+        free_views(s->views); free(s->barriers); free(s->sub);
+    }
+    pthread_mutex_unlock(&wm);
+    kh_swap_generation_drop(c->swap);
+    free(c->objects);
+    free(c->res); kh_records_free(&c->cpu); free(c);
+}
+static const char *cut_prepare(struct KhGpuCut *c){
+    for(u32 i=0;i<wt_cap;i++){
+        WEnt *e=wt+i;
+        if(!e->obj) continue;
+        if(e->kind==WK_DEVICE) c->device=e->real;
+        if(e->kind==WK_QUEUE&&ID3D12CommandQueue_GetDesc((ID3D12CommandQueue*)e->real).Type==D3D12_COMMAND_LIST_TYPE_DIRECT)
+            c->queue=e->real;
+    }
+    if(!c->device||!c->queue) return "savestate-gpu-direct-queue";
+    c->swap=kh_swap_capture(c->buffers);
+    if(!c->swap) return "savestate-gpu-swapchain-set";
+    c->res=calloc(wt_n+3,sizeof *c->res);
+    if(!c->res) return "savestate-gpu-slot-memory";
+    if(FAILED(ID3D12Device_CreateCommandAllocator(c->device,D3D12_COMMAND_LIST_TYPE_DIRECT,&IID_ID3D12CommandAllocator,(void**)&c->alloc))||
+       FAILED(ID3D12Device_CreateCommandList(c->device,0,D3D12_COMMAND_LIST_TYPE_DIRECT,c->alloc,NULL,&IID_ID3D12GraphicsCommandList,(void**)&c->list)))
+        return "savestate-gpu-copy-list";
+    for(u32 i=0;i<wt_cap+3;i++){
+        struct CutResource *r=c->res+c->count;
+        if(i>=wt_cap){
+            r->resource=c->buffers[i-wt_cap];
+            WEnt *wrapped=wt_find(r->resource);
+            if(wrapped&&wrapped->obj) continue;
+            r->private_resource=1; r->state=D3D12_RESOURCE_STATE_PRESENT;
+        }else{
+            WEnt *e=wt+i;
+            if(!e->obj||(e->kind!=WK_RESOURCE&&e->kind!=WK_QHEAP)) continue;
+            if(e->kind==WK_QHEAP&&!e->query_buffer) return "savestate-gpu-query-type";
+            r->resource=e->real; r->state=e->state; r->inactive=e->inactive; r->nsub=e->nsub;
+            if(e->query_buffer){ r->private_resource=1; r->resource=e->query_buffer; r->state=D3D12_RESOURCE_STATE_COPY_DEST; }
+            r->sub=cut_dup(e->sub,e->nsub*sizeof *e->sub);
+        }
+        c->count++;
+        D3D12_RESOURCE_DESC d=ID3D12Resource_GetDesc(r->resource);
+        D3D12_HEAP_PROPERTIES h; D3D12_HEAP_FLAGS flags;
+        if(FAILED(ID3D12Resource_GetHeapProperties(r->resource,&h,&flags))) return "savestate-gpu-heap-properties";
+        if(h.Type==D3D12_HEAP_TYPE_UPLOAD||h.Type==D3D12_HEAP_TYPE_READBACK){
+            if(d.Dimension!=D3D12_RESOURCE_DIMENSION_BUFFER) return "savestate-gpu-mapped-image";
+            r->size=d.Width;
+            if(FAILED(ID3D12Resource_Map(r->resource,0,NULL,&r->mapped))||!r->mapped) return "savestate-gpu-map";
+            /* Keep the address embedded in guest memory stable across the branch. */
+        }else if(h.Type==D3D12_HEAP_TYPE_DEFAULT){
+            if(!r->inactive&&FAILED(ID3D12Device_CreateCommittedResource(c->device,&h,D3D12_HEAP_FLAG_NONE,&d,
+                    D3D12_RESOURCE_STATE_COPY_DEST,NULL,&IID_ID3D12Resource,(void**)&r->copy))) return "savestate-gpu-resource-copy";
+        }else return "savestate-gpu-heap-type";
+    }
+    return NULL;
+}
+const char *kh_gpu_cut_check(struct KhGpuCut **slot,int load){
+    if(!kh_gfx_vkd3d_on) return NULL;
+    KhDrainResult drained;
+    if(kh_gfx_gate_quiesce_bounded(120,25)!=KH_GATE_QUIESCED) return "savestate-gpu-admission";
+    if(!kh_gfx_queues_drain(120,25,&drained)) return "savestate-gpu-drain";
+    unsigned np=0,left=0;
+    if(!kh_present_quiesce_all_bounded(120,25,&np,&left)) return "savestate-gpu-presenter";
+    for(u32 i=0;i<wt_cap;i++) if(wt[i].obj&&wt[i].kind==WK_FENCE&&wt[i].event_target){
+        if(ID3D12Fence_GetCompletedValue((ID3D12Fence*)wt[i].real)<wt[i].event_target) return "savestate-gpu-pending-fence-event";
+        wt[i].event_target=0;
+    }
+    struct KhGpuCut *c=*slot;
+    if(!load){
+        *slot=c=calloc(1,sizeof *c);
+        if(!c) return "savestate-gpu-slot-memory";
+    }
+    for(unsigned k=0;k<WK_N;k++){
+        if(!load){ c->made[k]=n_made[k]; c->dead[k]=n_dead[k]; }
+        else if((k==WK_DEVICE||k==WK_QUEUE)&&(c->made[k]!=n_made[k]||c->dead[k]!=n_dead[k])){
+            fprintf(stderr,"kh: savestate-gpu-wrapper-set: %s made %llu -> %llu, released %llu -> %llu\n",
+                wk[k].iface,P(c->made[k]),P(n_made[k]),P(c->dead[k]),P(n_dead[k]));
+            return "savestate-gpu-wrapper-set";
+        }
+    }
+    if(load&&!kh_swap_compatible(c->swap)) return "savestate-gpu-swapchain-set";
+    if(load) for(size_t i=0;i<c->nobjects;i++){
+        WEnt *s=c->objects+i,*e=wt_find(s->real);
+        if(!e||s->private_revision!=e->private_revision) return "savestate-gpu-private-data-changed";
+        if(s->list_open&&s->list_revision!=e->list_revision) return "savestate-gpu-open-list-changed";
+    }
+    if(load) return NULL;
+    save_objects(c);
+    return cut_prepare(c);
+}
+static void cut_transition(ID3D12GraphicsCommandList *l,ID3D12Resource *r,D3D12_RESOURCE_STATES before,
+                           D3D12_RESOURCE_STATES after,UINT sub){
+    if(before==after) return;
+    D3D12_RESOURCE_BARRIER b={0}; b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource=r; b.Transition.Subresource=sub;
+    b.Transition.StateBefore=before; b.Transition.StateAfter=after;
+    ID3D12GraphicsCommandList_ResourceBarrier(l,1,&b);
+}
+static void cut_states(ID3D12GraphicsCommandList *l,ID3D12Resource *r,D3D12_RESOURCE_STATES base,
+                       D3D12_RESOURCE_STATES *sub,UINT n,D3D12_RESOURCE_STATES copy,int finish){
+    for(UINT i=0;i<(sub?n:1);i++){
+        D3D12_RESOURCE_STATES state=sub?sub[i]:base;
+        cut_transition(l,r,finish?copy:state,finish?state:copy,sub?i:D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+    }
+}
+static void copy_cut_resource(ID3D12GraphicsCommandList *list,struct CutResource *r,WEnt *e,int load){
+    if(load&&!r->private_resource&&e->inactive){
+        D3D12_RESOURCE_BARRIER alias={.Type=D3D12_RESOURCE_BARRIER_TYPE_ALIASING};
+        alias.Aliasing.pResourceAfter=r->resource;
+        ID3D12GraphicsCommandList_ResourceBarrier(list,1,&alias);
+    }
+    D3D12_RESOURCE_STATES use=load?D3D12_RESOURCE_STATE_COPY_DEST:D3D12_RESOURCE_STATE_COPY_SOURCE;
+    cut_states(list,r->resource,r->private_resource?r->state:e->state,r->private_resource?NULL:e->sub,r->private_resource?0:e->nsub,use,0);
+    ID3D12GraphicsCommandList_CopyResource(list,load?r->resource:r->copy,load?r->copy:r->resource);
+    cut_states(list,r->resource,r->state,r->sub,r->nsub,use,1);
+    if(!load) cut_transition(list,r->copy,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES);
+}
+void kh_gpu_cut_apply(struct KhGpuCut *c,int load){
+    if(!c) return;
+    if(load&&(FAILED(ID3D12CommandAllocator_Reset(c->alloc))||FAILED(ID3D12GraphicsCommandList_Reset(c->list,c->alloc,NULL))))
+        kh_fatal(NULL,"savestate-gpu-list-reset");
+    if(load){ restore_objects(c); kh_swap_restore(c->swap); }
+    KhRecords *rec=&c->cpu;
+    kh_records_begin(rec,load);
+    unsigned copies=0,maps=0;
+    size_t bytes=0;
+    for(size_t i=0;i<c->count;i++){
+        struct CutResource *r=c->res+i;
+        WEnt *e=wt_find(r->resource);
+        if(r->size){
+            void *p=NULL;
+            if(FAILED(ID3D12Resource_Map(r->resource,0,NULL,&p))||!p) kh_fatal(NULL,"savestate-gpu-map");
+            if(p!=r->mapped) kh_fatal(NULL,"savestate-gpu-map-address");
+            kh_record_pages(rec,p,r->size);
+            D3D12_RANGE none={0,0};
+            ID3D12Resource_Unmap(r->resource,0,load?NULL:&none);
+            maps++; bytes+=r->size;
+        }else if(r->copy){
+            copy_cut_resource(c->list,r,e,load);
+            copies++;
+        }
+        if(load&&!r->private_resource){
+            e->inactive=r->inactive; e->state=r->state; free(e->sub); e->sub=NULL;
+            if(r->sub){
+                size_t n=r->nsub*sizeof *e->sub; e->sub=malloc(n);
+                if(!e->sub) kh_fatal(NULL,"savestate-gpu-slot-memory");
+                memcpy(e->sub,r->sub,n);
+            }
+        }
+    }
+    if(FAILED(ID3D12GraphicsCommandList_Close(c->list))) kh_fatal(NULL,"savestate-gpu-copy-close");
+    ID3D12CommandList *lists[]={(ID3D12CommandList*)c->list};
+    kh_gfx_gate_enter_drain("checkpoint resource copy");
+    ID3D12CommandQueue_ExecuteCommandLists(c->queue,1,lists);
+    kh_gfx_gate_leave();
+    KhDrainResult done;
+    if(!kh_gfx_queues_drain(200,25,&done)) kh_fatal(NULL,"savestate-gpu-copy-drain");
+    for(size_t k=0;k<c->nobjects;k++) if(c->objects[k].kind==WK_FENCE){
+        ID3D12Fence *f=c->objects[k].real; u64 value=ID3D12Fence_GetCompletedValue(f);
+        KH_RECORD(rec,value);
+        if(load&&FAILED(ID3D12Fence_Signal(f,value))) kh_fatal(NULL,"savestate-gpu-fence-signal");
+    }
+    extern void kh_gfxc_cut_bindings(KhRecords *);
+    kh_gfxc_cut_bindings(rec);
+    kh_records_end(rec);
+    fprintf(stderr,"kh: savestate-gpu-%s copies=%u mapped=%u bytes=%zu drained=%u\n",
+        load?"restore":"capture",copies,maps,bytes,done.drained);
+}
+
 /* ---- report ------------------------------------------------------------------------------------------------------------------------- */
 void kh_wrap_report(FILE *f){
     pthread_mutex_lock(&qreg_m);                                        /* TASK41: only when a suspend drain ran or a queue Wait was made */
@@ -715,8 +1343,82 @@ static int fatal_case(KCtx *g,int which,const char *expect){
  * kh_wrap_serialize_rootsig, then the import's ret), callable here without a device, where the import itself takes the null path */
 static void st_serialize_imp(KCtx *g){ kh_wrap_serialize_rootsig(g); KH_RET(g); }
 /* no device needed: runs in every --selftest of a binary that has the backend */
+/* A CPU fixture with real IUnknown reference semantics. A and B keep different
+ * native identities alive while the guest reuses the same wrapper address. */
+typedef struct { IUnknown iface; ULONG refs; } CutFake;
+static ULONG STDMETHODCALLTYPE cut_fake_add(IUnknown *u){ return ++((CutFake*)u)->refs; }
+static ULONG STDMETHODCALLTYPE cut_fake_release(IUnknown *u){ return --((CutFake*)u)->refs; }
+typedef struct {
+    ID3D12GraphicsCommandList iface;
+    D3D12_RESOURCE_BARRIER barriers[12];
+    unsigned n,copies;
+} CopyFixture;
+static void STDMETHODCALLTYPE fixture_barriers(ID3D12GraphicsCommandList *l,UINT n,const D3D12_RESOURCE_BARRIER *b){
+    CopyFixture *f=(CopyFixture*)l;
+    if(n>12-f->n) kh_fatal(NULL,"savestate-test-barrier-count");
+    memcpy(f->barriers+f->n,b,n*sizeof *b); f->n+=n;
+}
+static void STDMETHODCALLTYPE fixture_copy(ID3D12GraphicsCommandList *l,ID3D12Resource *dst,ID3D12Resource *src){
+    ((CopyFixture*)l)->copies++;
+    memcpy(dst,src,sizeof(u64));
+}
+static void cut_copy_test(void){
+    static const ID3D12GraphicsCommandListVtbl vt={.ResourceBarrier=fixture_barriers,.CopyResource=fixture_copy};
+    CopyFixture f={.iface.lpVtbl=&vt};
+    u64 value=1919,snapshot=0;
+    struct CutResource r={.resource=(ID3D12Resource*)&value,.copy=(ID3D12Resource*)&snapshot,
+        .state=D3D12_RESOURCE_STATE_RENDER_TARGET};
+    WEnt e={.state=r.state};
+    copy_cut_resource(&f.iface,&r,&e,0);
+    T(snapshot==1919&&f.copies==1&&f.n==3);
+    T(f.barriers[2].Transition.pResource==r.copy&&f.barriers[2].Transition.StateAfter==D3D12_RESOURCE_STATE_COPY_SOURCE);
+    value=84; f.n=0; e.state=D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE; e.inactive=1;
+    copy_cut_resource(&f.iface,&r,&e,1);
+    T(value==1919&&snapshot==1919&&f.copies==2&&f.n==3);
+    T(f.barriers[0].Type==D3D12_RESOURCE_BARRIER_TYPE_ALIASING&&f.barriers[0].Aliasing.pResourceAfter==r.resource);
+    T(f.barriers[1].Transition.StateBefore==e.state&&f.barriers[2].Transition.StateAfter==r.state);
+    /* Timestamp shadow buffers stay in COPY_DEST before and after a guest resolve. */
+    r.private_resource=1; r.state=D3D12_RESOURCE_STATE_COPY_DEST; f.n=0;
+    copy_cut_resource(&f.iface,&r,NULL,0);
+    value=63; copy_cut_resource(&f.iface,&r,NULL,1);
+    T(value==1919&&f.n==3);
+}
+static void cut_objects_test(KCtx *g){
+    static const IUnknownVtbl methods={.AddRef=cut_fake_add,.Release=cut_fake_release};
+    CutFake a={{&methods},1},b={{&methods},1},list={{&methods},1};
+    struct KhGpuCut *first=calloc(1,sizeof *first),*second=calloc(1,sizeof *second);
+    if(!first||!second) kh_fatal(g,"savestate-gpu-slot-memory");
+    u64 epoch=gpu_epoch;
+    wt_put(g,&a,16,WK_RESOURCE);
+    wt_put(g,&list,32,WK_LIST);
+    wt_find(&a)->owned=wt_find(&list)->owned=1;
+    wt_find(&a)->nsub=2;
+    D3D12_RESOURCE_BARRIER br={.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION};
+    br.Transition.pResource=(ID3D12Resource*)&a; br.Transition.Subresource=1;
+    br.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_DEST;
+    cut_barriers((ID3D12GraphicsCommandList*)&list,1,&br);
+    T(!wt_find(&a)->sub);
+    ID3D12CommandList *lists[]={(ID3D12CommandList*)&list};
+    cut_submit(1,lists);
+    T(wt_find(&a)->sub&&wt_find(&a)->sub[1]==D3D12_RESOURCE_STATE_COPY_DEST);
+    save_objects(first);
+    T(a.refs==2&&list.refs==2);
+    IUnknown_Release(&a.iface); wt_find(&a)->owned--; forget_entry(wt_find(&a));
+    wt_put(g,&b,16,WK_PSO); wt_find(&b)->owned=1;
+    save_objects(second);
+    restore_objects(first);
+    T(w_lookup(&a)==16&&w_lookup(&b)==0&&a.refs==2&&b.refs==1);
+    T(wt_find(&list)->nbar==1&&wt_find(&list)->barriers[0].Transition.Subresource==1);
+    restore_objects(second);
+    T(w_lookup(&a)==0&&w_lookup(&b)==16&&a.refs==1&&b.refs==2);
+    kh_gpu_cut_free(first); kh_gpu_cut_free(second);
+    T(!wt_find(&a)&&b.refs==1&&list.refs==1);
+    forget_entry(wt_find(&b)); forget_entry(wt_find(&list));
+    gpu_epoch=epoch;
+}
 int kh_wrap_selftest_pure(KCtx *g){
     st_n=st_f=0; kh_gfxc_st_fails=0; kh_wrap_classes();
+    cut_objects_test(g); cut_copy_test();
     SynG s; s.cap=1u<<17; s.used=64; s.mem=malloc(s.cap); if(!s.mem){ fprintf(stderr,"gfx wrap selftest FAIL: out of memory\n"); return 1; } memset(s.mem,0xCD,s.cap);
     WX x; x.bias=(uintptr_t)s.mem-(uintptr_t)SG_BASE; x.g=g; x.synth=1; x.used=0; x.nbig=0; x.chain=NULL;
     T(x.bias!=0); T(x.bias!=(uintptr_t)XL(g,0));

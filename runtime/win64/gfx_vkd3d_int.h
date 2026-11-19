@@ -66,6 +66,13 @@ void kh_gfxc_bundle_replay(KCtx *g,ID3D12GraphicsCommandList *l,u64 bundle);    
 /* ---- the wrapped bridge (gfx_wrap.c) -------------------------------------------------------------------------------------------- */
 enum { WK_DEVICE=0, WK_QUEUE, WK_ALLOCATOR, WK_LIST, WK_RESOURCE, WK_DHEAP, WK_FENCE, WK_PSO, WK_ROOTSIG, WK_HEAP, WK_QHEAP, WK_BLOB, WK_N };
 void  kh_wrap_classes(void);                                                         /* register the wrapper classes (idempotent) */
+struct KhSwapGeneration;
+struct KhSwapGeneration *kh_swap_capture(ID3D12Resource **buffers);
+void kh_swap_restore(struct KhSwapGeneration *);
+int kh_swap_compatible(const struct KhSwapGeneration *);
+void kh_swap_generation_drop(struct KhSwapGeneration *);
+unsigned kh_wrap_buffer_pins(void *);
+void kh_wrap_retire_buffer(KCtx *,void *);
 u64   kh_wrap_obj(KCtx *g,void *real,int kind);                                      /* THE guest object of a real object (made on first use; one per real object) */
 void *kh_wrap_real(KCtx *g,u64 obj,int kind,const char *what);                       /* real pointer behind a guest object (0 -> NULL; anything else that is not such a wrapper: named fatal) */
 u32   kh_wrap_release_real(KCtx *g,void *real);                                      /* the runtime drops ITS reference to a real object that may have a wrapper */

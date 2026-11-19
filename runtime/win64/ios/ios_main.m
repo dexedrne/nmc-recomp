@@ -121,7 +121,7 @@ static BOOL options_input(unsigned short buttons){
             kh_app_resume(KH_APP_RESUME_BOUND_MS);
         }else if((down&0x1000) && kh_setting_action(selected_option)){
             int result=kh_setting_set(kh_options[selected_option].name,option_value(selected_option).UTF8String);
-            if(result==-2) show_options(@"Save states require an interactive null-graphics, frame-clock session.");
+            if(result==-2) show_options(@"Enable KHNMC_SAVESTATE=1 for interactive play with the frames clock and null or WAV audio.");
             else if(result) show_options(@"A command is already queued");
             else show_options(@"Queued. Circle to resume.");
         }else if(down&3){

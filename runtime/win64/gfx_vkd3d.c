@@ -707,6 +707,21 @@ typedef struct { u64 list, rs, heap[2]; u32 set_mask; } LState;                 
 #define MAXRS 32
 #define MAXLISTS 4096
 static RsLayout rsl[MAXRS]; static int nrsl; static LState lst[MAXLISTS]; static int nlst; static pthread_mutex_t lsm=PTHREAD_MUTEX_INITIALIZER;
+static unsigned cut_dumps,cut_pass;
+void kh_gfxc_cut_bindings(KhRecords *r){
+    const char *n=getenv("KHNMC_TEST_SAVESTATE_PICTURES");
+    if(n&&*n){
+        char *end;
+        unsigned long count=strtoul(n,&end,10);
+        if(*end||!count||count>120||!dump_dir[0]) kh_fatal(NULL,"savestate-picture-count: expected 1..120 and a dump directory");
+        cut_dumps=(unsigned)count; cut_pass++;
+    }
+    pthread_mutex_lock(&lsm);
+    KH_RECORD(r,nlst); kh_record(r,lst,nlst*sizeof *lst);
+    KH_RECORD(r,nrsl); kh_record(r,rsl,nrsl*sizeof *rsl);
+    u64 live=n_bundles_live; KH_RECORD(r,live); if(r->loading) n_bundles_live=live;
+    pthread_mutex_unlock(&lsm);
+}
 static LState lstate_get(u64 l){ LState r; memset(&r,0,sizeof r); r.list=l; pthread_mutex_lock(&lsm); for(int i=0;i<nlst;i++) if(lst[i].list==l){ r=lst[i]; break; } pthread_mutex_unlock(&lsm); return r; }
 static void lstate_put(KCtx *g,const LState *st){
     pthread_mutex_lock(&lsm); int i; for(i=0;i<nlst;i++) if(lst[i].list==st->list) break;
@@ -1294,7 +1309,7 @@ void kh_vkd3d_serialize_rootsig(KCtx *g){
  *                                    committed  the old path: vkd3d's committed resources (the presenter cannot read those: named fatal)
  * vkd3d never destroys a wrapped VkImage (resource.c 988-989): at ResizeBuffers the old images are destroyed here, after the reference
  * check, the gate, a fence signalled on the queue and waited for (in slices), and the presenter's own submissions. */
-typedef struct Swap { u64 obj; ID3D12CommandQueue *queue; ID3D12Device *dev; ID3D12Resource *buf[NBUF]; u32 w,h;
+typedef struct Swap { struct KhSwapGeneration *generation; u64 obj; ID3D12CommandQueue *queue; ID3D12Device *dev; ID3D12Resource *buf[NBUF]; u32 w,h;
     ID3D12CommandAllocator *alloc; ID3D12GraphicsCommandList *list; ID3D12Fence *fence; u64 fence_val;
     ID3D12Resource *rb; u64 rb_size; D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp; u8 *seen;
     int bbmode; const KhVk *vk; VkImage img[NBUF]; VkDeviceMemory mem[NBUF]; KhPresenter *pres; } Swap;
@@ -1349,6 +1364,51 @@ static void bb_drain(KCtx *g,Swap *s,const char *why){
 }
 static void bb_info(const Swap *s,KhPresentBuffers *bb){ memset(bb,0,sizeof *bb); bb->w=s->w; bb->h=s->h; bb->n=NBUF; bb->general=s->bbmode==BB_GENERAL; for(int i=0;i<NBUF;i++) bb->image[i]=(u64)(uintptr_t)s->img[i]; }
 
+/* Each generation owns the original D3D objects and the VkImage allocations
+ * wrapped by them. A resize can retire the generation while slots retain it. */
+struct KhSwapGeneration {
+    _Atomic unsigned refs;
+    Swap *owner;
+    Swap buffers;
+};
+static Swap *cut_swap;
+static int multiple_cut_swaps;
+static void remember_buffers(Swap *s){
+    if(!kh_cut_enabled) return;
+    struct KhSwapGeneration *gen=calloc(1,sizeof *gen);
+    if(!gen) kh_fatal(NULL,"savestate-swap-memory");
+    ID3D12Device_AddRef(s->dev);
+    gen->refs=1; gen->owner=s; gen->buffers=*s; s->generation=gen;
+}
+struct KhSwapGeneration *kh_swap_capture(ID3D12Resource **buffers){
+    if(multiple_cut_swaps||!cut_swap||!cut_swap->generation) return NULL;
+    struct KhSwapGeneration *gen=cut_swap->generation;
+    atomic_fetch_add(&gen->refs,1);
+    for(int i=0;i<NBUF;i++) buffers[i]=gen->buffers.buf[i];
+    return gen;
+}
+int kh_swap_compatible(const struct KhSwapGeneration *gen){
+    return !multiple_cut_swaps&&gen&&gen->owner==cut_swap;
+}
+void kh_swap_generation_drop(struct KhSwapGeneration *gen){
+    if(!gen||atomic_fetch_sub(&gen->refs,1)!=1) return;
+    Swap *b=&gen->buffers;
+    for(int i=0;i<NBUF;i++) ID3D12Resource_Release(b->buf[i]);
+    ID3D12Resource_Release(b->rb);
+    if(b->bbmode!=BB_COMMITTED) bb_images_free(b);
+    ID3D12Device_Release(b->dev); free(gen);
+}
+void kh_swap_restore(struct KhSwapGeneration *gen){
+    Swap *s=gen->owner,*b=&gen->buffers;
+    if(s->generation==gen) return;
+    struct KhSwapGeneration *old=s->generation;
+    atomic_fetch_add(&gen->refs,1); s->generation=gen;
+    s->w=b->w; s->h=b->h; s->rb=b->rb; s->rb_size=b->rb_size; s->fp=b->fp;
+    memcpy(s->buf,b->buf,sizeof s->buf); memcpy(s->img,b->img,sizeof s->img); memcpy(s->mem,b->mem,sizeof s->mem);
+    if(s->pres){ KhPresentBuffers bb; bb_info(s,&bb); kh_present_resize(s->pres,&bb); }
+    kh_swap_generation_drop(old);
+}
+
 static void buffers_make(KCtx *g,Swap *s,u32 w,u32 h){
     s->w=w; s->h=h;
     D3D12_HEAP_PROPERTIES def; memset(&def,0,sizeof def); def.Type=D3D12_HEAP_TYPE_DEFAULT;
@@ -1362,6 +1422,7 @@ static void buffers_make(KCtx *g,Swap *s,u32 w,u32 h){
     D3D12_RESOURCE_DESC bd; memset(&bd,0,sizeof bd); bd.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER; bd.Width=total; bd.Height=1; bd.DepthOrArraySize=1; bd.MipLevels=1; bd.SampleDesc.Count=1; bd.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     HRCHK(ID3D12Device_CreateCommittedResource(s->dev,&rbh,D3D12_HEAP_FLAG_NONE,&bd,D3D12_RESOURCE_STATE_COPY_DEST,NULL,&IID_ID3D12Resource,(void**)&s->rb),"CreateCommittedResource(readback buffer)");
     s->rb_size=total;
+    remember_buffers(s);
 }
 /* CreateSwapChainForHwnd(factory, queue, hwnd, desc1, ...) : called by null_d3d12.c after it built the guest object */
 void kh_vkd3d_swap_attach(KCtx *g,u64 sc,u64 queue,u64 desc){
@@ -1376,6 +1437,7 @@ void kh_vkd3d_swap_attach(KCtx *g,u64 sc,u64 queue,u64 desc){
     s->queue=(ID3D12CommandQueue*)rq; ID3D12CommandQueue_AddRef(s->queue);
     HRCHK(ID3D12CommandQueue_GetDevice(s->queue,&IID_ID3D12Device,(void**)&s->dev),"ID3D12CommandQueue::GetDevice");
     s->bbmode=bb_mode_test>=0?bb_mode_test:bb_mode_env;
+    if(kh_cut_enabled){ if(cut_swap&&cut_swap!=s) multiple_cut_swaps=1; cut_swap=s; }
     int pmode=kh_present_mode();
     if(pmode&&s->bbmode==BB_COMMITTED) kh_fatal(g,"gfx-present-needs-own-backbuffers: KHNMC_GFX_PRESENT=%s reads the back buffers as VkImages, which KHNMC_GFX_BACKBUFFERS=committed does not have (use own or general)",pmode==1?"headless":"layer");
     if(s->bbmode!=BB_COMMITTED) s->vk=kh_vk_for(s->dev);
@@ -1402,10 +1464,17 @@ void kh_vkd3d_swap_getbuffer(KCtx *g,u64 o){
 void kh_vkd3d_swap_resize(KCtx *g,u64 o,u32 w,u32 h){
     Swap *s=swap_of(g,o,"ResizeBuffers");
     for(int i=0;i<NBUF;i++){ ID3D12Resource_AddRef(s->buf[i]); ULONG rc=ID3D12Resource_Release(s->buf[i]);
+        if(s->generation) rc-=kh_wrap_buffer_pins(s->buf[i]);
         if(rc!=1){ fprintf(stderr,"kh: gfx vkd3d: ResizeBuffers(%ux%u) refused: back buffer %d still has %u outstanding reference(s) -> DXGI_ERROR_INVALID_CALL\n",w,h,i,(unsigned)rc-1); SET_RAX(g,DXGI_INVALID_CALL); return; } }
-    for(int i=0;i<NBUF;i++){ drop_real(g,s->buf[i]); s->buf[i]=NULL; }                 /* our reference was the last one: a guest object of the buffer dies with it */
-    ID3D12Resource_Release(s->rb); s->rb=NULL;
-    if(s->bbmode!=BB_COMMITTED){ bb_drain(g,s,"ResizeBuffers"); bb_images_free(s); }   /* own images: nothing in flight uses them any more */
+    if(s->generation){
+        bb_drain(g,s,"ResizeBuffers");
+        for(int i=0;i<NBUF;i++) kh_wrap_retire_buffer(g,s->buf[i]);
+        kh_swap_generation_drop(s->generation); s->generation=NULL;
+    }else{
+        for(int i=0;i<NBUF;i++){ drop_real(g,s->buf[i]); s->buf[i]=NULL; }                 /* our reference was the last one: a guest object of the buffer dies with it */
+        ID3D12Resource_Release(s->rb); s->rb=NULL;
+        if(s->bbmode!=BB_COMMITTED){ bb_drain(g,s,"ResizeBuffers"); bb_images_free(s); }   /* own images: nothing in flight uses them any more */
+    }
     buffers_make(g,s,w,h);
     if(s->pres){ KhPresentBuffers bb; bb_info(s,&bb); kh_present_resize(s->pres,&bb); }
     fprintf(stderr,"kh: gfx vkd3d: swap chain 0x%llx resized to %ux%u\n",P(o),w,h);
@@ -1423,11 +1492,20 @@ void kh_vkd3d_test_bbmode(int mode){ bb_mode_test=mode; }
 void kh_vkd3d_swap_test_release(KCtx *g,u64 sc){
     Swap *s=swap_of(g,sc,"swap chain release (selftest)");
     for(int i=0;i<NBUF;i++){ ID3D12Resource_AddRef(s->buf[i]); ULONG rc=ID3D12Resource_Release(s->buf[i]);
+        if(s->generation) rc-=kh_wrap_buffer_pins(s->buf[i]);
         if(rc!=1) kh_fatal(g,"gfx-selftest-swapchain: release of swap chain 0x%llx while back buffer %d still has %u outstanding reference(s)",P(sc),i,(unsigned)rc-1); }
     if(s->pres){ kh_present_teardown(s->pres); s->pres=NULL; }
-    for(int i=0;i<NBUF;i++){ drop_real(g,s->buf[i]); s->buf[i]=NULL; }
-    if(s->bbmode!=BB_COMMITTED){ bb_drain(g,s,"swap chain release"); bb_images_free(s); }
-    ID3D12Resource_Release(s->rb); ID3D12GraphicsCommandList_Release(s->list); ID3D12CommandAllocator_Release(s->alloc); ID3D12Fence_Release(s->fence);
+    if(s->generation){
+        bb_drain(g,s,"swap chain release");
+        for(int i=0;i<NBUF;i++) kh_wrap_retire_buffer(g,s->buf[i]);
+        kh_swap_generation_drop(s->generation);
+        if(cut_swap==s) cut_swap=NULL;
+    }else{
+        for(int i=0;i<NBUF;i++){ drop_real(g,s->buf[i]); s->buf[i]=NULL; }
+        if(s->bbmode!=BB_COMMITTED){ bb_drain(g,s,"swap chain release"); bb_images_free(s); }
+        ID3D12Resource_Release(s->rb);
+    }
+    ID3D12GraphicsCommandList_Release(s->list); ID3D12CommandAllocator_Release(s->alloc); ID3D12Fence_Release(s->fence);
     pthread_mutex_lock(&cen_m); if(cen_dev==s->dev) cen_dev=NULL; pthread_mutex_unlock(&cen_m);   /* TASK38: no census read of a device that may be gone */
     ID3D12Device_Release(s->dev); ID3D12CommandQueue_Release(s->queue); free(s->seen); wr64(g,sc+SW_PTR,0); free(s);
 }
@@ -1492,7 +1570,10 @@ static const u8 *readback(KCtx *g,Swap *s,u32 idx,u64 n,const char *where){
 static void readback_done(Swap *s){ D3D12_RANGE none={0,0}; ID3D12Resource_Unmap(s->rb,0,&none); }
 static void dump_frame(KCtx *g,Swap *s,const u8 *base,u32 idx,u64 n,u64 t0){
     u32 w=s->w,h=s->h,pitch=s->fp.Footprint.RowPitch;
-    char path[1200]; snprintf(path,sizeof path,"%s/frame-%06llu.ppm",dump_dir,P(n));
+    char name[96],path[1200];
+    if(cut_pass) snprintf(name,sizeof name,"cut-%u-frame-%06llu.ppm",cut_pass,P(n));
+    else snprintf(name,sizeof name,"frame-%06llu.ppm",P(n));
+    snprintf(path,sizeof path,"%s/%s",dump_dir,name);
     FILE *f=fopen(path,"wb"); if(!f) kh_fatal(g,"gfx-dump-write: cannot create %s (%s)",path,strerror(errno));
     u8 *row=malloc(3ull*w); if(!s->seen) s->seen=malloc(1u<<21); if(!row||!s->seen) kh_fatal(g,"gfx-dump-write: out of memory");
     memset(s->seen,0,1u<<21);
@@ -1508,7 +1589,7 @@ static void dump_frame(KCtx *g,Swap *s,const u8 *base,u32 idx,u64 n,u64 t0){
     char idx_path[1200]; snprintf(idx_path,sizeof idx_path,"%s/index.tsv",dump_dir);
     FILE *ix=fopen(idx_path,"a"); if(!ix) kh_fatal(g,"gfx-dump-write: cannot append %s (%s)",idx_path,strerror(errno));
     if(ftell(ix)==0) fprintf(ix,"present\tfile\twidth\theight\tnonblack_pct\tmean_r\tmean_g\tmean_b\tmean_a\tdistinct_rgb\tdraws_total\tgame_frame\tvblank\n");
-    fprintf(ix,"%llu\tframe-%06llu.ppm\t%u\t%u\t%.3f\t%.2f\t%.2f\t%.2f\t%.2f\t%llu\t%llu\t%llu\t%llu\n",P(n),P(n),w,h,100.0*nonblack/px,sr/px,sg/px,sb/px,sa/px,P(distinct),P(gfx_draws),P(kh_input_game_frames()),P(kh_vclock_on?kh_vclock_vblanks():0));
+    fprintf(ix,"%llu\t%s\t%u\t%u\t%.3f\t%.2f\t%.2f\t%.2f\t%.2f\t%llu\t%llu\t%llu\t%llu\n",P(n),name,w,h,100.0*nonblack/px,sr/px,sg/px,sb/px,sa/px,P(distinct),P(gfx_draws),P(kh_input_game_frames()),P(kh_vclock_on?kh_vclock_vblanks():0));
     if(fclose(ix)) kh_fatal(g,"gfx-dump-write: closing %s failed (%s)",idx_path,strerror(errno));
     atomic_fetch_add(&dumps_written,1);
     fprintf(stderr,"kh: gfx dump present=%llu back-buffer=%u file=%s %ux%u non-black=%.2f%% mean-rgb=(%.1f,%.1f,%.1f) mean-a=%.1f distinct-rgb=%llu readback-ms=%.1f\n",P(n),idx,path,w,h,100.0*nonblack/px,sr/px,sg/px,sb/px,sa/px,P(distinct),(kh_host_ns()-t0)/1e6);
@@ -1637,6 +1718,7 @@ void kh_vkd3d_present(KCtx *g,u64 o,u64 n){
     memlow_check(n);                                                    /* review X38 n=2: the gfx-memory-low soft stop, before a dump allocates */
     u32 idx=rd32(g,o+40)%NBUF;
     int want_dump=dump_dir[0]&&n>=dump_from&&n<=dump_to&&n%dump_every==0, want_video=video_wanted(), want_hash=hash_f!=NULL, want_band=band_f!=NULL;
+    if(cut_dumps){ want_dump=1; cut_dumps--; }
     if(want_dump||want_video||want_hash||want_band){
         u64 t0=kh_host_ns(); const u8 *base=readback(g,s,idx,n,"Present (frame readback)");
         if(want_hash) hash_frame(g,s,base,n);
@@ -1740,6 +1822,18 @@ static void st_fence_waiter(KCtx *g){ FWait *w=(FWait*)(uintptr_t)A0(g); atomic_
 int kh_gfxc_selftest_pure(KCtx *g){
     int n=0, f=0;
 #define TP(c) do{ n++; if(!(c)){ f++; fprintf(stderr,"vkd3d shared-part selftest FAIL: %s (line %d)\n",#c,__LINE__); } }while(0)
+    {
+        Swap live={.w=1280,.h=720,.fence_val=701};
+        struct KhSwapGeneration first={.refs=1,.owner=&live},later={.refs=2,.owner=&live};
+        first.buffers=(Swap){.w=1920,.h=1350,.rb_size=10368000};
+        first.buffers.buf[2]=(ID3D12Resource*)(uintptr_t)0x1230;
+        live.generation=&later;
+        kh_swap_restore(&first);
+        TP(live.generation==&first&&live.buf[2]==first.buffers.buf[2]&&live.w==1920&&live.h==1350);
+        TP(first.refs==2&&later.refs==1&&live.fence_val==701&&live.rb_size==10368000);
+        kh_swap_restore(&first);
+        TP(first.refs==2&&later.refs==1);
+    }
     /* n=4: AddRef and Release of a bundle and a bundle allocator on 8 threads at once (the game AddRefs both).  The test holds 2^20
      * references of its own, so a lost update can never take a count to 0 here; afterwards both counts must be exactly that again. */
     { bundle_classes(); u64 al=kh_gfxc_bundle_allocator_new(g), bl=kh_gfxc_bundle_new(g,al,0), live=n_bundles_live;
