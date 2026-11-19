@@ -207,6 +207,11 @@ endif
 # it), 156e20 = H4b (the event letterbox bars, after it), 126fd0 = H5 (full-height scissor rects); 126500 and 19d040 are pass-throughs
 # that record the measurement M with KHNMC_ASPECT_LOG=2 (the dk loop's setScreenMode, the cam+0x84 readers), as does bgload.c's 4ad270.
 ASPECT_HOOKS += 2bd190 156f10 156e20 126fd0 126500 19d040
+# Task 46 (runtime/aspect.c, H7): 11a330 = the 2D primitive submit (count vertices of the current vertex block; every sprite, rectangle
+# and layout piece goes through it).  In fill mode on a screen narrower than 16:9 a 4-vertex rectangle that spans the whole height of
+# the centred 16:9 band (a menu backdrop, a dim / fade rectangle) is stretched in y to the frame's first and last row before the
+# lifted body draws it.  With nothing set or KHNMC_ASPECT=pc it is one flag test and the lifted body.
+ASPECT_HOOKS += 11a330
 FILE_HOOKS += $(ASPECT_HOOKS)
 # Task 44, review (runtime/null_mf.c): the movie seam's three pass-through hooks.  5375d0 = the movie module's command function
 # (command 0 = start: a request the game drops at its own guard is seen and said), 2cbd80 = the event's end (did the movie's event end

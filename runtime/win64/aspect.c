@@ -24,9 +24,10 @@
  * it returns out in rax.  Its callers draw black bars of (GX+0x10 - result) / 2 around it: f_14e050 (shard_0026.c:36792, after the
  * fades / overlay of 0x156940 -> 0x14e020) and the settings-menu copy f_4ed940 (shard_0105.c:38419).  On a narrow screen H1 replaces y
  * by H' * GX+0x24, the value of the exe's own not-narrow branch: the bars get zero height.  x is never changed; at 16:9 or wider the
- * exe's y already is that value, so H1 is an identity there.  H1 acts when fill is on, the screen is narrow, and the 3D view was drawn
- * in this game frame or the previous one (frames without a 3D view, such as the title and full-screen menus, keep the exe's bars);
- * KHNMC_ASPECT_TEST_H1=unconditional drops that last condition.  Each call is checked against a replica of the exe's arithmetic
+ * exe's y already is that value, so H1 is an identity there.  H1 acts when fill is on and the screen is narrow, on EVERY frame (task
+ * 46, H7: no bars on the title and the full-screen menus either).  Until task 46 it acted only when the 3D view was drawn in this game
+ * frame or the previous one; KHNMC_ASPECT_TEST_OFF=h7 (a test aid) brings that gate back, and KHNMC_ASPECT_TEST_H1=unconditional (the
+ * older test aid) drops it whatever else is set.  Each call is checked against a replica of the exe's arithmetic
  * (h1_model); a call whose result differs (for example GX changed by another thread between the exe's reads and ours) is left as the
  * exe made it and counted (reported at exit, with a WARNING line when not zero).
  *
@@ -77,13 +78,19 @@ void kh_aspect_config(const char *mode,const char *log,const char *test_h1){
         if(asp_mode!=1) kh_fatal(NULL,"aspect-test-h1-needs-fill: KHNMC_ASPECT_TEST_H1=unconditional changes H1, which runs only with KHNMC_ASPECT=fill");
         asp_h1_uncond=1; }
     kh_aspect_dk=asp_mode||kh_aspect_m;
-    if(asp_mode||kh_aspect_log)
-        fprintf(stderr,"kh: aspect: KHNMC_ASPECT=%s%s%s\n",asp_mode?"fill (H1: no 16:9 bars on a screen narrower than 16:9":"pc",
-                asp_mode?(asp_h1_uncond?", UNCONDITIONAL: every frame, KHNMC_ASPECT_TEST_H1 test aid)":", on frames with the 3D view)"):"",
-                kh_aspect_m?"; KHNMC_ASPECT_LOG=2: size records and the measurement M on":kh_aspect_log?"; KHNMC_ASPECT_LOG=1: size records on":"");
+}
+/* the run's start line.  It is composed from the state BOTH configuration functions leave (task 46 review finding 7: the line used to
+ * be printed before KHNMC_ASPECT_TEST_OFF was read and still said "on frames with the 3D view", the gate H7 removed), so
+ * kh_aspect_test_config prints it */
+static int asp_off_h7;                     /* KHNMC_ASPECT_TEST_OFF=h7 (task 46): the gate of tasks 37 / 42 again, band rectangles left alone */
+static void asp_banner(char *out,size_t n){
+    snprintf(out,n,"kh: aspect: KHNMC_ASPECT=%s%s%s",asp_mode?"fill (H1: no 16:9 bars on a screen narrower than 16:9":"pc",
+             asp_mode?(asp_h1_uncond?", UNCONDITIONAL: every frame, KHNMC_ASPECT_TEST_H1 test aid)":
+                       asp_off_h7?", only on frames with the 3D view: TEST AID KHNMC_ASPECT_TEST_OFF=h7, the gate of task 37)":", on every frame: task 46, H7)"):"",
+             kh_aspect_m?"; KHNMC_ASPECT_LOG=2: size records and the measurement M on":kh_aspect_log?"; KHNMC_ASPECT_LOG=1: size records on":"");
 }
 /* task 40 test aids (plan step 5 / 7 tests; both need KHNMC_ASPECT=fill, any other value is a named fatal):
- *   KHNMC_ASPECT_TEST_OFF=list   comma-separated h2 (= h2b,h2c), h2b, h2c, h3 (task 42), h4, h5: those fill hooks pass straight
+ *   KHNMC_ASPECT_TEST_OFF=list   comma-separated h2 (= h2b,h2c), h2b, h2c, h3 (task 42), h4, h5, h7 (task 46): those fill hooks pass straight
  *                                through (the picture "without its change"); the others stay on.
  *   KHNMC_ASPECT_TEST_NOCULL=1   H2b / H2c divide m11 by 2047/208 (the exe's guard band) instead of r: the "no-cull reference" of
  *                                plan step 5 (nothing is culled vertically inside the guard band; the tall picture must equal it). */
@@ -96,14 +103,17 @@ void kh_aspect_test_config(const char *off,const char *nocull){
             if(n==2&&!strncmp(p,"h2",2)) asp_off_h2b=asp_off_h2c=1; else if(n==3&&!strncmp(p,"h2b",3)) asp_off_h2b=1; else if(n==3&&!strncmp(p,"h2c",3)) asp_off_h2c=1;
             else if(n==2&&!strncmp(p,"h3",2)) asp_off_h3=1;
             else if(n==2&&!strncmp(p,"h4",2)) asp_off_h4=1; else if(n==2&&!strncmp(p,"h5",2)) asp_off_h5=1;
-            else kh_fatal(NULL,"aspect-test-off-value: KHNMC_ASPECT_TEST_OFF=%s: '%.*s' is not one of h2, h2b, h2c, h3, h4, h5 (comma-separated)",off,(int)n,p);
+            else if(n==2&&!strncmp(p,"h7",2)) asp_off_h7=1;
+            else kh_fatal(NULL,"aspect-test-off-value: KHNMC_ASPECT_TEST_OFF=%s: '%.*s' is not one of h2, h2b, h2c, h3, h4, h5, h7 (comma-separated)",off,(int)n,p);
             p+=n; if(*p==','){ p++; if(!*p) kh_fatal(NULL,"aspect-test-off-value: KHNMC_ASPECT_TEST_OFF=%s ends with a comma",off); } } }
     if(nocull&&*nocull){
         if(strcmp(nocull,"1")) kh_fatal(NULL,"aspect-test-nocull-value: KHNMC_ASPECT_TEST_NOCULL=%s (the only value is 1, a test aid)",nocull);
         if(asp_mode!=1) kh_fatal(NULL,"aspect-test-needs-fill: KHNMC_ASPECT_TEST_NOCULL=1 changes H2, which runs only with KHNMC_ASPECT=fill");
         asp_nocull=1; }
-    if(asp_off_h2b||asp_off_h2c||asp_off_h3||asp_off_h4||asp_off_h5||asp_nocull)
-        fprintf(stderr,"kh: aspect: TEST AID: %s%s%s%s%s%s(not for play)\n",asp_off_h2b?"H2b off; ":"",asp_off_h2c?"H2c off; ":"",asp_off_h3?"H3 off; ":"",asp_off_h4?"H4 off; ":"",asp_off_h5?"H5 off; ":"",
+    if(asp_mode||kh_aspect_log){ char b[512]; asp_banner(b,sizeof b); fprintf(stderr,"%s\n",b); }
+    if(asp_off_h2b||asp_off_h2c||asp_off_h3||asp_off_h4||asp_off_h5||asp_off_h7||asp_nocull)
+        fprintf(stderr,"kh: aspect: TEST AID: %s%s%s%s%s%s%s(not for play)\n",asp_off_h2b?"H2b off; ":"",asp_off_h2c?"H2c off; ":"",asp_off_h3?"H3 off; ":"",asp_off_h4?"H4 off; ":"",asp_off_h5?"H5 off; ":"",
+                asp_off_h7?"H7 off (the exe's bars on frames without the 3D view, band rectangles left in the band); ":"",
                 asp_nocull?"H2 divides m11 by 2047/208 instead of r (the no-cull reference); ":"");
 }
 void kh_aspect_drawlog_config(const char *v);
@@ -139,6 +149,7 @@ static H1Model h1_model(float W,float H,float sx,float sy,float s){
 }
 static _Atomic u64 h1_calls, h1_wide, h1_narrow, h1_rewritten, h1_kept, h1_mismatch, h1_since[4]; static _Atomic u32 h1_tid;
 static _Atomic int h1_logged_narrow, h1_logged_rewrite, h1_logged_mismatch;
+static _Atomic u64 h7_h1_no3d, h7_h3_no3d;  /* task 46 (H7): H1 rewrites / dk passes anchored on frames without the 3D view (the gate of tasks 37 / 42 would have kept the bars) */
 static void h1_post(KCtx *g,u64 out){
     h1_calls++; { u32 z=0; atomic_compare_exchange_strong(&h1_tid,&z,cur_tid()); }
     float W=rdf(g,GX+0x18), H=rdf(g,GX+0x1c), sx=rdf(g,GX+0x20), sy=rdf(g,GX+0x24), s=rdf(g,GX+0x28);
@@ -154,10 +165,10 @@ static void h1_post(KCtx *g,u64 out){
         fprintf(stderr,"kh: aspect: H1: first narrow screen: GX+0x18 %g x %g, GX+0x20/0x24 %g/%g, GX+0x28 %g -> the exe's 16:9 fit %g x %g, bars of %g rows above and below (GX+0x10 height %g); full height %g; game frame %llu, present %llu, guest thread %u\n",
                 W,H,sx,sy,s,ox,oy,(rdf(g,GX+0x14)-oy)/2,rdf(g,GX+0x14),m.yfull,P(now),P(gfx_presents),cur_tid());
     if(!asp_mode) return;                                                           /* pc: counted only */
-    if(asp_h1_uncond||gate_open_d(d)){
-        wrf(g,out+4,m.yfull); h1_rewritten++;
+    if(asp_h1_uncond||gate_open_d(d)||!asp_off_h7){                                   /* task 46 (H7): no bars on any frame of a narrow screen */
+        wrf(g,out+4,m.yfull); h1_rewritten++; if(!asp_h1_uncond&&!gate_open_d(d)) h7_h1_no3d++;
         if(kh_aspect_log&&!atomic_exchange(&h1_logged_rewrite,1))
-            fprintf(stderr,"kh: aspect: H1: first rewrite: %g x %g -> %g x %g (%s) at game frame %llu, present %llu\n",ox,oy,ox,m.yfull,asp_h1_uncond?"unconditional":d<0?"?":d==0?"3D view drawn in this frame":"3D view drawn in the previous frame",P(now),P(gfx_presents));
+            fprintf(stderr,"kh: aspect: H1: first rewrite: %g x %g -> %g x %g (%s) at game frame %llu, present %llu\n",ox,oy,ox,m.yfull,asp_h1_uncond?"unconditional":!gate_open_d(d)?"no 3D view in this frame: H7, no bars on any frame":d==0?"3D view drawn in this frame":"3D view drawn in the previous frame",P(now),P(gfx_presents));
     } else h1_kept++;
 }
 void orig_f_11c1e0(KCtx *);
@@ -629,7 +640,9 @@ static void h3a_post(KCtx *g){
     if(asp_off_h3){ h3.off++; return; }
     float W=rdf(g,GX+0x18), H=rdf(g,GX+0x1c); double o=(W>0&&H>0)?kh_aspect_o(W,H):0.0;
     if(o==0.0){ h3.identity++; return; }                                             /* 16:9 or wider: nothing is written */
-    if(!asp_h1_uncond&&!gate_open_at(kh_game_frames())){ h3.bars++; return; }         /* the exe's bars are on this frame: the HUD stays in the band */
+    if(!asp_h1_uncond&&!gate_open_at(kh_game_frames())){
+        if(asp_off_h7){ h3.bars++; return; }                                         /* the exe's bars are on this frame: the HUD stays in the band */
+        h7_h3_no3d++; }                                                              /* task 46 (H7): no bars on any frame, so the pass is anchored as in play */
     float wc=rdf(g,GX+0xac);
     double dw=(double)wc-o; if(!(dw<=0.5&&dw>=-0.5)){ h3.mismatch++; h3.mm_wc=wc; h3.mm_o=(float)o;
         if(!atomic_exchange(&h3.warned,1)) fprintf(stderr,"kh: aspect: WARNING: h3-band-mismatch: the dk loop's MagicScale.w is %g where the band offset o of the %gx%g screen is %g: the pass is left as the exe made it (counted)\n",wc,W,H,o);
@@ -700,6 +713,269 @@ static void h3_report(FILE *f){
                               P(h3.inner_anch),P(h3.inner_reapplied),P(h3.inner_other));
     if(h3.mismatch) fprintf(f,"kh: aspect: WARNING: h3-band-mismatch: %llu dk passes left as the exe made them (MagicScale.w %g against o %g at the last)\n",P(h3.mismatch),h3.mm_wc,h3.mm_o);
     if(h3.nested||h3.nopass) fprintf(f,"kh: aspect: NOTE: H3: %llu dk passes begun inside another pass, %llu next objects outside a pass (both 0 in task 40's M)\n",P(h3.nested),P(h3.nopass));
+}
+
+/* ==== task 46: H7, no black bars in the menus of the tall frame =========================================================================
+ *
+ * With tasks 37 / 40 / 42 the 3D view fills the tall frame and the HUD sits at its edges, but every frame WITHOUT the 3D view (title,
+ * New Game, the save menu, the camp / main menu, the pause screen, the map-change wipe) kept the exe's 16:9 bars (H1's gate).  H7 has
+ * two halves, both only with KHNMC_ASPECT=fill on a screen narrower than 16:9 (r > 1, o > 0):
+ *   (a) no bars on any frame: H1 rewrites the 16:9 fit on every frame (the gate of task 37 no longer decides), and H3 anchors every
+ *       dk pass (the gate of task 42 existed only because the bars covered the strips).  The strips then show what is drawn there:
+ *       the frame's clear colour, the picture the final blit copies (the 3D scene behind the pause screen; the camp menu's own
+ *       full-frame quad, Tz::MenuObj, VS 586710 in pixels), layout pieces that lie beyond the band, and the rectangles of (b).
+ *   (b) backdrops reach the frame's first and last row.  A backdrop is recognised by its shape, in the GS frame (0..416 = the band):
+ *       R1  one quad that is an axis-aligned rectangle spanning the band's whole height (y_min <= 0 + 1, y_max >= 416 - 1): a
+ *           background picture, a dimming or fading rectangle, a full-height side strip.  Only that quad is changed.
+ *       R2  a batch (the parts of one layout sequence frame) in which no quad is such a rectangle but whose wide rectangles (at
+ *           least as wide as the frame, less 2 GS columns; wherever they are in x: the save menu slides its backdrop in from the
+ *           left) stack without a gap from y <= 0 + 1 to y >= 416 - 1: a background picture cut into horizontal stripes (the camp
+ *           and save menus: 8 stripes of 64 rows, x -101..612, y -51..461, plus 8 right-hand pieces of the same picture).  The
+ *           stack's stripes and every rectangle of the batch that lies on a stripe's rows (the right-hand pieces) are changed, with
+ *           one factor, so the picture stays in one piece; any other quad of the batch (a header, a cursor) is left where it is and
+ *           counted (review finding 4).
+ *       R3  a rectangle that R1 and R2 left, narrower than the frame, at least 3/4 of the band tall, with ONE edge exactly on a band
+ *           edge (y_min = 0 or y_max = 416 within 1/8 row): a picture the 16:9 screen cuts with a straight edge (the title's 400 x
+ *           400 picture, x 195..595, y 0..400: its top is cut by the screen, its other three sides fade out).  It is MOVED by b to
+ *           the frame's edge, not stretched: the cut edge is the frame's edge again and the picture keeps its shape (review finding
+ *           1: left in place, its cut edge was a hard line 135 rows below the frame's top).
+ *       An R1 rectangle is left ("covered by its batch") when the batch's own rectangles above and below it, each at least as wide
+ *       as the part of it inside the frame and meeting it without a gap, already reach beyond the frame: the batch covers the strips
+ *       itself (the map-change transition's batch of a centre square with a rectangle on each side: review finding 2).
+ *       The change is a stretch in y about the band's centre by the smallest factor that makes the rectangle (R1) or the stack (R2)
+ *       cover the frame: y' = 208 + (y - 208) s, s = max(1, (208 + b) / (208 - y_min), (208 + b) / (y_max - 208)), b = 208 (r - 1) =
+ *       the strip's height in GS rows.  s = r for a rectangle that is exactly the band (0..416); less for one that already reaches
+ *       beyond it (the title's pictures -31..448: 1.09; the pause screen's dim -16..436: 1.16; the camp menu's stripes: 1.03); s = 1,
+ *       i.e. nothing written, for one that already covers the frame (H4's fades).  Everything else (widgets, text, cursors: quads
+ *       that do not span the band's height) is left exactly where it is, and x is never changed.  A rectangle is a quad whose
+ *       corners lie within 1/8 GS unit of its box (GS coordinates are multiples of 1/16; a piece drawn through a 180-degree turn
+ *       comes out one step off: review finding 3).
+ * Where: every 2D primitive is submitted through f_11a330(GX, count, prim, flags) (0x14011a330; reached by a jump from f_11a2f0 and
+ * 0x14011a480, so the return address on the guest stack names the game's draw routine).  Its vertices were written by the caller
+ * into the block f_121ff0 handed out: the current vertex buffer object B (0x14011a386..0x14011a3b2: [GX+0x59b8] != 0 ? [GX+0x59b8] +
+ * 0x60 + 0x58 * (s32)[that + 0x58] : GX + 0x5790 + 0x58 * [GX+0x578c]) holds the stride at +0x8 and the block's address at +0x48
+ * (f_121ff0 0x1401220c4 / 0x1401220f4; f_127ef0 passes exactly these to the index builder f_142f40, 0x140127f43 / 0x140127f46).  A
+ * vertex begins with POSITION x, y (floats, GS units); the vertex shader subtracts cbConstantVS.xyOffset, which f_1121d0 stages from
+ * GX+0x138 / +0x13c (0x14011301e / 0x140113026), and maps with MagicScale, staged from GX+0xa0 unless [GX+0xb4] or [GX+0xb8] is 0
+ * (then GX+0x90: 0x140112386..0x14011239d).  Primitive 8 is a list of quads, 4 vertices each (f_142f40 0x140142f64..0x140142feb builds
+ * one strip per 4 vertices); the layout draw f_1969a0 submits the parts of one sequence frame as one such list (0x140196f59:
+ * [rdi+0x30] parts, 4 vertices of 0x1c bytes each from f_197b60).  H7 acts at the entry of f_11a330, before the lifted body builds
+ * the indices and draws:
+ *   - only for the draw routines of the table h7site (by return address).  The ppp effect routines submit world-space quads through
+ *     f_11a330 too, with the same 28-byte vertex and a 3D vertex shader: a band-height rectangle from any other routine is counted
+ *     and listed (h7-unlisted-site) and never written.
+ *   - MagicScale must be the centred band of this screen: the row GX+0xa0 in force, MS.w = o and 416 MS.y = H - 2 o within 1/2 pixel
+ *     (the dk loop's mode, the menus' mode, the fades' mode).  An anchored HUD object (MS.w = 0 or 2 o), a zoomed window, a draw
+ *     into a small target: not examined (counted).
+ *   - the vertex must be the 28-byte 2D vertex and the batch a quad list (primitive 8, a multiple of 4 vertices) or 4 vertices.
+ *     A batch whose box spans the band's height without R1 or R2 applying is left and LISTED (by return address and dk class): the
+ *     place to look when a screen keeps a strip (the map-change wipe's frame of 5 quads is one: it covers the frame by itself).
+ *   - the lifted body's own lazy begin (0x14011a345: [GX+0x4c0] == 0 with [GX+0x4b0] != 0) is left to the exe (counted).
+ *   - the vertex block must be the one f_121ff0 just handed out (h7_pre): otherwise the named, counted condition h7-vertex-block
+ *     (a WARNING line in the exit report) and the batch is left.
+ * Why a stretch in y and not a uniform scale: a uniform scale would crop the picture at both sides and move its features in x too;
+ * the smallest covering factor keeps the distortion at 3 to 25 % in y, none at the band's centre, and widgets do not move at all.
+ * At 16:9 or wider nothing is read or written beyond GX+0x18 / +0x1c; with nothing set or KHNMC_ASPECT=pc the hook is one flag test and
+ * the lifted body.  KHNMC_ASPECT_TEST_OFF=h7 turns both halves off (the picture of task 42). */
+#define H7_T 1.0                           /* GS rows / columns of tolerance at the band's edges */
+#define H7_GAP 0.51                        /* R2: the largest gap between two stripes of a stack (GS rows) */
+#define H7_STRIDE 0x1cu                    /* the 2D vertex: f_15fee0 and f_1969a0 ask f_111970 for blocks of stride 0x1c (0x140160076, 0x140196f62) */
+#define H7_MAXV 4096                       /* a batch of more vertices is not examined (counted) */
+#define H7_MAXQ (H7_MAXV/4)                /* so every quad of an examined batch has its box in h7_pre's tables */
+#define H7_E 0.125                         /* GS units: a rectangle's corners against its box, and "exactly on a band edge" (R3); GS coordinates are multiples of 1/16 */
+#define H7_R3_MIN 312.0                    /* R3: the rectangle is at least 3/4 of the band tall (GS rows) */
+enum { H7K_FULL=0, H7K_PIECE, H7K_STACK, H7K_ALREADY, H7K_SITE, H7K_SHAPE, H7K_EDGE, H7K_BATCH, H7K_N };
+static const char *h7_kname[H7K_N]={"R1 stretched, full band width","R1 stretched, a band-height piece narrower than the band","R2 stretched, a quad of a batch whose wide stripes stack over the band height",
+                                     "already covering the frame's height, left","a band-height rectangle or stripe stack from a draw routine that is not in H7's table, left",
+                                     "the batch's box spans the band height but neither R1 nor R2 applies, left",
+                                     "R3 moved to the frame's edge, a picture cut by a band edge",
+                                     "a band-height rectangle whose batch covers the strips above and below it, left"};
+/* the draw routines whose rectangles H7 may stretch, by the return address f_11a330 finds on the guest stack (it is entered by a jump
+ * from f_11a2f0, so this is the address after `call 0x14011a2f0`).  Any other routine is left alone whatever it draws: the pppEi /
+ * ppp effect routines (0x1404b3c85, 0x1404ade0d, 0x1404b8de6 ...) submit world-space quads through f_11a330 too, some with the same
+ * 28-byte vertex (M, camp route: 196 batches from 0x1404b3c85 drawn with a 3D vertex shader, 1,568 of their quads band-height
+ * rectangles by their numbers). */
+typedef struct { u64 ra; const char *what; } H7Site;
+static const H7Site h7site[]={
+    {GS_BASE+0x16022cull,"f_15fee0, the GS sprite / rectangle draw (0x140160227): fades (H4 already extends its three), flat rectangles"},
+    {GS_BASE+0x197033ull,"f_1969a0, the layout / sequence part draw, plain path (0x14019702e): the parts of one sequence frame as a quad list"},
+    {GS_BASE+0x19701aull,"f_1969a0, the same with its blend path (0x140197015)"}};
+#define H7_NSITE ((int)(sizeof h7site/sizeof *h7site))
+static int h7_site_index(u64 ra){ for(int i=0;i<H7_NSITE;i++) if(h7site[i].ra==ra) return i; return -1; }
+typedef struct { _Atomic u64 calls, off, identity, lazy, mode90, modeother, nobuf, fmt, count, batches, quads, small, kind[H7K_N], batch_ext, stack_batches, stack_other; } H7Stat;
+static H7Stat h7;
+typedef struct { u64 ra, vt; int kind; u32 prim, count; u64 n; float y0,y1,x0,x1; double smin,smax; Ivs fr; char name[72]; } H7Row;
+#define H7_ROWS 96
+static H7Row h7r[H7_ROWS]; static int n_h7r; static u64 h7r_cut;
+static __thread int h7_in;                 /* 1 + kind while the lifted f_11a330 runs for a batch H7 classified (M: the draws made inside) */
+static u64 h7_m_draws[H7K_N][16];        /* [kind][vertex-shader kind VK_*] (M, null backend) */
+/* the smallest stretch about GS y 208 with which y0..y1 (y0 < 208 < y1) covers -b..416 + b; 1 when it already does */
+static double h7_cover(double y0,double y1,double b){ double s=1.0, t=(208.0+b)/(208.0-y0), u=(208.0+b)/(y1-208.0); if(t>s) s=t; if(u>s) s=u; return s; }
+static float h7_map(float y,double s){ return (float)(208.0+((double)y-208.0)*s); }
+/* a quad's box bb = x0, x1, y0, y1 from its 4 corners (x, y) in the GS frame; 1 when it is an axis-aligned rectangle */
+static int h7_box(const float (*v)[2],float *bb){
+    float x0=v[0][0],x1=x0,y0=v[0][1],y1=y0; int nan=!(x0==x0)||!(y0==y0);
+    for(int i=1;i<4;i++){ if(v[i][0]<x0) x0=v[i][0]; if(v[i][0]>x1) x1=v[i][0]; if(v[i][1]<y0) y0=v[i][1]; if(v[i][1]>y1) y1=v[i][1]; if(!(v[i][0]==v[i][0])||!(v[i][1]==v[i][1])) nan=1; }
+    bb[0]=x0; bb[1]=x1; bb[2]=y0; bb[3]=y1;
+    if(nan||!(x1>x0)||!(y1>y0)) return 0;
+    for(int i=0;i<4;i++){ float dx0=v[i][0]-x0, dx1=x1-v[i][0], dy0=v[i][1]-y0, dy1=y1-v[i][1];
+        if(!((dx0<=(float)H7_E||dx1<=(float)H7_E)&&(dy0<=(float)H7_E||dy1<=(float)H7_E))) return 0; }   /* rotated or skewed (more than 2 GS subpixels) */
+    return 1;
+}
+/* R1 for one quad (rect = h7_box's result): -1 (not a rectangle spanning the band height: left), H7K_ALREADY, or H7K_FULL / H7K_PIECE
+ * with *s = its factor.  r = the screen's ratio; xl / xr = the GS columns of the frame's left and right edge */
+static int h7_r1(const float *bb,int rect,double r,double xl,double xr,double *s){
+    if(!rect||!(bb[2]<=0.0+H7_T&&bb[3]>=416.0-H7_T)) return -1;
+    *s=h7_cover(bb[2],bb[3],208.0*(r-1.0)); if(*s<=1.0) return H7K_ALREADY;
+    return (bb[0]<=xl+H7_T&&bb[1]>=xr-H7_T)?H7K_FULL:H7K_PIECE;
+}
+/* review finding 2: 1 when the R1 rectangle q of a batch of n quads (boxes bb[i], rect[i]) need not be stretched because the batch
+ * covers the strips itself: its other rectangles that are at least as wide as q's part inside the frame xl..xr and whose edge MEETS
+ * q's top / bottom edge (or the edge reached so far) within H7_GAP carry q's column range beyond the frame's first and last row (b =
+ * the strip's height in GS rows).  The map-change transition draws such a batch: a centre square, a rectangle above, one below, one
+ * on each side.  A rectangle that overlaps or contains q is another layer, not a tile above or below it, and does not count (a
+ * picture drawn over a larger black rectangle must still be stretched) */
+static int h7_batch_covers(const float (*bb)[4],const u8 *rect,int n,int q,double b,double xl,double xr){
+    double x0=bb[q][0]>xl?bb[q][0]:xl, x1=bb[q][1]<xr?bb[q][1]:xr, y0=bb[q][2], y1=bb[q][3];
+    for(int it=0,ch=1;ch&&it<n;it++){ ch=0;
+        for(int i=0;i<n;i++){ if(i==q||!rect[i]||(double)bb[i][0]>x0+H7_T||(double)bb[i][1]<x1-H7_T) continue;   /* not across q's columns */
+            if((double)bb[i][2]<y0&&(double)bb[i][3]>=y0-H7_GAP&&(double)bb[i][3]<=y0+H7_GAP){ y0=bb[i][2]; ch=1; }
+            if((double)bb[i][3]>y1&&(double)bb[i][2]<=y1+H7_GAP&&(double)bb[i][2]>=y1-H7_GAP){ y1=bb[i][3]; ch=1; } } }
+    return h7_cover(y0,y1,b)<=1.0;
+}
+/* R2 for a batch of n quads (boxes bb[i], rect[i]): 0 = its wide rectangles (as wide as the frame xl..xr less 2 T, anywhere in x) do
+ * not stack over the band height; 1 = they do and cover the frame already; 2 = they do, *s = the stack's factor.  on[i] = 1 for the
+ * quads the factor is for: the stack's stripes and every rectangle on a stripe's rows (y_min and y_max within T of one stripe's: a
+ * further piece of the same picture row); any other quad of the batch is not part of the picture (review finding 4) */
+static int h7_r2(const float (*bb)[4],const u8 *rect,int n,double r,double xl,double xr,double *s,u8 *on){
+    float lo[H7_MAXQ], hi[H7_MAXQ]; int m=0, e;
+    for(int i=0;i<n&&m<H7_MAXQ;i++) if(rect[i]&&(double)bb[i][1]-(double)bb[i][0]>=xr-xl-2.0*H7_T){ lo[m]=bb[i][2]; hi[m]=bb[i][3]; m++; }
+    if(m<2) return 0;                                                                /* one wide band-height rectangle is R1's case */
+    for(int a=1;a<m;a++){ float l=lo[a], h=hi[a]; int c=a; while(c>0&&lo[c-1]>l){ lo[c]=lo[c-1]; hi[c]=hi[c-1]; c--; } lo[c]=l; hi[c]=h; }
+    double y0=lo[0], y1=hi[0];
+    if(!(y0<=0.0+H7_T)) return 0;
+    for(e=1;e<m&&y1<416.0-H7_T;e++){ if(lo[e]>y1+H7_GAP) return 0; if(hi[e]>y1) y1=hi[e]; }
+    if(!(y1>=416.0-H7_T)) return 0;
+    for(;e<m&&lo[e]<=y1+H7_GAP;e++) if(hi[e]>y1) y1=hi[e];                            /* stripes beyond the band belong to the stack too */
+    for(int i=0;i<n;i++){ on[i]=0; if(!rect[i]) continue;                             /* the stack is the sorted stripes 0..e-1 */
+        for(int a=0;a<e;a++){ double d0=(double)bb[i][2]-(double)lo[a], d1=(double)bb[i][3]-(double)hi[a]; if(d0<=H7_T&&d0>=-H7_T&&d1<=H7_T&&d1>=-H7_T){ on[i]=1; break; } } }
+    *s=h7_cover(y0,y1,208.0*(r-1.0)); return *s<=1.0?1:2;
+}
+/* R3 for one quad that R1 left, in a batch R2 left (review finding 1): -1 / +1 = a rectangle narrower than the frame xl..xr, at least
+ * H7_R3_MIN rows tall, whose top / bottom edge (and only that one) lies exactly on the band's: it is moved up / down by b; 0 = not */
+static int h7_r3(const float *bb,int rect,double xl,double xr){
+    if(!rect||!((double)bb[3]-(double)bb[2]>=H7_R3_MIN)) return 0;
+    if((double)bb[1]-(double)bb[0]>=xr-xl-2.0*H7_T) return 0;                         /* as wide as the frame: a backdrop's piece, R1's and R2's business */
+    int top=(double)bb[2]>=-H7_E&&(double)bb[2]<=H7_E, bot=(double)bb[3]>=416.0-H7_E&&(double)bb[3]<=416.0+H7_E;
+    return top&&!bot?-1:bot&&!top?1:0;
+}
+static void h7_note(KCtx *g,u64 ra,int kind,u32 prim,u32 count,const float *bb,double s){
+    u64 vt=(h3_depth>0&&h3_on[h3_depth-1])?h3_cur_vt[h3_depth-1]:0;
+    pthread_mutex_lock(&mm); int i; for(i=0;i<n_h7r;i++) if(h7r[i].ra==ra&&h7r[i].vt==vt&&h7r[i].kind==kind&&h7r[i].prim==prim) break;
+    if(i==n_h7r){ if(n_h7r<H7_ROWS){ H7Row *q=&h7r[i]; memset(q,0,sizeof *q); q->ra=ra; q->vt=vt; q->kind=kind; q->prim=prim; q->count=count; q->x0=bb[0]; q->x1=bb[1]; q->y0=bb[2]; q->y1=bb[3]; q->smin=q->smax=s;
+            if(vt) rtti_name(g,vt,q->name,sizeof q->name); else snprintf(q->name,sizeof q->name,"(outside a dk object)"); n_h7r++; } else { h7r_cut++; pthread_mutex_unlock(&mm); return; } }
+    H7Row *q=&h7r[i]; q->n++; if(bb[0]<q->x0) q->x0=bb[0]; if(bb[1]>q->x1) q->x1=bb[1]; if(bb[2]<q->y0) q->y0=bb[2]; if(bb[3]>q->y1) q->y1=bb[3]; if(s<q->smin) q->smin=s; if(s>q->smax) q->smax=s;
+    iv_add(&q->fr,(u32)kh_game_frames());
+    pthread_mutex_unlock(&mm);
+}
+/* the current vertex buffer object as f_11a330 finds it (0x14011a386..0x14011a3b2) */
+static u64 h7_vbobj(KCtx *g){
+    u64 d=rd64(g,GX+0x59b8);
+    if(d){ if(!GA_OK(d+0x58)||!GA_OK(d+0x5b)) return 0; return d+0x60+0x58ull*(u64)(s64)(s32)rd32(g,d+0x58); }
+    return GX+0x5790+0x58ull*(u64)rd32(g,GX+0x578c);
+}
+static void h7_quadlog(KCtx *g,u64 ra,u32 prim,int q,int nq,const float *bb,int kind,double s,double y0n,double y1n,u64 va,u32 stride);   /* M's draw log (below) */
+/* H7 (b) at the entry of f_11a330: returns the kind (H7K_*) of a classified batch, -1 otherwise */
+static int h7_pre(KCtx *g){
+    h7.calls++;
+    if(asp_off_h7){ h7.off++; return -1; }
+    float W=rdf(g,GX+0x18), H=rdf(g,GX+0x1c); double o=(W>0&&H>0)?kh_aspect_o(W,H):0.0;
+    if(o==0.0){ h7.identity++; return -1; }                                          /* 16:9 or wider: nothing is read or written */
+    s32 count=(s32)(u32)KH_RDX(g); u32 prim=(u32)KH_R8(g);
+    if(count<4||count>H7_MAXV){ h7.count++; return -1; }
+    if(!rd32(g,GX+0xb4)||!rd32(g,GX+0xb8)){ h7.mode90++; return -1; }                 /* f_1121d0 stages MagicScale from GX+0x90 */
+    float msx=rdf(g,GX+0xa0), msy=rdf(g,GX+0xa4), msz=rdf(g,GX+0xa8), msw=rdf(g,GX+0xac);
+    double dw=(double)msw-o, dh=416.0*(double)msy-((double)H-2.0*o);
+    if(!(dw<=0.5&&dw>=-0.5&&dh<=0.5&&dh>=-0.5)||!(msx>0)){ h7.modeother++; return -1; }
+    if(!rd8(g,GX+0x4c0)&&rd64(g,GX+0x4b0)){ h7.lazy++; return -1; }                   /* the body's lazy begin is pending: left to the exe */
+    u64 B=h7_vbobj(g); if(!B||!GA_OK(B)||!GA_OK(B+0x57)){ h7.nobuf++; return -1; }
+    u32 stride=rd32(g,B+0x8); u64 vp=rd64(g,B+0x48);
+    if(stride!=H7_STRIDE){ h7.fmt++; return -1; }                                    /* not the 2D vertex */
+    /* the block must be the one f_121ff0 handed out for this batch: base [B+0x40] + the write offset [B+0x38] (0x1401220ef /
+     * 0x1401220f1), at least `count` vertices long ([B+0x50] = the count asked for, 0x1401220d0) and inside the buffer's capacity
+     * [B+0x30] (0x1401220e5).  With a real graphics backend the buffer is the memory ID3D12Resource::Map returned (runtime/gfx_wrap.c:
+     * host - bias), which is not guest-arena memory: the game has just written these very bytes, so they are read and written through
+     * the same address and never tested with GA_OK. */
+    { u64 base=rd64(g,B+0x40), cap=rd64(g,B+0x30); u32 off=rd32(g,B+0x38); s32 asked=(s32)rd32(g,B+0x50);
+      if(!base||!vp||vp!=base+off||count>asked||(u64)off+(u64)count*stride>cap){ h7.nobuf++; return -1; } }
+    h7.batches++;
+    float ox=rdf(g,GX+0x138), oy=rdf(g,GX+0x13c);
+    double r=kh_aspect_r(W,H), b=208.0*(r-1.0), xl=(0.0-(double)msz)/(double)msx, xr=((double)W-(double)msz)/(double)msx, s=1.0;
+    u64 ra=rd64(g,KH_RSP(g)); int site=h7_site_index(ra), best=-1, wrote=0, k2=0, nq=((prim==8&&!(count&3))||count==4)?count/4:0;
+    float ab[4]={1e30f,-1e30f,1e30f,-1e30f}, qb[H7_MAXQ][4]; u8 qr[H7_MAXQ], qon[H7_MAXQ]; signed char qk[H7_MAXQ];   /* the batch's box; per quad its box, rectangle flag, R2 mask, kind */
+    /* every quad's box first: R1's "covered by its batch" test, R2 and R3 need the whole batch */
+    for(int q=0;q<nq;q++){ float v[4][2]; u64 a=vp+(u64)q*4u*stride; float *bb=qb[q];
+        for(int i=0;i<4;i++){ v[i][0]=rdf(g,a+(u64)i*stride)-ox; v[i][1]=rdf(g,a+(u64)i*stride+4)-oy; }
+        qr[q]=(u8)h7_box(v,bb); h7.quads++;
+        if(bb[0]<ab[0]) ab[0]=bb[0]; if(bb[1]>ab[1]) ab[1]=bb[1]; if(bb[2]<ab[2]) ab[2]=bb[2]; if(bb[3]>ab[3]) ab[3]=bb[3]; }
+    /* R1, quad by quad */
+    for(int q=0;q<nq;q++){ const float *bb=qb[q]; u64 a=vp+(u64)q*4u*stride; int kind=h7_r1(bb,qr[q],r,xl,xr,&s);
+        if((kind==H7K_FULL||kind==H7K_PIECE)&&nq>1&&h7_batch_covers((const float (*)[4])qb,qr,nq,q,b,xl,xr)) kind=H7K_BATCH;   /* review finding 2 */
+        if(kind>=0&&site<0) kind=H7K_SITE;                                           /* not one of the 2D draw routines of the table: never written */
+        int st=kind==H7K_FULL||kind==H7K_PIECE; qk[q]=(signed char)kind;
+        if(__builtin_expect(kh_aspect_m,0)) h7_quadlog(g,ra,prim,q,nq,bb,kind,st?s:1.0,st?h7_map(bb[2],s):bb[2],st?h7_map(bb[3],s):bb[3],a,stride);
+        if(st){ for(int i=0;i<4;i++){ u64 p=a+(u64)i*stride+4; wrf(g,p,h7_map(rdf(g,p)-oy,s)+oy); } wrote=1; }
+        if(kind<0){ h7.small++; continue; }
+        h7.kind[kind]++; h7_note(g,ra,kind,prim,(u32)count,bb,st?s:1.0); if(best<0||kind<best) best=kind; }
+    /* R2: no quad of the batch is a band-height rectangle.  Only the stack's stripes and the rectangles on their rows are changed */
+    if(best<0&&nq>=2&&(k2=h7_r2((const float (*)[4])qb,qr,nq,r,xl,xr,&s,qon))!=0){
+        int st, non=0; best=site<0?H7K_SITE:k2==1?H7K_ALREADY:H7K_STACK; st=best==H7K_STACK; if(st) h7.stack_batches++;
+        for(int q=0;q<nq;q++){ u64 a=vp+(u64)q*4u*stride; if(!qon[q]){ if(st) h7.stack_other++; continue; }
+            non++; qk[q]=(signed char)best;
+            if(__builtin_expect(kh_aspect_m,0)) h7_quadlog(g,ra,prim,q,nq,qb[q],best,st?s:1.0,st?h7_map(qb[q][2],s):qb[q][2],st?h7_map(qb[q][3],s):qb[q][3],a,stride);
+            if(st){ for(int i=0;i<4;i++){ u64 p=a+(u64)i*stride+4; wrf(g,p,h7_map(rdf(g,p)-oy,s)+oy); } wrote=1; }
+            h7_note(g,ra,best,prim,(u32)count,qb[q],st?s:1.0); }
+        h7.small-=(u64)non; h7.kind[best]+=(u64)non; }
+    /* R3: a picture cut by a band edge, among the quads R1 left in a batch that is not a stripe stack: moved to the frame's edge */
+    if(!k2) for(int q=0;q<nq;q++){ int d; if(qk[q]>=0||!(d=h7_r3(qb[q],qr[q],xl,xr))) continue;
+        u64 a=vp+(u64)q*4u*stride; int kind=site<0?H7K_SITE:H7K_EDGE; double dy=(double)d*b; qk[q]=(signed char)kind;
+        if(__builtin_expect(kh_aspect_m,0)) h7_quadlog(g,ra,prim,q,nq,qb[q],kind,1.0,kind==H7K_EDGE?(double)qb[q][2]+dy:qb[q][2],kind==H7K_EDGE?(double)qb[q][3]+dy:qb[q][3],a,stride);
+        if(kind==H7K_EDGE){ for(int i=0;i<4;i++){ u64 p=a+(u64)i*stride+4; wrf(g,p,(float)((double)(rdf(g,p)-oy)+dy)+oy); } wrote=1; }
+        h7.small--; h7.kind[kind]++; h7_note(g,ra,kind,prim,(u32)count,qb[q],kind==H7K_EDGE?dy:1.0); if(best<0||kind<best) best=kind; }
+    if(!nq) for(s32 i=0;i<count;i++){ float x=rdf(g,vp+(u64)i*stride)-ox, y=rdf(g,vp+(u64)i*stride+4)-oy;   /* another primitive: its box only (never changed) */
+        if(x<ab[0]) ab[0]=x; if(x>ab[1]) ab[1]=x; if(y<ab[2]) ab[2]=y; if(y>ab[3]) ab[3]=y; }
+    if(best<0&&ab[2]<=0.0+H7_T&&ab[3]>=416.0-H7_T){ best=H7K_SHAPE; h7.kind[best]++; h7_note(g,ra,best,prim,(u32)count,ab,1.0); }
+    if(wrote) h7.batch_ext++;
+    return best;
+}
+void orig_f_11a330(KCtx *);
+void f_11a330(KCtx *g){
+    if(__builtin_expect(!asp_mode,1)){ orig_f_11a330(g); return; }                    /* nothing set / pc: exactly the exe */
+    int k=h7_pre(g);
+    if(k<0){ orig_f_11a330(g); return; }
+    int sv=h7_in; h7_in=1+k; orig_f_11a330(g); h7_in=sv;
+}
+static void h7_report(FILE *f){
+    fprintf(f,"kh: aspect report: H7 (task 46: no bars on any frame, backdrops stretched to the frame's height; 0x11a330): H1 rewrites on frames without the 3D view %llu; dk passes anchored on such frames %llu; "
+              "2D batches %llu: test aid off %llu; o = 0 (16:9 or wider), nothing read %llu; fewer than 4 or more than 4096 vertices (left) %llu; MagicScale from GX+0x90 (left) %llu; "
+              "MagicScale not the centred band (left) %llu; the body's lazy begin pending (left) %llu; not the 28-byte 2D vertex (left) %llu; vertex block not the one f_121ff0 handed out (h7-vertex-block, left) %llu; examined %llu batches, %llu quads: "
+              "not a backdrop (left) %llu; stretched %llu (R1 full band width %llu, R1 band-height pieces %llu, R2 quads of stripe stacks %llu in %llu batches) and moved to the frame's edge (R3, pictures cut by a band edge) %llu, in %llu batches; already covering the frame's height (left) %llu; "
+              "band-height rectangles covered by their own batch (left) %llu; quads of stripe-stack batches that are not on a stripe's rows (left) %llu; "
+              "backdrop shapes of a draw routine not in the table (left, listed) %llu; batches spanning the band height without R1 or R2 (left, listed) %llu\n",
+            P(h7_h1_no3d),P(h7_h3_no3d),P(h7.calls),P(h7.off),P(h7.identity),P(h7.count),P(h7.mode90),P(h7.modeother),P(h7.lazy),P(h7.fmt),P(h7.nobuf),P(h7.batches),P(h7.quads),P(h7.small),
+            P(h7.kind[H7K_FULL]+h7.kind[H7K_PIECE]+h7.kind[H7K_STACK]),P(h7.kind[H7K_FULL]),P(h7.kind[H7K_PIECE]),P(h7.kind[H7K_STACK]),P(h7.stack_batches),P(h7.kind[H7K_EDGE]),P(h7.batch_ext),P(h7.kind[H7K_ALREADY]),
+            P(h7.kind[H7K_BATCH]),P(h7.stack_other),P(h7.kind[H7K_SITE]),P(h7.kind[H7K_SHAPE]));
+    pthread_mutex_lock(&mm);
+    for(int i=0;i<n_h7r;i++){ H7Row *q=&h7r[i];
+        fprintf(f,"kh: aspect report: H7 %s: %s: from return address 0x%llx, dk object %s: %llu (primitive %u, %u vertices in the first batch), GS frame as submitted x %g..%g, y %g..%g",
+                q->kind==H7K_SHAPE?"batch":"quad",h7_kname[q->kind],P(q->ra),q->name,P(q->n),q->prim,q->count,q->x0,q->x1,q->y0,q->y1);
+        if(q->kind<=H7K_STACK) fprintf(f,", factor %.4f..%.4f",q->smin,q->smax);
+        if(q->kind==H7K_EDGE) fprintf(f,", moved by %.4f..%.4f GS rows",q->smin,q->smax);
+        fputc(';',f); iv_print(f,&q->fr); fputc('\n',f); }
+    if(h7r_cut) fprintf(f,"kh: aspect report: H7 quad: %llu of further (kind, return address, class) rows (table full)\n",P(h7r_cut));
+    pthread_mutex_unlock(&mm);
+    if(h7.nobuf) fprintf(f,"kh: aspect: WARNING: h7-vertex-block: %llu 2D batches in the band's mode whose vertex block is not base + offset of the current vertex buffer object, or longer than what f_121ff0 handed out: left as the exe made them\n",P(h7.nobuf));
+    if(h7.kind[H7K_SITE]) fprintf(f,"kh: aspect: NOTE: h7-unlisted-site: %llu quads with a backdrop's shape came from draw routines that are not in H7's table and were left as the exe made them (see the `H7 quad: a band-height rectangle or stripe stack from a draw routine` lines)\n",P(h7.kind[H7K_SITE]));
 }
 
 /* ---- M: the dk draw loop and the draws ----------------------------------------------------------------------------------------- */
@@ -837,6 +1113,18 @@ static int m_chain(KCtx *g,u64 *ra,int max){
     for(u64 a=sp;a<sp+0x2000&&n<max;a+=8){ if(!GA_OK(a+7)) break; u64 v=rd64(g,a); if(v>=text_lo&&v<text_hi&&call_before(g,v)) ra[n++]=v; }
     return n;
 }
+/* task 46: with the draw log open, every quad H7 examined in the log's presents: one `#h7q` line (its GS box as submitted, H7's kind
+ * or -1, the factor and the y range it was given; a quad of an R2 batch or an R3 quad has two lines, the first with kind -1).  Review
+ * finding 5: the last two columns are the bytes +8..+27 of the quad's first and last vertex as it was submitted (5 words each: what
+ * follows POSITION x, y in the 28-byte 2D vertex), so that a flat rectangle can be told from a picture by its numbers */
+static void h7_quadlog(KCtx *g,u64 ra,u32 prim,int q,int nq,const float *bb,int kind,double s,double y0n,double y1n,u64 va,u32 stride){
+    if(!dl_f) return; u64 fr=gfx_presents+1; int in=0; for(int r=0;r<dl_n;r++) if(fr>=dl_lo[r]&&fr<=dl_hi[r]) in=1; if(!in) return;
+    u32 w[2][5]; for(int c=0;c<2;c++) for(int i=0;i<5;i++) w[c][i]=stride>=28?rd32(g,va+(u64)(c?3:0)*stride+8u+4u*(u32)i):0;
+    pthread_mutex_lock(&mm);
+    fprintf(dl_f,"#h7q\t%llu\t%llu\t%llx\t%s\t%u\t%d/%d\t%g\t%g\t%g\t%g\t%d\t%.4f\t%g\t%g\t%08x.%08x.%08x.%08x.%08x\t%08x.%08x.%08x.%08x.%08x\n",P(fr),P(kh_game_frames()),P(ra-GS_BASE),dk_in&&dk_cur>=0?dkc[dk_cur].name:"-",prim,q,nq,bb[0],bb[1],bb[2],bb[3],kind,s,
+            y0n,y1n,w[0][0],w[0][1],w[0][2],w[0][3],w[0][4],w[1][0],w[1][1],w[1][2],w[1][3],w[1][4]);
+    pthread_mutex_unlock(&mm);
+}
 /* runtime/bgload.c f_4ad270 when kh_aspect_dk (fill, or KHNMC_ASPECT_LOG=2): obj = its result.  H3b first (it sets the object's MS.w
  * before M notes the object current; M records only) */
 void kh_aspect_dk_next(KCtx *g,u64 ra,u64 obj){
@@ -876,6 +1164,7 @@ void kh_aspect_m_draw(KCtx *g,const KhMDraw *d){
         if(have){ ms_src[d->src&3]++; ms_mssrc[d->mssrc&3]++; if(d->nocbv) ms_nocbv++; } }
     if(have&&vk_ms(kind)){ int i; for(i=0;i<n_xyo;i++) if(xyo[i][0]==ox&&xyo[i][1]==oy) break; if(i==n_xyo&&n_xyo<8){ xyo[i][0]=ox; xyo[i][1]=oy; n_xyo++; } if(i<8) xyo_n[i]++; }
     float a=d->ymin-oy, b=d->ymax-oy, pa=a*msy+msw, pb=b*msy+msw; int yv=have&&vk_ms(kind);
+    if(h7_in>0&&h7_in<=H7K_N) h7_m_draws[h7_in-1][kind]++;                               /* task 46: which vertex shader draws H7's batches */
     if(!dk_in) dk_out_draws[kind]++;
     else if(dk_cur<0) dk_gap_draws[kind]++;
     else { DkCls *c=&dkc[dk_cur]; c->draws[kind]++;
@@ -897,8 +1186,10 @@ void kh_aspect_m_draw(KCtx *g,const KhMDraw *d){
                 if(yv){ c->ydraws++; if(a<c->ymin) c->ymin=a; if(b>c->ymax) c->ymax=b; if(pa<c->pymin) c->pymin=pa; if(pb>c->pymax) c->pymax=pb; } } } }
     if(inlog){
         { char ch[128]; int p=0; ch[0]=0; for(int m=0;m<nra_&&p<(int)sizeof ch-12;m++) p+=snprintf(ch+p,sizeof ch-p,"%s%llx",m?",":"",P(ra[m]-GS_BASE));
-            fprintf(dl_f,"%llu\t%llu\t%u\t%llx\t%llx\t%s\t%d\t%u\t%u\t%d\t%s\t%s\t%d\t%s\n",P(fr),P(kh_game_frames()),t,P(d->list),P(d->pso),vk_name[kind],d->indexed,d->count,d->start,d->base,
+            fprintf(dl_f,"%llu\t%llu\t%u\t%llx\t%llx\t%s\t%d\t%u\t%u\t%d\t%s\t%s\t%d\t%s",P(fr),P(kh_game_frames()),t,P(d->list),P(d->pso),vk_name[kind],d->indexed,d->count,d->start,d->base,
                     !dk_in?"out":dk_cur<0?"gap":"obj",dk_in&&dk_cur>=0?dkc[dk_cur].name:"-",dk_in?dk_pos-1:-1,nra_>0?ch:"-");
+            /* task 46: the draw's GS-frame box (POSITION - xyOffset), its screen rows, which MagicScale row was staged, H7's kind (0 = none, 1 + H7K_*) */
+            if(yv) fprintf(dl_f,"\t%g\t%g\t%g\t%g\t%.1f\t%.1f\t%d\t%d\n",d->xmin-ox,d->xmax-ox,a,b,pa,pb,d->mssrc,h7_in); else fprintf(dl_f,"\t-\t-\t-\t-\t-\t-\t-\t%d\n",h7_in);
             dl_lines++; } }
     pthread_mutex_unlock(&mm);
 }
@@ -915,7 +1206,7 @@ void kh_aspect_drawlog_config(const char *v){
     memcpy(dl_path,v,(size_t)(at-v)); dl_path[at-v]=0;
     dl_f=fopen(dl_path,"w"); if(!dl_f) kh_fatal(NULL,"aspect-m-drawlog-open: KHNMC_ASPECT_M_DRAWLOG: cannot create %s (%s)",dl_path,strerror(errno));
     setvbuf(dl_f,NULL,_IOLBF,0);
-    fprintf(dl_f,"frame\tgame_frame\ttid\tlist\tpso\tvs\tindexed\tcount\tstart\tbase\tdk\tclass\tpos\tchain_rva\n");
+    fprintf(dl_f,"frame\tgame_frame\ttid\tlist\tpso\tvs\tindexed\tcount\tstart\tbase\tdk\tclass\tpos\tchain_rva\tgs_x0\tgs_x1\tgs_y0\tgs_y1\trow0\trow1\tms_src\th7\n");
     fprintf(stderr,"kh: aspect: KHNMC_ASPECT_M_DRAWLOG: every draw of %d present range(s) (the first %llu-%llu) into %s (a diagnostic of the measurement M; the frame column numbers presents as the `kh: gfx frame=` lines do)\n",dl_n,P(dl_lo[0]),P(dl_hi[0]),dl_path);
 }
 void kh_aspect_m_null_report(FILE *f);
@@ -924,6 +1215,8 @@ static void m_report(FILE *f){
     pthread_mutex_lock(&mm);
     fprintf(f,"kh: aspect M: dk passes (f_166640 setScreenMode at 0x140166677) %llu (begun inside another pass %llu), objects made current %llu, guest thread of the passes %u; "
               "draws (null backend) on guest thread %u, on another thread %llu; classes %d%s\n",P(dk_passes),P(dk_passes_nested),P(dk_objects),dk_tid,draw_tid,P(draws_other_thread),n_dkc,dkc_cut?" (table full: some classes not recorded)":"");
+    fprintf(f,"kh: aspect M: H7: draws made inside a classified batch, by kind and vertex shader:");
+    for(int k=0;k<H7K_N;k++){ fprintf(f," [%s:",h7_kname[k]); for(int v=0;v<VK_N;v++) if(h7_m_draws[k][v]) fprintf(f," %s=%llu",vk_name[v],P(h7_m_draws[k][v])); fprintf(f,"]"); } fputc('\n',f);
     fprintf(f,"kh: aspect M: draws by vertex shader outside dk passes:"); for(int k=0;k<VK_N;k++) if(dk_out_draws[k]) fprintf(f," %s=%llu",vk_name[k],P(dk_out_draws[k]));
     fprintf(f,"; inside a pass but outside an object:"); for(int k=0;k<VK_N;k++) if(dk_gap_draws[k]) fprintf(f," %s=%llu",vk_name[k],P(dk_gap_draws[k])); fputc('\n',f);
     fprintf(f,"kh: aspect M: GS offset (cbConstantVS xyOffset.xy, from the source counted in the next line) at the MagicScale draws:"); for(int i=0;i<n_xyo;i++) fprintf(f," (%g, %g) x%llu",xyo[i][0],xyo[i][1],P(xyo_n[i]));
@@ -1024,6 +1317,7 @@ void kh_aspect_report(FILE *f){
         if(to||so) fprintf(f,"kh: aspect: NOTE: H4 left %llu fade / bar draws and %llu bar settings with a rect that is neither the exe's nor the extended one (see the M lines for the rects)\n",P(to),P(so));
         fprintf(f,"kh: aspect report: H5 (full-height scissors, 0x126fd0): calls %llu: extended %llu, other rects (left) %llu, r = 1 %llu, test aid off %llu\n",P(h5_calls),P(h5_ext),P(h5_other),P(h5_identity),P(h5_off));
         h3_report(f);                                                               /* task 42 */
+        h7_report(f);                                                               /* task 46 */
     }
     if(kh_aspect_m) m_report(f);
     if(!kh_aspect_log) return;
@@ -1354,8 +1648,341 @@ static void h3_selftest(KCtx *g){
     memcpy(&h3,&sh,sizeof sh); asp_mode=sm; asp_h1_uncond=su; asp_off_h3=so; kh_aspect_dk=sdk; kh_aspect_m=sml; atomic_store(&last3d_plus1,s3);
     memcpy(hp(g,ID_TAB),tsave,0x204); wr32(g,GX_GUARD,guard); memcpy(hp(g,GX),gxsave,0x100);
 }
+/* ---- task 46: H7 through the real hook f_11a330 and the lifted body -----------------------------------------------------------------
+ * A 2D batch as the game submits it: the vertices in a guest block, the current vertex buffer object (GX+0x5790, index [GX+0x578c] =
+ * 0, [GX+0x59b8] = 0) holding the stride (+0x8) and the block (+0x48), then the hook f_11a330(GX, count, prim, 0) with the draw
+ * routine's return address.  The lifted body runs: with [GX+0x4c0] = 1 its lazy begin is done and with [GX + 0x7c00 + 0x228 [GX+0x60]]
+ * = 0 it takes its own no-device path (0x14011a3c8 -> 0x14011a447: three stores into the buffer object, no draw), so the test needs no
+ * D3D12 device.  MagicScale is the exe's: the lifted f_126500 / f_1433a0 computes it for the screen and the mode {1,0,0,0}.  Every
+ * vertex carries a pattern in its other 20 bytes and a guard word follows the block: `same` says that nothing but y changed. */
+#define H7T_OX 1792.0f
+#define H7T_OY 1840.0f
+#define H7T_LAY  (GS_BASE+0x197033ull)
+#define H7T_LAYB (GS_BASE+0x19701aull)
+#define H7T_RECT (GS_BASE+0x16022cull)
+#define H7T_PPP  (GS_BASE+0x4b3c85ull)
+static u64 h7t_vb; static u32 h7t_stride;
+static void h7t_quad(float (*v)[2],float x0,float x1,float y0,float y1){ v[0][0]=x0; v[0][1]=y0; v[1][0]=x1; v[1][1]=y0; v[2][0]=x0; v[2][1]=y1; v[3][0]=x1; v[3][1]=y1; }
+/* the y the hook must store for a submitted GS y and a factor (the same single-precision steps as h7_pre) */
+static float h7t_exp(float y,double s){ float st=y+H7T_OY, in=st-H7T_OY; return h7_map(in,s)+H7T_OY; }
+static float h7t_raw(float y){ return y+H7T_OY; }
+static float h7t_mov(float y,double dy){ float st=y+H7T_OY, in=st-H7T_OY; return (float)((double)in+dy)+H7T_OY; }   /* R3: moved by dy (the same steps as h7_pre) */
+/* submit nv vertices; out[i] = the stored y of vertex i afterwards; *same = x, the other bytes and the guard word are unchanged */
+static int h7t_submit(KCtx *g,u64 ra,u32 prim,const float (*v)[2],int nv,float *out,int *same){
+    u64 vb=h7t_vb, B=GX+0x5790; u32 st=h7t_stride; int k, sm=1;
+    for(int i=0;i<nv;i++){ u64 a=vb+(u64)i*st; for(u32 q=0;q<st;q+=4) wr32(g,a+q,0xa5000000u+(u32)i*256u+q); wrf(g,a,v[i][0]+H7T_OX); wrf(g,a+4,v[i][1]+H7T_OY); }
+    wr32(g,vb+(u64)nv*st,0xdeadbeefu);
+    wr32(g,GX+0x578c,0); wr64(g,GX+0x59b8,0); wr32(g,B+0x8,st); wr64(g,B+0x30,0x2000); wr32(g,B+0x38,0); wr64(g,B+0x40,vb); wr64(g,B+0x48,vb); wr32(g,B+0x50,(u32)nv);   /* as f_121ff0 leaves it */
+    st_call_ra(g,f_11a330,ra,0,(u64[]){GX,(u64)(u32)nv,prim,0},4,&k);
+    if(rd32(g,vb+(u64)nv*st)!=0xdeadbeefu) sm=0;
+    for(int i=0;i<nv;i++){ u64 a=vb+(u64)i*st; out[i]=rdf(g,a+4); if(fbits(rdf(g,a))!=fbits(v[i][0]+H7T_OX)) sm=0; for(u32 q=8;q<st;q+=4) if(rd32(g,a+q)!=0xa5000000u+(u32)i*256u+q) sm=0; }
+    *same=sm; return k;
+}
+/* the screen and the exe's own MagicScale for the 2D mode {1,0,0,0}, the GS offset of a menu frame */
+static void h7t_screen(KCtx *g,float W,float H){
+    wrf(g,GX+0x18,W); wrf(g,GX+0x1c,H); wrf(g,GX+0x10,W); wrf(g,GX+0x14,H); wrf(g,GX+0x20,1); wrf(g,GX+0x24,1); wrf(g,GX+0x28,1); wrf(g,GX+0x38,512); wrf(g,GX+0x3c,416); wrf(g,GX+0x48,512); wrf(g,GX+0x4c,416);
+    u64 out=ga_calloc(1,0x20), mode=ga_calloc(1,0x10); int k; wrf(g,mode,1.0f); st_call(g,f_126500,(u64[]){out,mode},2,&k); ACHECK(k&&rd32(g,GX+0xb4)!=0);
+    wr32(g,GX+0xb8,1);                      /* with [GX+0xb4] the condition under which f_1121d0 stages MagicScale from GX+0xa0 (0x140112386) */
+    /* MS.x / MS.z as a run has them (the 512-wide GS frame over the band's 4:3 middle: task 42's first-pass line, MagicScale 2.8125
+     * 2.59615 240 135 at 1920x1350 and 3.91113 3.61028 333.75 188.062 at 2670x1878; the selftest's GX has no widescreen setting and
+     * f_1433a0 leaves MS.x = MS.y here).  H7 uses them only for the frame's left and right GS columns (-85.33 and 597.33) */
+    { double bh=(double)H-2.0*kh_aspect_o(W,H); wrf(g,GX+0xa0,(float)(bh*4.0/3.0/512.0)); wrf(g,GX+0xa8,(float)(((double)W-bh*4.0/3.0)/2.0)); }
+    wrf(g,GX+0x138,H7T_OX); wrf(g,GX+0x13c,H7T_OY); ga_free(out); ga_free(mode);
+}
+static int h7t_all(const float *out,const float (*v)[2],int nv,int raw){ for(int i=0;i<nv;i++) if(fbits(out[i])!=fbits(raw?h7t_raw(v[i][1]):0)) return 0; return 1; }
+static void h7_selftest(KCtx *g){
+    /* the arithmetic */
+    ACHECK(h7_cover(0,416,52)==1.25&&h7_cover(-53,469,52)==1.0&&h7_cover(-52,468,52)==1.0&&h7_cover(-1000,2000,52)==1.0);
+    ACHECK(h7_cover(-31,448,52)==260.0/239.0&&h7_cover(-30,449,52)==260.0/238.0&&h7_cover(-16,436,52)==260.0/224.0&&h7_cover(-51,461,52)==260.0/253.0&&h7_cover(-8,423,52)==260.0/215.0);
+    ACHECK(h7_cover(-63,416,52)==1.25&&h7_cover(0,500,52)==1.25&&h7_cover(-51.5,468,52)==260.0/259.5);
+    ACHECK(h7_map(0,1.25)==-52.0f&&h7_map(416,1.25)==468.0f&&h7_map(208,1.25)==208.0f&&h7_map(208,260.0/224.0)==208.0f&&h7_map(-16,260.0/224.0)==-52.0f);
+    for(int i=0;i<5;i++){ static const double q[5][2]={{0,416},{-31,448},{-16,436},{-51,461},{-8,423}};        /* the stretched range covers the frame, and exactly at one edge */
+        double sp=h7_cover(q[i][0],q[i][1],52), t=208+(q[i][0]-208)*sp, u=208+(q[i][1]-208)*sp; ACHECK(t<=-52+1e-9&&u>=468-1e-9&&(near(t,-52,1e-9)||near(u,468,1e-9))); }
+    { float v[4][2], bb[4]; double sp=0;
+      h7t_quad(v,-101,602,-16,436); ACHECK(h7_box(v,bb)==1&&bb[0]==-101&&bb[1]==602&&bb[2]==-16&&bb[3]==436);
+      ACHECK(h7_r1(bb,1,1.25,-85.333,597.333,&sp)==H7K_FULL&&sp==260.0/224.0);
+      ACHECK(h7_r1(bb,0,1.25,-85.333,597.333,&sp)==-1);                                               /* not a rectangle */
+      h7t_quad(v,-88,8,-16,432); ACHECK(h7_box(v,bb)==1&&h7_r1(bb,1,1.25,-85.333,597.333,&sp)==H7K_PIECE&&sp==260.0/224.0);
+      h7t_quad(v,-84.5f,596.5f,1,415); ACHECK(h7_box(v,bb)==1&&h7_r1(bb,1,1.25,-85.333,597.333,&sp)==H7K_FULL);   /* the tolerances: 1 GS row / column */
+      h7t_quad(v,-84,596,1,415); ACHECK(h7_box(v,bb)==1&&h7_r1(bb,1,1.25,-85.333,597.333,&sp)==H7K_PIECE);
+      h7t_quad(v,-101,602,1.5f,436); ACHECK(h7_box(v,bb)==1&&h7_r1(bb,1,1.25,-85.333,597.333,&sp)==-1);
+      h7t_quad(v,-101,602,-16,414.5f); ACHECK(h7_box(v,bb)==1&&h7_r1(bb,1,1.25,-85.333,597.333,&sp)==-1);
+      h7t_quad(v,195,595,0,400); ACHECK(h7_box(v,bb)==1&&h7_r1(bb,1,1.25,-85.333,597.333,&sp)==-1&&h7_r3(bb,1,-85.333,597.333)==-1);   /* the title's 400 x 400 picture: not R1's (not band-height); R3 moves it up (review finding 1) */
+      h7t_quad(v,-86,598,-53,469); ACHECK(h7_box(v,bb)==1&&h7_r1(bb,1,1.25,-85.333,597.333,&sp)==H7K_ALREADY&&sp==1.0);
+      h7t_quad(v,-86,598,-52,468); ACHECK(h7_r1(bb,h7_box(v,bb),1.25,-85.333,597.333,&sp)==H7K_ALREADY);
+      h7t_quad(v,-86,598,-51.5f,468); ACHECK(h7_r1(bb,h7_box(v,bb),1.25,-85.333,597.333,&sp)==H7K_FULL&&sp==260.0/259.5);   /* half a row short: stretched by 0.2 % */
+      h7t_quad(v,0,512,0,416); v[3][1]=420; ACHECK(h7_box(v,bb)==0);                                    /* skewed */
+      v[0][0]=23.3f; v[0][1]=187.8f; v[1][0]=258.3f; v[1][1]=-47.25f; v[2][0]=258.4f; v[2][1]=422.8f; v[3][0]=493.4f; v[3][1]=187.7f; ACHECK(h7_box(v,bb)==0&&bb[2]==-47.25f&&bb[3]==422.8f);   /* rotated */
+      h7t_quad(v,5,5,0,416); ACHECK(h7_box(v,bb)==0); h7t_quad(v,0,512,7,7); ACHECK(h7_box(v,bb)==0);     /* no area */
+      h7t_quad(v,0,512,0,416); v[2][1]=__builtin_nanf(""); ACHECK(h7_box(v,bb)==0); }
+    /* R2: the camp menu's backdrop as M logged it (camp route, present 21652): 8 full-width stripes of 64 rows from -51 and the 8
+     * right-hand pieces of the same picture */
+    { float bb[20][4]; u8 rc[20], on[20]; double sp=0; int n=0;
+      for(int i=0;i<8;i++){ bb[n][0]=612; bb[n][1]=875+40*i; bb[n][2]=-51+64*i; bb[n][3]=13+64*i; rc[n++]=1; }
+      for(int i=0;i<8;i++){ bb[n][0]=-101; bb[n][1]=612; bb[n][2]=-51+64*i; bb[n][3]=13+64*i; rc[n++]=1; }
+      ACHECK(h7_r2(bb,rc,16,1.25,-85.333,597.333,&sp,on)==2&&sp==260.0/253.0);
+      ACHECK(h7_r2(bb,rc,15,1.25,-85.333,597.333,&sp,on)==0);                                           /* the last stripe missing: ends at 397 */
+      ACHECK(h7_r2(bb+9,rc+9,7,1.25,-85.333,597.333,&sp,on)==0);                                        /* the first missing: begins at 13 */
+      { float sv=bb[11][3]; bb[11][3]=sv-1; ACHECK(h7_r2(bb,rc,16,1.25,-85.333,597.333,&sp,on)==0); bb[11][3]=sv-0.5f; ACHECK(h7_r2(bb,rc,16,1.25,-85.333,597.333,&sp,on)==2); bb[11][3]=sv; }   /* a gap of a row / of half a row */
+      rc[12]=0; ACHECK(h7_r2(bb,rc,16,1.25,-85.333,597.333,&sp,on)==0); rc[12]=1;                         /* one stripe is not a rectangle */
+      { float sv=bb[10][1]; bb[10][1]=579; ACHECK(h7_r2(bb,rc,16,1.25,-85.333,597.333,&sp,on)==0); bb[10][1]=580; ACHECK(h7_r2(bb,rc,16,1.25,-85.333,597.333,&sp,on)==2); bb[10][1]=sv; }   /* one stripe narrower than the frame (682.67 - 2) */
+      for(int i=8;i<16;i++){ bb[i][0]-=700; bb[i][1]-=700; } ACHECK(h7_r2(bb,rc,16,1.25,-85.333,597.333,&sp,on)==2&&sp==260.0/253.0); for(int i=8;i<16;i++){ bb[i][0]+=700; bb[i][1]+=700; }   /* sliding in from the left */
+      ACHECK(h7_r2(bb,rc,8,1.25,-85.333,597.333,&sp,on)==0);                                            /* only the right-hand pieces */
+      ACHECK(h7_r2(bb+8,rc+8,1,1.25,-85.333,597.333,&sp,on)==0);                                        /* one rectangle is R1's case */
+      bb[8][2]=-60; bb[15][3]=470; ACHECK(h7_r2(bb,rc,16,1.25,-85.333,597.333,&sp,on)==1&&sp==1.0);       /* a stack that covers the frame already */
+      bb[15][3]=461; ACHECK(h7_r2(bb,rc,16,1.25,-85.333,597.333,&sp,on)==2&&sp==260.0/253.0);
+      /* review finding 4: the mask.  The 8 stripes and the 8 right-hand pieces (the same rows) are the picture; a header (the camp
+       * menu's: y -25..34), a panel below the band, a rotated piece on a stripe's rows and a rectangle one row and a half off a
+       * stripe's rows are not */
+      bb[8][2]=-51; ACHECK(h7_r2(bb,rc,16,1.25,-85.333,597.333,&sp,on)==2&&sp==260.0/253.0);              /* the batch as M logged it again */
+      { int all=1; for(int i=0;i<16;i++) if(on[i]!=1) all=0; ACHECK(all); }
+      bb[16][0]=100; bb[16][1]=400; bb[16][2]=-25; bb[16][3]=34; rc[16]=1;  bb[17][0]=157; bb[17][1]=687; bb[17][2]=333; bb[17][3]=547; rc[17]=1;   /* the panel: its top on a stripe's first row, its bottom not */
+      bb[18][0]=620; bb[18][1]=700; bb[18][2]=13; bb[18][3]=77; rc[18]=0;   bb[19][0]=620; bb[19][1]=700; bb[19][2]=14.5f; bb[19][3]=77; rc[19]=1;
+      ACHECK(h7_r2(bb,rc,20,1.25,-85.333,597.333,&sp,on)==2&&sp==260.0/253.0&&on[16]==0&&on[17]==0&&on[18]==0&&on[19]==0&&on[0]==1&&on[7]==1&&on[8]==1&&on[15]==1);
+      bb[19][2]=14; ACHECK(h7_r2(bb,rc,20,1.25,-85.333,597.333,&sp,on)==2&&on[19]==1); }                 /* within a row of a stripe's rows: a piece of the picture */
+    /* review finding 6: stripes beyond the band belong to the stack.  ..., 333..397, 397..416, 416..461: the stack is -51..461 (factor
+     * 260/253), not -51..416 (1.25); a stripe beyond a gap of a row is not part of it */
+    { float bb[9][4]; u8 rc[9], on[9]; double sp=0; int n=0;
+      for(int i=0;i<7;i++){ bb[n][0]=-101; bb[n][1]=612; bb[n][2]=-51+64*i; bb[n][3]=13+64*i; rc[n++]=1; }
+      bb[n][0]=-101; bb[n][1]=612; bb[n][2]=397; bb[n][3]=416; rc[n++]=1;  bb[n][0]=-101; bb[n][1]=612; bb[n][2]=416; bb[n][3]=461; rc[n++]=1;
+      ACHECK(h7_r2(bb,rc,9,1.25,-85.333,597.333,&sp,on)==2&&sp==260.0/253.0&&on[8]==1&&on[7]==1);
+      ACHECK(h7_r2(bb,rc,8,1.25,-85.333,597.333,&sp,on)==2&&sp==1.25);                                   /* without the last stripe: the stack ends at the band's edge */
+      bb[8][2]=417; ACHECK(h7_r2(bb,rc,9,1.25,-85.333,597.333,&sp,on)==2&&sp==1.25&&on[8]==0&&on[7]==1); }
+    /* review finding 3: a rectangle one or two GS subpixels (1/16) off at one corner is a rectangle (the map-change shutter's left
+     * piece as M logged it: box -328.5..55.5625, -11.5..428.5; its mirror piece 457..841, -12..428); three subpixels off is skewed */
+    { float v[4][2], bb[4]; double sp=0;
+      h7t_quad(v,-328.5f,55.5625f,-11.5f,428.5f); v[3][0]=55.5f; ACHECK(h7_box(v,bb)==1&&bb[1]==55.5625f&&h7_r1(bb,1,1.25,-85.333,597.333,&sp)==H7K_PIECE&&sp==260.0/219.5);
+      v[3][0]=55.4375f; ACHECK(h7_box(v,bb)==1); v[3][0]=55.375f; ACHECK(h7_box(v,bb)==0);
+      h7t_quad(v,457,841,-12,428); v[0][1]=-11.9375f; ACHECK(h7_box(v,bb)==1&&bb[2]==-12.0f&&h7_r1(bb,1,1.25,-85.333,597.333,&sp)==H7K_PIECE&&sp==260.0/220.0);
+      v[0][1]=-11.8125f; ACHECK(h7_box(v,bb)==0); }
+    /* review finding 1: R3, a picture cut by a band edge.  Exactly on ONE band edge (1/8 row), at least 312 rows tall, narrower than
+     * the frame, a rectangle */
+    { float v[4][2], bb[4];
+      h7t_quad(v,195,595,0,400); ACHECK(h7_r3(bb,h7_box(v,bb),-85.333,597.333)==-1);                     /* the title's picture: its top edge */
+      h7t_quad(v,195,595,16,416); ACHECK(h7_r3(bb,h7_box(v,bb),-85.333,597.333)==1);                     /* the mirror case: the bottom edge */
+      h7t_quad(v,195,595,0.125f,400); ACHECK(h7_r3(bb,h7_box(v,bb),-85.333,597.333)==-1); h7t_quad(v,195,595,0.1875f,400); ACHECK(h7_r3(bb,h7_box(v,bb),-85.333,597.333)==0);
+      h7t_quad(v,195,595,-0.125f,400); ACHECK(h7_r3(bb,h7_box(v,bb),-85.333,597.333)==-1); h7t_quad(v,195,595,-0.1875f,400); ACHECK(h7_r3(bb,h7_box(v,bb),-85.333,597.333)==0);
+      h7t_quad(v,195,595,104,416.125f); ACHECK(h7_r3(bb,h7_box(v,bb),-85.333,597.333)==1); h7t_quad(v,195,595,104,416.1875f); ACHECK(h7_r3(bb,h7_box(v,bb),-85.333,597.333)==0);
+      h7t_quad(v,195,595,104,415.8125f); ACHECK(h7_r3(bb,h7_box(v,bb),-85.333,597.333)==0);
+      h7t_quad(v,195,595,0,312); ACHECK(h7_r3(bb,h7_box(v,bb),-85.333,597.333)==-1); h7t_quad(v,195,595,0,311.5f); ACHECK(h7_r3(bb,h7_box(v,bb),-85.333,597.333)==0);   /* 3/4 of the band; shorter: a widget */
+      h7t_quad(v,-84,596,0,400); ACHECK(h7_r3(bb,h7_box(v,bb),-85.333,597.333)==-1); h7t_quad(v,-84.5f,596.5f,0,400); ACHECK(h7_r3(bb,h7_box(v,bb),-85.333,597.333)==0);  /* as wide as the frame less 2 columns: a backdrop's piece */
+      h7t_quad(v,195,595,0,416); ACHECK(h7_r3(bb,h7_box(v,bb),-85.333,597.333)==0);                      /* both edges: band-height, R1's */
+      h7t_quad(v,195,595,0,400); ACHECK(h7_r3(bb,0,-85.333,597.333)==0); }                                /* not a rectangle */
+    /* review finding 2: h7_batch_covers.  The map-change transition's batch as M logged it (camp route, present 3534): a centre
+     * square and a rectangle below, above, right and left of it */
+    { static const float w5[5][4]={{13,524,-16,495},{-581,1118,495,746},{-581,1118,-271,-16},{524,1118,-16,495},{-581,13,-16,495}};
+      float bb[6][4]; u8 rc[6]={1,1,1,1,1,1}; memcpy(bb,w5,sizeof w5);
+      ACHECK(h7_batch_covers(bb,rc,5,0,52,-85.333,597.333)==1&&h7_batch_covers(bb,rc,5,3,52,-85.333,597.333)==1&&h7_batch_covers(bb,rc,5,4,52,-85.333,597.333)==1);
+      rc[2]=0; ACHECK(h7_batch_covers(bb,rc,5,0,52,-85.333,597.333)==0); rc[2]=1;                         /* the piece above is not a rectangle */
+      bb[2][3]=-17; ACHECK(h7_batch_covers(bb,rc,5,0,52,-85.333,597.333)==0); bb[2][3]=-16.5f; ACHECK(h7_batch_covers(bb,rc,5,0,52,-85.333,597.333)==1); bb[2][3]=-16;   /* a gap of a row / of half a row above */
+      bb[2][2]=-51; ACHECK(h7_batch_covers(bb,rc,5,0,52,-85.333,597.333)==0); bb[2][2]=-52; ACHECK(h7_batch_covers(bb,rc,5,0,52,-85.333,597.333)==1); bb[2][2]=-271;      /* the piece above ends a row short of the frame's first row */
+      bb[2][0]=15; ACHECK(h7_batch_covers(bb,rc,5,0,52,-85.333,597.333)==0&&h7_batch_covers(bb,rc,5,3,52,-85.333,597.333)==1); bb[2][0]=-581;   /* the piece above does not span the centre's columns (it still spans the right piece's) */
+      bb[5][0]=-581; bb[5][1]=1118; bb[5][2]=-400; bb[5][3]=-271;                                            /* two pieces above, one over the other */
+      bb[2][2]=-40; bb[5][3]=-40; ACHECK(h7_batch_covers(bb,rc,5,0,52,-85.333,597.333)==0&&h7_batch_covers(bb,rc,6,0,52,-85.333,597.333)==1); bb[2][2]=-271;
+      /* a rectangle that contains the R1 rectangle (another layer: a picture over a larger black rectangle) is not a tile above or below it */
+      bb[0][0]=-100; bb[0][1]=700; bb[0][2]=-16; bb[0][3]=432; bb[1][0]=-100; bb[1][1]=700; bb[1][2]=-60; bb[1][3]=480;
+      ACHECK(h7_batch_covers(bb,rc,2,0,52,-85.333,597.333)==0);
+      bb[0][2]=-16; bb[0][3]=480; bb[1][2]=-60; bb[1][3]=200; ACHECK(h7_batch_covers(bb,rc,2,0,52,-85.333,597.333)==0);     /* overlaps its top part only */
+      bb[0][2]=-60; bb[0][3]=432; bb[1][2]=200; bb[1][3]=480; ACHECK(h7_batch_covers(bb,rc,2,0,52,-85.333,597.333)==0);     /* overlaps its bottom part only */
+      bb[0][2]=-16; bb[0][3]=480; bb[1][2]=-60; bb[1][3]=-16; ACHECK(h7_batch_covers(bb,rc,2,0,52,-85.333,597.333)==1); }   /* a tile above, the rectangle itself passes the frame's last row */
+    /* review finding 7: the run's start line says on which frames H1 acts */
+    { char bn[512]; int m0=asp_mode, u0=asp_h1_uncond, o0=asp_off_h7, a0=kh_aspect_m, l0=kh_aspect_log; kh_aspect_m=kh_aspect_log=0;
+      asp_mode=1; asp_h1_uncond=0; asp_off_h7=0; asp_banner(bn,sizeof bn);
+      ACHECK(!strcmp(bn,"kh: aspect: KHNMC_ASPECT=fill (H1: no 16:9 bars on a screen narrower than 16:9, on every frame: task 46, H7)"));
+      asp_off_h7=1; asp_banner(bn,sizeof bn); ACHECK(strstr(bn,", only on frames with the 3D view: TEST AID KHNMC_ASPECT_TEST_OFF=h7")!=NULL&&strstr(bn,"on every frame")==NULL);
+      asp_h1_uncond=1; asp_banner(bn,sizeof bn); ACHECK(strstr(bn,"UNCONDITIONAL: every frame, KHNMC_ASPECT_TEST_H1 test aid)")!=NULL&&strstr(bn,"3D view")==NULL);
+      asp_mode=0; asp_h1_uncond=0; asp_off_h7=0; kh_aspect_log=1; asp_banner(bn,sizeof bn); ACHECK(!strcmp(bn,"kh: aspect: KHNMC_ASPECT=pc; KHNMC_ASPECT_LOG=1: size records on"));
+      asp_mode=m0; asp_h1_uncond=u0; asp_off_h7=o0; kh_aspect_m=a0; kh_aspect_log=l0; }
+    ACHECK(h7_site_index(H7T_LAY)>=0&&h7_site_index(H7T_LAYB)>=0&&h7_site_index(H7T_RECT)>=0&&h7_site_index(H7T_PPP)<0&&h7_site_index(GS_BASE+0x16a853ull)<0&&h7_site_index(0)<0);
+    /* through the hook and the lifted body */
+    u8 gxsave[0x148]; memcpy(gxsave,hp(g,GX),0x148); u8 s4b0[0x18]; memcpy(s4b0,hp(g,GX+0x4b0),0x18); u8 svb[0x60]; memcpy(svb,hp(g,GX+0x578c),0x60);
+    u64 s59b8=rd64(g,GX+0x59b8), s7c00=rd64(g,GX+0x7c00); u32 guard=rd32(g,GX_GUARD); wr32(g,GX_GUARD,0x80000000u);
+    int sm=asp_mode, su=asp_h1_uncond, so3=asp_off_h3, sdk=kh_aspect_dk, sml=kh_aspect_m, sl=kh_aspect_log; u64 s3=atomic_load(&last3d_plus1), sn1=h7_h1_no3d, sn3=h7_h3_no3d;
+    H7Stat sh7; memcpy(&sh7,&h7,sizeof sh7); H3Stat sh3; memcpy(&sh3,&h3,sizeof sh3); static H7Row srow[H7_ROWS]; memcpy(srow,h7r,sizeof srow); int snr=n_h7r; u64 scut=h7r_cut;
+    kh_aspect_m=0; kh_aspect_log=0; asp_h1_uncond=0; asp_off_h3=0; asp_off_h7=0; asp_mode=1; h3.warned=1; h3.warned_inner=1;
+    wr8(g,GX+0x4c0,1); wr64(g,GX+0x7c00,0); wr32(g,GX+0x60,0);
+    h7t_vb=ga_calloc(1,0x2000); h7t_stride=H7_STRIDE;
+    float v[80][2], out[80]; int k, same;
+    #define H7SUB(ra_,prim_,nv_) (k=h7t_submit(g,(ra_),(prim_),(const float (*)[2])v,(nv_),out,&same))
+    static const float scr[2][2]={{1920,1350},{2670,1878}};
+    for(int sc=0;sc<2;sc++){ float W=scr[sc][0], H=scr[sc][1]; h7t_screen(g,W,H);
+        double r=kh_aspect_r(W,H), b=208.0*(r-1.0), o=kh_aspect_o(W,H), msy=rdf(g,GX+0xa4), msw=rdf(g,GX+0xac);
+        ACHECK(near(msw,o,1e-3)&&near(416.0*msy,H-2.0*o,1e-2));                                          /* the exe's mode is the centred band */
+        ACHECK(near(-(double)rdf(g,GX+0xa8)/rdf(g,GX+0xa0),-85.3333,1e-3)&&near(((double)W-rdf(g,GX+0xa8))/rdf(g,GX+0xa0),597.3333,1e-3));
+        /* R1: exactly the band -> the frame's first and last row */
+        { double xl=-(double)rdf(g,GX+0xa8)/rdf(g,GX+0xa0), xr=((double)W-rdf(g,GX+0xa8))/rdf(g,GX+0xa0); u64 f0=h7.kind[H7K_FULL], e0=h7.batch_ext;
+          h7t_quad(v,(float)xl,(float)xr,0,416); H7SUB(H7T_LAY,8,4); ACHECK(k&&same&&h7.kind[H7K_FULL]==f0+1&&h7.batch_ext==e0+1);
+          for(int i=0;i<4;i++) ACHECK(fbits(out[i])==fbits(h7t_exp(v[i][1],r)));
+          double row0=((double)out[0]-H7T_OY)*msy+msw, row1=((double)out[2]-H7T_OY)*msy+msw; ACHECK(near(row0,0,0.01)&&near(row1,H,0.01));   /* screen rows 0 and H */
+          if(sc==0) ACHECK(out[0]==H7T_OY-52.0f&&out[1]==H7T_OY-52.0f&&out[2]==H7T_OY+468.0f&&out[3]==H7T_OY+468.0f); }
+        /* R1: the pause screen's dim rectangle (M: -101..602, -16..436), from both paths of f_1969a0 and from f_15fee0 (primitive 6) */
+        { static const u64 ras[3]={H7T_LAY,H7T_LAYB,H7T_RECT}; static const u32 pr[3]={8,8,6}; double sp=h7_cover(-16,436,b);
+          for(int c=0;c<3;c++){ u64 f0=h7.kind[H7K_FULL]; h7t_quad(v,-101,602,-16,436); H7SUB(ras[c],pr[c],4); ACHECK(k&&same&&h7.kind[H7K_FULL]==f0+1);
+              for(int i=0;i<4;i++) ACHECK(fbits(out[i])==fbits(h7t_exp(v[i][1],sp)));
+              ACHECK(((double)out[0]-H7T_OY)*msy+msw<=0.01&&((double)out[2]-H7T_OY)*msy+msw>=H-0.01); } }
+        /* R1: a full-height side strip (the camp menu: -88..8) is a piece */
+        { u64 p0=h7.kind[H7K_PIECE]; double sp=h7_cover(-16,432,b); h7t_quad(v,-88,8,-16,432); H7SUB(H7T_LAYB,8,4); ACHECK(k&&same&&h7.kind[H7K_PIECE]==p0+1);
+          for(int i=0;i<4;i++) ACHECK(fbits(out[i])==fbits(h7t_exp(v[i][1],sp))); }
+        /* widgets: not one bit changes */
+        { u64 s0=h7.small; h7t_quad(v,116,401,193,223); H7SUB(H7T_LAY,8,4); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,4,1)&&h7.small==s0+1);
+          h7t_quad(v,195,595,0,300); H7SUB(H7T_LAY,8,4); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,4,1));       /* touches the band's top edge only, 300 rows tall */
+          h7t_quad(v,195,595,0.5f,400); H7SUB(H7T_LAY,8,4); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,4,1));    /* half a row off the band's edge */
+          h7t_quad(v,157,687,314,547); H7SUB(H7T_LAYB,8,4); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,4,1));    /* reaches below the band only */
+          h7t_quad(v,-101,612,-51,13); H7SUB(H7T_LAYB,8,4); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,4,1)&&h7.small==s0+5); }   /* one stripe alone */
+        /* a batch of three quads: only the band-height rectangle in the middle changes */
+        { double sp=h7_cover(-16,432,b); h7t_quad(v,116,401,193,223); h7t_quad(v+4,-100,1084,-16,432); h7t_quad(v+8,178,337,225,255); u64 f0=h7.kind[H7K_FULL], s0=h7.small, e0=h7.batch_ext;
+          H7SUB(H7T_LAYB,8,12); ACHECK(k&&same&&h7.kind[H7K_FULL]==f0+1&&h7.small==s0+2&&h7.batch_ext==e0+1&&h7t_all(out,(const float (*)[2])v,4,1)&&h7t_all(out+8,(const float (*)[2])(v+8),4,1));
+          for(int i=4;i<8;i++) ACHECK(fbits(out[i])==fbits(h7t_exp(v[i][1],sp))); }
+        /* R3 (review finding 1): the title's picture (195..595, 0..400) is moved up by b: its cut edge is the frame's first row, its
+         * height, its x and the rest of its vertices unchanged; the mirror case moves down to the frame's last row; from a routine
+         * that is not in the table and with the test aid: not one bit */
+        { u64 e0=h7.kind[H7K_EDGE], x0=h7.batch_ext, s0=h7.small, t0=h7.kind[H7K_SITE];
+          h7t_quad(v,195,595,0,400); H7SUB(H7T_LAY,8,4); ACHECK(k&&same&&h7.kind[H7K_EDGE]==e0+1&&h7.batch_ext==x0+1&&h7.small==s0);
+          for(int i=0;i<4;i++) ACHECK(fbits(out[i])==fbits(h7t_mov(v[i][1],-b)));
+          ACHECK(near(((double)out[0]-H7T_OY)*msy+msw,0,0.01)&&near((double)out[2]-(double)out[0],400,1e-3)&&fbits(out[0])==fbits(out[1])&&fbits(out[2])==fbits(out[3]));
+          if(sc==0) ACHECK(out[0]==H7T_OY-52.0f&&out[2]==H7T_OY+348.0f);
+          h7t_quad(v,195,595,16,416); H7SUB(H7T_LAYB,8,4); ACHECK(k&&same&&h7.kind[H7K_EDGE]==e0+2);
+          for(int i=0;i<4;i++) ACHECK(fbits(out[i])==fbits(h7t_mov(v[i][1],b)));
+          ACHECK(near(((double)out[2]-H7T_OY)*msy+msw,H,0.01)&&near((double)out[2]-(double)out[0],400,1e-3));
+          h7t_quad(v,195,595,0,400); H7SUB(H7T_PPP,8,4); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,4,1)&&h7.kind[H7K_EDGE]==e0+2&&h7.kind[H7K_SITE]==t0+1);
+          asp_off_h7=1; H7SUB(H7T_LAY,8,4); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,4,1)&&h7.kind[H7K_EDGE]==e0+2); asp_off_h7=0;
+          /* the title's batch shapes together: the flat backdrop (R1), the picture (R3), the logo (left) */
+          { double sp=h7_cover(-31,448,b); u64 f0=h7.kind[H7K_FULL]; x0=h7.batch_ext; h7t_quad(v,-149,660,-31,448); h7t_quad(v+4,195,595,0,400); h7t_quad(v+8,11,206,52,275);
+            H7SUB(H7T_LAY,8,12); ACHECK(k&&same&&h7.kind[H7K_FULL]==f0+1&&h7.kind[H7K_EDGE]==e0+3&&h7.batch_ext==x0+1&&h7t_all(out+8,(const float (*)[2])(v+8),4,1));
+            for(int i=0;i<4;i++) ACHECK(fbits(out[i])==fbits(h7t_exp(v[i][1],sp))&&fbits(out[4+i])==fbits(h7t_mov(v[4+i][1],-b))); }
+          /* in a stripe-stack batch (R2) nothing is moved: the same rectangle among the camp menu's 16 quads is left where it is */
+          { int n=0; double sp=h7_cover(-51,461,b); u64 o0=h7.stack_other, k0=h7.kind[H7K_STACK];
+            for(int i=0;i<8;i++){ h7t_quad(v+4*n,612,875+40*i,-51+64*i,13+64*i); n++; } for(int i=0;i<8;i++){ h7t_quad(v+4*n,-101,612,-51+64*i,13+64*i); n++; }
+            h7t_quad(v+64,195,595,0,400); H7SUB(H7T_LAYB,8,68); ACHECK(k&&same&&h7.kind[H7K_STACK]==k0+16&&h7.stack_other==o0+1&&h7.kind[H7K_EDGE]==e0+3&&h7t_all(out+64,(const float (*)[2])(v+64),4,1));
+            for(int i=0;i<64;i++) ACHECK(fbits(out[i])==fbits(h7t_exp(v[i][1],sp))); } }
+        /* review finding 2: the map-change transition's batch (camp route, present 3534: centre, below, above, right, left).  Its
+         * band-height centre, right and left pieces are covered by the batch's own pieces above and below: not one bit changes */
+        { static const float w5[5][4]={{13,524,-16,495},{-581,1118,495,746},{-581,1118,-271,-16},{524,1118,-16,495},{-581,13,-16,495}};
+          u64 c0=h7.kind[H7K_BATCH], p0=h7.kind[H7K_PIECE], f0=h7.kind[H7K_FULL], x0=h7.batch_ext, s0=h7.small, h0=h7.kind[H7K_SHAPE];
+          for(int q=0;q<5;q++) h7t_quad(v+4*q,w5[q][0],w5[q][1],w5[q][2],w5[q][3]);
+          H7SUB(H7T_LAY,8,20); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,20,1)&&h7.kind[H7K_BATCH]==c0+3&&h7.kind[H7K_PIECE]==p0&&h7.kind[H7K_FULL]==f0&&h7.batch_ext==x0&&h7.small==s0+2);
+          /* five frames later (present 3539) no piece spans the band: left, listed as a batch that spans it */
+          { static const float w6[5][4]={{82,449,47,414},{-346,877,414,595},{-346,877,-137,47},{449,877,47,414},{-346,82,47,414}};
+            for(int q=0;q<5;q++) h7t_quad(v+4*q,w6[q][0],w6[q][1],w6[q][2],w6[q][3]);
+            H7SUB(H7T_LAY,8,20); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,20,1)&&h7.kind[H7K_BATCH]==c0+3&&h7.kind[H7K_SHAPE]==h0+1); }
+          /* the camp menu's two side strips in one batch (present 21652) and the save menu's rectangle with its side piece (present
+           * 20562) are still stretched: no piece of their batch lies above or below them */
+          { double sp=h7_cover(-16,432,b); p0=h7.kind[H7K_PIECE]; f0=h7.kind[H7K_FULL]; h7t_quad(v,-88,8,-16,432); h7t_quad(v+4,504,600,-16,432);
+            H7SUB(H7T_LAYB,8,8); ACHECK(k&&same&&h7.kind[H7K_PIECE]==p0+2&&h7.kind[H7K_BATCH]==c0+3); for(int i=0;i<8;i++) ACHECK(fbits(out[i])==fbits(h7t_exp(v[i][1],sp)));
+            h7t_quad(v,-100,1084,-16,432); h7t_quad(v+4,-101,168,-16,432);
+            H7SUB(H7T_LAYB,8,8); ACHECK(k&&same&&h7.kind[H7K_PIECE]==p0+3&&h7.kind[H7K_FULL]==f0+1&&h7.kind[H7K_BATCH]==c0+3); for(int i=0;i<8;i++) ACHECK(fbits(out[i])==fbits(h7t_exp(v[i][1],sp))); }
+          /* a band-height rectangle drawn over a larger rectangle of the same batch (another layer, not a tile): still stretched */
+          { double sp=h7_cover(-16,432,b); u64 a0=h7.kind[H7K_ALREADY]; f0=h7.kind[H7K_FULL]; h7t_quad(v,-100,700,-60,480); h7t_quad(v+4,-100,700,-16,432);
+            H7SUB(H7T_LAY,8,8); ACHECK(k&&same&&h7.kind[H7K_FULL]==f0+1&&h7.kind[H7K_ALREADY]==a0+1&&h7.kind[H7K_BATCH]==c0+3&&h7t_all(out,(const float (*)[2])v,4,1));
+            for(int i=4;i<8;i++) ACHECK(fbits(out[i])==fbits(h7t_exp(v[i][1],sp))); } }
+        /* review finding 3: the shutter's left piece with one corner a GS subpixel off is stretched like its mirror piece */
+        { u64 p0=h7.kind[H7K_PIECE]; double sp=h7_cover(-11.5,428.5,b); h7t_quad(v,-328.5f,55.5625f,-11.5f,428.5f); v[3][0]=55.5f;
+          H7SUB(H7T_LAY,8,4); ACHECK(k&&same&&h7.kind[H7K_PIECE]==p0+1); for(int i=0;i<4;i++) ACHECK(fbits(out[i])==fbits(h7t_exp(v[i][1],sp)));
+          ACHECK(((double)out[0]-H7T_OY)*msy+msw<=0.01&&((double)out[2]-H7T_OY)*msy+msw>=H-0.01); }
+        /* review finding 4: a header, a panel and a rotated piece in the camp menu's stripe batch stay exactly where they are; the 16
+         * quads of the picture are stretched as before */
+        { int n=0; double sp=h7_cover(-51,461,b); u64 k0=h7.kind[H7K_STACK], sb0=h7.stack_batches, s0=h7.small, o0=h7.stack_other;
+          for(int i=0;i<8;i++){ h7t_quad(v+4*n,612,875+40*i,-51+64*i,13+64*i); n++; } for(int i=0;i<8;i++){ h7t_quad(v+4*n,-101,612,-51+64*i,13+64*i); n++; }
+          h7t_quad(v+64,100,400,-25,34); h7t_quad(v+68,157,687,314,547);
+          v[72][0]=660; v[72][1]=13; v[73][0]=700; v[73][1]=45; v[74][0]=620; v[74][1]=45; v[75][0]=660; v[75][1]=77;
+          H7SUB(H7T_LAYB,8,76); ACHECK(k&&same&&h7.kind[H7K_STACK]==k0+16&&h7.stack_batches==sb0+1&&h7.small==s0+3&&h7.stack_other==o0+3);
+          for(int i=0;i<64;i++) ACHECK(fbits(out[i])==fbits(h7t_exp(v[i][1],sp)));
+          ACHECK(h7t_all(out+64,(const float (*)[2])(v+64),12,1)); }
+        /* already covering the frame (H4's fade rectangle), a rotated square, 5 vertices, a draw routine that is not in the table: left */
+        { u64 a0=h7.kind[H7K_ALREADY], h0=h7.kind[H7K_SHAPE], t0=h7.kind[H7K_SITE], c0=h7.count;
+          h7t_quad(v,-86,598,-54,470); H7SUB(H7T_RECT,6,4); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,4,1)&&h7.kind[H7K_ALREADY]==a0+1);
+          v[0][0]=23.3f; v[0][1]=187.8f; v[1][0]=258.3f; v[1][1]=-47.25f; v[2][0]=258.4f; v[2][1]=422.8f; v[3][0]=493.4f; v[3][1]=187.7f;
+          H7SUB(H7T_LAY,8,4); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,4,1)&&h7.kind[H7K_SHAPE]==h0+1);
+          h7t_quad(v,-101,602,-16,436); v[4][0]=0; v[4][1]=0; H7SUB(H7T_LAY,5,5); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,5,1)&&h7.kind[H7K_SHAPE]==h0+2);   /* not a quad list */
+          h7t_quad(v,-101,602,-16,436); H7SUB(H7T_PPP,8,4); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,4,1)&&h7.kind[H7K_SITE]==t0+1);
+          H7SUB(GS_BASE+0x16a853ull,8,4); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,4,1)&&h7.kind[H7K_SITE]==t0+2);
+          h7t_quad(v,-101,602,-16,436); H7SUB(H7T_LAY,8,3); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,3,1)&&h7.count==c0+1); }
+        /* R2: the camp menu's 16 quads -> all 64 vertices with the stack's factor; without its last stripe: nothing */
+        { int n=0; double sp=h7_cover(-51,461,b); u64 k0=h7.kind[H7K_STACK], sb0=h7.stack_batches, s0=h7.small, h0=h7.kind[H7K_SHAPE];
+          for(int i=0;i<8;i++){ h7t_quad(v+4*n,612,875+40*i,-51+64*i,13+64*i); n++; } for(int i=0;i<8;i++){ h7t_quad(v+4*n,-101,612,-51+64*i,13+64*i); n++; }
+          H7SUB(H7T_LAYB,8,64); ACHECK(k&&same&&h7.kind[H7K_STACK]==k0+16&&h7.stack_batches==sb0+1&&h7.small==s0);
+          for(int i=0;i<64;i++) ACHECK(fbits(out[i])==fbits(h7t_exp(v[i][1],sp)));
+          ACHECK(((double)out[32]-H7T_OY)*msy+msw<=0.01&&((double)out[62]-H7T_OY)*msy+msw>=H-0.01&&fbits(out[34])==fbits(out[36]));   /* covers the frame; the stripes still meet */
+          H7SUB(H7T_LAYB,8,60); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,60,1)&&h7.kind[H7K_STACK]==k0+16&&h7.kind[H7K_SHAPE]==h0+1);
+          H7SUB(H7T_PPP,8,64); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,64,1)&&h7.kind[H7K_STACK]==k0+16);             /* the same stack from another routine */
+          for(int i=0;i<64;i++) v[i][0]-=700; H7SUB(H7T_LAY,8,64); ACHECK(k&&same&&h7.kind[H7K_STACK]==k0+32&&h7.stack_batches==sb0+2);   /* the stack while it slides in */
+          for(int i=0;i<64;i++) ACHECK(fbits(out[i])==fbits(h7t_exp(v[i][1],sp))); }
+        /* the mode: an anchored HUD object's MagicScale (MS.w = 0 / 2 o), a zoomed mode, the GX+0x90 row, another vertex: left */
+        { u64 m0=h7.modeother, n0=h7.mode90, f0=h7.fmt; float w0=rdf(g,GX+0xac), y0=rdf(g,GX+0xa4); h7t_quad(v,-101,602,-16,436);
+          wrf(g,GX+0xac,0); H7SUB(H7T_LAY,8,4); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,4,1)&&h7.modeother==m0+1);
+          wrf(g,GX+0xac,(float)(2.0*o)); H7SUB(H7T_LAY,8,4); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,4,1)&&h7.modeother==m0+2);
+          wrf(g,GX+0xac,w0); wrf(g,GX+0xa4,y0*0.8f); H7SUB(H7T_LAY,8,4); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,4,1)&&h7.modeother==m0+3); wrf(g,GX+0xa4,y0);
+          wr32(g,GX+0xb4,0); H7SUB(H7T_LAY,8,4); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,4,1)&&h7.mode90==n0+1); wr32(g,GX+0xb4,1);
+          wr32(g,GX+0xb8,0); H7SUB(H7T_LAY,8,4); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,4,1)&&h7.mode90==n0+2); wr32(g,GX+0xb8,1);
+          h7t_stride=60; H7SUB(H7T_LAY,8,4); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,4,1)&&h7.fmt==f0+1); h7t_stride=H7_STRIDE;
+          H7SUB(H7T_LAY,8,4); ACHECK(k&&same&&fbits(out[0])==fbits(h7t_exp(-16,h7_cover(-16,436,b)))); }                           /* and with the mode back: stretched */
+        /* the lazy begin pending (h7_pre alone: the body would call the device), an unreadable block */
+        { u64 l0=h7.lazy, nb0=h7.nobuf, B=GX+0x5790, svrsp=KH_RSP(g), svrdx=KH_RDX(g), svr8=KH_R8(g); h7t_quad(v,-101,602,-16,436); H7SUB(H7T_LAY,8,4);
+          for(int i=0;i<4;i++) wrf(g,h7t_vb+(u64)i*H7_STRIDE+4,h7t_raw(v[i][1]));
+          u64 sp=(svrsp-0x400)&~15ull; wr64(g,sp,H7T_LAY); KH_RSP(g)=sp; KH_RDX(g)=4; KH_R8(g)=8;
+          wr8(g,GX+0x4c0,0); wr64(g,GX+0x4b0,h7t_vb); ACHECK(h7_pre(g)==-1&&h7.lazy==l0+1&&rdf(g,h7t_vb+4)==h7t_raw(-16)); wr8(g,GX+0x4c0,1); wr64(g,GX+0x4b0,0);
+          wr32(g,B+0x38,0);                                                                 /* the lifted body's no-device path left [B+0x38] as it was: 0 */
+          wr64(g,B+0x48,0); ACHECK(h7_pre(g)==-1&&h7.nobuf==nb0+1); wr64(g,B+0x48,h7t_vb+0x1c); ACHECK(h7_pre(g)==-1&&h7.nobuf==nb0+2);   /* not base + offset */
+          wr64(g,B+0x48,h7t_vb); wr32(g,B+0x50,3); ACHECK(h7_pre(g)==-1&&h7.nobuf==nb0+3); wr32(g,B+0x50,4);                         /* more vertices than asked for */
+          wr64(g,B+0x30,0x6f); ACHECK(h7_pre(g)==-1&&h7.nobuf==nb0+4); wr64(g,B+0x30,0x70);                                          /* beyond the capacity; exactly the capacity is fine */
+          wr64(g,B+0x40,0); ACHECK(h7_pre(g)==-1&&h7.nobuf==nb0+5&&rdf(g,h7t_vb+4)==h7t_raw(-16)); wr64(g,B+0x40,h7t_vb);
+          ACHECK(h7_pre(g)==H7K_FULL&&rdf(g,h7t_vb+4)==h7t_exp(-16,h7_cover(-16,436,b)));
+          /* a block that is not guest-arena memory (a real backend's mapped buffer) is used all the same: here a host array */
+          { static float hb[4*7+1]; u64 ga=(u64)(uintptr_t)hb-(u64)((uintptr_t)hp(g,GX)-(uintptr_t)GX); float q[4][2]; h7t_quad(q,-101,602,-16,436);
+            for(int i=0;i<4;i++){ hb[i*7]=q[i][0]+H7T_OX; hb[i*7+1]=q[i][1]+H7T_OY; } hb[28]=1234.5f;
+            wr64(g,B+0x40,ga); wr64(g,B+0x48,ga); wr64(g,B+0x30,0x70); wr32(g,B+0x38,0); wr32(g,B+0x50,4);
+            if(!GA_OK(ga)){ ACHECK(h7_pre(g)==H7K_FULL&&hb[1]==h7t_exp(-16,h7_cover(-16,436,b))&&hb[15]==h7t_exp(436,h7_cover(-16,436,b))&&hb[0]==-101+H7T_OX&&hb[28]==1234.5f); }
+            else kh_selftest_not_run("aspect","H7 on a vertex block outside the guest arena (the selftest's static array is inside it)",1);
+            wr64(g,B+0x40,h7t_vb); wr64(g,B+0x48,h7t_vb); wr64(g,B+0x30,0x2000); }
+          /* review finding 6: a block at a non-zero write offset of the buffer ([B+0x38] = 0x70, the block = base + 0x70: a second
+           * batch in the same buffer) is used; the quad at the buffer's base is not touched; the capacity is tested with the offset */
+          { for(int i=0;i<4;i++){ u64 a0=h7t_vb+(u64)i*H7_STRIDE, a1=h7t_vb+0x70+(u64)i*H7_STRIDE; wrf(g,a0,v[i][0]+H7T_OX); wrf(g,a0+4,h7t_raw(v[i][1])); wrf(g,a1,v[i][0]+H7T_OX); wrf(g,a1+4,h7t_raw(v[i][1])); }
+            u64 nb1=h7.nobuf; wr32(g,B+0x38,0x70); wr64(g,B+0x48,h7t_vb+0x70); wr64(g,B+0x30,0x2000); wr32(g,B+0x50,4);
+            ACHECK(h7_pre(g)==H7K_FULL&&h7.nobuf==nb1&&rdf(g,h7t_vb+0x70+4)==h7t_exp(-16,h7_cover(-16,436,b))&&rdf(g,h7t_vb+0x70+3*H7_STRIDE+4)==h7t_exp(436,h7_cover(-16,436,b))
+                   &&rdf(g,h7t_vb+4)==h7t_raw(-16)&&rdf(g,h7t_vb+3*H7_STRIDE+4)==h7t_raw(436));
+            for(int i=0;i<4;i++) wrf(g,h7t_vb+0x70+(u64)i*H7_STRIDE+4,h7t_raw(v[i][1]));
+            wr64(g,B+0x30,0xdf); ACHECK(h7_pre(g)==-1&&h7.nobuf==nb1+1&&rdf(g,h7t_vb+0x70+4)==h7t_raw(-16)); wr64(g,B+0x30,0xe0); ACHECK(h7_pre(g)==H7K_FULL&&h7.nobuf==nb1+1);   /* offset + 4 vertices = 0xe0 */
+            wr32(g,B+0x38,0); wr64(g,B+0x48,h7t_vb); wr64(g,B+0x30,0x2000); }
+          KH_RSP(g)=svrsp; KH_RDX(g)=svrdx; KH_R8(g)=svr8; }
+        /* test aid off, pc: not one bit, pc counts nothing */
+        { u64 o0=h7.off, c0=h7.calls; h7t_quad(v,-101,602,-16,436);
+          asp_off_h7=1; H7SUB(H7T_LAY,8,4); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,4,1)&&h7.off==o0+1); asp_off_h7=0;
+          asp_mode=0; c0=h7.calls; H7SUB(H7T_LAY,8,4); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,4,1)&&h7.calls==c0); asp_mode=1; } }
+    /* 16:9 or wider: nothing is read or written (an unreadable block is not even looked at) */
+    { static const float same169[4][2]={{1920,1080},{2560,1440},{3840,2160},{2560,1080}};
+      for(int i=0;i<4;i++){ h7t_screen(g,same169[i][0],same169[i][1]); u64 i0=h7.identity, nb0=h7.nobuf, e0=h7.batch_ext, B=GX+0x5790;
+          h7t_quad(v,-200,700,0,416); H7SUB(H7T_LAY,8,4); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,4,1)&&h7.identity==i0+1&&h7.batch_ext==e0);
+          int n=0; for(int q=0;q<8;q++){ h7t_quad(v+4*n,-200,700,-51+64*q,13+64*q); n++; } H7SUB(H7T_LAYB,8,32); ACHECK(k&&same&&h7t_all(out,(const float (*)[2])v,32,1)&&h7.identity==i0+2);
+          u64 svrsp=KH_RSP(g), svrdx=KH_RDX(g), sp=(svrsp-0x400)&~15ull; wr64(g,sp,H7T_LAY); KH_RSP(g)=sp; KH_RDX(g)=4; wr64(g,B+0x48,0);
+          ACHECK(h7_pre(g)==-1&&h7.identity==i0+3&&h7.nobuf==nb0); KH_RSP(g)=svrsp; KH_RDX(g)=svrdx; } }
+    /* (a) no bars on any frame: H1 without the 3D view rewrites the fit, with the test aid it keeps the exe's bars */
+    { float x,y; u64 n0=h7_h1_no3d; atomic_store(&last3d_plus1,0);
+      h1_call(g,1920,1350,1,1,1,&x,&y); ACHECK(x==1920.0f&&y==1350.0f&&h7_h1_no3d==n0+1);
+      h1_call(g,2670,1878,1,1,1,&x,&y); ACHECK(x==2670.0f&&y==1878.0f&&h7_h1_no3d==n0+2);
+      h1_call(g,1920,1080,1,1,1,&x,&y); ACHECK(x==1920.0f&&y==1080.0f&&h7_h1_no3d==n0+2);            /* 16:9: not narrow, nothing rewritten */
+      h1_call(g,2560,1080,1,1,1,&x,&y); ACHECK(x==1920.0f&&y==1080.0f&&h7_h1_no3d==n0+2);
+      asp_off_h7=1; h1_call(g,1920,1350,1,1,1,&x,&y); ACHECK(x==1920.0f&&y==1080.0f&&h7_h1_no3d==n0+2); asp_off_h7=0;
+      note_3d(kh_game_frames()); h1_call(g,1920,1350,1,1,1,&x,&y); ACHECK(x==1920.0f&&y==1350.0f&&h7_h1_no3d==n0+2);   /* with the 3D view: H1 as before, not counted here */
+      asp_mode=0; atomic_store(&last3d_plus1,0); h1_call(g,1920,1350,1,1,1,&x,&y); ACHECK(x==1920.0f&&y==1080.0f&&h7_h1_no3d==n0+2); asp_mode=1; }
+    /* (a) a dk pass on a frame without the 3D view is anchored (a top class first, then a bottom class); with the test aid: the bars */
+    { u8 tsave[0x204]; memcpy(tsave,hp(g,ID_TAB),0x204); if(rd32(g,ID_TAB+0x200)==0){ for(int i=0;i<64;i++) wr64(g,ID_TAB+8ull*i,~0ull); wr32(g,ID_TAB+0x200,0x80000000u); }
+      int sdk2=kh_aspect_dk; kh_aspect_dk=1; u64 o[2]={h3t_obj(g,GS_BASE+0x5b2400ull,7),h3t_obj(g,GS_BASE+0x5b2078ull,3)}; float ws[2], we; u64 n0=h7_h3_no3d, b0=h3.bars;
+      h7t_screen(g,1920,1350); atomic_store(&last3d_plus1,0);
+      ACHECK(h3t_pass(g,o,2,ws,&we)&&ws[0]==0.0f&&ws[1]==270.0f&&h7_h3_no3d==n0+1&&h3.bars==b0);
+      asp_off_h7=1; ACHECK(h3t_pass(g,o,2,ws,&we)&&ws[0]==135.0f&&fbits(ws[1])==H3T_SNAN&&h7_h3_no3d==n0+1&&h3.bars==b0+1); asp_off_h7=0;
+      h7t_screen(g,1920,1080); ACHECK(h3t_pass(g,o,2,ws,&we)&&fbits(ws[1])==H3T_SNAN&&h7_h3_no3d==n0+1);                     /* 16:9: nothing written */
+      kh_aspect_dk=sdk2; ga_free(o[0]); ga_free(o[1]); memcpy(hp(g,ID_TAB),tsave,0x204); }
+    #undef H7SUB
+    ga_free(h7t_vb); h7t_vb=0;
+    memcpy(&h7,&sh7,sizeof sh7); memcpy(&h3,&sh3,sizeof sh3); memcpy(h7r,srow,sizeof srow); n_h7r=snr; h7r_cut=scut; h7_h1_no3d=sn1; h7_h3_no3d=sn3;
+    asp_mode=sm; asp_h1_uncond=su; asp_off_h3=so3; kh_aspect_dk=sdk; kh_aspect_m=sml; kh_aspect_log=sl; atomic_store(&last3d_plus1,s3);
+    wr64(g,GX+0x59b8,s59b8); wr64(g,GX+0x7c00,s7c00); memcpy(hp(g,GX+0x578c),svb,0x60); memcpy(hp(g,GX+0x4b0),s4b0,0x18); wr32(g,GX_GUARD,guard); memcpy(hp(g,GX),gxsave,0x148);
+}
 int kh_aspect_selftest(KCtx *g){
     sfails=schecks=0;
+    /* task 46: the cases of tasks 37 / 40 / 42 below test the hooks with H7 off (the gate of H1 / H3 as those tasks made it); H7's own
+     * cases (h7_selftest) follow them with it on */
+    int s_h7=asp_off_h7; asp_off_h7=1;
     /* -- r, o, b (plan section 3) -- */
     static const int same[4][2]={{1920,1080},{2560,1440},{3840,2160},{2560,1080}};
     for(int i=0;i<4;i++){ double W=same[i][0],H=same[i][1]; ACHECK(kh_aspect_r(W,H)==1.0&&kh_aspect_o(W,H)==0.0&&kh_aspect_b(W,H)==0.0); }
@@ -1590,6 +2217,7 @@ int kh_aspect_selftest(KCtx *g){
         ACHECK(fatal_case(14,"aspect-m-drawlog-needs-m: KHNMC_ASPECT_M_DRAWLOG=x.tsv@1-2")); ACHECK(fatal_case(15,"aspect-m-drawlog-value: KHNMC_ASPECT_M_DRAWLOG=x.tsv@5-3"));
         ACHECK(fatal_case(16,"aspect-m-drawlog-value: KHNMC_ASPECT_M_DRAWLOG=x.tsv@1-2,")); ACHECK(fatal_case(17,"aspect-m-drawlog-open: KHNMC_ASPECT_M_DRAWLOG: cannot create /nonexistent-khnmc-dir/x.tsv")); }
     else kh_selftest_not_run("aspect","the 18 named fatals of KHNMC_SCREEN / KHNMC_ASPECT* (no child process)",18);
+    asp_off_h7=0; h7_selftest(g); asp_off_h7=s_h7;
     fprintf(stderr,"kh: aspect selftest: %d checks, %d failures\n",schecks,sfails);
     return sfails;
 }
