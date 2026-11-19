@@ -912,6 +912,120 @@ void *h_get_ref(u64 h,int *kind_out){
     pthread_mutex_unlock(&hm); return w;
 }
 void kh_wobj_unref(KWaitObj *w){ if(atomic_fetch_sub(&w->refs,1)==1){ pthread_mutex_destroy(&w->m); pthread_cond_destroy(&w->cv); free(w); atomic_fetch_add(&wobj_frees,1); } }
+/* A slot pins objects independently of the guest handles and wait references.
+ * All guest threads must be stopped, including while validating before load. */
+struct SyncObject {
+    KWaitObj *w;
+    u32 index;
+    int signaled,manual,recurse,waiters,tokens;
+    long count,maxcount;
+    u64 owner,gen,satisfied,exit_code;
+    KThread *last_taker;
+    int suspended,done;
+};
+struct SyncWait { KThread *thread; struct KhPendingWait pending; };
+struct KhSyncSlot {
+    u32 next,objects,waiters;
+    struct KhClockSlot *clock;
+    struct KhCsSlot *sections;
+    struct KhTimerSlot *timers;
+    struct SyncWait *waits;
+    struct SyncObject records[];
+};
+static int sync_kind(int k){ return k==HK_EVENT||k==HK_SEM||k==HK_MUTEX||k==HK_THREAD; }
+static void sync_record(struct SyncObject *r,KWaitObj *w,u32 idx){
+    atomic_fetch_add(&w->refs,1);
+    *r=(struct SyncObject){.w=w,.index=idx,.signaled=w->signaled,.manual=w->manual,.recurse=w->recurse,
+        .waiters=w->waiters,.tokens=w->pulse_tokens,.count=w->count,.maxcount=w->maxcount,
+        .owner=w->owner,.gen=w->gen,.satisfied=w->satisfied,.last_taker=w->last_taker};
+    if(w->thread){
+        r->suspended=w->thread->suspended; r->done=w->thread->done; r->exit_code=w->thread->exit_code;
+    }
+}
+struct KhSyncSlot *kh_sync_capture(struct KhPendingWait **waits,KThread **threads,unsigned n){
+    pthread_mutex_lock(&hm);
+    u32 count=0;
+    for(u32 i=1;i<MAXH;i++) count+=sync_kind(htab[i].kind);
+    struct KhSyncSlot *s=calloc(1,sizeof *s+(count+n)*sizeof s->records[0]);
+    if(!s||(n&&!(s->waits=calloc(n,sizeof *s->waits)))) kh_fatal(NULL,"savestate-sync-memory");
+    s->next=hnext;
+    for(u32 i=1;i<MAXH;i++) if(sync_kind(htab[i].kind))
+        sync_record(&s->records[s->objects++],htab[i].obj,i);
+    for(unsigned i=0;i<n;i++){
+        s->waits[s->waiters++]=(struct SyncWait){threads[i],*waits[i]};
+        u32 j=0;
+        while(j<s->objects&&s->records[j].w!=waits[i]->object) j++;
+        if(j==s->objects) sync_record(&s->records[s->objects++],waits[i]->object,0);
+    }
+    pthread_mutex_unlock(&hm);
+    s->clock=kh_clock_capture();
+    s->sections=kh_cs_capture();
+    s->timers=kh_timer_capture();
+    return s;
+}
+void kh_sync_discard(struct KhSyncSlot *s){
+    for(u32 j=0;j<s->objects;j++) kh_wobj_unref(s->records[j].w);
+    free(s->clock); kh_cs_discard(s->sections); free(s->timers); free(s->waits); free(s);
+}
+const char *kh_sync_restore(struct KhSyncSlot *s,struct KhPendingWait **waits,KThread **threads,unsigned n){
+    const char *clock_error=kh_clock_validate(s->clock);
+    if(clock_error) return clock_error;
+    const char *cs_error=kh_cs_validate(s->sections);
+    if(cs_error) return cs_error;
+    const char *timer_error=kh_timer_validate(s->timers);
+    if(timer_error) return timer_error;
+    if(n!=s->waiters) return "savestate-sync-waiter-set";
+    for(unsigned i=0;i<n;i++){
+        unsigned j=0; while(j<n&&s->waits[j].thread!=threads[i]) j++;
+        if(j==n||waits[i]->handoff!=s->waits[j].pending.handoff) return "savestate-sync-waiter-set";
+        if(!waits[i]->handoff&&waits[i]->deadline_client!=s->waits[j].pending.deadline_client)
+            return "savestate-sync-deadline-client";
+    }
+    pthread_mutex_lock(&hm);
+    const char *error=NULL;
+    for(unsigned j=0;j<s->objects;j++){
+        struct SyncObject *r=&s->records[j];
+        int k=htab[r->index].kind;
+        if(k&&!sync_kind(k)) error="savestate-sync-handle-conflict";
+        if(r->w->thread&&r->w->thread->done!=r->done) error="savestate-sync-thread-lifetime";
+    }
+    if(error){ pthread_mutex_unlock(&hm); return error; }
+    for(u32 i=1;i<MAXH;i++) if(sync_kind(htab[i].kind)){
+        kh_wobj_unref(htab[i].obj); htab[i]=(HEnt){0};
+    }
+    for(unsigned j=0;j<s->objects;j++){
+        struct SyncObject *r=&s->records[j]; KWaitObj *w=r->w;
+        if(r->index){ atomic_fetch_add(&w->refs,1); htab[r->index]=(HEnt){w->kind,w}; }
+        w->signaled=r->signaled; w->manual=r->manual; w->count=r->count; w->maxcount=r->maxcount;
+        w->owner=r->owner; w->recurse=r->recurse; w->gen=r->gen; w->waiters=r->waiters;
+        w->pulse_tokens=r->tokens; w->satisfied=r->satisfied; w->last_taker=r->last_taker;
+        if(w->thread){ w->thread->suspended=r->suspended; w->thread->exit_code=r->exit_code; }
+    }
+    hnext=s->next;
+    for(unsigned i=0;i<n;i++){
+        unsigned j=0; while(s->waits[j].thread!=threads[i]) j++;
+        struct KhPendingWait saved=s->waits[j].pending;
+        atomic_fetch_add(&saved.object->refs,1);
+        kh_wobj_unref(waits[i]->object);
+        *waits[i]=saved;
+        if(saved.handoff) continue;
+        KThread *t=threads[i];
+        atomic_store(&t->vc_w,saved.blocked?saved.object:NULL);
+        atomic_store(&t->vc_gen0,saved.generation);
+        atomic_store(&t->vc_k,saved.object->kind);
+        atomic_store(&t->vc_blocked,saved.blocked);
+        atomic_store(&t->vc_state,saved.blocked?1:0);
+    }
+    pthread_mutex_unlock(&hm);
+    for(unsigned i=0;i<n;i++){
+        struct KhPendingWait *p=waits[i];
+        if(!p->handoff&&p->deadline_client>=0) kh_vclock_client_due(p->deadline_client,p->deadline);
+    }
+    kh_clock_restore(s->clock);
+    kh_timer_restore(s->timers);
+    kh_cs_restore(s->sections);
+    return NULL;
+}
 int h_close(u64 h){
     if(h<0x100||h>=0x100+4ull*MAXH||(h&3)) return 0; u32 i=(u32)((h-0x100)>>2); pthread_mutex_lock(&hm); int k=htab[i].kind; void *o=htab[i].obj; htab[i].kind=HK_NONE; htab[i].obj=NULL; pthread_mutex_unlock(&hm);
     if(k==HK_NONE) return 0;

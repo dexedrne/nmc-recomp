@@ -160,7 +160,8 @@ void kh_vclock_deadline_drop(int id){ kh_vclock_client_drop(id); }
 int kh_vclock_vsleep(u32 ms){
     if(!kh_vclock_sync||!atomic_load(&stepped)||!cur_thread()) return 0;
     u64 dl=kh_vclock_now_ns()+(u64)ms*1000000ull; int id=kh_vclock_client_add_prio("sleep",dl,1<<28); kh_vclock_client_set_key(id,1<<28,cur_thread(),0); n_vsleeps++;
-    kh_vclock_client_wait(id,dl);                                                        /* ordered after the mixer and the timers of that instant, the guest quiet */
+    if(kh_cut_enabled) (void)kh_vclock_timer_wait(id,dl);
+    else kh_vclock_client_wait(id,dl);                                                        /* ordered after the mixer and the timers of that instant, the guest quiet */
     kh_vclock_client_drop(id);                                                           /* running (client_wait marked it), then the clock may leave the deadline */
     return 1;
 }
@@ -216,14 +217,25 @@ void kh_vclock_wait_until(u64 t){
     if(kh_vclock_sync){ kh_vclock_idle(1); kh_vclock_wait_until_raw(t); kh_vclock_idle(0); return; }
     kh_vclock_wait_until_raw(t);
 }
-void kh_vclock_wait_until_raw(u64 t){
+static u64 wait_until_raw(u64 t,int client){
     for(;;){
-        if(!atomic_load(&stepped)){ u64 h=kh_host_ns(); if(h>=t) return; host_sleep_until(t-h>50000000ull?h+50000000ull:t); continue; }   /* re-check every 50 ms: stepping may begin */
+        if(!atomic_load(&stepped)){ u64 h=kh_host_ns(); if(h>=t) return t; host_sleep_until(t-h>50000000ull?h+50000000ull:t); continue; }
         pthread_mutex_lock(&vm);
-        while(atomic_load(&stepped)&&atomic_load(&v_now)<t) kh_cut_wait("clock-deadline",&vcv,&vm);
+        while(atomic_load(&stepped)){
+            if(client>=0) t=clients[client].due;
+            if(atomic_load(&v_now)>=t) break;
+            kh_cut_wait("clock-deadline",&vcv,&vm);
+        }
         int done=atomic_load(&stepped)&&atomic_load(&v_now)>=t; pthread_mutex_unlock(&vm);
-        if(done) return;
+        if(done) return t;
     }
+}
+void kh_vclock_wait_until_raw(u64 t){ (void)wait_until_raw(t,-1); }
+u64 kh_cut_mix_wait(int client,u64 due){
+    kh_vclock_idle(1);
+    due=wait_until_raw(due,client);
+    kh_vclock_idle(0);
+    return due;
 }
 /* a client is a thread with work at known virtual instants (the mixer's passes): the clock stops at every `due` and goes on only when
  * the client has announced a later one.  first_due = the instant of its first piece of work. */
@@ -233,6 +245,12 @@ int kh_vclock_client_add_prio(const char *name,u64 first_due,int prio){
     pthread_mutex_unlock(&vm);
     if(id<0) kh_fatal(NULL,"vclock-clients: more than %d clock clients",MAXCLIENTS);
     return id;
+}
+u64 kh_clock_client_deadline(int id){
+    pthread_mutex_lock(&vm);
+    u64 due=clients[id].due;
+    pthread_mutex_unlock(&vm);
+    return due;
 }
 int kh_vclock_client_add(const char *name,u64 first_due){ return kh_vclock_client_add_prio(name,first_due,0); }
 /* TASK28: clients with work at the SAME instant run one after the other, in the order of their prio (smaller first): the mixer's pass
@@ -363,6 +381,44 @@ void kh_vclock_vblank_raw(KCtx *g,u64 dev){
     pthread_mutex_unlock(&vm);
     for(int i=0;i<nlisten;i++) listeners[i](g,k,vnow);
 }
+struct KhClockSlot {
+    VClient clients[MAXCLIENTS];
+    u64 now,origin,vblank,presents,ticks,frames,sem[2],releases,taken;
+    long in_wait,rest;
+    int calibrated,how,stepped;
+};
+struct KhClockSlot *kh_clock_capture(void){
+    struct KhClockSlot *s=malloc(sizeof *s);
+    if(!s) kh_fatal(NULL,"savestate-clock-memory");
+    pthread_mutex_lock(&vm);
+    *s=(struct KhClockSlot){.now=v_now,.origin=v_t0,.stepped=stepped,.vblank=n_vblank,
+        .presents=presents_seen,.ticks=ticks_seen,.frames=frames_seen,.how=last_how,
+        .sem={frame_sem_h[0],frame_sem_h[1]},.releases=frame_releases,.taken=frame_taken,
+        .in_wait=frame_in_wait,.rest=frame_rest,.calibrated=frame_rest_ok};
+    memcpy(s->clients,clients,sizeof clients);
+    pthread_mutex_unlock(&vm);
+    return s;
+}
+const char *kh_clock_validate(struct KhClockSlot *s){
+    if(v_t0!=s->origin||stepped!=s->stepped) return "savestate-clock-origin";
+    for(int i=0;i<MAXCLIENTS;i++){
+        VClient *a=&s->clients[i],*b=&clients[i];
+        if(a->used!=b->used) return "savestate-clock-client-set";
+        if(a->used&&(strcmp(a->name,b->name)||a->keyth!=b->keyth||a->keyseq!=b->keyseq))
+            return "savestate-clock-client-binding";
+    }
+    return NULL;
+}
+void kh_clock_restore(struct KhClockSlot *s){
+    pthread_mutex_lock(&vm);
+    v_now=s->now; n_vblank=s->vblank; presents_seen=s->presents; ticks_seen=s->ticks;
+    frames_seen=s->frames; last_how=s->how; frame_sem_h[0]=s->sem[0]; frame_sem_h[1]=s->sem[1];
+    frame_releases=s->releases; frame_taken=s->taken; frame_in_wait=s->in_wait;
+    frame_rest=s->rest; frame_rest_ok=s->calibrated;
+    memcpy(clients,s->clients,sizeof clients);
+    for(int i=0;i<MAXCLIENTS;i++) if(clients[i].quiet_wait) clients[i].quiet_since=kh_host_ns();
+    pthread_mutex_unlock(&vm);
+}
 void kh_vclock_report(FILE *f){
     if(!kh_vclock_on) return;
     pthread_mutex_lock(&vm); u64 k=atomic_load(&n_vblank); int st=atomic_load(&stepped); u64 host=st?kh_host_ns()-host_t0:0, virt=st?atomic_load(&v_now)-v_t0:0;
@@ -430,10 +486,16 @@ static int st_timer_replay(u32 timer){
     if(id==MAXCLIENTS){ pthread_mutex_unlock(&vm); return 0; }
     const u64 saved_now=atomic_load(&v_now),saved_due=clients[id].due;
     int count=atomic_load(&st_tn),ok=count==3;
+    pthread_mutex_unlock(&vm);
+    struct KhTimerSlot *timer_slot=kh_timer_capture();
+    pthread_mutex_lock(&vm);
     u64 reference[3]={0};
     for(int branch=0;ok&&branch<=10;branch++){
         atomic_store(&v_now,saved_now);
-        clients[id].due=saved_due;
+        pthread_mutex_unlock(&vm);
+        ok=kh_timer_validate(timer_slot)==NULL;
+        if(ok) kh_timer_restore(timer_slot);
+        pthread_mutex_lock(&vm);
         atomic_store(&st_tn,count);
         memset(st_tat+count,0,sizeof reference);
         for(int tick=0;ok&&tick<3;tick++){
@@ -457,6 +519,7 @@ static int st_timer_replay(u32 timer){
     clients[id].due=saved_due+15000000;
     pthread_cond_broadcast(&vcv);
     pthread_mutex_unlock(&vm);
+    free(timer_slot);
     if(ok) fprintf(stderr,"kh: timer rewind selftest: ten replays of three callback instants matched\n");
     return ok;
 }

@@ -141,7 +141,7 @@ IMP(winmm,timeEndPeriod){ SET_RAX(g,0); }
 IMP(winmm,timeGetDevCaps){ if(A0(g)){ wr32(g,A0(g),1); wr32(g,A0(g)+4,1000000); } SET_RAX(g,0); }
 static u64 t0ms; IMP(winmm,timeGetTime){ if(kh_cut_enabled){ SET_RAX(g,(u32)(1000+kh_cut_elapsed_ns()/1000000)); return; } u64 n=kh_now_ns()/1000000; if(!t0ms) t0ms=n; SET_RAX(g,(u32)(n-t0ms+1000)); }
 typedef struct Timer { u32 id; u32 delay; u64 cb, user; u32 flags; volatile int killed; struct Timer *next;
-    u64 fires, settled, no_consumer, guard_hits; u64 seth[4]; u64 setsat[4]; int setwait[4]; int nset; KThread *owner; int owner_seq; int anchor; } Timer;   /* anchor: review of task 28, 1 = created before the first vblank and anchored there, -1 = not anchored (guard) */   /* frames clock: consumer tracking, same-instant order (TASK28) */
+    u64 fires, settled, no_consumer, guard_hits; u64 seth[4]; u64 setsat[4]; int setwait[4]; int nset; KThread *owner; int owner_seq; int clock_client; int anchor; } Timer;   /* anchor: review of task 28, 1 = created before the first vblank and anchored there, -1 = not anchored (guard) */   /* frames clock: consumer tracking, same-instant order (TASK28) */
 static Timer *timers; static u32 next_timer=1; static pthread_mutex_t tmm=PTHREAD_MUTEX_INITIALIZER;
 /* A multimedia timer fires on a fixed grid (start + n*period), it does not drift by the time its handler takes: absolute deadlines.
  * A timer that fell behind by more than a period drops the missed periods, as Windows does.  TIME_CALLBACK_EVENT_SET (0x10) is
@@ -188,6 +188,7 @@ static void timer_proc_virtual(KCtx *g,Timer *t){
     if(t->anchor==1&&next<=now0) next=start+((now0-start)/per+1)*per;                 /* sync=timers: the clock may have moved on meanwhile */
     char nm[32]; snprintf(nm,sizeof nm,"winmm-timer-%u",t->id);
     int cid=kh_vclock_client_add_prio(strdup(nm),next,16);
+    t->clock_client=cid;
     kh_vclock_client_set_key(cid,16,t->owner,t->owner_seq);                            /* the creating thread's name / start routine (read at each comparison), then its own creation order */
     if(t->anchor==1) tm_anchored++;                                                    /* counted once registered at the origin (the selftest waits for it) */
     if(tm_nframes<16) tm_list_frames[tm_nframes++]=t;
@@ -210,6 +211,7 @@ static void timer_proc_virtual(KCtx *g,Timer *t){
         u64 now=kh_vclock_now_ns(); next=start+((now-start)/per+1)*per;
         kh_vclock_client_due(cid,next);
     }
+    t->clock_client=-1;
     kh_vclock_client_drop(cid);
 }
 u64 kh_timer_anchor_counts(u64 *unanchored){ if(unanchored) *unanchored=tm_unanchored; return tm_anchored; }
@@ -243,9 +245,46 @@ static void timer_proc(KCtx *g){
         timer_fire(g,t);
         if(!(t->flags&1)) break; }
     KH_RET(g); }
-IMP(winmm,timeSetEvent){ Timer *t=calloc(1,sizeof *t); t->owner=cur_thread(); t->owner_seq=t->owner?t->owner->vc_ntimers++:0; t->delay=(u32)A0(g)?(u32)A0(g):1; t->cb=A2(g); t->user=A3(g); t->flags=(u32)ARG(g,4); pthread_mutex_lock(&tmm); t->id=next_timer++; t->next=timers; timers=t; pthread_mutex_unlock(&tmm);
+IMP(winmm,timeSetEvent){ Timer *t=calloc(1,sizeof *t); t->clock_client=-1; t->owner=cur_thread(); t->owner_seq=t->owner?t->owner->vc_ntimers++:0; t->delay=(u32)A0(g)?(u32)A0(g):1; t->cb=A2(g); t->user=A3(g); t->flags=(u32)ARG(g,4); pthread_mutex_lock(&tmm); t->id=next_timer++; t->next=timers; timers=t; pthread_mutex_unlock(&tmm);
     kh_spawn_hostfn_thread(g,"winmm_timer",timer_proc,kh_cut_enabled?t->id:(u64)(uintptr_t)t); SET_RAX(g,t->id); }
 IMP(winmm,timeKillEvent){ u32 id=(u32)A0(g); int ok=1; pthread_mutex_lock(&tmm); for(Timer *t=timers;t;t=t->next) if(t->id==id){ t->killed=1; ok=0; } pthread_mutex_unlock(&tmm); SET_RAX(g,ok?0xffffffffu:0); }
+
+/* Called with the guest at a barrier. Timer nodes live for the session.
+ * A thread which has exited cannot be resurrected by resetting its killed bit. */
+struct KhTimerSlot {
+    Timer *head;
+    unsigned count,next;
+    struct TimerRecord { Timer *target; Timer state; u64 due; } records[];
+};
+struct KhTimerSlot *kh_timer_capture(void){
+    unsigned count=0;
+    for(Timer *t=timers;t;t=t->next) count++;
+    struct KhTimerSlot *slot=calloc(1,sizeof *slot+count*sizeof slot->records[0]);
+    if(!slot) kh_fatal(NULL,"savestate-timer-memory");
+    slot->head=timers; slot->next=next_timer;
+    for(Timer *t=timers;t;t=t->next){
+        struct TimerRecord *r=&slot->records[slot->count++];
+        r->target=t; r->state=*t;
+        if(t->clock_client>=0) r->due=kh_clock_client_deadline(t->clock_client);
+    }
+    return slot;
+}
+const char *kh_timer_validate(struct KhTimerSlot *s){
+    if(timers!=s->head||next_timer!=s->next) return "savestate-timer-lifetime";
+    for(unsigned i=0;i<s->count;i++){
+        struct TimerRecord *r=&s->records[i];
+        if(r->target->clock_client!=r->state.clock_client||r->target->killed!=r->state.killed)
+            return "savestate-timer-lifetime";
+    }
+    return NULL;
+}
+void kh_timer_restore(struct KhTimerSlot *s){
+    for(unsigned i=0;i<s->count;i++){
+        struct TimerRecord *r=&s->records[i];
+        *r->target=r->state;
+        if(r->state.clock_client>=0) kh_vclock_client_due(r->state.clock_client,r->due);
+    }
+}
 
 /* ---- advapi32 registry: in-memory key/value store (documented stub; HKCU\Software\SQUARE\KHProj) --------------------------- */
 typedef struct RegV { char key[512]; u32 type; u8 *data; u32 size; struct RegV *next; } RegV; static RegV *regvals; static pthread_mutex_t rgm=PTHREAD_MUTEX_INITIALIZER;

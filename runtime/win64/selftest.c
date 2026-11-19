@@ -277,6 +277,8 @@ static int selftest_all(KCtx *g){
           if(strcmp(only,"route31")) kh_fatal(g,"KHNMC_SELFTEST_ONLY=%s: the suites that can run alone are route31, vsync, gfx, aspect, gate, app, ordered, membench, pipecache and hostlog",only);
           extern int kh_input_route31_selftest(KCtx *); int f=kh_input_route31_selftest(g);
           fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=route31): only the suite `input route Q31` ran, %d failures\n",f); return f?f:0; } }
+    extern int kh_sync_slot_selftest(KCtx *);
+    fails+=kh_sync_slot_selftest(g);
     CHECK(rd64(g,GS_BASE+0x7534a8)!=0); /* Task 6: table 3 must exist before scripts run. */
     extern int kh_mod_static_selftest(KCtx *);
     fails+=kh_mod_static_selftest(g);    /* Task 12: first, before any other test can touch the edited tables or the mod buffer */

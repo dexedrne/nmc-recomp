@@ -24,19 +24,35 @@ static u64 kh_cmdline_ga;
  * ==================================================================================================================== */
 /* Reserve the first f_501480 object before the timing thread can claim its
  * size class. f_439064 calls malloc via a tail jump, with a 0x28-byte frame. */
-static _Atomic u64 cut_boot_object;
+static _Atomic u64 cut_boot_object, cut_boot_table;
+/* f_1287d0 evicts the oldest 72-byte node when the history reaches
+ * 0x1e entries (0x128fb6..0x129020). Reserve the whole initial fill. */
+enum { CUT_TIMING_HISTORY=30 };
+static u64 cut_boot_requests[CUT_TIMING_HISTORY];
+static unsigned cut_requests_used;
 void kh_cut_reserve_boot_object(void){
     u64 p=ga_alloc_src(80,16,GA_SRC_CRT);
     if(!p) kh_fatal(NULL,"savestate-boot-reservation: 80-byte object");
     atomic_store(&cut_boot_object,p);
+    p=ga_alloc_src(280,16,GA_SRC_CRT);
+    if(!p) kh_fatal(NULL,"savestate-boot-reservation: 280-byte object");
+    atomic_store(&cut_boot_table,p);
+    for(unsigned i=0;i<CUT_TIMING_HISTORY;i++){
+        cut_boot_requests[i]=ga_alloc_src(72,16,GA_SRC_CRT);
+        if(!cut_boot_requests[i]) kh_fatal(NULL,"savestate-boot-reservation: timing request");
+    }
 }
 IMP(CRTH,malloc){
     u64 p=0;
-    if(kh_cut_enabled&&A0(g)==80&&atomic_load(&cut_boot_object)&&
-       rd64(g,KH_RSP(g))==GS_BASE+0x439083&&
-       rd64(g,KH_RSP(g)+0x30)==GS_BASE+0x5014bf){
-        p=atomic_exchange(&cut_boot_object,0);
-        if(p) fprintf(stderr,"kh: savestate-boot-object caller=5014bf guest=%llx\n",(unsigned long long)p);
+    if(kh_cut_enabled&&(A0(g)==72||A0(g)==80||A0(g)==280)&&
+       rd64(g,KH_RSP(g))==GS_BASE+0x439083){
+        u64 caller=rd64(g,KH_RSP(g)+0x30)-GS_BASE;
+        if(A0(g)==72&&caller==0x10ef68&&cur_thread()->start==GS_BASE+0x129110&&cut_requests_used<CUT_TIMING_HISTORY)
+            p=cut_boot_requests[cut_requests_used++];
+        if(A0(g)==80&&caller==0x5014bf) p=atomic_exchange(&cut_boot_object,0);
+        if(A0(g)==280&&caller==0x4f102e) p=atomic_exchange(&cut_boot_table,0);
+        if(p) fprintf(stderr,"kh: savestate-boot-object caller=%llx guest=%llx\n",
+                      (unsigned long long)caller,(unsigned long long)p);
     }
     SET_RAX(g,p?p:ga_alloc_src(A0(g),16,GA_SRC_CRT));
 }

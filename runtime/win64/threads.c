@@ -192,7 +192,8 @@ static void cut_boot_ready(KCtx *g){
     pthread_cond_broadcast(&t->cv);
     pthread_mutex_unlock(&t->m);
 }
-u32 kh_wait(KCtx *g,u64 h,u32 ms){
+_Thread_local struct KhPendingWait *kh_cut_pending;
+static u32 wait_object(KCtx *g,u64 h,u32 ms,int *frame_wait){
     KThread *me=cur_thread(); SYNC_CHAOS();
     if(kh_cut_enabled) cut_boot_ready(g);
     if(h==PSEUDO_THREAD||h==PSEUDO_PROCESS) return 0x102;
@@ -200,37 +201,59 @@ u32 kh_wait(KCtx *g,u64 h,u32 ms){
     int vsync=kh_vclock_sync&&me, vcl=-1; u64 vdl=0;                                  /* the idle mark from the start; virtual time-outs once the clock steps */
     if(vsync&&kh_vclock_stepped()&&ms!=0xFFFFFFFFu&&ms){ vdl=kh_vclock_now_ns()+(u64)ms*1000000ull; vcl=kh_vclock_deadline_add(vdl); vc_vwaits++; }
     struct timespec dl; if(ms!=0xFFFFFFFFu) abs_deadline(&dl,ms);
-    pthread_mutex_t *m=&w->m; pthread_cond_t *cv=&w->cv; KThread *th=NULL;
-    if(k==HK_THREAD){ th=w->thread; m=&th->m; cv=&th->cv; }                 /* signalled by the thread's own exit notification */
+    struct KhPendingWait pending={.object=w,.handle=h,.frame_wait=frame_wait?*frame_wait:0,
+                                  .deadline_client=vcl,.timeout_ms=ms,.deadline=vdl};
+    int restorable=kh_cut_enabled&&kh_cut_wait_owner==KH_CUT_HANDLE&&(ms==UINT32_MAX||vcl>=0);
+    u32 res=0; u64 waited=0;
+    pthread_mutex_t *m;
+    pthread_cond_t *cv;
+    KThread *th;
+    int first=1;
+bind:
+    w=pending.object; k=w->kind; ms=pending.timeout_ms;
+    vdl=pending.deadline; vcl=pending.deadline_client;
+    th=k==HK_THREAD?w->thread:NULL;
+    m=th?&th->m:&w->m; cv=th?&th->cv:&w->cv;
     pthread_mutex_lock(m);
-    u32 res=0; u64 waited=0, gen0=w->gen; int blocked=0;
+    if(first){ pending.generation=w->gen; first=0; }
     for(;;){
-        if(atomic_load(&kh_cut_requested)) kh_cut_poll("handle-wait",m);
-        if(th?th->done:wobj_try(w,k,me,gen0,blocked)) break;
+        if(atomic_load(&kh_cut_requested)){
+            if(restorable&&!kh_cut_callback_depth&&kh_cut_loader_safe()){
+                pthread_mutex_unlock(m);
+                kh_cut_pending=&pending;
+                kh_cut_poll("handle-wait",NULL);
+                kh_cut_pending=NULL;
+                goto bind;
+            }
+            kh_cut_poll("handle-wait",m);
+        }
+        if(th?th->done:wobj_try(w,k,me,pending.generation,pending.blocked)) break;
         if(ms==0){ res=0x102; break; }
-        if(!blocked){ blocked=1; if(!th){ w->waiters++; if(kh_vclock_on) pthread_cond_broadcast(cv); }     /* frames clock: a timer client may wait for a consumer to be back (kh_wobj_settle) */
-            if(vsync){ atomic_store(&me->vc_k,k); atomic_store(&me->vc_gen0,gen0); atomic_store(&me->vc_blocked,1); atomic_store(&me->vc_w,(void*)w); atomic_store(&me->vc_state,1); kh_vclock_idle(2); } }
+        if(!pending.blocked){ pending.blocked=1; if(!th){ w->waiters++; if(kh_vclock_on) pthread_cond_broadcast(cv); }     /* frames clock: a timer client may wait for a consumer to be back (kh_wobj_settle) */
+            if(vsync){ atomic_store(&me->vc_k,k); atomic_store(&me->vc_gen0,pending.generation); atomic_store(&me->vc_blocked,1); atomic_store(&me->vc_w,(void*)w); atomic_store(&me->vc_state,1); kh_vclock_idle(2); } }
         int rc;
         if(vcl>=0){                                                                      /* virtual time-out: poll the clock, the object wakes us as usual */
             /* the due test runs the quiescence test, which takes tlist_m, other threads' vc_m and THEIR objects' locks: never with m held
              * (review of task 28: a second thread blocked on this object made the test lock m again, and two timed waiters testing at
              * once took each other's object locks in opposite orders).  m is retaken and the object tested again before a time-out. */
             if(kh_vclock_now_ns()>=vdl){ pthread_mutex_unlock(m); int due=kh_vclock_deadline_due(vcl,vdl); pthread_mutex_lock(m);
-                if(due){ if(!(th?th->done:wobj_try(w,k,me,gen0,blocked))) res=0x102; break; } }
+                if(due){ if(!(th?th->done:wobj_try(w,k,me,pending.generation,pending.blocked))) res=0x102; break; } }
             struct timespec d2; abs_deadline(&d2,1); kh_cond_wait_until(cv,m,&d2); continue; }
-        if(ms==0xFFFFFFFFu&&kh_cut_enabled){ kh_cut_wait("handle-wait",cv,m); continue; }
+        if(ms==0xFFFFFFFFu&&kh_cut_enabled){ struct timespec poll; abs_deadline(&poll,10); kh_cond_wait_until(cv,m,&poll); continue; }
         if(ms==0xFFFFFFFFu){ struct timespec d2; abs_deadline(&d2,10000); rc=kh_cond_wait_until(cv,m,&d2);
             if(rc==ETIMEDOUT){ waited+=10; if(kh_verbose||(waited%60==0)) fprintf(stderr,"kh: thread %u ('%s') waiting %llus on handle %llx kind %d (site rva %llx)\n",me->tid,me->name,(unsigned long long)waited,(unsigned long long)h,k,(unsigned long long)(rd64(g,KH_RSP(g))-GS_BASE)); } }
-        else { rc=kh_cond_wait_until(cv,m,&dl); if(rc==ETIMEDOUT){ if(!(th?th->done:wobj_try(w,k,me,gen0,blocked))) res=0x102; break; } }
+        else { rc=kh_cond_wait_until(cv,m,&dl); if(rc==ETIMEDOUT){ if(!(th?th->done:wobj_try(w,k,me,pending.generation,pending.blocked))) res=0x102; break; } }
     }
-    if(blocked&&!th){ w->waiters--; if(w->pulse_tokens>w->waiters) w->pulse_tokens=w->waiters; }
+    if(pending.blocked&&!th){ w->waiters--; if(w->pulse_tokens>w->waiters) w->pulse_tokens=w->waiters; }
     if(!th&&res==0){ w->satisfied++; w->last_taker=me; if(kh_vclock_on) pthread_cond_broadcast(cv); }
-    if(vsync&&blocked) atomic_store(&me->vc_state,0);                                    /* running again: set while the object's lock is held (the quiescence test takes it) */
+    if(vsync&&pending.blocked) atomic_store(&me->vc_state,0);                                    /* running again: set while the object's lock is held (the quiescence test takes it) */
     pthread_mutex_unlock(m);
-    if(vsync&&blocked){ pthread_mutex_lock(&me->vc_m); atomic_store(&me->vc_w,NULL); pthread_mutex_unlock(&me->vc_m); }
+    if(vsync&&pending.blocked){ pthread_mutex_lock(&me->vc_m); atomic_store(&me->vc_w,NULL); pthread_mutex_unlock(&me->vc_m); }
     if(vcl>=0) kh_vclock_deadline_drop(vcl);                                             /* after "running": the clock held at the deadline may go on */
+    if(frame_wait) *frame_wait=pending.frame_wait;
     kh_wobj_unref(w); return res;
 }
+u32 kh_wait(KCtx *g,u64 h,u32 ms){ return wait_object(g,h,ms,NULL); }
 int kh_wobj_waitstate(u64 h,int *waiters,u64 *satisfied){
     int k; KWaitObj *w=h_get_ref(h,&k); if(!w) return -1; if(k==HK_THREAD){ kh_wobj_unref(w); return -1; }
     pthread_mutex_lock(&w->m); *waiters=w->waiters; *satisfied=w->satisfied; pthread_mutex_unlock(&w->m); kh_wobj_unref(w); return 0;
@@ -287,6 +310,91 @@ void kh_set_event_hook(void (*fn)(void*,u64),void *ctx){ tl_set_hook=fn; tl_set_
 
 /* ---- critical sections (state lives in the guest CRITICAL_SECTION: +0xC recursion, +0x10 owner) ---------------------------- */
 static inline u64 cs_owner(KCtx *g,u64 cs){ return __atomic_load_n((u64*)XL(g,cs+0x10),__ATOMIC_ACQUIRE); }
+/* Only owned sections have mutable state at an admitted cut. Contenders
+ * prevent the barrier from accepting the cut until acquisition finishes. */
+static u64 *cut_owned_cs;
+static size_t cut_cs_count,cut_cs_capacity;
+static pthread_mutex_t cut_cs_lock=PTHREAD_MUTEX_INITIALIZER;
+static void cut_cs_acquired(u64 cs){
+    pthread_mutex_lock(&cut_cs_lock);
+    if(cut_cs_count==cut_cs_capacity){
+        size_t cap=cut_cs_capacity?cut_cs_capacity*2:16;
+        u64 *more=realloc(cut_owned_cs,cap*sizeof *more);
+        if(!more) kh_fatal(NULL,"savestate-critical-section-memory");
+        cut_owned_cs=more; cut_cs_capacity=cap;
+    }
+    cut_owned_cs[cut_cs_count++]=cs;
+    pthread_mutex_unlock(&cut_cs_lock);
+}
+static void cut_cs_released(u64 cs){
+    pthread_mutex_lock(&cut_cs_lock);
+    size_t i=0;
+    while(i<cut_cs_count&&cut_owned_cs[i]!=cs) i++;
+    if(i==cut_cs_count) kh_fatal(NULL,"savestate-critical-section-binding");
+    cut_owned_cs[i]=cut_owned_cs[--cut_cs_count];
+    pthread_mutex_unlock(&cut_cs_lock);
+}
+struct KhCsSlot {
+    struct KhCsSlot *next;
+    int expired;
+    size_t count;
+    struct CsRecord { u64 address,owner; u32 depth; } records[];
+};
+static struct KhCsSlot *cs_slots;
+/* A branch may release a saved section. Reinitializing or deleting that
+ * address ends its identity even when the arena later recycles the address. */
+static void cut_cs_reset(KCtx *g,u64 cs){
+    if(kh_cut_enabled){
+        pthread_mutex_lock(&cut_cs_lock);
+        for(struct KhCsSlot *s=cs_slots;s;s=s->next)
+            for(size_t i=0;i<s->count;i++) if(s->records[i].address==cs) s->expired=1;
+        pthread_mutex_unlock(&cut_cs_lock);
+    }
+    memset(hp(g,cs),0,0x28);
+}
+struct KhCsSlot *kh_cs_capture(void){
+    struct KhCsSlot *s=malloc(sizeof *s+cut_cs_count*sizeof s->records[0]);
+    if(!s) kh_fatal(NULL,"savestate-critical-section-memory");
+    s->count=cut_cs_count; s->expired=0; s->next=cs_slots; cs_slots=s;
+    KCtx *g=cur_thread()->g;
+    for(size_t i=0;i<s->count;i++){
+        u64 cs=cut_owned_cs[i];
+        s->records[i]=(struct CsRecord){cs,cs_owner(g,cs),rd32(g,cs+12)};
+    }
+    return s;
+}
+const char *kh_cs_validate(struct KhCsSlot *s){
+    if(s->expired) return "savestate-critical-section-lifetime";
+    KCtx *g=cur_thread()->g;
+    for(size_t i=0;i<s->count;i++){
+        u64 cs=s->records[i].address;
+        if(!GA_OK(cs)||!GA_OK(cs+23)) return "savestate-critical-section-mapping";
+        size_t j=0; while(j<cut_cs_count&&cut_owned_cs[j]!=cs) j++;
+        if(j==cut_cs_count&&(cs_owner(g,cs)||rd32(g,cs+12)))
+            return "savestate-critical-section-binding";
+    }
+    return NULL;
+}
+void kh_cs_discard(struct KhCsSlot *s){
+    pthread_mutex_lock(&cut_cs_lock);
+    struct KhCsSlot **p=&cs_slots;
+    while(*p&&*p!=s) p=&(*p)->next;
+    if(!*p) kh_fatal(NULL,"savestate-critical-section-slot");
+    *p=s->next; pthread_mutex_unlock(&cut_cs_lock); free(s);
+}
+void kh_cs_restore(struct KhCsSlot *s){
+    KCtx *g=cur_thread()->g;
+    for(size_t i=0;i<cut_cs_count;i++){
+        wr32(g,cut_owned_cs[i]+12,0); wr64(g,cut_owned_cs[i]+16,0);
+    }
+    cut_cs_count=s->count; /* capacity never shrinks */
+    for(size_t i=0;i<s->count;i++){
+        struct CsRecord *r=&s->records[i];
+        cut_owned_cs[i]=r->address;
+        wr32(g,r->address+12,r->depth);
+        wr64(g,r->address+16,r->owner);
+    }
+}
 /* KHNMC_CLOCK_SYNC=all: a waiter past 2,000 spins sleeps 50 us at a time; it used to be marked idle (2) for the quiescence test, which
  * stayed true after the owner LEFT the section: the clock could step before the waiter took it, at a host-chosen instant.  On ONE CPU
  * that decided which 16 ms handler tick created the title music's voice (review of task 28: pinned title starts gave 5 hashes in 20).
@@ -300,23 +408,25 @@ static void cs_enter(KCtx *g,u64 cs){
         if(++spins<200) KH_CPU_RELAX(); else if(spins<2000) sched_yield(); else { if(spins==2000&&kh_vclock_sync){ atomic_store(&ct->vc_csown,(unsigned long long*)own); atomic_store(&ct->vc_state,3); kh_vclock_idle(2); } struct timespec ts={0,50000}; nanosleep(&ts,0); } }
     if(spins>=2000&&kh_vclock_sync) kh_vclock_idle(0);
     wr32(g,cs+0xC,1);
+    if(kh_cut_enabled) cut_cs_acquired(cs);
 }
 static void cs_leave(KCtx *g,u64 cs){
     u64 *own=(u64*)XL(g,cs+0x10); u32 r=rd32(g,cs+0xC);
     if(__atomic_load_n(own,__ATOMIC_RELAXED)!=cur_thread()->tid){ kh_fatal(g,"LeaveCriticalSection(%llx) by non-owner (owner=%llx me=%u)",(unsigned long long)cs,(unsigned long long)*own,cur_thread()->tid); }
     if(r>1){ wr32(g,cs+0xC,r-1); return; }
+    if(kh_cut_enabled) cut_cs_released(cs);
     wr32(g,cs+0xC,0); __atomic_store_n(own,0,__ATOMIC_RELEASE); vc_released();
     SYNC_CHAOS();
 }
-IMP(K32,InitializeCriticalSection){ u64 cs=A0(g); memset(hp(g,cs),0,0x28); SET_RAX(g,0); }
-IMP(K32,InitializeCriticalSectionAndSpinCount){ u64 cs=A0(g); memset(hp(g,cs),0,0x28); SET_RAX(g,1); }
-IMP(K32,InitializeCriticalSectionEx){ u64 cs=A0(g); memset(hp(g,cs),0,0x28); SET_RAX(g,1); }
-IMP(K32,DeleteCriticalSection){ memset(hp(g,A0(g)),0,0x28); }
+IMP(K32,InitializeCriticalSection){ u64 cs=A0(g); cut_cs_reset(g,cs); SET_RAX(g,0); }
+IMP(K32,InitializeCriticalSectionAndSpinCount){ u64 cs=A0(g); cut_cs_reset(g,cs); SET_RAX(g,1); }
+IMP(K32,InitializeCriticalSectionEx){ u64 cs=A0(g); cut_cs_reset(g,cs); SET_RAX(g,1); }
+IMP(K32,DeleteCriticalSection){ cut_cs_reset(g,A0(g)); }
 IMP(K32,EnterCriticalSection){ cs_enter(g,A0(g)); }
 IMP(K32,LeaveCriticalSection){ cs_leave(g,A0(g)); }
 /* msvcp140 _Mtx_*: the in-situ mutex storage is used like a CRITICAL_SECTION (recursive, so also valid for std::mutex) */
-IMP(MSVCP,_Mtx_init_in_situ){ memset(hp(g,A0(g)),0,0x28); SET_RAX(g,0); }
-IMP(MSVCP,_Mtx_destroy_in_situ){ memset(hp(g,A0(g)),0,0x28); }
+IMP(MSVCP,_Mtx_init_in_situ){ cut_cs_reset(g,A0(g)); SET_RAX(g,0); }
+IMP(MSVCP,_Mtx_destroy_in_situ){ cut_cs_reset(g,A0(g)); }
 IMP(MSVCP,_Mtx_lock){ cs_enter(g,A0(g)); SET_RAX(g,0); }
 IMP(MSVCP,_Mtx_unlock){ cs_leave(g,A0(g)); SET_RAX(g,0); }
 /* _Thrd_sleep(const xtime*): xtime { __time64_t sec; long nsec } is an ABSOLUTE wall-clock time (std::this_thread::sleep_until builds it
@@ -358,11 +468,15 @@ static _Atomic u64 vc_wake_waits, vc_wake_guard;
 static void vc_after_wake(u64 h,int had_waiters,u64 sat0){
     KThread *me=cur_thread(); if(!kh_vclock_sync||!me||!had_waiters||!kh_vclock_stepped()) return;
     int k; KWaitObj *w=h_get_ref(h,&k); if(!w) return;
+    struct KhPendingWait handoff={.object=w,.handle=h,.generation=sat0,.handoff=1};
     u64 t0=0; struct timespec ts={0,20000}; KThread *tk=NULL;
     for(;;){
         if(atomic_load(&kh_cut_requested)){
             u64 pause=kh_host_ns();
+            kh_cut_pending=&handoff;
             kh_cut_poll("wake-handoff",NULL);
+            kh_cut_pending=NULL;
+            w=handoff.object; sat0=handoff.generation;
             if(t0) t0+=kh_host_ns()-pause;
         }
         pthread_mutex_lock(&w->m); u64 sat=w->satisfied; tk=w->last_taker; int left=w->waiters; pthread_mutex_unlock(&w->m);
@@ -403,7 +517,7 @@ IMP(K32,ReleaseMutex){ int k; KWaitObj *w=h_get_ref(A0(g),&k); if(!w||k!=HK_MUTE
     if(w->recurse==0||w->owner!=cur_thread()->tid){ pthread_mutex_unlock(&w->m); kh_wobj_unref(w); kh_set_last_error(288); SET_RAX(g,0); return; }
     if(--w->recurse==0){ w->owner=0; pthread_cond_broadcast(&w->cv); vc_released(); } pthread_mutex_unlock(&w->m); kh_wobj_unref(w); SET_RAX(g,1); }
 /* KHNMC_CLOCK=frames: the virtual display must know when the game thread is parked in its frame wait and when it has taken a release */
-IMP(K32,WaitForSingleObject){ if(kh_cut_enabled) kh_cut_transfer_wait(g,KH_CUT_HANDLE,i_kernel32__WaitForSingleObject); u64 h=A0(g); int fw=kh_vclock_on&&kh_vclock_frame_wait_enter(h); u32 r=kh_wait(g,h,(u32)A1(g)); if(fw) kh_vclock_frame_wait_leave(r==0); SET_RAX(g,r); }
+IMP(K32,WaitForSingleObject){ if(kh_cut_enabled) kh_cut_transfer_wait(g,KH_CUT_HANDLE,i_kernel32__WaitForSingleObject); u64 h=A0(g); int fw=kh_vclock_on&&kh_vclock_frame_wait_enter(h); u32 r=wait_object(g,h,(u32)A1(g),&fw); if(fw) kh_vclock_frame_wait_leave(r==0); SET_RAX(g,r); }
 IMP(K32,WaitForSingleObjectEx){ SET_RAX(g,kh_wait(g,A0(g),(u32)A1(g))); }
 IMP(K32,CloseHandle){ u64 h=A0(g); if(h==PSEUDO_THREAD||h==PSEUDO_PROCESS){ SET_RAX(g,1); return; } int ok=h_close(h); if(!ok) kh_set_last_error(6); SET_RAX(g,ok); }
 static void host_sleep_ms(u32 ms){ struct timespec ts={ms/1000,(long)(ms%1000)*1000000L}; if(kh_vclock_sync) kh_vclock_idle(1); nanosleep(&ts,0); if(kh_vclock_sync) kh_vclock_idle(0); }
@@ -852,6 +966,57 @@ static void st_fiber_body(KCtx *g){
     kh_fiber_switch(g,st_fb.main_h);
     kh_fatal(g,"sync selftest: fiber resumed after its last switch");
 }
+struct SyncReplay { u64 a,b; _Atomic unsigned completed; };
+static void st_replay_wait(KCtx *g){
+    struct SyncReplay *r=(void *)(uintptr_t)A0(g);
+    kh_cut_wait_owner=KH_CUT_HANDLE;
+    if(kh_wait(g,r->a,UINT32_MAX)==0) atomic_fetch_add(&r->completed,1);
+    if(kh_wait(g,r->b,UINT32_MAX)==0) atomic_fetch_add(&r->completed,1);
+    kh_cut_wait_owner=0;
+    KH_RET(g);
+}
+/* Runs before other selftests have started any guest workers. */
+int kh_sync_slot_selftest(KCtx *g){
+    extern int kh_sync_test_cut(KThread *,struct KhSyncSlot **,int);
+    int checks=0,fails=0,enabled=kh_cut_enabled;
+    kh_cut_enabled=1;
+    struct SyncReplay r={mk_sem(0,3),mk_event(0,0),0};
+    u64 cs=ga_calloc_src(1,0x28,GA_SRC_RT);
+    cs_enter(g,cs); cs_enter(g,cs);
+    u64 manual=mk_event(1,1);
+    KWaitObj *mu=wobj_new(HK_MUTEX);
+    u64 mh=h_new(HK_MUTEX,mu);
+    SCHECK(kh_wait(g,mh,0)==0&&kh_wait(g,mh,0)==0);
+    u64 th=thread_create(g,0,kh_host_fn("sync_replay_wait",st_replay_wait),(u64)(uintptr_t)&r,0,NULL);
+    KThread *worker=((KWaitObj *)h_get(th,HK_THREAD))->thread;
+    struct KhSyncSlot *slot=NULL;
+    SCHECK(st_blocked(r.a,1,3000));
+    SCHECK(kh_sync_test_cut(worker,&slot,0));
+    u32 err=0,prev=0;
+    SCHECK(sem_release(r.a,1,&prev,&err));
+    SCHECK(st_blocked(r.b,1,3000)&&atomic_load(&r.completed)==1);
+    h_close(r.a); event_reset(manual); mu->owner=0; mu->recurse=0;
+    worker->exit_code=5; cs_leave(g,cs); cs_leave(g,cs);
+    u64 branch=mk_sem(2,2);
+    SCHECK(slot&&kh_sync_test_cut(worker,&slot,1));
+    SCHECK(cs_owner(g,cs)==cur_thread()->tid&&rd32(g,cs+12)==2);
+    SCHECK(!h_kind(branch)&&h_kind(r.a)==HK_SEM&&mu->recurse==2&&mu->owner==cur_thread()->tid);
+    SCHECK(kh_wait(g,manual,0)==0&&worker->exit_code==0);
+    int waiting=0; u64 taken=1;
+    SCHECK(!kh_wobj_waitstate(r.a,&waiting,&taken)&&waiting==1&&taken==0);
+    kh_event_set(r.b);
+    SCHECK(sem_release(r.a,1,&prev,&err));
+    if(kh_wait(g,th,3000)!=0) kh_fatal(g,"sync-slot-selftest: worker failed to leave restored wait");
+    SCHECK(atomic_load(&r.completed)==2);
+    SCHECK(kh_wait(g,r.b,0)==0&&kh_wait(g,r.b,0)==0x102);
+    if(slot) kh_sync_discard(slot);
+    h_close(th); h_close(manual); h_close(mh); h_close(r.a); h_close(r.b);
+    while(cs_owner(g,cs)) cs_leave(g,cs);
+    ga_free(cs);
+    kh_cut_enabled=enabled;
+    fprintf(stderr,"kh: sync slot selftest: %d checks, %d failures\n",checks,fails);
+    return fails;
+}
 int kh_sync_selftest(KCtx *g){
     int checks=0,fails=0; StW a[3];
     /* 1. manual-reset event: SetEvent immediately followed by ResetEvent releases every thread that was waiting */
@@ -1091,7 +1256,9 @@ int kh_sync_vclock_selftest(KCtx *g){
       SCHECK(kh_threads_quiet(NULL,0)==1);                                                          /* owned by someone else: idle */
       __atomic_store_n(own,(u64)wt->tid,__ATOMIC_RELEASE); SCHECK(kh_threads_quiet(NULL,0)==0);    /* its own id (it cannot take it: the field is not 0): running */
       atomic_store(&vst_what,"E (a critical section left during the test's pass)");
-      wr32(g,cs+0xC,1); __atomic_store_n(own,(u64)me->tid,__ATOMIC_RELEASE);                         /* this thread owns it now */
+      wr32(g,cs+0xC,1);
+      if(kh_cut_enabled) cut_cs_acquired(cs);
+      __atomic_store_n(own,(u64)me->tid,__ATOMIC_RELEASE);                         /* this thread owns it now */
       SCHECK(kh_threads_quiet(NULL,0)==1);                                                          /* owned by another thread: idle */
       u64 r0=vc_rel_retests; vst_hook_t=wt; vst_hook_caller=me; vst_hook_g=g; vst_hook_cs=cs; atomic_store(&vst_hook_fired,0);
       pthread_mutex_lock(&tlist_m); quiet_hook=vst_release_hook; pthread_mutex_unlock(&tlist_m);

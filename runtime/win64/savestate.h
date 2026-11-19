@@ -28,3 +28,34 @@ void kh_cut_transfer_wait(KCtx *g,enum KhCutWait kind,KhFn body);
 extern _Thread_local enum KhCutWait kh_cut_wait_owner;
 void kh_cut_loader_relock(KCtx *g);
 u64 kh_vclock_timer_wait(int id,u64 due);
+
+/* In-process records. The barrier owns the live wait frames until thaw. */
+struct KhPendingWait {
+    KWaitObj *object;
+    u64 handle, generation;
+    int blocked, handoff, frame_wait, deadline_client;
+    u32 timeout_ms;
+    u64 deadline;
+};
+extern _Thread_local struct KhPendingWait *kh_cut_pending;
+struct KhSyncSlot;
+struct KhSyncSlot *kh_sync_capture(struct KhPendingWait **waits,KThread **threads,unsigned n);
+const char *kh_sync_restore(struct KhSyncSlot *,struct KhPendingWait **waits,KThread **threads,unsigned n);
+void kh_sync_discard(struct KhSyncSlot *);
+
+struct KhTimerSlot;
+struct KhTimerSlot *kh_timer_capture(void);
+const char *kh_timer_validate(struct KhTimerSlot *);
+void kh_timer_restore(struct KhTimerSlot *);
+u64 kh_clock_client_deadline(int id);
+struct KhCsSlot;
+struct KhCsSlot *kh_cs_capture(void);
+const char *kh_cs_validate(struct KhCsSlot *);
+void kh_cs_discard(struct KhCsSlot *);
+void kh_cs_restore(struct KhCsSlot *);
+struct KhClockSlot;
+struct KhClockSlot *kh_clock_capture(void);
+const char *kh_clock_validate(struct KhClockSlot *);
+void kh_clock_restore(struct KhClockSlot *);
+u64 kh_cut_mix_wait(int client,u64 due);
+unsigned kh_cut_audio_graph(unsigned *buffers,unsigned *commands);

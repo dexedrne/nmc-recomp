@@ -19,7 +19,7 @@
 int kh_cut_enabled;
 _Thread_local unsigned kh_cut_callback_depth;
 _Atomic int kh_cut_requested;
-enum CutOperation { FREEZE, CENSUS, SAVE, LOAD };
+enum CutOperation { FREEZE, CENSUS, SAVE, LOAD, SYNC_SAVE, SYNC_CHECK };
 static struct Trigger {
     struct Trigger *next;
     u64 frame;
@@ -28,7 +28,7 @@ static struct Trigger {
 } *trigger_head;
 static pthread_mutex_t mutex=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t resume=PTHREAD_COND_INITIALIZER;
-static struct Park { struct Park *next; KThread *thread; const char *site,*owner; void *callers[64]; int depth,stream; } *parks;
+static struct Park { struct Park *next; KThread *thread; const char *site,*owner; void *callers[64]; int depth,stream; struct KhPendingWait *pending; } *parks;
 static unsigned generation, completed, missed;
 static FILE *oracle; /* CPU comparison evidence only; never accepted as a playable slot. */
 static int oracle_failed;
@@ -38,6 +38,7 @@ static _Atomic(const char *) menu_status;
 static struct Trigger menu_trigger;
 static char menu_path[4096];
 static int scripted;
+static struct KhSyncSlot *test_kernel;
 
 const char *kh_cut_menu_status(void){ return atomic_exchange(&menu_status,NULL); }
 int kh_cut_menu_request(int load,int slot){
@@ -109,12 +110,14 @@ void kh_cut_init(void){
         struct Trigger *item=calloc(1,sizeof *item);
         if(!item) kh_fatal(NULL,"savestate-trigger-memory");
         if(!strcmp(operation,"freeze")) item->op=FREEZE;
+        else if(!strcmp(operation,"sync-save")) item->op=SYNC_SAVE;
+        else if(!strcmp(operation,"sync-check")) item->op=SYNC_CHECK;
         else if(!strncmp(operation,"census:",7)&&operation[7]) item->op=CENSUS;
         else if(!strncmp(operation,"save:",5)&&operation[5]) item->op=SAVE;
         else if(!strncmp(operation,"load:",5)&&operation[5]) item->op=LOAD;
         else goto invalid;
         item->frame=frame;
-        if(item->op!=FREEZE){
+        if(item->op==CENSUS||item->op==SAVE||item->op==LOAD){
             item->slot=strdup(strchr(operation,':')+1);
             if(!item->slot) kh_fatal(NULL,"savestate-trigger-memory");
         }
@@ -136,6 +139,7 @@ void kh_cut_poll(const char *site,pthread_mutex_t *held){
     pthread_mutex_lock(&mutex);
     if(atomic_load(&kh_cut_requested)){
         struct Park p={parks,cur_thread(),site};
+        p.pending=kh_cut_pending;
         p.stream=kh_cut_on_stream();
         static const struct { const char *site,*name; } waits[]={
             [KH_CUT_SLEEP]={"clock-client","sleeper"}, [KH_CUT_HANDLE]={"handle-wait","handle"},
@@ -298,13 +302,15 @@ void kh_cut_frame(KCtx *g,u64 frame){
         nanosleep(&nap,NULL);
         pthread_mutex_lock(&mutex);
     }
-    int save=trigger_head->op==SAVE;
+    int sync_test=trigger_head->op==SYNC_SAVE||trigger_head->op==SYNC_CHECK;
+    int save=trigger_head->op==SAVE||sync_test;
+    const char *sync_error=NULL;
     unsigned blocker_tid=0;
     u64 blocker_start=0,blocker_return=0;
     const char *blocker_site=NULL;
-    unsigned wait_tid=0;
-    u64 wait_handle=0,wait_generation=0;
-    int wait_kind=0;
+    struct KhPendingWait *waits[4096];
+    KThread *wait_threads[4096];
+    unsigned wait_count=0,voices=0,buffers=0,commands=0;
     int gate_ok=0,stream_busy=0;
     char *tmp=NULL;
     int fd=-1;
@@ -339,12 +345,10 @@ void kh_cut_frame(KCtx *g,u64 frame){
                 }
                 if(!p->stream&&p->owner){
                     KThread *t=p->thread;
-                    if(!strcmp(p->site,"handle-wait")&&atomic_load(&t->vc_state)==1&&
-                       (!wait_tid||t->tid<wait_tid)){
-                        wait_tid=t->tid;
-                        wait_handle=KH_RCX(t->g);
-                        wait_generation=atomic_load(&t->vc_gen0);
-                        wait_kind=atomic_load(&t->vc_k);
+                    if(!strcmp(p->site,"handle-wait")||!strcmp(p->site,"wake-handoff")){
+                        if(!p->pending){ blocker_tid=t->tid; blocker_site="unrecorded handle wait";
+                            blocker_start=t->start; blocker_return=rd64(t->g,KH_RSP(t->g)); }
+                        else { waits[wait_count]=p->pending; wait_threads[wait_count++]=t; }
                     }
                     continue;
                 }
@@ -354,6 +358,25 @@ void kh_cut_frame(KCtx *g,u64 frame){
                 blocker_site=p->site;
                 KCtx *ctx=p->thread->g;
                 blocker_return=rd64(ctx,KH_RSP(ctx));
+            }
+        }
+        if(save&&gate_ok&&!stream_busy&&!blocker_site&&at_dispatch){
+            voices=kh_cut_audio_graph(&buffers,&commands);
+            struct KhSyncSlot *kernel=kh_sync_capture(waits,wait_threads,wait_count);
+            fprintf(stderr,"kh: savestate-sync-captured waiters=%u\n",wait_count);
+            if(trigger_head->op==SYNC_SAVE){
+                if(test_kernel) kh_sync_discard(test_kernel);
+                test_kernel=kernel;
+            }else{
+                if(trigger_head->op==SYNC_CHECK){
+                    sync_error=test_kernel?kh_sync_restore(test_kernel,waits,wait_threads,wait_count):"savestate-sync-test-empty";
+                    if(!sync_error){
+                        const char *rollback=kh_sync_restore(kernel,waits,wait_threads,wait_count);
+                        if(rollback) kh_fatal(g,"savestate-sync-test-rollback: %s",rollback);
+                        fprintf(stderr,"kh: savestate-sync-test restored both cuts at frame %llu\n",(unsigned long long)frame);
+                    }
+                }
+                kh_sync_discard(kernel);
             }
         }
         if(!save&&!completed&&gate_ok){
@@ -402,7 +425,8 @@ void kh_cut_frame(KCtx *g,u64 frame){
     }
     completed++;
     missed=0;
-    if(save){
+    if(sync_error) kh_fatal(g,"%s: sync checkpoint at frame %llu",sync_error,(unsigned long long)frame);
+    if(save&&(!sync_test||blocker_site||!at_dispatch)){
         const char *error;
         char detail[256];
         if(!at_dispatch){
@@ -413,17 +437,17 @@ void kh_cut_frame(KCtx *g,u64 frame){
             snprintf(detail,sizeof detail,"tid=%u start=%llx wait=%s guest-return=%llx",blocker_tid,
                      (unsigned long long)blocker_start,blocker_site,(unsigned long long)blocker_return);
         }else{
-            error="savestate-host-state";
-            if(wait_tid) snprintf(detail,sizeof detail,"no restore record for pending handle=%llx kind=%d generation=%llu waiter=%u",
-                         (unsigned long long)wait_handle,wait_kind,(unsigned long long)wait_generation,wait_tid);
-            else snprintf(detail,sizeof detail,"runtime owners have no restore records");
+            error=voices||commands?"savestate-mixer-graph":"savestate-host-state";
+            if(voices||commands)
+                snprintf(detail,sizeof detail,"sync-waits=%u live-voices=%u queued-buffers=%u deferred-calls=%u",wait_count,voices,buffers,commands);
+            else snprintf(detail,sizeof detail,"guest contexts, allocator and files require coordinated restore");
         }
         if(trigger_head==&menu_trigger){
             kh_warn("%s: %s slot=%s",error,detail,slot);
             finish_menu(error);
             return;
         }
-        kh_fatal(g,"%s: %s slot=%s",error,detail,slot);
+        kh_fatal(g,"%s: %s slot=%s",error,detail,slot?slot:"sync-test");
     }
     if(completed==(trigger_head->op==FREEZE?20:1)){
         struct Trigger *done=trigger_head;
@@ -432,4 +456,32 @@ void kh_cut_frame(KCtx *g,u64 frame){
         free(done);
         completed=0;
     }
+}
+
+/* Unit fixture: take the same predicate-loop barrier as a field save. The only
+ * running guest worker in this fixture is the thread passed by the test. */
+int kh_sync_test_cut(KThread *worker,struct KhSyncSlot **slot,int load){
+    struct timespec nap={0,1000000};
+    pthread_mutex_lock(&mutex);
+    generation++;
+    atomic_store(&kh_cut_requested,1);
+    u64 start=kh_host_ns();
+    struct Park *p=NULL;
+    while(kh_host_ns()-start<3000000000ull){
+        for(p=parks;p&&p->thread!=worker;p=p->next){}
+        if(p&&p->pending) break;
+        pthread_mutex_unlock(&mutex);
+        nanosleep(&nap,NULL);
+        pthread_mutex_lock(&mutex);
+    }
+    int ok=p&&p->pending;
+    if(ok){
+        if(load) ok=kh_sync_restore(*slot,&p->pending,&p->thread,1)==NULL;
+        else *slot=kh_sync_capture(&p->pending,&p->thread,1);
+    }
+    atomic_store(&kh_cut_requested,0);
+    pthread_cond_broadcast(&resume);
+    while(parks) pthread_cond_wait(&resume,&mutex);
+    pthread_mutex_unlock(&mutex);
+    return ok;
 }
