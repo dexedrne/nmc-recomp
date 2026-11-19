@@ -365,7 +365,9 @@ void kh_vclock_report(FILE *f){
     extern void kh_timer_frames_report(FILE*); kh_timer_frames_report(f);
     if(kh_vclock_sync){ extern u64 kh_threads_vwaits(void); extern u64 kh_threads_wake_waits(u64*); extern u64 kh_threads_rel_retests(void); u64 wg=0, ww=kh_threads_wake_waits(&wg);
         fprintf(f,"kh: vclock: KHNMC_CLOCK_SYNC=all: vblanks released because the guest was quiet=%llu; clock steps that waited for running threads=%llu (%.1f s of host time), let go by the %.0f s guard=%llu; due clock clients let go by the same guard=%llu; Sleep calls on the virtual clock=%llu, waits with a virtual time-out=%llu; wake-ups after which the waker waited for the woken thread=%llu, let go by the 2 s guard=%llu; quiescence tests not quiet because a thread was released during their pass=%llu\n",
-        (unsigned long long)n_quiet_rel,(unsigned long long)n_quiet_waits,quiet_host_ns/1e9,quiet_guard_ns/1e9,(unsigned long long)n_quiet_guard,(unsigned long long)n_client_quiet_guard,(unsigned long long)n_vsleeps,(unsigned long long)kh_threads_vwaits(),(unsigned long long)ww,(unsigned long long)wg,(unsigned long long)kh_threads_rel_retests()); }
+        (unsigned long long)n_quiet_rel,(unsigned long long)n_quiet_waits,quiet_host_ns/1e9,quiet_guard_ns/1e9,(unsigned long long)n_quiet_guard,(unsigned long long)n_client_quiet_guard,(unsigned long long)n_vsleeps,(unsigned long long)kh_threads_vwaits(),(unsigned long long)ww,(unsigned long long)wg,(unsigned long long)kh_threads_rel_retests());
+        { extern u64 kh_yield_vsleeps(void); u64 y=kh_yield_vsleeps();                 /* task 44: only when it happened (a movie's two yield loops) */
+          if(y) fprintf(f,"kh: vclock: %llu of those Sleep calls were SwitchToThread yields, each 1 ms on the virtual clock (the movie player's yield loops)\n",(unsigned long long)y); } }
 }
 
 /* ---- test hooks for the selftests of this and other modules (audio clock, timers, video): a stepped clock that only the test moves */

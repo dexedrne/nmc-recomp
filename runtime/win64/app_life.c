@@ -5,7 +5,7 @@
  *      in the order the shell asked for them.  The shell's thread only posts a request and waits for it in slices, at most its bound;
  *      it never calls a vkd3d queue function and never takes a lock that is held across a Vulkan or vkd3d call;
  *   3. the Linux test triggers KHNMC_TEST_GATE and KHNMC_TEST_SUSPEND;
- *   4. the step-12 call point (a named stub), the exit report and the selftest.
+ *   4. the step-12 call point (TASK43: the disk pipeline cache's save, runtime/gfx_pipecache.c), the exit report and the selftest.
  *
  * THE PC'S FOCUS LOSS (TASK41 item 2; evidence from the exe and the IL of the mixed-mode image, scratch/S4-il-boot-path/il/):
  *   - The native window procedure 0x10eb40 handles WM_DESTROY (2) and WM_SIZE (5) only; WM_ACTIVATE, WM_ACTIVATEAPP, WM_KILLFOCUS and
@@ -26,6 +26,7 @@
 #include "khnmc_app.h"
 #include "khnmc_audio_out.h"
 #include "gfx_present.h"
+#include "gfx_pipecache.h"
 #include <errno.h>
 #include <string.h>
 #include <time.h>
@@ -141,8 +142,9 @@ static int do_suspend(const LifeReq *rq){
         /* step 5: the presenters' submissions done */
         slots_ok=kh_present_quiesce_all_bounded(slices_of(bound_ms*2/10),LIFE_SLICE_MS,&np,&left);
         if(!slots_ok){ res|=KH_APP_SLOTS_LATE; atomic_fetch_add(&c_slots_late,1); }
-        /* step 6 */
-        kh_gfx_pipecache_save_point();
+        /* step 6 (TASK43, plan step 12): the disk pipeline cache is written here, while the game is parked: the gate is set, nothing is
+         * admitted, the queues are drained.  Nothing unless a cache file is configured (gfx_pipecache.c: the rule, the bound, the report) */
+        atomic_fetch_add(&c_pipecache,1); kh_gfx_pipecache_save_point(rq->deadline_ns);
     }
     /* the PC's minimise (BaseSimpleForm::suspend on the UI thread): the game pauses its sounds and its timing thread.  NOT under
      * KHNMC_CLOCK=frames (a Linux test clock, never on the phone): there the virtual clock moves only inside WaitForVBlank, which the
@@ -267,13 +269,9 @@ void kh_app_audio_interruption(int began){
     pthread_once(&l_once,l_init); atomic_store(&life_used,1);
     pthread_mutex_lock(&lm); l_post_locked(began?RQ_AU_BEGAN:RQ_AU_ENDED,0); pthread_mutex_unlock(&lm);
 }
-/* step 12's call point: the gate is set and nothing is admitted.  The disk pipeline cache (IOS-GRAPHICS-PLAN step 12) is not written
- * yet: this is a named stub that is counted and says so once. */
-void kh_gfx_pipecache_save_point(void){
-    if(atomic_fetch_add(&c_pipecache,1)==0) fprintf(stderr,"kh: gfx pipeline cache: save point reached (IOS-GRAPHICS-PLAN step 12 is not implemented: nothing is saved; counted)\n"); }
 
 /* ---- 3. test triggers ---- */
-static int t_kind; static u64 t_frame; static unsigned t_ms; static _Atomic int t_state; static _Atomic u64 t_at_present, t_r1, t_r2, t_held_ns;
+static int t_kind, t_at=-1; static u64 t_frame; static unsigned t_ms; static _Atomic int t_state; static _Atomic u64 t_at_present, t_r1, t_r2, t_held_ns;
 /* "frame:N:ms" -> 0 ok; 1 malformed; 2 out of range */
 static int test_parse(const char *s,u64 *n,unsigned *ms){
     if(!s||strncmp(s,"frame:",6)) return 1; s+=6; char *e; if(*s<'0'||*s>'9') return 1;
@@ -293,6 +291,67 @@ static void *test_gate_waiter(void *a){
     while(atomic_load(&gfx_presents)<tw_want){ rc=kh_cond_wait_stuck(&tw_cv,&tw_m,&ex,T_WAIT_BUDGET); if(rc==ETIMEDOUT) break; }
     pthread_mutex_unlock(&tw_m); atomic_store(&tw_rc,rc); return NULL; }
 static void test_sleep_ms(unsigned ms){ struct timespec ts={(time_t)(ms/1000),(long)(ms%1000)*1000000L}; while(nanosleep(&ts,&ts)==-1&&errno==EINTR){} }
+/* TASK43 (TASK43.md item 6): ONE suspend / resume cycle as the shell's main thread makes it, with its checks: the KHNMC_TEST_SUSPEND
+ * trigger and the presenter selftest (gfx_present.c) both run exactly this.
+ *   at = -1                      the cycle starts wherever the game happens to be (the trigger without KHNMC_TEST_SUSPEND_AT);
+ *   at = KH_TP_BEFORE_ACQUIRE    a Present is first stopped at the top of the presenter, before its vkAcquireNextImageKHR; the resign
+ *                                (the gate) comes while it stands there; then it goes on and parks BEFORE the acquire;
+ *   at = KH_TP_AFTER_ACQUIRE     the same right after a successful acquire: the Present then finds the gate at its check (e) and parks
+ *                                AFTER the acquire (park_after_acquire: on the way back the acquired image is consumed by an admitted
+ *                                submit, its semaphore is made anew, the swapchain is rebuilt as after-park).
+ * Both interleavings are correct paths.  The trigger used to fail the second one ("a Present parked after its acquire": seen once under
+ * load at task 41's merge) because it could not tell the park's rebuild from the resume's.  Now it verifies each: in both, a presenter
+ * must have SEEN the resume (kh_present_resume_seen: the generation kh_present_resume_all moves, read at a Present; that is what the
+ * a12b mutant removes) and a swapchain rebuild must have followed; after an acquire, also every parked acquire consumed and its
+ * semaphore made anew.  Returns the number of failed checks (their text in why). */
+int kh_app_test_suspend_cycle(int at,unsigned ms,char *why,size_t whycap,uint64_t *r1o,uint64_t *r2o){
+    int k=0, nf=0; if(whycap) why[0]=0; u64 t0=kh_host_ns();
+#define TFAIL(c,...) do{ if(!(c)){ nf++; if(k<(int)whycap-200){ int w_=snprintf(why+k,whycap-(size_t)k,__VA_ARGS__); if(w_>0) k+=w_; } } }while(0)
+    const char *atn=at<0?"wherever the game is":at==KH_TP_AFTER_ACQUIRE?"FORCED after the presenter's acquire":"FORCED before the presenter's acquire";
+    fprintf(stderr,"kh: app: TEST KHNMC_TEST_SUSPEND: present %llu: resign, suspend (bound %u ms), %u ms in the background, resume, from a host thread that stands for the shell's main thread (%s)\n",
+            P_(atomic_load(&gfx_presents)),KH_APP_SUSPEND_BOUND_MS,ms,atn);
+    u64 pres0=kh_present_presented(), rb0=kh_present_rebuilds_after_resume(), pk0=kh_present_parked_after_acquire(), rc0=kh_present_resume_calls(),
+        rs0=kh_present_resume_seen(), cn0=kh_present_consumed(), sr0=kh_present_sems_remade();
+    u64 dq0=atomic_load(&c_drain_q), dok0=atomic_load(&c_drain_ok), pads0=atomic_load(&c_pads), aus0=atomic_load(&c_au_stop), aua0=atomic_load(&c_au_start), np0=atomic_load(&c_null_parks);
+    int reached=1;
+    if(at>=0){ kh_present_test_point_arm(at); reached=kh_present_test_point_wait(120000);
+        if(!reached){ kh_present_test_point_arm(-1); TFAIL(0,"no Present reached the presenter's test point within 120 s (the forced interleavings need a presenter: KHNMC_GFX_PRESENT=headless); "); } }
+    kh_app_will_resign_active();                                       /* the gate: a Present stopped at the point sees it as soon as it goes on */
+    if(at>=0&&reached) kh_present_test_point_release();
+    int r1=kh_app_suspend(KH_APP_SUSPEND_BOUND_MS); if(r1o) *r1o=(u64)r1;
+    test_sleep_ms(ms);
+    u64 at_resume=atomic_load(&gfx_presents);
+    int r2=kh_app_resume(KH_APP_RESUME_BOUND_MS); if(r2o) *r2o=(u64)r2;
+    fprintf(stderr,"kh: app: TEST KHNMC_TEST_SUSPEND: suspend result 0x%x, resume result 0x%x, %.1f ms from the resign to the end of the resume (the game was at present %llu)\n",
+            r1,r2,(kh_host_ns()-t0)/1e6,P_(at_resume));
+    /* the swapchain-stale path: with a presenter, the first Presents after the resume rebuild OUR swapchain */
+    int with_pres=pres0>0||at>=0; u64 want=at_resume+2;
+    for(unsigned w=0;w<6000&&atomic_load(&gfx_presents)<want;w++){ struct timespec ts={0,10000000}; nanosleep(&ts,0); }
+    unsigned allowed=(kh_gfx_vkd3d_on&&!kh_gfx_wrap_on)?KH_APP_DRAIN_LATE:0;    /* the trampoline bridge registers no queue (by design, loud) */
+    u64 pk=kh_present_parked_after_acquire()-pk0, rb=kh_present_rebuilds_after_resume()-rb0, rs=kh_present_resume_seen()-rs0, cn=kh_present_consumed()-cn0, sr=kh_present_sems_remade()-sr0;
+    TFAIL((((unsigned)r1)&~allowed)==0,"suspend result 0x%x; ",r1);
+    TFAIL(r2==0,"resume result 0x%x; ",r2);
+    TFAIL(atomic_load(&c_pads)>pads0,"the pads were not set neutral; ");
+    TFAIL(kh_present_resume_calls()>rc0,"the presenters were not told to rebuild (kh_present_resume_all); ");
+    if(atomic_load(&c_au_stop)>aus0) TFAIL(atomic_load(&c_au_start)>aua0,"the audio stopped at the suspend did not start again; ");
+    if(kh_gfx_vkd3d_on&&kh_gfx_wrap_on) TFAIL(atomic_load(&c_drain_q)>dq0&&atomic_load(&c_drain_ok)-dok0==atomic_load(&c_drain_q)-dq0,"the queue drain did not reach every registered queue; ");
+    if(!kh_gfx_vkd3d_on) TFAIL(atomic_load(&c_null_parks)>np0,"the null backend's Present did not park while suspended; ");
+    TFAIL(atomic_load(&gfx_presents)>=want,"the game did not present twice after the resume; ");
+    if(with_pres){
+        TFAIL(rs>0,"no presenter saw the resume at a Present (kh_present_resume_all did not reach it); ");
+        TFAIL(rb>0,"no swapchain rebuild after the resume (the stale path); ");
+        /* a Present that parked after its acquire is a correct path: verified by its own counters instead of failed */
+        if(pk){ TFAIL(cn>=pk,"%llu Present(s) parked after their acquire, but only %llu parked acquire(s) were consumed; ",P_(pk),P_(cn));
+                TFAIL(sr>=pk,"%llu Present(s) parked after their acquire, but only %llu acquire semaphore(s) were made anew; ",P_(pk),P_(sr)); }
+        if(at==KH_TP_AFTER_ACQUIRE) TFAIL(pk>=1,"the suspend was forced after an acquire, but no Present parked after its acquire; ");
+        if(at==KH_TP_BEFORE_ACQUIRE) TFAIL(pk==0,"the suspend was forced before the acquire, but %llu Present(s) parked after an acquire; ",P_(pk)); }
+    fprintf(stderr,"kh: app: TEST KHNMC_TEST_SUSPEND: checks (%s): presenter %s, saw the resume +%llu, rebuilds after resume / park +%llu, parked after acquire +%llu (acquires consumed +%llu, semaphores made anew +%llu), queues drained %llu of %llu, pads neutral +%llu, audio stopped +%llu / started +%llu, null Present parks +%llu: %s\n",
+            atn,with_pres?"yes":"none",P_(rs),P_(rb),P_(pk),P_(cn),P_(sr),P_(atomic_load(&c_drain_ok)-dok0),P_(atomic_load(&c_drain_q)-dq0),
+            P_(atomic_load(&c_pads)-pads0),P_(atomic_load(&c_au_stop)-aus0),P_(atomic_load(&c_au_start)-aua0),P_(atomic_load(&c_null_parks)-np0),nf?"FAILED":"ok");
+#undef TFAIL
+    return nf;
+}
+int kh_app_test_used(int set){ int was=atomic_load(&life_used); if(set>=0) atomic_store(&life_used,set); return was; }   /* selftests: the report's "was used" flag, saved and put back */
 static void *test_main(void *a){
     (void)a; while(atomic_load(&gfx_presents)<t_frame){ struct timespec ts={0,2000000}; nanosleep(&ts,0); }
     atomic_store(&t_at_present,atomic_load(&gfx_presents)); atomic_store(&t_state,1);
@@ -322,35 +381,9 @@ static void *test_main(void *a){
         if(!kh_gfx_vkd3d_on) fprintf(stderr,"kh: app: TEST KHNMC_TEST_GATE: null backend: the game does not park at a gate set alone (a resign = the PC's focus loss); only the waiter was checked\n");
         if(k) kh_fatal(NULL,"app-test-gate-failed: KHNMC_TEST_GATE=frame:%llu:%u: %s",P_(t_frame),t_ms,why);
     } else {
-        fprintf(stderr,"kh: app: TEST KHNMC_TEST_SUSPEND: present %llu: resign, suspend (bound %u ms), %u ms in the background, resume, from a host thread that stands for the shell's main thread\n",
-                P_(atomic_load(&t_at_present)),KH_APP_SUSPEND_BOUND_MS,t_ms);
-        u64 pres0=kh_present_presented(), rb0=kh_present_rebuilds_after_resume(), pk0=kh_present_parked_after_acquire(), rc0=kh_present_resume_calls();
-        u64 dq0=atomic_load(&c_drain_q), dok0=atomic_load(&c_drain_ok), pads0=atomic_load(&c_pads), aus0=atomic_load(&c_au_stop), aua0=atomic_load(&c_au_start), np0=atomic_load(&c_null_parks);
-        kh_app_will_resign_active(); int r1=kh_app_suspend(KH_APP_SUSPEND_BOUND_MS); atomic_store(&t_r1,(u64)r1);
-        test_sleep_ms(t_ms);
-        u64 at_resume=atomic_load(&gfx_presents);
-        int r2=kh_app_resume(KH_APP_RESUME_BOUND_MS); atomic_store(&t_r2,(u64)r2); atomic_store(&t_held_ns,kh_host_ns()-t0);
-        fprintf(stderr,"kh: app: TEST KHNMC_TEST_SUSPEND: suspend result 0x%x, resume result 0x%x, %.1f ms from the resign to the end of the resume (the game was at present %llu)\n",
-                r1,r2,(kh_host_ns()-t0)/1e6,P_(at_resume));
-        /* the swapchain-stale path: with a presenter, the first Presents after the resume rebuild OUR swapchain as resumed, and that
-         * rebuild comes from kh_present_resume_all (not from a park after an acquire: those count apart) */
-        int with_pres=pres0>0; u64 want=at_resume+2;
-        for(unsigned w=0;w<6000&&atomic_load(&gfx_presents)<want;w++){ struct timespec ts={0,10000000}; nanosleep(&ts,0); }
-        unsigned allowed=(kh_gfx_vkd3d_on&&!kh_gfx_wrap_on)?KH_APP_DRAIN_LATE:0;    /* the trampoline bridge registers no queue (by design, loud) */
-        TFAIL((((unsigned)r1)&~allowed)==0,"suspend result 0x%x; ",r1);
-        TFAIL(r2==0,"resume result 0x%x; ",r2);
-        TFAIL(atomic_load(&c_pads)>pads0,"the pads were not set neutral; ");
-        TFAIL(kh_present_resume_calls()>rc0,"the presenters were not told to rebuild (kh_present_resume_all); ");
-        if(atomic_load(&c_au_stop)>aus0) TFAIL(atomic_load(&c_au_start)>aua0,"the audio stopped at the suspend did not start again; ");
-        if(kh_gfx_vkd3d_on&&kh_gfx_wrap_on) TFAIL(atomic_load(&c_drain_q)>dq0&&atomic_load(&c_drain_ok)-dok0==atomic_load(&c_drain_q)-dq0,"the queue drain did not reach every registered queue; ");
-        if(!kh_gfx_vkd3d_on) TFAIL(atomic_load(&c_null_parks)>np0,"the null backend's Present did not park while suspended; ");
-        TFAIL(atomic_load(&gfx_presents)>=want,"the game did not present twice after the resume; ");
-        if(with_pres){ TFAIL(kh_present_rebuilds_after_resume()>rb0,"no swapchain rebuild after the resume (the stale path); ");
-                       TFAIL(kh_present_parked_after_acquire()==pk0,"a Present parked after its acquire (its rebuild would count as after-park too); "); }
-        fprintf(stderr,"kh: app: TEST KHNMC_TEST_SUSPEND: checks: presenter %s, rebuilds after resume +%llu, parked after acquire +%llu, queues drained %llu of %llu, pads neutral +%llu, audio stopped +%llu / started +%llu, null Present parks +%llu: %s\n",
-                with_pres?"yes":"none",P_(kh_present_rebuilds_after_resume()-rb0),P_(kh_present_parked_after_acquire()-pk0),P_(atomic_load(&c_drain_ok)-dok0),P_(atomic_load(&c_drain_q)-dq0),
-                P_(atomic_load(&c_pads)-pads0),P_(atomic_load(&c_au_stop)-aus0),P_(atomic_load(&c_au_start)-aua0),P_(atomic_load(&c_null_parks)-np0),k?"FAILED":"ok");
-        if(k) kh_fatal(NULL,"app-test-suspend-failed: KHNMC_TEST_SUSPEND=frame:%llu:%u: %s",P_(t_frame),t_ms,why);
+        char sw[700]; u64 r1=0,r2=0; int nf=kh_app_test_suspend_cycle(t_at,t_ms,sw,sizeof sw,&r1,&r2);
+        atomic_store(&t_r1,r1); atomic_store(&t_r2,r2); atomic_store(&t_held_ns,kh_host_ns()-t0);
+        if(nf) kh_fatal(NULL,"app-test-suspend-failed: KHNMC_TEST_SUSPEND=frame:%llu:%u%s%s: %s",P_(t_frame),t_ms,t_at>=0?" KHNMC_TEST_SUSPEND_AT=":"",t_at<0?"":t_at==KH_TP_AFTER_ACQUIRE?"after-acquire":"before-acquire",sw);
     }
 #undef TFAIL
     atomic_store(&t_state,2); return NULL;
@@ -364,6 +397,11 @@ void kh_app_test_init(void){
     if(pr==1) kh_fatal(NULL,"app-test-value: %s=%s: expected frame:N:ms (N = the Present at which it starts, ms = how long the gate / the background lasts)",g?"KHNMC_TEST_GATE":"KHNMC_TEST_SUSPEND",v);
     if(pr==2) kh_fatal(NULL,"app-test-range: %s=%s: N 1..100000000, ms 0..3600000",g?"KHNMC_TEST_GATE":"KHNMC_TEST_SUSPEND",v);
     t_kind=g?1:2; atomic_store(&life_used,1); kh_cond_init(&tw_cv);
+    { const char *at=getenv("KHNMC_TEST_SUSPEND_AT");            /* TASK43: force the interleaving (before-acquire / after-acquire); unset = wherever the game is */
+      if(at&&*at){ if(!s) kh_fatal(NULL,"app-test-at-needs-suspend: KHNMC_TEST_SUSPEND_AT=%s without KHNMC_TEST_SUSPEND",at);
+          if(!strcmp(at,"before-acquire")) t_at=KH_TP_BEFORE_ACQUIRE; else if(!strcmp(at,"after-acquire")) t_at=KH_TP_AFTER_ACQUIRE;
+          else kh_fatal(NULL,"app-test-at-value: KHNMC_TEST_SUSPEND_AT=%s (before-acquire or after-acquire: where in the presenter's Present the suspend is forced)",at);
+          if(!kh_gfx_vkd3d_on) kh_fatal(NULL,"app-test-at-needs-presenter: KHNMC_TEST_SUSPEND_AT=%s needs the vkd3d backend with a presenter (KHNMC_GFX=vkd3dw KHNMC_GFX_PRESENT=headless)",at); } }
     pthread_t th; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setdetachstate(&at,PTHREAD_CREATE_DETACHED);
     if(pthread_create(&th,&at,test_main,NULL)) kh_fatal(NULL,"app-test-thread: the test trigger thread cannot be started");
     pthread_attr_destroy(&at);
@@ -387,6 +425,7 @@ void kh_app_report(FILE *f){
             P_(c_int_began),P_(c_int_stop),P_(c_int_ended),P_(c_int_start),P_(c_pads),P_(c_pads_held),
             P_(c_null_parks),atomic_load(&c_null_park_ns)/1e6,
             P_(c_fg_other),P_(c_min_posted),P_(c_res_posted),P_(sm),P_(sr),serving?"serving":"not serving",P_(c_min_skipped),P_(rz),P_(rzn),P_(rzo));
+    if(t_kind&&t_at>=0) fprintf(f,"; KHNMC_TEST_SUSPEND_AT=%s",t_at==KH_TP_AFTER_ACQUIRE?"after-acquire":"before-acquire");
     if(t_kind) fprintf(f,"; test %s frame:%llu:%u: %s at present %llu, suspend 0x%llx resume 0x%llx, %.1f ms",t_kind==1?"KHNMC_TEST_GATE":"KHNMC_TEST_SUSPEND",P_(t_frame),t_ms,
                        atomic_load(&t_state)==2?"done":atomic_load(&t_state)==1?"STARTED, NOT FINISHED":"NEVER STARTED (the run ended before that present)",
                        P_(atomic_load(&t_at_present)),P_(atomic_load(&t_r1)),P_(atomic_load(&t_r2)),atomic_load(&t_held_ns)/1e6);
@@ -447,9 +486,10 @@ int kh_app_life_selftest(void){
     { StAdm a; memset(&a,0,sizeof a); kh_gfx_gate_clear(); pthread_t ta,tg; pthread_create(&ta,NULL,st_adm,&a); for(int i=0;i<2000&&atomic_load(&a.state)<2;i++){ struct timespec ts={0,1000000}; nanosleep(&ts,0); }
       kh_app_will_resign_active(); pthread_create(&tg,NULL,st_go_later,&a);
       kh_input_host_pad_set(0x1000,200,0,9000,0,0,0);
-      u64 pc0=atomic_load(&c_pipecache), q0=atomic_load(&c_q_ok), d0=atomic_load(&c_drains); u64 t0=kh_host_ns();
+      u64 pc0=atomic_load(&c_pipecache), q0=atomic_load(&c_q_ok), d0=atomic_load(&c_drains), sp0=kh_pc_save_points(); u64 t0=kh_host_ns();
       int r=kh_app_suspend(3000); u64 dt=kh_host_ns()-t0; pthread_join(tg,NULL); pthread_join(ta,NULL);
       TA(SUSP_OK(r) && atomic_load(&a.state)==3 && dt>=80000000ull && atomic_load(&c_q_ok)==q0+1 && atomic_load(&c_drains)==d0+1 && atomic_load(&c_pipecache)==pc0+1);
+      TA(kh_pc_save_points()==sp0+1);                                      /* TASK43: the disk pipeline cache's save point itself was reached (gfx_pipecache.c), once */
       u16 b=1,l=1; s16 lx=1; extern void kh_input_host_pad_get(u16*,u16*,s16*); kh_input_host_pad_get(&b,&l,&lx);
       TA(b==0 && l==0 && lx==0 && atomic_load(&st_stops)==1 && atomic_load(&st_starts)==0);
       TA(kh_shell_test_take()==KH_SHELL_MINIMISE && kh_shell_test_take()==0);
@@ -472,8 +512,9 @@ int kh_app_life_selftest(void){
     /* 5. a submission that stays admitted past the bound: suspend-not-quiesced, the drain steps skipped, fence signals held, the gate
      *    stays set; the resume (after the thread left) clears it */
     { StAdm a; memset(&a,0,sizeof a); pthread_t ta; pthread_create(&ta,NULL,st_adm,&a); for(int i=0;i<2000&&atomic_load(&a.state)<2;i++){ struct timespec ts={0,1000000}; nanosleep(&ts,0); }
-      u64 d0=atomic_load(&c_drains), h0=atomic_load(&c_hold), pc0=atomic_load(&c_pipecache); kh_app_will_resign_active(); int r=kh_app_suspend(500);
+      u64 d0=atomic_load(&c_drains), h0=atomic_load(&c_hold), pc0=atomic_load(&c_pipecache), sp0=kh_pc_save_points(); kh_app_will_resign_active(); int r=kh_app_suspend(500);
       TA((r&KH_APP_NOT_QUIESCED) && atomic_load(&c_drains)==d0 && atomic_load(&c_hold)==h0+1 && atomic_load(&c_pipecache)==pc0 && kh_gfx_gate_is_set() && kh_gfx_gate_admitted()==1);
+      TA(kh_pc_save_points()==sp0);                                        /* TASK43: not quiesced: no save point (a thread is still inside a submission) */
       atomic_store(&a.go,1); pthread_join(ta,NULL); TA(kh_app_resume(2000)==0 && !kh_gfx_gate_is_set()); while(kh_shell_test_take()){} }
     TCLEAN();
     /* 6. the caller's bound: a worker step that takes longer (an audio stop of 400 ms) does not hold the caller beyond its bound (100 ms):

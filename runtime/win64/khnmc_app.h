@@ -68,7 +68,11 @@ void kh_app_note_foreground_query(void);        /* GetForegroundWindow answered 
 void kh_app_test_init(void);                    /* start-up (null_d3d12.c): KHNMC_TEST_GATE / KHNMC_TEST_SUSPEND (below) */
 void kh_app_report(FILE *f);                    /* exit: one line when anything of this header was used, else nothing */
 int  kh_app_life_selftest(void);
-void kh_gfx_pipecache_save_point(void);         /* step 12's call point (the gate is set, nothing admitted): a named stub today */
+/* step 12's call point (the gate is set, nothing admitted): TASK43, kh_gfx_pipecache_save_point(deadline_ns) of runtime/gfx_pipecache.h */
+int  kh_app_test_suspend_cycle(int at,unsigned ms,char *why,size_t whycap,uint64_t *r1,uint64_t *r2);   /* TASK43: one resign / suspend / resume
+                                                 * cycle with the trigger's checks; at = -1, or a presenter test point (gfx_present.h KH_TP_*);
+                                                 * returns the number of failed checks */
+int  kh_app_test_used(int set);                 /* selftests: the "life cycle was used" flag of the exit report: returns it; set >= 0 stores it */
 int  kh_app_suspended(void);                    /* 1 from kh_app_suspend to the resume that clears the gate */
 void kh_app_null_present_park(void);            /* the null backend's Present: waits while suspended (never at a resign alone), counted */
 uint64_t kh_app_null_parks(void);
@@ -98,11 +102,17 @@ unsigned kh_input_host_pad_neutral(void);       /* every button up, sticks and t
  *   KHNMC_TEST_GATE=frame:N:ms      at the N-th Present a host thread sets the suspend gate, holds it ms of host time, clears it
  *   KHNMC_TEST_SUSPEND=frame:N:ms   at the N-th Present a host thread (standing for the shell's main thread) calls the same
  *                                   kh_app_will_resign_active, kh_app_suspend(KH_APP_SUSPEND_BOUND_MS), waits ms, kh_app_resume(...)
+ *   KHNMC_TEST_SUSPEND_AT=before-acquire | after-acquire   (TASK43; with KHNMC_TEST_SUSPEND, needs a presenter) the suspend is FORCED
+ *                                   at that point of the presenter's Present: a Present is stopped there, the resign comes, it goes on.
+ *                                   Both interleavings are correct paths and each is verified (after an acquire: the parked acquire is
+ *                                   consumed, its semaphore made anew, the swapchain rebuilt); without the variable the suspend comes
+ *                                   wherever the game is, and whichever interleaving happens is verified the same way.
  * Both are reported at exit (kh_app_report), and both ASSERT what they show (review A41): the gate trigger runs a stuck-budget waiter
  * (kh_cond_wait_stuck, 30 slices) behind the parked game and requires that it saw the game come back, that slices under the gate were not
  * charged, and with vkd3d that nothing was submitted outside an admission and (wrapped bridge) a game queue call parked; the suspend
  * trigger requires results 0, pads neutral, the presenters told to rebuild, audio restarted when it was stopped, every registered queue
- * drained, the null Present parked (null backend), and with a presenter an after-resume rebuild with no park after an acquire.  A failed
+ * drained, the null Present parked (null backend), and with a presenter that a Present saw the resume and a swapchain rebuild followed
+ * (TASK43: a Present that parked after its acquire no longer fails the test; its own counters are checked instead).  A failed
  * check is the named fatal app-test-gate-failed / app-test-suspend-failed. */
 
 #ifdef __cplusplus

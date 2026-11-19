@@ -137,5 +137,13 @@ uint64_t kh_present_presented(void);             /* swapchain presents so far (t
 uint64_t kh_present_rebuilds_after_resume(void);
 uint64_t kh_present_resume_calls(void);          /* review A41: kh_present_resume_all calls (every build) */
 uint64_t kh_present_parked_after_acquire(void);  /* review A41: Presents that parked after their acquire (they also rebuild as after-park) */
+/* TASK43 (the suspend test's two interleavings): what tells the park's rebuild from the resume's, and a test point in the Present */
+uint64_t kh_present_resume_seen(void);           /* Presents at which a presenter found a new kh_present_resume_all generation */
+uint64_t kh_present_consumed(void);              /* parked acquires consumed by an admitted submit */
+uint64_t kh_present_sems_remade(void);           /* acquire semaphores destroyed and made anew after such a consumption */
+enum { KH_TP_BEFORE_ACQUIRE=0, KH_TP_AFTER_ACQUIRE=1 };
+void kh_present_test_point_arm(int where);       /* the next Present of any presenter stops at that point (once); -1 = disarm */
+int  kh_present_test_point_wait(unsigned ms);    /* 1 = a Present stands at the point now; 0 = none came within ms (no presenter: always 0) */
+void kh_present_test_point_release(void);        /* it goes on */
 /* runtime-internal (the suspend drain's worker): every presenter's slot fences, bounded, no fatal; 1 = all complete */
 int  kh_present_quiesce_all_bounded(unsigned slices,unsigned slice_ms,unsigned *npres,unsigned *left);

@@ -253,6 +253,8 @@ static int selftest_all(KCtx *g){
               fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=vsync): only the suite `vsync` ran, %d failures\n",f); return f; }
           if(!strcmp(only,"gfx")){ extern int kh_gfx_selftest(KCtx *); int f=kh_gfx_selftest(g);
               fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=gfx): only the graphics suites ran, %d failures\n",f); return f; }
+          if(!strcmp(only,"movies")){ extern int kh_movies_selftest(KCtx *); int f=kh_movies_selftest(g);      /* task 44: for its mutation checks */
+              fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=movies): only the suite `movies` ran, %d failures\n",f); return f; }
           if(!strcmp(only,"aspect")){ extern int kh_aspect_selftest(KCtx *); int f=kh_aspect_selftest(g);      /* task 37: for its mutation checks */
               fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=aspect): only the suite `aspect` ran, %d failures\n",f); return f; }
           /* task 39: `gate` (the admission-counted suspend gate), `ordered` (memory ordering: the option really on in this binary) and
@@ -266,7 +268,11 @@ static int selftest_all(KCtx *g){
           /* TASK41: `app` (the app's life cycle: resign, suspend, resume, the stuck budgets under the gate) for its mutation checks */
           if(!strcmp(only,"app")){ extern int kh_app_life_selftest(void); int f=kh_app_life_selftest();
               fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=app): only the suite `app life` ran, %d failures\n",f); return f; }
-          if(strcmp(only,"route31")) kh_fatal(g,"KHNMC_SELFTEST_ONLY=%s: the suites that can run alone are route31, vsync, gfx, aspect, gate, app, ordered and membench",only);
+          if(!strcmp(only,"pipecache")){ extern int kh_pc_selftest(void); int f=kh_pc_selftest();                 /* TASK43: for its mutation checks */
+              fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=pipecache): only the suite `gfx pipecache` ran, %d failures\n",f); return f; }
+          if(!strcmp(only,"hostlog")){ extern int kh_host_log_selftest(void); extern int kh_gfx_frameline_selftest(void); extern int kh_gfx_vklog_selftest(void); int f=kh_host_log_selftest()+kh_gfx_frameline_selftest()+kh_gfx_vklog_selftest();
+              fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=hostlog): only the suites `host log`, `gfx frame line` and `gfx vkd3d log` ran, %d failures\n",f); return f; }
+          if(strcmp(only,"route31")) kh_fatal(g,"KHNMC_SELFTEST_ONLY=%s: the suites that can run alone are route31, vsync, gfx, aspect, gate, app, ordered, membench, pipecache and hostlog",only);
           extern int kh_input_route31_selftest(KCtx *); int f=kh_input_route31_selftest(g);
           fprintf(stderr,"kh: selftest: PARTIAL RUN (KHNMC_SELFTEST_ONLY=route31): only the suite `input route Q31` ran, %d failures\n",f); return f?f:0; } }
     CHECK(rd64(g,GS_BASE+0x7534a8)!=0); /* Task 6: table 3 must exist before scripts run. */
@@ -297,6 +303,10 @@ static int selftest_all(KCtx *g){
     { extern int kh_vsync_selftest(void); fails+=kh_vsync_selftest(); }        /* TASK36: WaitForVBlank paced by display ticks (gfx_present.c) */
     { extern int kh_gfx_gate_selftest(void); fails+=kh_gfx_gate_selftest(); }  /* task 39: the admission-counted suspend gate (gfx_present.c) */
     { extern int kh_app_life_selftest(void); fails+=kh_app_life_selftest(); }  /* TASK41: resign / suspend / resume, stuck budgets under the gate (app_life.c) */
+    { extern int kh_pc_selftest(void); fails+=kh_pc_selftest(); }              /* TASK43: the disk pipeline cache's file and rules, no device (gfx_pipecache.c) */
+    { extern int kh_host_log_selftest(void); fails+=kh_host_log_selftest(); }  /* TASK43: the log file's size cap (host_env.c) */
+    { extern int kh_gfx_frameline_selftest(void); fails+=kh_gfx_frameline_selftest(); }   /* TASK43: the per-present line's interval and the frame-time counter (null_d3d12.c) */
+    { extern int kh_gfx_vklog_selftest(void); fails+=kh_gfx_vklog_selftest(); }   /* review C43 n=2: vkd3d's log, de-duplicated (null_d3d12.c) */
     { extern int kh_ordered_mem_selftest(KCtx *); fails+=kh_ordered_mem_selftest(g); }   /* task 39: KH_ORDERED_MEM (runtime/ordered_mem.c) */
     { extern int kh_loader_selftest(void); fails+=kh_loader_selftest(); }      /* review U35 n=24: the bias-mode reservation keeps its low guard or is a named fatal */
     input_selftest(g);
@@ -310,6 +320,7 @@ static int selftest_all(KCtx *g){
     { extern int kh_warp_selftest(KCtx *); fails+=kh_warp_selftest(g); }                     /* task 33: the debug warp (runtime/warp.c) */
     { extern int kh_input_route33_selftest(KCtx *); fails+=kh_input_route33_selftest(g); }   /* task 33: the @warp / @warp list steps */
     { extern int kh_aspect_selftest(KCtx *); fails+=kh_aspect_selftest(g); }                 /* task 37: KHNMC_SCREEN (S1, S2), r / o / b, H1 (runtime/aspect.c) */
+    { extern int kh_movies_selftest(KCtx *); fails+=kh_movies_selftest(g); }                 /* task 44: the empty movie of the movie seam (runtime/null_mf.c) */
     /* allocator */
     u64 p[64]; for(int i=0;i<64;i++){ p[i]=ga_alloc((u64)(i*37+1),(i%5==0)?64:16); CHECK(p[i]&&!(p[i]&15)); if(i%5==0) CHECK(!(p[i]&63)); memset(hp(g,p[i]),0xA5,(size_t)(i*37+1)); }
     for(int i=0;i<64;i+=2) ga_free(p[i]); u64 q=ga_calloc(10,10); CHECK(q&&rd64(g,q)==0&&rd64(g,q+88)==0); q=ga_realloc(q,5000); CHECK(q&&ga_usable(q)>=5000);

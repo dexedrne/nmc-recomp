@@ -641,6 +641,20 @@ static u64 st_cost_n, st_cost_sum, st_cost_max, st_acq_sum, st_acq_max, st_hold_
 #define HBUCK 2000
 static u64 cost_hist[HBUCK+1];                               /* present cost (d)-(f) in 10-us buckets, last = 20 ms and more */
 static void (*test_after_acquire)(KhPresenter *);
+/* TASK43 (TASK43.md item 6): a test point in the Present.  Armed for KH_TP_BEFORE_ACQUIRE (the top of the Present, no lock held) or
+ * KH_TP_AFTER_ACQUIRE (right after a successful vkAcquireNextImageKHR), the next Present that comes by stops there once, says so and
+ * waits until it is released: the suspend test (app_life.c kh_app_test_suspend_cycle) sets the gate in between, so the Present then
+ * parks before its acquire, or after it (park_after_acquire), by construction and not by luck.  Unarmed: one relaxed load per Present. */
+static _Atomic int tp_armed=-1, tp_state;                    /* tp_state: 0 nobody there, 1 a Present stands at the point */
+static _Atomic u64 c_resume_seen, c_tp_hits;
+static void tp_hit(int where){
+    int w=where; if(!atomic_compare_exchange_strong(&tp_armed,&w,-1)) return;
+    atomic_fetch_add(&c_tp_hits,1); atomic_store(&tp_state,1);
+    while(atomic_load(&tp_state)==1){ struct timespec ts={0,200000}; nanosleep(&ts,0); } }
+void kh_present_test_point_arm(int where){ atomic_store(&tp_armed,where); }
+int  kh_present_test_point_wait(unsigned ms){ u64 t0=kh_host_ns(); while(atomic_load(&tp_state)!=1){ if(kh_host_ns()-t0>(u64)ms*1000000ull) return 0; struct timespec ts={0,200000}; nanosleep(&ts,0); } return 1; }
+void kh_present_test_point_release(void){ atomic_store(&tp_state,0); }
+uint64_t kh_present_resume_seen(void){ return atomic_load(&c_resume_seen); }
 static int  test_force_check=-1;                             /* selftest: check every present (1) */
 /* TASK41, the Linux SIGSTOP test: KHNMC_TEST_MARKER_HOLD=present:N:ms makes the marker wait (d) of present N a real bounded wait: the
  * game's queue first Waits on a fence that a helper thread signals from the CPU ms later (absolute deadline), and a line says so.  A
@@ -873,13 +887,14 @@ int kh_present_frame(KCtx *g,KhPresenter *p,u32 idx,u64 n){
     atomic_fetch_add(&c_frames,1); present_number_last=n;
     PSlot *s; u32 ii=0; int subopt=0; u64 t_acq=0;
     for(;;){
+        if(__builtin_expect(atomic_load_explicit(&tp_armed,memory_order_relaxed)==KH_TP_BEFORE_ACQUIRE,0)) tp_hit(KH_TP_BEFORE_ACQUIRE);   /* TASK43: test point */
         kh_gfx_gate_park("presenter: before acquire");                                       /* (a) */
         pthread_mutex_lock(&p->m);
         if(p->busy) kh_fatal(NULL,p->chk_pending?"gfx-present-check-orphan: kh_present_frame entered while the check of present %llu still waits for its reference (kh_present_check was not called)"
                                                 :"gfx-present-reentry: kh_present_frame entered while another Present of the same swap chain is inside it (present %llu)",P_(p->chk_n));
         if(kh_gfx_gate_is_set()){ pthread_mutex_unlock(&p->m); continue; }
         if(atomic_load(&pr_gen)!=p->gen&&p->sc){ p->stale=1; p->stale_reason=RC_SIZE; }
-        { u32 rg=atomic_load(&pr_resume_gen); if(rg!=p->resume_gen){ p->resume_gen=rg; if(p->sc){ p->stale=1; p->stale_reason=RC_RESUME; } } }   /* TASK41: kh_present_resume_all */
+        { u32 rg=atomic_load(&pr_resume_gen); if(rg!=p->resume_gen){ p->resume_gen=rg; atomic_fetch_add(&c_resume_seen,1); if(p->sc){ p->stale=1; p->stale_reason=RC_RESUME; } } }   /* TASK41: kh_present_resume_all (TASK43: counted, so a test can tell it from a park's rebuild) */
         if(!p->sc||p->stale) swapchain_build(p);                                              /* (b) */
         if(!p->sc){ pthread_mutex_unlock(&p->m); atomic_fetch_add(&c_zero_size,1); return 0; }   /* zero-size drawable: nothing to present (counted) */
         s=&p->slot[p->frames%PSLOTS];
@@ -899,6 +914,7 @@ int kh_present_frame(KCtx *g,KhPresenter *p,u32 idx,u64 n){
         if(ii>=p->nimg) kh_fatal(NULL,"gfx-present-vk: vkAcquireNextImageKHR gave image %u of %u",ii,p->nimg);
         subopt=r==VK_SUBOPTIMAL_KHR; p->counted_timeouts=0; s->acquired=1; s->img=(int)ii;
         if(test_after_acquire) test_after_acquire(p);
+        if(__builtin_expect(atomic_load_explicit(&tp_armed,memory_order_relaxed)==KH_TP_AFTER_ACQUIRE,0)) tp_hit(KH_TP_AFTER_ACQUIRE);    /* TASK43: test point */
         if(__builtin_expect(test_mh_at!=0,0)&&n==test_mh_at) test_marker_hold(p,n);                 /* TASK41: KHNMC_TEST_MARKER_HOLD */
         /* (d) everything the game queued for this frame has left vkd3d's op queue.  WITHOUT the presenter's lock (review Y39 n=1): under
          *     a set gate this wait has no bound (its slices are not counted), and step 11's main thread takes p->m before it clears the
@@ -1023,6 +1039,8 @@ static int test_in_marker(KhPresenter *p){ pthread_mutex_lock(&p->m); int r=p->i
  * Present (only OUR VkSwapchainKHR; the game sees nothing).  An atomic generation, no lock (see pres_list_m). */
 void kh_present_resume_all(void){ atomic_fetch_add(&sh_resume_calls,1); atomic_fetch_add(&pr_resume_gen,1); }
 uint64_t kh_present_parked_after_acquire(void){ return atomic_load(&c_parked_acq); }
+uint64_t kh_present_consumed(void){ return atomic_load(&c_consumed); }
+uint64_t kh_present_sems_remade(void){ return atomic_load(&c_sem_remade); }
 uint64_t kh_present_presented(void){ return atomic_load(&c_presents); }
 uint64_t kh_present_rebuilds_after_resume(void){ return atomic_load(&c_rebuild[RC_RESUME]); }
 /* TASK41: the suspend drain's step 5 (a worker thread, never the main thread): every submission of every presenter made so far is
@@ -1159,7 +1177,8 @@ static void pt_free(PT *t){ if(t->pso) ID3D12PipelineState_Release(t->pso); if(t
 static void pt_bar(ID3D12GraphicsCommandList *l,ID3D12Resource *r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b){
     D3D12_RESOURCE_BARRIER x; memset(&x,0,sizeof x); x.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; x.Transition.pResource=r; x.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     x.Transition.StateBefore=a; x.Transition.StateAfter=b; ID3D12GraphicsCommandList_ResourceBarrier(l,1,&x); }
-/* one frame into the current back buffer: `draws` patterned full-screen draws, then (clear>=0) a clear to colour c; executed on the queue */
+/* one frame into the current back buffer: `draws` patterned full-screen draws, then (clear>=0) a clear to colour c; executed on the queue.
+ * clear == -2 (review C43): colour c is put UNDER the draws instead (a clear before them), so a draw that the driver side drops shows */
 static int pt_frame(PT *t,KCtx *g,u64 sc,int draws,int clear,const float c[4]){
     u32 i=(u32)GC(VT(sc,36),sc); if(i>=3) return 0; ID3D12Resource *rt=t->si.buf[i];
     if(t->fv&&ID3D12Fence_GetCompletedValue(t->fe)<t->fv) for(int k=0;k<600000&&ID3D12Fence_GetCompletedValue(t->fe)<t->fv;k++){ struct timespec ts={0,100000}; nanosleep(&ts,0); }
@@ -1170,6 +1189,7 @@ static int pt_frame(PT *t,KCtx *g,u64 sc,int draws,int clear,const float c[4]){
     D3D12_VIEWPORT vp={0,0,(float)t->si.w,(float)t->si.h,0,1}; D3D12_RECT rc={0,0,(LONG)t->si.w,(LONG)t->si.h};
     ID3D12GraphicsCommandList_RSSetViewports(t->cl,1,&vp); ID3D12GraphicsCommandList_RSSetScissorRects(t->cl,1,&rc);
     ID3D12GraphicsCommandList_SetGraphicsRootSignature(t->cl,t->rs); ID3D12GraphicsCommandList_SetPipelineState(t->cl,t->pso); ID3D12GraphicsCommandList_IASetPrimitiveTopology(t->cl,D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    if(clear==-2) ID3D12GraphicsCommandList_ClearRenderTargetView(t->cl,h,c,0,NULL);
     for(int k=0;k<draws;k++) ID3D12GraphicsCommandList_DrawInstanced(t->cl,3,1,0,0);
     if(clear>=0) ID3D12GraphicsCommandList_ClearRenderTargetView(t->cl,h,c,0,NULL);
     pt_bar(t->cl,rt,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_PRESENT);
@@ -1213,6 +1233,10 @@ static void *m5g_main(void *a){ Main5g *h=(Main5g*)a; struct timespec ms1={0,100
     if(FAILED(ID3D12Fence_Signal(h->fence,1))) fprintf(stderr,"gfx present selftest: 5g: ID3D12Fence::Signal from the CPU failed\n");
     if(h->calls_started) pthread_join(c,NULL);
     return NULL; }
+/* TASK43, selftest 5i: the suspend cycle on a thread that stands for the shell's main thread */
+typedef struct { int at, fails; char why[700]; _Atomic int done; } SuspCyc;
+static void *susp_cyc_main(void *a){ extern int kh_app_test_suspend_cycle(int,unsigned,char*,size_t,uint64_t*,uint64_t*); SuspCyc *c=(SuspCyc*)a;
+    c->fails=kh_app_test_suspend_cycle(c->at,60,c->why,sizeof c->why,NULL,NULL); atomic_store(&c->done,1); return NULL; }
 static void hook_start_5g(KhPresenter *p){ kh_present_test_after_acquire(NULL); m5g.p=p; m5g.spins0=atomic_load(&c_cpu_spins); m5g_started=pthread_create(&m5g_th,NULL,m5g_main,&m5g)==0; }
 /* review V36 n=1: pictures made on the CPU, independent of every GPU copy.  A flat colour (float -> UNORM, round to nearest) and the
  * selftest's pattern evaluated as the pixel shader does in float: R = frac(px/7), G = frac(py/5), B = frac((px+py)/23) at the pixel
@@ -1233,6 +1257,25 @@ static int pt_cpu_check(KhPresenter *p,const u8 *ref,u32 bw,u32 bh,double tmax,d
         ok=!cr.bars_bad&&cr.dmax<=tmax+1e-9&&mean<=tmean+1e-9; if(cr.dmax>cpu_dmax) cpu_dmax=cr.dmax;
         if(!ok) fprintf(stderr,"gfx present selftest: %s %d: the presented picture against the CPU-made one: largest difference %.2f, mean %.3f (tolerance %.1f / %.2f), %llu bar pixels not black\n",what,k,cr.dmax,mean,tmax,tmean,P_(cr.bars_bad)); }
     p->lchk_valid=0; pthread_mutex_unlock(&p->m); return ok; }
+/* review C43 n=1: the selftest's pattern frame on ANY device: a 96x64 swap chain on the caller's guest queue `q` (no presenter), a
+ * pipeline state made here, a clear to magenta and ONE patterned draw over it (vkd3d creates its VkPipeline at that draw, through the
+ * device's VkPipelineCache; a draw that is dropped leaves the magenta), and the back buffer read back through Vulkan (BGRA, 4*96*64
+ * bytes into out).  *dmax = the largest difference against the CPU-made pattern.  0 = done; 1 = the swap chain, the pipeline state or the frame failed; 2 = the read-back failed; 3 = the swap chain has no
+ * VkImage of ours to read (KHNMC_GFX_BACKBUFFERS=committed).  The disk pipeline cache's device selftest draws it on a device whose
+ * cache was made empty and on one whose cache was LOADED from the file, and compares the two pictures (gfx_vkd3d.c) */
+int kh_present_test_pattern(KCtx *g,u64 gm,u64 fct,u64 q,u8 *out,double *dmax){
+    *dmax=1e9; kh_present_test_override(0,0,0,0);
+    u64 sc=mk_swap(g,gm,fct,q,96,64); int rc=1; PT t; memset(&t,0,sizeof t);
+    if(sc&&pt_init(&t,g,sc)){
+        if(t.si.bbmode==2||!t.si.image[0]) rc=3;
+        else if(pt_frame(&t,g,sc,1,-2,(const float[4]){1.0f,0.0f,1.0f,1.0f})){
+            for(int k=0;k<600000&&ID3D12Fence_GetCompletedValue(t.fe)<t.fv;k++){ struct timespec ts={0,100000}; nanosleep(&ts,0); }
+            rc=kh_vk_test_read_image(t.si.dev,t.si.queue,t.si.image[0],96,64,t.si.bbmode==1,out)?2:0;
+            if(!rc){ u8 *ref=cpu_pattern(96,64); double mx=0; for(u32 i=0;i<96u*64u;i++) for(int c=0;c<3;c++){ double d=fabs((double)out[4*i+c]-(double)ref[4*i+c]); if(d>mx) mx=d; } free(ref); *dmax=mx; } } }
+    pt_free(&t); if(sc) kh_vkd3d_swap_test_release(g,sc);
+    kh_present_test_override(-1,0,0,0);
+    return rc;
+}
 /* review A41 (verification): a stand-in vkWaitForFences that never completes (the suspend drain's budget test) */
 static _Atomic int fq_timed, fq_polls;
 static VkResult VKAPI_PTR fq_wait(VkDevice d,uint32_t n,const VkFence *f,VkBool32 all,uint64_t to){ (void)d;(void)n;(void)f;(void)all;
@@ -1346,6 +1389,27 @@ int kh_present_selftest(KCtx *g,u64 m,u64 dev,u64 q,u64 fct){
           u64 rr0=atomic_load(&c_rebuild[RC_RESUME]); TS(pt_frame(&t,g,sc,1,-1,NULL)); TS(atomic_load(&c_rebuild[RC_RESUME])==rr0+1);
           TS(pt_cpu_check(t.si.pres,pat128,128,72,tm,tn,"the present after the resume",0) && !kh_gfx_gate_is_set() && kh_gfx_gate_admitted()==0);
           ID3D12Fence_Release(fw); } }
+    /* 5i. TASK43 (TASK43.md item 6: `KHNMC_TEST_SUSPEND` failed once when the suspend came after an acquire).  The shell's WHOLE cycle
+     *     (resign, suspend with its quiesce and queue drain, 60 ms in the background, resume) with the suspend test's own checks
+     *     (app_life.c kh_app_test_suspend_cycle), FORCED before the presenter's acquire and FORCED after it: every run proves both
+     *     interleavings.  Before: the Present parks at (a), nothing was acquired.  After: it parks at (e), the acquired image is consumed
+     *     by an admitted submit, its semaphore is made anew, the swapchain is rebuilt; in both a Present saw the resume. */
+    { extern int kh_app_test_suspend_cycle(int,unsigned,char*,size_t,uint64_t*,uint64_t*); extern int kh_app_test_used(int); extern int kh_shell_test_take(void);
+      int used0=kh_app_test_used(-1);
+      for(int at=KH_TP_BEFORE_ACQUIRE;at<=KH_TP_AFTER_ACQUIRE;at++){
+          SuspCyc sc5; memset(&sc5,0,sizeof sc5); sc5.at=at; pthread_t th;
+          u64 pk0=atomic_load(&c_parked_acq), cn0=atomic_load(&c_consumed), sr0=atomic_load(&c_sem_remade), rs0=atomic_load(&c_resume_seen), rr0=atomic_load(&c_rebuild[RC_RESUME]), hit0=atomic_load(&c_tp_hits);
+          int started=pthread_create(&th,NULL,susp_cyc_main,&sc5)==0, bad=0, frames=0; TS(started);
+          /* the cycle needs Presents: the one that is stopped at the point and parks through the background, and two after the resume */
+          if(started){ while(!atomic_load(&sc5.done)&&frames<400){ if(!pt_frame(&t,g,sc,1,-1,NULL)) bad++; frames++; } pthread_join(th,NULL); }
+          TS(!bad && atomic_load(&sc5.done) && sc5.fails==0 && atomic_load(&c_tp_hits)==hit0+1);
+          if(sc5.fails) fprintf(stderr,"gfx present selftest: 5i (%s): %d failed check(s) of the suspend cycle: %s\n",at?"after the acquire":"before the acquire",sc5.fails,sc5.why);
+          u64 pk=atomic_load(&c_parked_acq)-pk0, cn=atomic_load(&c_consumed)-cn0, sr=atomic_load(&c_sem_remade)-sr0;
+          if(at==KH_TP_BEFORE_ACQUIRE) TS(pk==0 && cn==0 && sr==0); else TS(pk==1 && cn==1 && sr==1);
+          TS(atomic_load(&c_resume_seen)==rs0+1 && atomic_load(&c_rebuild[RC_RESUME])==rr0+1);
+          TS(pt_cpu_check(t.si.pres,pat128,128,72,tm,tn,at?"after a suspend forced after the acquire":"after a suspend forced before the acquire",0) && !kh_gfx_gate_is_set() && kh_gfx_gate_admitted()==0);
+          while(kh_shell_test_take()){} }
+      kh_present_test_point_arm(-1); kh_app_test_used(used0); }
     /* 5b. (review V36 n=3) SURFACE_LOST from vkQueuePresentKHR (injected once after a real present: the headless surface never loses
      *     itself): the swapchain and the surface are dropped at once and made anew at the next present, counted as a surface-lost rebuild
      *     (before, the lost surface was kept and the next build asked it for its capabilities: the named fatal gfx-present-vk) */
@@ -1418,7 +1482,7 @@ out:
       else fprintf(stderr,"kh: gfx present bench: not run (KHNMC_GFX_PRESENT_BENCH=n with n >= 2 runs it)\n"); }
     kh_present_test_override(-1,0,0,0); kh_present_test_force_check(0); kh_present_test_after_acquire(NULL); kh_vkd3d_test_bbmode(-1); kh_present_test_tol(tm,tn); ga_free(gm);
     test_inject_present=test_inject_acquire=0; test_inject_zero=0; atomic_store(&sh_size_calls,shs0); atomic_store(&sh_size_same,shsame0);
-    fprintf(stderr,"kh: gfx present selftest: %d checks, %d failures (headless surface: every present against the D3D12 readback AND a CPU-made picture: the suspend drain's slot-fence budget, clear colours, patterned picture, ResizeBuffers, size change (and the same size: no rebuild), gate after acquire, surface lost at present and at acquire, zero-size drawable, sync stress own + general, presents = submissions, nothing left)\n",n,f);
+    fprintf(stderr,"kh: gfx present selftest: %d checks, %d failures (headless surface: every present against the D3D12 readback AND a CPU-made picture: the suspend drain's slot-fence budget, clear colours, patterned picture, ResizeBuffers, size change (and the same size: no rebuild), gate after acquire, the shell's suspend cycle forced before and after the acquire, surface lost at present and at acquire, zero-size drawable, sync stress own + general, presents = submissions, nothing left)\n",n,f);
 #undef TS
     return f;
 }
@@ -1433,6 +1497,12 @@ void kh_present_set_size(uint32_t w,uint32_t h){
 /* TASK41: no presenter exists without the backend */
 void kh_present_resume_all(void){ atomic_fetch_add(&sh_resume_calls,1); }
 uint64_t kh_present_parked_after_acquire(void){ return 0; }
+uint64_t kh_present_resume_seen(void){ return 0; }               /* TASK43: no presenter, no test point */
+uint64_t kh_present_consumed(void){ return 0; }
+uint64_t kh_present_sems_remade(void){ return 0; }
+void kh_present_test_point_arm(int where){ (void)where; }
+int  kh_present_test_point_wait(unsigned ms){ (void)ms; return 0; }
+void kh_present_test_point_release(void){}
 uint64_t kh_present_presented(void){ return 0; }
 uint64_t kh_present_rebuilds_after_resume(void){ return 0; }
 int kh_present_quiesce_all_bounded(unsigned slices,unsigned slice_ms,unsigned *npres,unsigned *left){ (void)slices;(void)slice_ms; *npres=0; *left=0; return 1; }

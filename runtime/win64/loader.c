@@ -159,8 +159,11 @@ void kh_exit_process(int code){
     kh_vclock_report(stderr);
     { extern void kh_vsync_report(FILE*); kh_vsync_report(stderr); }                     /* TASK36: how WaitForVBlank was paced (gfx_present.c) */
     { extern void kh_present_shell_report(FILE*); kh_present_shell_report(stderr); }     /* TASK36 review n=5: the shell's presenter calls, used or DROPPED */
+    { extern void kh_gfx_pipecache_exit(void); kh_gfx_pipecache_exit(); }                 /* TASK43 (plan step 12): the disk pipeline cache's save at exit (nothing unless one is configured) */
     { extern void kh_app_report(FILE*); kh_app_report(stderr); }                         /* TASK41: the app's life cycle (only when it was used) */
     { extern void kh_gfx_vkd3d_finish(void); kh_gfx_vkd3d_finish(); }
+    { extern void kh_gfx_exit_report(FILE*); kh_gfx_exit_report(stderr); }                /* TASK43: pipeline creation, the pipeline cache, frame times, MoltenVK's shader statistics (each only when it has something to say) */
+    { extern void kh_host_log_report(FILE*); kh_host_log_report(stderr); }                /* TASK43: the log's size cap (only with a `logcap` line) */
     { extern void kh_import_counts_report(FILE*); kh_import_counts_report(stderr); }      /* KH_IMPORT_COUNTS=1 */
     { extern void kh_import_sites_report(FILE*); kh_import_sites_report(stderr); }        /* KH_IMPORT_SITES=text */
     { extern void kh_libm_args_close(void); kh_libm_args_close(); }                       /* KH_LIBM_ARGS=file */

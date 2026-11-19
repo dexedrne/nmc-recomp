@@ -38,7 +38,10 @@ void f_5122e0(KCtx *g){
     orig_f_5122e0(g);
 }
 void orig_f_511300(KCtx *); void f_511300(KCtx *g){ entries[3]++; atomic_store(&initial_alive,0); orig_f_511300(g); }
-PHASE(13da10,4)
+/* task 44: Movie::open.  The movie seam (runtime/null_mf.c) is told while it runs: in its default mode the header read inside gets a
+ * stand-in instead of the file; with KHNMC_MOVIES=fail both calls do nothing */
+void kh_movie_open_begin(KCtx *g); void kh_movie_open_end(KCtx *g);
+void orig_f_13da10(KCtx *); void f_13da10(KCtx *g){ entries[4]++; kh_movie_open_begin(g); orig_f_13da10(g); kh_movie_open_end(g); }
 PHASE(13d260,5)
 void kh_phase_mapevent_entry(void){ entries[6]++; } /* f_405440 itself lives in mod_hooks_a.c (Task 9) */
 /* FIELD_COMMAND.execute: also a running total (the video stream starts "when the field is up") and the place of its first call */

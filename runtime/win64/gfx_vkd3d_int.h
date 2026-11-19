@@ -129,6 +129,7 @@ int  kh_vkd3d_swap_test_info(KCtx *g,u64 sc,KhSwapInfo *out);                   
 void kh_vkd3d_swap_test_release(KCtx *g,u64 sc);                                     /* presenter teardown, back buffers released and destroyed */
 void kh_vkd3d_test_bbmode(int mode);                                                 /* -1 = KHNMC_GFX_BACKBUFFERS; 0 own, 1 general, 2 committed */
 int  kh_present_selftest(KCtx *g,u64 m,u64 dev,u64 q,u64 fct);                      /* gfx_present.c, called by the vkd3d selftest */
+int  kh_present_test_pattern(KCtx *g,u64 gm,u64 fct,u64 q,u8 *out,double *dmax);    /* review C43 n=1: the pattern frame on any device, read back (4*96*64 BGRA) */
 /* task 39 selftest helper (gfx_present.c): a thread that (when after_change is set) first waits until *after_change differs from
  * `from`, then sets the gate after set_ms, holds it hold_ms, clears it, waits 10 ms and then signals `fence` to 1 from the CPU (a queue
  * that Waits on it is blocked until then: the bounded waits must not count the held time) */

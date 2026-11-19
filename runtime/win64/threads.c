@@ -363,7 +363,21 @@ IMP(K32,CloseHandle){ u64 h=A0(g); if(h==PSEUDO_THREAD||h==PSEUDO_PROCESS){ SET_
 static void host_sleep_ms(u32 ms){ struct timespec ts={ms/1000,(long)(ms%1000)*1000000L}; if(kh_vclock_sync) kh_vclock_idle(1); nanosleep(&ts,0); if(kh_vclock_sync) kh_vclock_idle(0); }
 IMP(K32,Sleep){ u32 ms=(u32)A0(g); if(ms==0) sched_yield(); else if(!kh_vclock_vsleep(ms)) host_sleep_ms(ms); }
 IMP(K32,SleepEx){ u32 ms=(u32)A0(g); if(ms==0) sched_yield(); else if(!kh_vclock_vsleep(ms)) host_sleep_ms(ms); SET_RAX(g,0); }
-IMP(K32,SwitchToThread){ sched_yield(); SET_RAX(g,1); }
+/* task 44: with KHNMC_CLOCK=frames and its default KHNMC_CLOCK_SYNC=all the virtual clock moves only while every guest thread waits, and a
+ * thread that spins on SwitchToThread never does: the movie player's sound thread (exe 0x13ec00) yields in a loop until the game thread
+ * sets a flag one game frame later, and that frame needs the clock (seen: every clock step then waited out the 60 s quiescence guard).
+ * So a yield is 1 ms on the virtual clock, i.e. a wait like Sleep(1), counted and reported with the clock, but ONLY while an empty
+ * movie's reader exists (kh_movie_live, runtime/null_mf.c: the default mode, from MFCreateSourceReaderFromURL to the reader's last
+ * Release, which covers both loops: the sound thread's and the teardown's at 0x13cfc3).  Everywhere else it is the plain yield it
+ * always was: with KHNMC_MOVIES=fail (the old path calls SwitchToThread once per skipped movie, from the teardown of the player
+ * that never opened), in a run without a movie (a caller through the thunk 0x471e80 is not ruled out), and with the host clock
+ * (every real run), where the virtual sleep says no.  The exe has two direct call sites, both in the movie player (0x13cfc3, 0x13ece9). */
+static _Atomic u64 n_yield_vsleeps;
+u64 kh_yield_vsleeps(void){ return n_yield_vsleeps; }
+int kh_movie_live(void);
+/* the decision alone (the movies selftest calls it with a stand-in for the clock): 1 = the yield was a virtual 1 ms wait */
+int kh_yield(int movie_live,int (*vsleep)(u32 ms)){ if(movie_live&&vsleep(1)){ n_yield_vsleeps++; return 1; } sched_yield(); return 0; }
+IMP(K32,SwitchToThread){ kh_yield(kh_movie_live(),kh_vclock_vsleep); SET_RAX(g,1); }
 
 /* ---- threads --------------------------------------------------------------------------------------------------------- */
 static void thread_exit_notify(KThread *t){ pthread_mutex_lock(&t->m); t->done=1; pthread_cond_broadcast(&t->cv); pthread_mutex_unlock(&t->m); vc_released(); }

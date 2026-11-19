@@ -109,13 +109,19 @@ IMP(K32,CreateFileMappingA){ /* (file, attrs, protect, hi, lo, name) : only anon
     u64 size=((A3(g)&0xffffffffull)<<32)|(A4(g)&0xffffffffull); KMap *m=calloc(1,sizeof *m); m->size=size?size:4096; m->ga=ga_pages_src(m->size,GA_SRC_MAP); if(ARG(g,5)) snprintf(m->name,sizeof m->name,"%s",gstr(g,ARG(g,5))); SET_RAX(g,h_new(HK_MAPPING,m)); }
 IMP(K32,MapViewOfFile){ KMap *m=h_get(A0(g),HK_MAPPING); if(!m){ kh_set_last_error(6); SET_RAX(g,0); return; } SET_RAX(g,m->ga); }
 IMP(K32,UnmapViewOfFile){ SET_RAX(g,1); }
-IMP(K32,FindFirstFileA){ char p[2048]; kh_winpath(gstr(g,A0(g)),p,sizeof p); char *sl=strrchr(p,'/'); KFind *f=calloc(1,sizeof *f); if(sl){ *sl=0; snprintf(f->dir,sizeof f->dir,"%s",p); snprintf(f->pat,sizeof f->pat,"%s",sl+1); } else { snprintf(f->dir,sizeof f->dir,"."); snprintf(f->pat,sizeof f->pat,"%s",p); }
+/* task 44: the two file checks of the movie path are answered by the movie seam in its default mode (runtime/null_mf.c): a handle with
+ * no directory behind it, the name as asked for, nothing to enumerate */
+int kh_movie_find(KCtx *g,const char *win,const char *host,u64 site_rva);
+IMP(K32,FindFirstFileA){ char p[2048]; kh_winpath(gstr(g,A0(g)),p,sizeof p);
+    if(kh_movie_find(g,gstr(g,A0(g)),p,guest_return_addr(g)-GS_BASE)){ KFind *mf=calloc(1,sizeof *mf); const char *w=gstr(g,A0(g)), *a=strrchr(w,'/'), *b=strrchr(w,'\\'); if(b>a) a=b;
+        u64 data=A1(g); memset(hp(g,data),0,0x140); wr32(g,data,0x80); strncpy((char*)hp(g,data+0x2c),a?a+1:w,259); SET_RAX(g,h_new(HK_FIND,mf)); return; }
+    char *sl=strrchr(p,'/'); KFind *f=calloc(1,sizeof *f); if(sl){ *sl=0; snprintf(f->dir,sizeof f->dir,"%s",p); snprintf(f->pat,sizeof f->pat,"%s",sl+1); } else { snprintf(f->dir,sizeof f->dir,"."); snprintf(f->pat,sizeof f->pat,"%s",p); }
     f->d=opendir(f->dir); if(!f->d){ free(f); kh_set_last_error(3); SET_RAX(g,INVALID_HANDLE); return; }
     u64 h=h_new(HK_FIND,f); u64 data=A1(g); struct dirent *de; for(;;){ de=readdir(f->d); if(!de){ h_close(h); kh_set_last_error(2); SET_RAX(g,INVALID_HANDLE); return; }
         if(fnmatch(f->pat,de->d_name,FNM_CASEFOLD)==0) break; }
     char full[2200]; snprintf(full,sizeof full,"%s/%s",f->dir,de->d_name); struct stat st; stat(full,&st); memset(hp(g,data),0,0x140); wr32(g,data,S_ISDIR(st.st_mode)?0x10:0x80); wr32(g,data+28,(u32)((u64)st.st_size>>32)); wr32(g,data+32,(u32)st.st_size);
     strncpy((char*)hp(g,data+0x2c),de->d_name,259); SET_RAX(g,h); }
-IMP(K32,FindNextFileA){ KFind *f=h_get(A0(g),HK_FIND); if(!f){ SET_RAX(g,0); return; } u64 data=A1(g); struct dirent *de; for(;;){ de=readdir(f->d); if(!de){ kh_set_last_error(18); SET_RAX(g,0); return; } if(fnmatch(f->pat,de->d_name,FNM_CASEFOLD)==0) break; }
+IMP(K32,FindNextFileA){ KFind *f=h_get(A0(g),HK_FIND); if(!f){ SET_RAX(g,0); return; } if(!f->d){ kh_set_last_error(18); SET_RAX(g,0); return; } u64 data=A1(g); struct dirent *de; for(;;){ de=readdir(f->d); if(!de){ kh_set_last_error(18); SET_RAX(g,0); return; } if(fnmatch(f->pat,de->d_name,FNM_CASEFOLD)==0) break; }
     char full[2200]; snprintf(full,sizeof full,"%s/%s",f->dir,de->d_name); struct stat st; stat(full,&st); memset(hp(g,data),0,0x140); wr32(g,data,S_ISDIR(st.st_mode)?0x10:0x80); wr32(g,data+28,(u32)((u64)st.st_size>>32)); wr32(g,data+32,(u32)st.st_size);
     strncpy((char*)hp(g,data+0x2c),de->d_name,259); SET_RAX(g,1); }
 IMP(K32,FindClose){ SET_RAX(g,h_close(A0(g))); }

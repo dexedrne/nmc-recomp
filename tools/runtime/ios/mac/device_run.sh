@@ -39,6 +39,26 @@
 #   TRANSFER_SRC).  The surface caps (`kh: gfx present: surface caps`), the swapchain lines and the life-cycle lines (`kh: app:`) are copied
 #   into present-report.txt.  GFX=1 PRESENT=1 play is allowed: that conf stays on the phone (the icon then starts the game with the
 #   picture); every later test run puts the null-backend play conf back.  Without PRESENT=1 nothing of this is written.
+# TASK43 (IOS-GRAPHICS-PLAN step 12, and the play-mode log):
+#   The disk pipeline cache is ON by default in the graphics app (Library/Caches/khnmc/pipe.bin; runtime/gfx_pipecache.h).  For GFX=1
+#   ROUTE runs: PIPECACHE=fresh -> env KHNMC_GFX_PIPECACHE_RESET=1 (the app removes the file at start-up: this run is a first run and
+#   writes a new file at its exit; refused in every other mode: the runtime honours that line at EVERY start, and a play configuration
+#   stays on the phone); PIPECACHE=off -> env KHNMC_GFX_PIPECACHE=off (no cache at all: the baseline); unset -> the default (a file
+#   that is there is used).  HITCH=n (GFX=1 route) -> env KHNMC_GFX_HITCH=n: the Present-to-Present intervals above 25 ms over the
+#   first n presents after the field came up.  The lines `kh: gfx pipeline cache:`, `kh: gfx pipelines`, `kh: gfx MoltenVK shader
+#   statistics`, `kh: gfx frame times` and `kh: gfx vkd3d log` are copied into pipecache-report.txt, and the last of each is shown.
+#   GFX=1 PRESENT=1 PLAY (the configuration an icon launch uses): the cache is used only once its picture checks have passed on this
+#   phone (MAC-STEPS-43.md sections 2 and 3; then `touch $STATE/pipecache-verified` on this Mac).  Until that file exists the play
+#   configuration gets env KHNMC_GFX_PIPECACHE=off, and the script says so; PIPECACHE=on (play only) or PIPECACHE=off decides for one call.
+#   PLAY mode is quiet WITHOUT hiding vkd3d's failures (vkd3d logs them at class warn: "Failed to create Vulkan graphics pipeline",
+#   "Failed to compile shader", "Failed to begin render pass, ignoring draw call"): VKD3D_DEBUG=warn with the runtime's own filter,
+#   env KHNMC_GFX_VKD3D_LOG_REPEATS=8 (each vkd3d log site prints its first 8 lines, then a notice and one line at every power of ten:
+#   `Aliasing barriers not implemented yet`, about 15,000 lines per story route in the test modes, becomes a dozen).  An app older
+#   than that filter gets vkd3d's default level instead (VKD3D_DEBUG=fixme), as before.  The per-present
+#   line every 600 presents (env KHNMC_GFX_FRAME_LINE_EVERY=600), and the log is size-bounded (`logcap 16M`: khnmc.log + khnmc.log.1,
+#   at most 2 x 16 MiB; only when the signed app knows the directive).  MoltenVK's 108 x `Could not create MTLCounterSampleBuffer ...
+#   VK_QUERY_TYPE_TIMESTAMP. Reverting to emulated behavior` at start-up stay (the game's own 140 two-query timestamp heaps; MoltenVK has
+#   no setting for emulated timestamps): they are counted apart from other [mvk-error] lines below.
 # GFX_APP=1|0 (review X38 n=1): the signed app must have (1) / must not have (0) the graphics backend, whatever backend the run uses;
 #   checked with nm before anything is installed.  The plain (null-backend) selftest of the graphics app is `GFX_APP=1 device_run.sh
 #   selftest`.  GFX=1 implies GFX_APP=1 (GFX=1 GFX_APP=0 is refused).  Unset: no check, as before.
@@ -57,6 +77,12 @@ case "$MODE" in
 esac
 DUMP_EVERY=${DUMP_EVERY:-}; FETCH=${FETCH:-}; HASHLOG=${HASHLOG:-0}; CLOCK=${CLOCK:-}
 bad(){ echo "ios/mac: device_run: $*" >&2; exit 2; }
+PIPECACHE=${PIPECACHE:-}; HITCH=${HITCH:-}                 # TASK43
+case "$PIPECACHE" in ''|fresh|off|on) ;; *) bad "PIPECACHE is fresh (route), off, on (play) or unset (got '$PIPECACHE')";; esac
+[ -z "$PIPECACHE" ] || [ "$GFX" = 1 ] || bad "PIPECACHE needs GFX=1 (the pipeline cache belongs to the vkd3d backend)"
+[ "$PIPECACHE" != fresh ] || [ "$MODE" = route ] || bad "PIPECACHE=fresh is for GFX=1 route runs only: the app removes the cache file at EVERY start while that line is in its configuration, and a play configuration stays on the phone (every icon launch would be a first run)"
+[ "$PIPECACHE" != on ] || [ "$MODE" = play ] || bad "PIPECACHE=on is for GFX=1 PRESENT=1 play only (test runs use the cache unless PIPECACHE=off or fresh)"
+[ -z "$HITCH" ] || { [ "$GFX" = 1 ] && [ "$MODE" = route ] || bad "HITCH is for GFX=1 route runs only"; case "$HITCH" in *[!0-9]*|0*) bad "HITCH must be a positive number of presents (got '$HITCH')";; esac; }
 PRESENT=${PRESENT:-0}; PRESENT_CHECK=${PRESENT_CHECK:-}
 case "$PRESENT" in 0|1) ;; *) bad "PRESENT is 0 or 1 (got '$PRESENT')";; esac
 [ "$PRESENT" = 1 ] && [ "$GFX" != 1 ] && bad "PRESENT=1 needs GFX=1 (the picture comes from the vkd3d backend)"
@@ -93,14 +119,31 @@ if [ "${SKIP_INSTALL:-0}" != 1 ]; then
     || { say "install FAILED"; tail -5 "$OUT/devicectl.log"; exit 1; }
   cp_to "$KROOT/pc/kh2fm.exe" kh2fm.exe || { say "copy of kh2fm.exe FAILED"; tail -5 "$OUT/devicectl.log"; exit 1; }
 fi
-play_conf(){ { echo "# the game (tools/ios/mac/device_run.sh play): the controller is pad 0, sound on, no script, no time limit"; echo "log khnmc.log"; echo "status khnmc.status"; } > "$OUT/play.conf"; }
+# TASK43: the play configurations are quiet.  `logcap` is a conf DIRECTIVE: an app older than TASK43 would stop at it (host-conf: unknown
+# directive), so it is written only when the signed app knows it; the env lines are harmless for an older app (it ignores them).
+app_has_logcap(){ grep -a -q 'logcap needs a log directive' "$APP/KHNMC" 2>/dev/null; }
+quiet_lines(){ if app_has_logcap; then echo "logcap 16M"; fi; echo "env KHNMC_GFX_FRAME_LINE_EVERY=600"; }
+play_conf(){ { echo "# the game (tools/ios/mac/device_run.sh play): the controller is pad 0, sound on, no script, no time limit"; echo "log khnmc.log"; echo "status khnmc.status"; quiet_lines; } > "$OUT/play.conf"; }
+[ -x "$APP/KHNMC" ] && { app_has_logcap || say "the signed app does not know the conf directive logcap (older than TASK43): the play configuration is written without a log size cap"; }
 play_conf
 # TASK41: the conf lines of a run with the picture on the screen (GFX=1 PRESENT=1)
-gfx_lines(){ :; }; if [ "$GFX" = 1 ]; then gfx_lines(){ echo "env KHNMC_GFX=vkd3dw"; echo "env VKD3D_DEBUG=warn"; echo "env VKD3D_SHADER_DEBUG=warn"; echo "env MVK_CONFIG_PERFORMANCE_TRACKING=1"; }; fi
+pc_lines(){ case "$PIPECACHE" in fresh) echo "env KHNMC_GFX_PIPECACHE_RESET=1";; off) echo "env KHNMC_GFX_PIPECACHE=off";; esac; }
+gfx_lines(){ :; }; if [ "$GFX" = 1 ]; then gfx_lines(){ echo "env KHNMC_GFX=vkd3dw"; echo "env VKD3D_DEBUG=warn"; echo "env VKD3D_SHADER_DEBUG=warn"; echo "env MVK_CONFIG_PERFORMANCE_TRACKING=1"; pc_lines; }; fi
+# Review C43 n=1, n=4, n=7: the cache line of the PLAY configuration, the one that stays on the phone.  Never the RESET line (the app
+# honours it at every start).  The cache is used by an icon launch only once its picture checks passed on this phone (MAC-STEPS-43
+# sections 2 and 3, then `touch $STATE/pipecache-verified`); PIPECACHE=on|off decides for one call.
+pc_play_lines(){ case "$PIPECACHE" in off) echo "env KHNMC_GFX_PIPECACHE=off";; on) :;; *) [ -f "$STATE/pipecache-verified" ] || echo "env KHNMC_GFX_PIPECACHE=off";; esac; }
+# Review C43 n=2: play mode keeps vkd3d at warn (its failures are logged at that class) behind the runtime's de-duplicating filter; an
+# app that does not know the filter gets vkd3d's default level, as before (the repeat of a FIXME_ONCE site is class warn and stays off)
+app_has_vklog(){ grep -a -q 'KHNMC_GFX_VKD3D_LOG_REPEATS' "$APP/KHNMC" 2>/dev/null; }
+gfx_play_lines(){ :; }; if [ "$GFX" = 1 ]; then gfx_play_lines(){ echo "env KHNMC_GFX=vkd3dw"; if app_has_vklog; then echo "env VKD3D_DEBUG=warn"; echo "env VKD3D_SHADER_DEBUG=warn"; echo "env KHNMC_GFX_VKD3D_LOG_REPEATS=8"; else echo "env VKD3D_DEBUG=fixme"; echo "env VKD3D_SHADER_DEBUG=fixme"; fi; echo "env MVK_CONFIG_PERFORMANCE_TRACKING=1"; pc_play_lines; }; fi
 # HUD=1 (owner 2026-11-18, default 1 for runs with the picture; HUD=0 turns it off): Apple's Metal performance HUD (fps, frame and GPU time)
 present_lines(){ echo "env KHNMC_GFX_PRESENT=layer"; echo "env KHNMC_SCREEN=layer"; echo "env KHNMC_ASPECT=fill"; [ "${HUD:-1}" = 1 ] && echo "env KHNMC_HUD=1"; [ -z "$PRESENT_CHECK" ] || echo "env KHNMC_GFX_PRESENT_CHECK=$PRESENT_CHECK"; }
 if [ "$MODE" = play ] && [ "$PRESENT" = 1 ]; then
-  { echo "# the game with its picture (tools/ios/mac/device_run.sh GFX=1 PRESENT=1 play): the controller is pad 0, sound on, no script"; echo "log khnmc.log"; echo "status khnmc.status"; gfx_lines; present_lines; } > "$OUT/gfx-play.conf"
+  { echo "# the game with its picture (tools/ios/mac/device_run.sh GFX=1 PRESENT=1 play): the controller is pad 0, sound on, no script"; echo "log khnmc.log"; echo "status khnmc.status"; quiet_lines; gfx_play_lines; present_lines; } > "$OUT/gfx-play.conf"
+  if grep -q '^env KHNMC_GFX_PIPECACHE=off$' "$OUT/gfx-play.conf"; then say "the disk pipeline cache is OFF in this play configuration (PIPECACHE=off, or no $STATE/pipecache-verified yet: MAC-STEPS-43.md sections 2 and 3 first, then touch that file; PIPECACHE=on decides for this call)"
+  else say "the disk pipeline cache is ON in this play configuration (the app's own file, Library/Caches/khnmc/pipe.bin)"; fi
+  if grep -q '^env KHNMC_GFX_VKD3D_LOG_REPEATS=' "$OUT/gfx-play.conf"; then say "vkd3d logs at warn behind the runtime's filter (8 lines per site, then counted)"; else say "the signed app does not know KHNMC_GFX_VKD3D_LOG_REPEATS (older than the TASK43 review): vkd3d logs at its default level, its warn-class failure lines are NOT in the play log"; fi
   cp_to "$OUT/gfx-play.conf" khnmc.conf || { say "copy of the GFX play configuration FAILED"; tail -5 "$OUT/devicectl.log"; exit 1; }
   # NOLAUNCH=1 (owner not playing right now): leave the configuration on the phone and do not start the game; the icon starts it
   if [ "${NOLAUNCH:-0}" = 1 ]; then say "the play configuration with the picture is on the phone; NOT launched (NOLAUNCH=1): the icon starts it"; echo "$OUT"; exit 0; fi
@@ -124,6 +167,7 @@ fi
   if [ "$GFX" = 1 ]; then gfx_lines; [ "$PRESENT" = 1 ] && present_lines
     [ -z "$DUMP_EVERY" ] || { echo "env KHNMC_GFX_DUMP=@DOCS@/frames"; echo "env KHNMC_GFX_DUMP_EVERY=$DUMP_EVERY"; }
     [ "$HASHLOG" = 0 ] || echo "env KHNMC_GFX_HASHLOG=@DOCS@/hash.tsv"
+    [ -z "$HITCH" ] || echo "env KHNMC_GFX_HITCH=$HITCH"
     [ -z "$CLOCK" ] || echo "env KHNMC_CLOCK=$CLOCK"; fi
 } > "$OUT/khnmc.conf"
 IX0=0
@@ -155,7 +199,13 @@ if [ "$GFX" = 1 ]; then
     say "device report: $(grep -c '^kh: gfx device report: ' "$OUT/device-report.txt") lines in device-report.txt; $(grep -a 'BC decision' "$OUT/device-report.txt" | sed 's/^kh: gfx device report: //' | cut -c1-150)"
   else say "GFX=1, but khnmc.log has no complete device report block (device-report.txt holds what there is)"; xrc=1; fi
   f=$(grep -a -m1 '^kh: FATAL: gfx-' "$OUT/khnmc.log"); [ -z "$f" ] || say "$f"
-  say "vkd3d lines in khnmc.log: err $(grep -a -c -E '^vkd3d:([0-9]+:)?err:' "$OUT/khnmc.log"), fixme $(grep -a -c -E '^vkd3d:([0-9]+:)?fixme:' "$OUT/khnmc.log"), warn $(grep -a -c -E '^vkd3d:([0-9]+:)?warn:' "$OUT/khnmc.log"); MoltenVK errors $(grep -a -c '\[mvk-error\]' "$OUT/khnmc.log")"
+  # TASK43: the known start-up lines of MoltenVK's timestamp-pool fallback are counted apart, so any OTHER [mvk-error] stands out
+  mvk_all=$(grep -a -c '\[mvk-error\]' "$OUT/khnmc.log"); mvk_ts=$(grep -a '\[mvk-error\]' "$OUT/khnmc.log" | grep -c 'MTLCounterSampleBuffer.*VK_QUERY_TYPE_TIMESTAMP.*Reverting to emulated behavior')
+  say "vkd3d lines in khnmc.log: err $(grep -a -c -E '^vkd3d:([0-9]+:)?err:' "$OUT/khnmc.log"), fixme $(grep -a -c -E '^vkd3d:([0-9]+:)?fixme:' "$OUT/khnmc.log"), warn $(grep -a -c -E '^vkd3d:([0-9]+:)?warn:' "$OUT/khnmc.log"); MoltenVK errors $mvk_all (of them $mvk_ts the known timestamp-pool fallback at start-up, OTHER: $((mvk_all-mvk_ts)))"
+  grep -a -e '^kh: gfx pipeline cache:' -e '^kh: gfx pipelines ' -e '^kh: gfx pipelines: ' -e '^kh: gfx MoltenVK shader statistics' -e '^kh: gfx frame times' -e '^kh: gfx vkd3d log' -e '^kh: gfx pipecache device selftest' "$OUT/khnmc.log" > "$OUT/pipecache-report.txt" 2>/dev/null
+  say "pipeline creations that FAILED (pipeline-create-failed lines; each is a dropped draw or dispatch): $(grep -a -c 'pipeline-create-failed' "$OUT/khnmc.log")"
+  for k in 'kh: gfx pipeline cache: loaded ' 'kh: gfx pipeline cache: saved ' 'kh: gfx pipeline cache: file ' 'kh: gfx pipelines ' 'kh: gfx MoltenVK shader statistics' 'kh: gfx frame times'; do
+    l=$(grep -a -F "$k" "$OUT/pipecache-report.txt" | tail -1); [ -z "$l" ] || say "$(printf '%s' "$l" | cut -c1-600)"; done
   if [ "$PRESENT" = 1 ]; then
     grep -a -e '^kh: gfx present: ' -e '^kh: app: ' -e '^kh: ios: ' -e '^kh: screen: ' -e '^kh: vsync: ' -e '^kh: gfx gate: ' "$OUT/khnmc.log" > "$OUT/present-report.txt" 2>/dev/null
     say "present report: $(grep -c 'surface caps' "$OUT/present-report.txt") surface-caps line(s), swapchains made/rebuilt $(grep -c -e 'swapchain made' -e 'swapchain rebuilt' "$OUT/present-report.txt"), $(grep -a -m1 '^kh: gfx present: mode=' "$OUT/khnmc.log" | cut -c1-160)"

@@ -3,7 +3,7 @@
 #
 #   tools/route_batch.sh [-n RUNS] [-j PARALLEL] [-s SECONDS] [-o OUTDIR] [-d none|cycle|0..3] [-i INPUT_SCRIPT]
 #                        [-g GAME_FRAMES] [-c CPUS_PER_RUN] [-w "WRAPPER CMD"] [-e VAR=VALUE]... [-m MIN_AVAILABLE_MB] [-b BINARY]
-#                        [-r field|none] [-t] [-k]
+#                        [-r field|none] [-t] [-k] [-G]
 #
 #   -n  number of runs (default 8)                 -j  runs in parallel (default 4; more than 4 is refused: live desktop machine)
 #   -s  KH_RUN_SECONDS per run (default 120)       -o  output directory (default run-batch/<date>-<pid>)
@@ -26,6 +26,9 @@
 #       to be done (`kh: route report: ... ROUTE INCOMPLETE` = DIVERGED, with the step it was waiting at); a state that never came
 #       within its time-out is a named fatal (`route-wait-timeout`), i.e. a FAIL
 #   -t  also write an import trace (KH_TRACE, first 50,000 calls)            -k  keep the binary copy even when all runs pass
+#   -G  (task 44, review) with -g: every run must have MADE its GAME_FRAMES.  A run that exits 0 with fewer (the -s time limit came
+#       first, or the game stopped advancing: a stalled run of task 44 was scored `ok` with 5,732 of 6,500) is SHORT, a failure.
+#       Without -G a run's `ok` says nothing about its length: read the gframes column
 #
 # Per run R (r01, r02, ...): OUTDIR/R/{root,docs}/ (fresh KH_ROOT and KH_DOCS), phase.log, files.log, run.out, exit, time.
 # Result: OUTDIR/summary.tsv + a printed table.  Exit status 0 only when every run exited 0 and reached the required point; 1 when
@@ -35,12 +38,12 @@
 # route script the game frame at which each step's state was met (`L<line>:<condition>=<game frame>`, from `kh: route report`).
 set -u
 HERE=$(cd "$(dirname "$0")/.." && pwd)
-N=8; J=4; SECS=120; GFR=0; OUT=""; DIFF=none; WRAP=""; MINMB=1500; TRACE=0; PIN=0; KEEP=0; REQ=field
+N=8; J=4; SECS=120; GFR=0; OUT=""; DIFF=none; WRAP=""; MINMB=1500; TRACE=0; PIN=0; KEEP=0; REQ=field; MUSTG=0
 BIN="$HERE/khnmc"; EXTRA=()
 INPUT="$HERE/input/route-field-battle.txt"
-while getopts "n:j:s:g:o:d:i:c:w:e:m:b:r:tk" o; do case "$o" in
+while getopts "n:j:s:g:o:d:i:c:w:e:m:b:r:tkG" o; do case "$o" in
   n) N=$OPTARG;; j) J=$OPTARG;; s) SECS=$OPTARG;; g) GFR=$OPTARG;; o) OUT=$OPTARG;; d) DIFF=$OPTARG;; i) INPUT=$OPTARG;; c) PIN=$OPTARG;;
-  w) WRAP=$OPTARG;; e) EXTRA+=("$OPTARG");; m) MINMB=$OPTARG;; b) BIN=$OPTARG;; r) REQ=$OPTARG;; t) TRACE=1;; k) KEEP=1;;
+  w) WRAP=$OPTARG;; e) EXTRA+=("$OPTARG");; m) MINMB=$OPTARG;; b) BIN=$OPTARG;; r) REQ=$OPTARG;; t) TRACE=1;; k) KEEP=1;; G) MUSTG=1;;
   *) sed -n '2,30p' "$0" >&2; exit 2;; esac; done
 case "$N$J$SECS$MINMB$PIN$GFR" in *[!0-9]*) echo "route_batch: -n -j -s -g -m -c take numbers" >&2; exit 2;; esac
 [ "$N" -ge 1 ] && [ "$J" -ge 1 ] || { echo "route_batch: -n and -j must be at least 1" >&2; exit 2; }
@@ -48,6 +51,7 @@ case "$N$J$SECS$MINMB$PIN$GFR" in *[!0-9]*) echo "route_batch: -n -j -s -g -m -c
 [ $((J*PIN)) -le "$(nproc)" ] || { echo "route_batch: -j $J x -c $PIN needs more cpus than the $(nproc) present" >&2; exit 2; }
 case "$DIFF" in none|cycle|0|1|2|3) ;; *) echo "route_batch: -d takes none, cycle or 0..3" >&2; exit 2;; esac
 case "$REQ" in field|none) ;; *) echo "route_batch: -r takes field or none" >&2; exit 2;; esac
+[ "$MUSTG" = 0 ] || [ "$GFR" -gt 0 ] || { echo "route_batch: -G needs -g GAME_FRAMES" >&2; exit 2; }
 EXE="$HERE/pc/kh2fm.exe"
 for f in "$BIN" "$EXE" "$INPUT" "$HERE/data-full" "$HERE/pkgdir"; do [ -e "$f" ] || { echo "route_batch: missing $f" >&2; exit 2; }; done
 INPUT=$(cd "$(dirname "$INPUT")" && pwd)/$(basename "$INPUT")      # every run starts in its own root directory
@@ -58,7 +62,7 @@ mkdir -p "$OUT" || exit 2; OUT=$(cd "$OUT" && pwd)
 cp -f "$BIN" "$OUT/khnmc.bin" || { echo "route_batch: cannot copy $BIN" >&2; exit 2; }
 BINSUM=$(sha256sum "$OUT/khnmc.bin" | cut -c1-16)
 avail_mb(){ awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo; }
-echo "route_batch: $N runs, $J parallel, ${SECS}s each, game frames=$GFR, difficulty=$DIFF ($DIFFVAR), cpus/run=$PIN, must reach=$REQ, wrapper='${WRAP}', extra env='${EXTRA[*]:-}'"
+echo "route_batch: $N runs, $J parallel, ${SECS}s each, game frames=$GFR$([ "$MUSTG" = 1 ] && echo " (required: -G)"), difficulty=$DIFF ($DIFFVAR), cpus/run=$PIN, must reach=$REQ, wrapper='${WRAP}', extra env='${EXTRA[*]:-}'"
 echo "route_batch: input $INPUT ($([ "$ROUTE" = 1 ] && echo "route: state-driven steps" || echo "frame-numbered script"))"
 echo "route_batch: binary $BIN sha256 $BINSUM..., out=$OUT, MemAvailable $(avail_mb) MB (need $MINMB MB per started run)"
 
@@ -121,6 +125,9 @@ for i in $(seq 1 "$started"); do
   elif [ "$ex" = 0 ] && [ "$REQ" = field ] && [ "${fld:-0}" -eq 0 ]; then
     fails=$((fails+1)); diverged=$((diverged+1)); result=DIVERGED
     sig="exit 0 but the route never reached the field | last $(grep -a 'InitialSetting frame=' "$o" 2>/dev/null | tail -1 | sed 's/^kh: //')"
+  elif [ "$ex" = 0 ] && [ "$MUSTG" = 1 ] && [ "${gfr:-0}" -lt "$GFR" ]; then
+    fails=$((fails+1)); result=SHORT
+    sig="exit 0 but only ${gfr:-0} of the $GFR game frames were made (-G): the time limit of ${SECS} s came first or the game stopped advancing"
   elif [ "$ex" != 0 ]; then
     fails=$((fails+1)); result=FAIL
     line=$(grep -a -m1 -E '^kh: SIGNAL |^kh: FATAL: |^kh_fault: ' "$o" 2>/dev/null)

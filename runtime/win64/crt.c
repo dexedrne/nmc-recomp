@@ -246,7 +246,10 @@ IMP(CRTS,__stdio_common_vfprintf){ /* (opts, FILE*, fmt, locale, arglist) */
     FILE *f=file_of(g,A1(g)); int need; char *b=malloc(65536); kh_vformat(g,b,65536,gstr(g,A2(g)),ARG(g,4),0,&need); if(f) fwrite(b,1,need<65536?(size_t)need:65535,f); free(b); SET_RAX(g,(u32)need); }
 /* low-level io: host fds are handed out directly */
 static int conv_oflag(int o){ int r=0; switch(o&3){ case 0: r=O_RDONLY; break; case 1: r=O_WRONLY; break; default: r=O_RDWR; } if(o&8) r|=O_APPEND; if(o&0x100) r|=O_CREAT; if(o&0x200) r|=O_TRUNC; if(o&0x400) r|=O_EXCL; return r; }
-IMP(CRTS,_sopen_dispatch){ char p[2048]; kh_winpath(gstr(g,A0(g)),p,sizeof p); int fd=open(p,conv_oflag((int)A1(g)),0644); u64 pfh=ARG(g,4);
+int kh_movie_open_fd(KCtx *g);                      /* task 44 (runtime/null_mf.c): the header read of Movie::open gets a stand-in, the file is not opened */
+IMP(CRTS,_sopen_dispatch){ char p[2048]; kh_winpath(gstr(g,A0(g)),p,sizeof p); u64 pfh=ARG(g,4);
+    { int mfd=kh_movie_open_fd(g); if(mfd>=0){ if(!pfh){ close(mfd); kh_set_errno(g,EINVAL); SET_RAX(g,EINVAL); return; } wr32(g,pfh,(u32)mfd); SET_RAX(g,0); return; } }
+    int fd=open(p,conv_oflag((int)A1(g)),0644);
     if(kh_verbose||strstr(p,".hed")||strstr(p,".pkg")||(fd<0&&nopenfail++<60)) fprintf(stderr,"kh: file: _sopen(\"%s\" -> \"%s\", oflag=%x) = %d%s\n",gstr(g,A0(g)),p,(unsigned)A1(g),fd,fd<0?" FAILED":"");
     if(fd<0){ int en=errno; kh_set_errno(g,en); if(pfh) wr32(g,pfh,(u32)-1); SET_RAX(g,(u32)en); kh_set_last_error(2); return; }
     /* _sopen_dispatch always returns errno_t; arg 6 selects validation, not the return ABI. */

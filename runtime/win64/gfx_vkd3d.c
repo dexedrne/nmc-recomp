@@ -109,9 +109,11 @@ void kh_gfx_vkd3d_report(FILE *f){ (void)f; }
 void kh_gfx_vkd3d_finish(void){}
 int kh_gfx_vkd3d_selftest(KCtx *g){ NOT_BUILT("the vkd3d selftest"); }
 void kh_gfx_submit_counts(u64 *total,u64 *set_admitted,u64 *set_outside){ *total=*set_admitted=*set_outside=0; }   /* review A41: the KHNMC_TEST_GATE check (no backend: nothing submits) */
+void kh_gfx_vkd3d_exit_report(FILE *f){ (void)f; }                    /* TASK43: no backend, no pipeline */
 #else
 /* ---- backend ------------------------------------------------------------------------------------------------------------- */
 #include "gfx_vkd3d_int.h"
+#include "gfx_pipecache.h"
 #include <dlfcn.h>
 #if KH_GFX_TRAMP
 #include <link.h>
@@ -187,6 +189,7 @@ static int phdr_cb(struct dl_phdr_info *info,size_t size,void *data){
 }
 #endif
 static void video_vblank(KCtx *g,u64 k,u64 vnow);
+static const KhPcProvider gw_pc_prov;      /* TASK43: defined with the gipa wrapper */
 static char video_path[1024]; static int video_scale, video_from_field, video_exit; static u64 video_from, video_lead, video_max;
 static void video_setup(void){
     const char *e=getenv("KHNMC_GFX_VIDEO"); if(!e||!*e) return;
@@ -257,6 +260,15 @@ void kh_gfxc_init_common(const char *label){
     video_setup();
     e=getenv("KHNMC_GFX_TRACE"); kh_native_trace=e&&*e=='1';
     kh_fiber_host_stack=16ull<<20;          /* vkd3d and the Vulkan driver run on the calling fiber's host stack */
+    kh_pc_set_provider(&gw_pc_prov);        /* TASK43 (step 12): how the disk pipeline cache gets the driver's bytes (only at its two save points) */
+    /* review C43 n=2: KHNMC_GFX_VKD3D_LOG_REPEATS=n: vkd3d's lines go through the runtime's de-duplicating filter (null_d3d12.c), so play
+     * mode can keep vkd3d at warn, where its failures are logged.  As shared objects (Linux) each of the three libraries has its own
+     * callback; libvkd3d-shader is not on this binary's link line, so its setter is looked up (it is loaded as libvkd3d's dependency).  In
+     * a static link (the iPhone app) the three share ONE callback (libvkd3d-common's debug.c), and the first call sets it for all */
+    { extern int kh_vklog_setup(void); extern void kh_vklog_callback(const char*,va_list);
+      if(kh_vklog_setup()){ vkd3d_set_log_callback(kh_vklog_callback); vkd3d_utils_set_log_callback(kh_vklog_callback);
+          void (*ssl)(PFN_vkd3d_log)=(void(*)(PFN_vkd3d_log))dlsym(RTLD_DEFAULT,"vkd3d_shader_set_log_callback"); if(ssl) ssl(kh_vklog_callback);
+          fprintf(stderr,"kh: gfx vkd3d log: the filter is installed in libvkd3d and libvkd3d-utils%s\n",ssl?", and in libvkd3d-shader (its setter was found by name)":"; vkd3d_shader_set_log_callback was not found by name (a static link, where one callback serves all three; otherwise the shader library's lines are printed unfiltered)"); } }
     bundle_classes();
     kh_gfx_vkd3d_on=1;
     fprintf(stderr,"kh: gfx backend: %s; address model: %s; frame dump: %s%s every %llu presents",label,KH_XLATE_MODE==0?"identity":"bias",dump_dir[0]?"to ":"off",dump_dir,P(dump_every));
@@ -300,10 +312,12 @@ const char *kh_gfxc_dump_dir(void){ return dump_dir; }
 KhPresExt kh_gfxc_pres_ext;
 static _Atomic u64 gw_names, gw_inst_calls, gw_dev_calls;
 static PFN_vkCreateInstance gw_real_ci; static PFN_vkCreateDevice gw_real_cd;
+static VkInstance gw_instance; static void gw_dev_note(VkPhysicalDevice pd,VkDevice d);   /* TASK43 */
 static int has_name(const char *const *v,u32 n,const char *s){ for(u32 i=0;i<n;i++) if(v[i]&&!strcmp(v[i],s)) return 1; return 0; }
 static VkResult VKAPI_PTR gw_create_instance(const VkInstanceCreateInfo *ci,const VkAllocationCallbacks *a,VkInstance *out){
     atomic_fetch_add(&gw_inst_calls,1);
     VkResult r=gw_real_ci(ci,a,out);
+    if(r==VK_SUCCESS&&out) gw_instance=*out;                              /* TASK43: the device identity of a pipeline cache is read through it */
     if(r==VK_SUCCESS&&ci){ const char *const *e=ci->ppEnabledExtensionNames; u32 n=ci->enabledExtensionCount;
         kh_gfxc_pres_ext.surface=has_name(e,n,"VK_KHR_surface"); kh_gfxc_pres_ext.headless=has_name(e,n,"VK_EXT_headless_surface");
         kh_gfxc_pres_ext.metal=has_name(e,n,"VK_EXT_metal_surface"); kh_gfxc_pres_ext.layer_settings=has_name(e,n,"VK_EXT_layer_settings"); kh_gfxc_pres_ext.seen_instance=1; }
@@ -312,6 +326,7 @@ static VkResult VKAPI_PTR gw_create_instance(const VkInstanceCreateInfo *ci,cons
 static VkResult VKAPI_PTR gw_create_device(VkPhysicalDevice pd,const VkDeviceCreateInfo *ci,const VkAllocationCallbacks *a,VkDevice *out){
     atomic_fetch_add(&gw_dev_calls,1);
     VkResult r=gw_real_cd(pd,ci,a,out);
+    if(r==VK_SUCCESS&&out) gw_dev_note(pd,*out);                           /* TASK43: which physical device this VkDevice is on (the pipeline cache's identity) */
     if(r==VK_SUCCESS&&ci){ const char *const *e=ci->ppEnabledExtensionNames; u32 n=ci->enabledExtensionCount;
         kh_gfxc_pres_ext.swapchain=has_name(e,n,"VK_KHR_swapchain"); kh_gfxc_pres_ext.display_timing=has_name(e,n,"VK_GOOGLE_display_timing");
         kh_gfxc_pres_ext.metal_objects=has_name(e,n,"VK_EXT_metal_objects"); kh_gfxc_pres_ext.seen_device=1; }
@@ -345,11 +360,214 @@ static VkResult VKAPI_PTR gw_queue_submit(VkQueue q,uint32_t n,const VkSubmitInf
     return real(q,n,si,f);
 }
 void kh_gfx_submit_counts(u64 *total,u64 *set_admitted,u64 *set_outside){ *total=atomic_load(&gw_submits); *set_admitted=atomic_load(&gw_sub_set_admitted); *set_outside=atomic_load(&gw_sub_set_outside); }
+/* ---- TASK43 (IOS-GRAPHICS-PLAN step 12): the disk pipeline cache and the pipeline-creation counters, in the gipa wrapper ------------
+ * vkd3d makes ONE VkPipelineCache per device, with no initial data (device.c 2409-2430), passes it to every vkCreateGraphicsPipelines
+ * (state.c 4124; pipelines are made at the first draw that needs them, d3d12_pipeline_state_get_or_create_pipeline), passes
+ * VK_NULL_HANDLE to vkCreateComputePipelines (state.c 2509-2510), and never calls vkGetPipelineCacheData or vkMergePipelineCaches.
+ * So gw_gdpa answers five more names:
+ *   vkCreatePipelineCache      the real one, with pInitialData from the configured file when its own header says it was written by THIS
+ *                              physical device (gfx_pipecache.c); not for a capability probe (D3D12CreateDevice with ppDevice NULL makes
+ *                              and destroys a whole device: on MoltenVK its cache would compile every stored shader for nothing).  If
+ *                              the driver refuses bytes that passed our checks, the real call is made again without them.
+ *   vkDestroyPipelineCache, vkDestroyDevice   the table below forgets the object (never while a save reads it).
+ *   vkCreateGraphicsPipelines, vkCreateComputePipelines   counted and timed (wall time, and the calling thread's CPU time: a driver
+ *                              that compiles on other threads or in another process, as Metal does, shows in the wall time only).
+ * The save (gfx_pipecache.c, only while the game is parked or at exit) fetches vkGetPipelineCacheData of the newest live cache of a
+ * device that is not a probe, through pc_fetch below.  While it does, no pipeline is created: a creation call that arrives waits on
+ * gw_dcv for the end of the fetch, and the fetch first waits, bounded, for the calls already inside the driver.  That makes the
+ * two-call size / data sequence exact (MoltenVK's writeData sizes its buffer from a count taken at the size call: MVKPipeline.mm
+ * writeDataImpl) and needs no promise from the driver about concurrent use. */
+#define GW_NDEV 8
+#define GW_SAVE_WAIT_SLICES 6u                 /* the fetch waits at most this many slices of GW_SAVE_SLICE_MS for creation calls in flight */
+#define GW_SAVE_SLICE_MS 50u
+typedef struct { VkDevice d; int probe, have_id; KhPcDev id; VkPipelineCache cache; u64 seq, creations, saved;
+    PFN_vkCreatePipelineCache create_cache; PFN_vkDestroyPipelineCache destroy_cache; PFN_vkGetPipelineCacheData get_data;
+    PFN_vkCreateGraphicsPipelines create_gp; PFN_vkCreateComputePipelines create_cp; PFN_vkDestroyDevice destroy_dev; } GwDev;
+typedef struct { u64 calls, pipelines, failed, wall_ns, wall_max_ns, cpu_ns, over16, with_cache; } GwPipeStat;
+static GwDev gw_dev[GW_NDEV]; static pthread_mutex_t gw_dm=PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t gw_dcv; static pthread_once_t gw_donce=PTHREAD_ONCE_INIT;
+static int gw_saving, gw_inflight, gw_test_refuse_next; static GwDev *gw_save_dev; static u64 gw_save_mark, gw_cache_seq;
+static GwPipeStat gw_gp, gw_cp; static u64 gw_caches_made, gw_caches_destroyed, gw_cache_ns, gw_devs_noted, gw_pipe_waits, gw_destroy_waits, gw_fail_said;
+/* selftest hooks (review C43 n=3 / n=8, n=2): the fetch stands between its size call and its data call (1 = armed, 2 = it stands there,
+ * until 3); the next data call is made to look like VK_INCOMPLETE (1), 0 bytes (2), more bytes than announced (3); the next
+ * vkCreateGraphicsPipelines fails without reaching the driver */
+static _Atomic int gw_test_fetch_pause; static int gw_test_data_fault, gw_test_fail_gp_next; static unsigned gw_fetch_slices_last;
+static u64 gw_init_bytes_last, gw_fetch_data_calls;      /* what the last real vkCreatePipelineCache was handed; data-phase calls of vkGetPipelineCacheData */
+static __thread int gw_probe_tls;              /* this thread is creating a capability-probe device (kh_vkd3d_create_device) */
+static void gw_dinit(void){ kh_cond_init(&gw_dcv); }
+/* caller holds gw_dm: the entry of d (made when create is set and none exists) */
+static GwDev *gw_dev_of(VkDevice d,int create){
+    GwDev *freee=NULL; for(int i=0;i<GW_NDEV;i++){ if(gw_dev[i].d==d&&d) return &gw_dev[i]; if(!gw_dev[i].d&&!freee) freee=&gw_dev[i]; }
+    if(!create) return NULL;
+    if(!freee){ pthread_mutex_unlock(&gw_dm); kh_fatal(NULL,"gfx-gipa-wrapper: more than %d Vulkan devices alive at once",GW_NDEV); }
+    memset(freee,0,sizeof *freee); freee->d=d; return freee;
+}
+static void gw_dev_note(VkPhysicalDevice pd,VkDevice d){
+    pthread_once(&gw_donce,gw_dinit);
+    PFN_vkGetPhysicalDeviceProperties gp=gw_instance?(PFN_vkGetPhysicalDeviceProperties)vk_gipa(gw_instance,"vkGetPhysicalDeviceProperties"):NULL;
+    VkPhysicalDeviceProperties pp; memset(&pp,0,sizeof pp); if(gp) gp(pd,&pp);
+    pthread_mutex_lock(&gw_dm); GwDev *e=gw_dev_of(d,1); e->probe=gw_probe_tls; e->have_id=gp!=NULL;
+    memcpy(e->id.uuid,pp.pipelineCacheUUID,16); e->id.vendor=pp.vendorID; e->id.device=pp.deviceID; e->id.driver=pp.driverVersion; gw_devs_noted++;
+    pthread_mutex_unlock(&gw_dm);
+}
+static u64 thread_cpu_ns(void){ struct timespec ts; if(clock_gettime(CLOCK_THREAD_CPUTIME_ID,&ts)) return 0; return (u64)ts.tv_sec*1000000000ull+(u64)ts.tv_nsec; }
+static VkResult VKAPI_PTR gw_create_pipeline_cache(VkDevice d,const VkPipelineCacheCreateInfo *ci,const VkAllocationCallbacks *a,VkPipelineCache *out){
+    pthread_once(&gw_donce,gw_dinit);
+    pthread_mutex_lock(&gw_dm); GwDev *e=gw_dev_of(d,1); PFN_vkCreatePipelineCache real=e->create_cache; KhPcDev id=e->id; int have_id=e->have_id, probe=e->probe; pthread_mutex_unlock(&gw_dm);
+    if(!real) kh_fatal(NULL,"gfx-gipa-wrapper: vkCreatePipelineCache on a VkDevice whose function was never resolved through the gipa wrapper");
+    VkPipelineCacheCreateInfo c=*ci; uint8_t *file=NULL; const uint8_t *pl=NULL; size_t n=0; int lr=KH_PC_MISSING, tried=0;
+    if(kh_pc_active()&&!ci->initialDataSize){
+        if(probe) kh_pc_note_probe_skipped();
+        else if(!have_id) fprintf(stderr,"kh: gfx pipeline cache: the physical device of this VkDevice is unknown to the gipa wrapper (vkCreateDevice did not come through it): no cache data is handed over (an empty cache)\n");
+        else { tried=1; lr=kh_pc_load(&id,&file,&pl,&n); } }
+    if(tried&&lr==KH_PC_OK){ c.initialDataSize=n; c.pInitialData=pl; }
+    gw_init_bytes_last=(u64)c.initialDataSize;
+    u64 t0=kh_host_ns(); VkResult r=real(d,&c,a,out); u64 dt=kh_host_ns()-t0;
+    if(tried&&lr==KH_PC_OK){
+        if(r==VK_SUCCESS&&gw_test_refuse_next){ gw_test_refuse_next=0;           /* selftest: a driver that refuses the bytes */
+            pthread_mutex_lock(&gw_dm); PFN_vkDestroyPipelineCache dc=e->destroy_cache; pthread_mutex_unlock(&gw_dm);
+            if(dc){ dc(d,*out,a); *out=VK_NULL_HANDLE; r=VK_ERROR_INITIALIZATION_FAILED; } }
+        if(r==VK_SUCCESS) kh_pc_note_loaded(n,kh_pc_fnv(pl,n),&id,dt);
+        else { kh_pc_note_driver_refused(n,(int)r); t0=kh_host_ns(); r=real(d,ci,a,out); dt=kh_host_ns()-t0; } }   /* vkd3d's own call: an empty cache */
+    free(file);
+    pthread_mutex_lock(&gw_dm); gw_cache_ns+=dt;
+    if(r==VK_SUCCESS){ e=gw_dev_of(d,1); e->cache=*out; e->seq=++gw_cache_seq; e->creations=e->saved=0; gw_caches_made++; }
+    pthread_mutex_unlock(&gw_dm);
+    return r;
+}
+/* caller holds gw_dm: a save that is reading the driver's cache finishes first (*waits counts the callers that found one) */
+static void gw_wait_save(u64 *waits){ if(gw_saving){ (*waits)++; while(gw_saving) pthread_cond_wait(&gw_dcv,&gw_dm); } }
+static void VKAPI_PTR gw_destroy_pipeline_cache(VkDevice d,VkPipelineCache pc,const VkAllocationCallbacks *a){
+    pthread_once(&gw_donce,gw_dinit);
+    pthread_mutex_lock(&gw_dm); gw_wait_save(&gw_destroy_waits); GwDev *e=gw_dev_of(d,0); PFN_vkDestroyPipelineCache real=e?e->destroy_cache:NULL;
+    if(e&&pc&&e->cache==pc){ e->cache=VK_NULL_HANDLE; gw_caches_destroyed++; }
+    pthread_mutex_unlock(&gw_dm);
+    if(!real) kh_fatal(NULL,"gfx-gipa-wrapper: vkDestroyPipelineCache on a VkDevice the gipa wrapper does not know");
+    real(d,pc,a);
+}
+static void VKAPI_PTR gw_destroy_device(VkDevice d,const VkAllocationCallbacks *a){
+    pthread_once(&gw_donce,gw_dinit);
+    pthread_mutex_lock(&gw_dm); gw_wait_save(&gw_destroy_waits); GwDev *e=gw_dev_of(d,0); PFN_vkDestroyDevice real=e?e->destroy_dev:NULL; if(e) memset(e,0,sizeof *e); pthread_mutex_unlock(&gw_dm);
+    if(!real){ real=(PFN_vkDestroyDevice)gw_real_gdpa(d,"vkDestroyDevice"); if(!real) kh_fatal(NULL,"gfx-gipa-wrapper: the Vulkan device has no vkDestroyDevice"); }
+    real(d,a);
+}
+/* a pipeline-creation call enters (waits while a save reads the cache) and leaves (counted, timed) */
+static void gw_pipe_enter(void){ pthread_once(&gw_donce,gw_dinit); pthread_mutex_lock(&gw_dm); gw_wait_save(&gw_pipe_waits); gw_inflight++; pthread_mutex_unlock(&gw_dm); }
+static void gw_pipe_leave(GwPipeStat *st,VkDevice d,VkPipelineCache pc,u32 n,VkResult r,u64 wall,u64 cpu){
+    pthread_mutex_lock(&gw_dm); gw_inflight--; u64 failed=0; int say=0;
+    if(st){ st->calls++; st->pipelines+=n; if(r<0){ failed=++st->failed; say=gw_fail_said<8; } st->wall_ns+=wall; if(wall>st->wall_max_ns) st->wall_max_ns=wall; st->cpu_ns+=cpu; if(wall>=16000000ull) st->over16++;
+        GwDev *e=gw_dev_of(d,0); if(e&&pc&&e->cache==pc){ e->creations++; st->with_cache++; } }
+    if(!gw_inflight) pthread_cond_broadcast(&gw_dcv);
+    pthread_mutex_unlock(&gw_dm);
+    /* review C43 n=2: a failed creation is said HERE, when it happens (vkd3d says it at class warn only, and the exit report is not reached
+     * by a play session that the system ends): vkd3d drops every draw that needs this pipeline */
+    if(say){ fprintf(stderr,"kh: gfx pipelines: pipeline-create-failed: %s returned VkResult %d for %u pipeline(s) (%.1f ms): vkd3d drops the draws or dispatches that need it (counted: %llu failed call(s) of this kind so far; the first 8 failures are printed)\n",
+                     st==&gw_gp?"vkCreateGraphicsPipelines":"vkCreateComputePipelines",(int)r,n,wall/1e6,P(failed));
+        pthread_mutex_lock(&gw_dm); gw_fail_said++; pthread_mutex_unlock(&gw_dm); }        /* gw_fail_said = the lines printed */
+}
+static VkResult VKAPI_PTR gw_create_gp(VkDevice d,VkPipelineCache pc,uint32_t n,const VkGraphicsPipelineCreateInfo *ci,const VkAllocationCallbacks *a,VkPipeline *out){
+    pthread_mutex_lock(&gw_dm); GwDev *e=gw_dev_of(d,0); PFN_vkCreateGraphicsPipelines real=e?e->create_gp:NULL; pthread_mutex_unlock(&gw_dm);
+    if(!real) kh_fatal(NULL,"gfx-gipa-wrapper: vkCreateGraphicsPipelines on a VkDevice the gipa wrapper does not know");
+    gw_pipe_enter(); u64 w0=kh_host_ns(), c0=thread_cpu_ns(); VkResult r;
+    if(__builtin_expect(gw_test_fail_gp_next,0)){ gw_test_fail_gp_next=0; for(u32 i=0;i<n;i++) out[i]=VK_NULL_HANDLE; r=VK_ERROR_OUT_OF_HOST_MEMORY; }   /* selftest: a driver that fails the creation */
+    else r=real(d,pc,n,ci,a,out);
+    u64 w1=kh_host_ns(), c1=thread_cpu_ns();
+    gw_pipe_leave(&gw_gp,d,pc,n,r,w1-w0,c1-c0); return r;
+}
+static VkResult VKAPI_PTR gw_create_cp(VkDevice d,VkPipelineCache pc,uint32_t n,const VkComputePipelineCreateInfo *ci,const VkAllocationCallbacks *a,VkPipeline *out){
+    pthread_mutex_lock(&gw_dm); GwDev *e=gw_dev_of(d,0); PFN_vkCreateComputePipelines real=e?e->create_cp:NULL; pthread_mutex_unlock(&gw_dm);
+    if(!real) kh_fatal(NULL,"gfx-gipa-wrapper: vkCreateComputePipelines on a VkDevice the gipa wrapper does not know");
+    gw_pipe_enter(); u64 w0=kh_host_ns(), c0=thread_cpu_ns(); VkResult r=real(d,pc,n,ci,a,out); u64 w1=kh_host_ns(), c1=thread_cpu_ns();
+    gw_pipe_leave(&gw_cp,d,pc,n,r,w1-w0,c1-c0); return r;
+}
+/* caller holds gw_dm: the newest live cache of a device that is not a probe (the game has one device; a test may have more) */
+static GwDev *gw_cache_newest(void){ GwDev *b=NULL; for(int i=0;i<GW_NDEV;i++){ GwDev *e=&gw_dev[i]; if(e->d&&e->cache&&!e->probe&&(!b||e->seq>b->seq)) b=e; } return b; }
+static int pc_dirty(void){ pthread_once(&gw_donce,gw_dinit); pthread_mutex_lock(&gw_dm); GwDev *e=gw_cache_newest(); int r=e?(e->creations!=e->saved):-1; pthread_mutex_unlock(&gw_dm); return r; }
+static void pc_end_locked(void){ gw_saving=0; gw_save_dev=NULL; pthread_cond_broadcast(&gw_dcv); }
+/* review C43 n=11: the slices of GW_SAVE_SLICE_MS a fetch may wait for creation calls in flight: all of them with no deadline, else what
+ * fits before the caller's deadline less the save's margin (0 = it does not wait at all) */
+static unsigned gw_wait_slices(u64 now_ns,u64 deadline_ns){
+    if(!deadline_ns) return GW_SAVE_WAIT_SLICES;
+    u64 margin=(u64)KH_PC_SAVE_MARGIN_MS*1000000ull; if(now_ns+margin>=deadline_ns) return 0;
+    u64 k=(deadline_ns-now_ns-margin)/((u64)GW_SAVE_SLICE_MS*1000000ull); return k<GW_SAVE_WAIT_SLICES?(unsigned)k:GW_SAVE_WAIT_SLICES;
+}
+static int pc_fetch(uint64_t cap,uint64_t deadline_ns,void **data,size_t *len,KhPcDev *dev,char *why,size_t whycap){
+    pthread_once(&gw_donce,gw_dinit); *data=NULL; *len=0;
+    pthread_mutex_lock(&gw_dm);
+    if(gw_saving){ pthread_mutex_unlock(&gw_dm); snprintf(why,whycap,"another fetch of the cache data is running"); return KH_PCF_BUSY; }
+    GwDev *e=gw_cache_newest();
+    if(!e){ pthread_mutex_unlock(&gw_dm); snprintf(why,whycap,"no VkPipelineCache of a game device is alive"); return KH_PCF_NONE; }
+    gw_saving=1;                                                  /* from now on a creation call that arrives waits */
+    unsigned expired=0, allow=gw_wait_slices(kh_host_ns(),deadline_ns); gw_fetch_slices_last=allow;
+    while(gw_inflight){
+        if(expired>=allow){ int k=gw_inflight; pc_end_locked(); pthread_mutex_unlock(&gw_dm);
+            snprintf(why,whycap,"%d pipeline-creation call(s) were still inside the driver after %u ms%s",k,expired*GW_SAVE_SLICE_MS,allow<GW_SAVE_WAIT_SLICES?" (the wait was cut to the caller's bound)":""); return KH_PCF_BUSY; }
+        struct timespec dl; kh_mono_deadline_ms(&dl,GW_SAVE_SLICE_MS);
+        if(kh_cond_wait_until(&gw_dcv,&gw_dm,&dl)==ETIMEDOUT&&gw_inflight) expired++; }
+    VkDevice d=e->d; VkPipelineCache pc=e->cache; PFN_vkGetPipelineCacheData get=e->get_data; *dev=e->id; gw_save_dev=e; gw_save_mark=e->creations;
+    pthread_mutex_unlock(&gw_dm);                                 /* e, d and pc stay valid: the destroy calls wait while gw_saving */
+    int res=KH_PCF_FAILED; size_t n=0; void *b=NULL;
+    if(!get){ get=(PFN_vkGetPipelineCacheData)gw_real_gdpa(d,"vkGetPipelineCacheData"); }
+    if(!get) snprintf(why,whycap,"the Vulkan device has no vkGetPipelineCacheData");
+    else { VkResult r=get(d,pc,&n,NULL);
+        if(r!=VK_SUCCESS) snprintf(why,whycap,"vkGetPipelineCacheData (size) failed: VkResult %d",(int)r);
+        else if(!n){ snprintf(why,whycap,"the driver's cache holds no data (0 bytes)"); res=KH_PCF_NONE; }
+        else if((uint64_t)n>cap){ *len=n; res=KH_PCF_TOO_LARGE; }
+        else if(!(b=malloc(n))) snprintf(why,whycap,"out of memory for %zu bytes of cache data",n);
+        else { if(__builtin_expect(atomic_load(&gw_test_fetch_pause)==1,0)){ atomic_store(&gw_test_fetch_pause,2);   /* selftest: between the size call and the data call, the exclusion held */
+                   while(atomic_load(&gw_test_fetch_pause)==2){ struct timespec ts={0,1000000}; nanosleep(&ts,0); } }
+            size_t m=n; gw_fetch_data_calls++; r=get(d,pc,&m,b);
+            if(__builtin_expect(gw_test_data_fault,0)){ int k=gw_test_data_fault; gw_test_data_fault=0; if(k==1) r=VK_INCOMPLETE; else if(k==2) m=0; else m=n+1; }
+            /* VK_SUCCESS with FEWER bytes than the size call announced is the driver's right (the size call gives a maximum; lavapipe
+             * announces 32 and writes 20): those bytes are the data.  More than announced, none at all, or VK_INCOMPLETE is a failure */
+            if(r!=VK_SUCCESS||!m||m>n){ snprintf(why,whycap,"vkGetPipelineCacheData wrote %zu bytes after announcing %zu (VkResult %d)",m,n,(int)r); free(b); b=NULL; }
+            else { *data=b; *len=m; res=KH_PCF_OK; } } }
+    if(res!=KH_PCF_OK){ pthread_mutex_lock(&gw_dm); pc_end_locked(); pthread_mutex_unlock(&gw_dm); }      /* only an OK fetch keeps the exclusion until done() */
+    return res;
+}
+static void pc_done(int committed){ pthread_mutex_lock(&gw_dm); if(committed&&gw_save_dev) gw_save_dev->saved=gw_save_mark; pc_end_locked(); pthread_mutex_unlock(&gw_dm); }
+static const KhPcProvider gw_pc_prov={pc_dirty,pc_fetch,pc_done};
+/* the exit report's lines of this backend (null_d3d12.c kh_gfx_exit_report): pipeline creation, and on the iPhone MoltenVK's own
+ * shader statistics (the same private API the memory census reads; they need MVK_CONFIG_PERFORMANCE_TRACKING=1) */
+static ID3D12Device *exit_stat_dev(void);
+void kh_gfx_vkd3d_exit_report(FILE *f){
+    pthread_mutex_lock(&gw_dm); GwPipeStat g=gw_gp, c=gw_cp; u64 made=gw_caches_made, gone=gw_caches_destroyed, cns=gw_cache_ns, waits=gw_pipe_waits, dwaits=gw_destroy_waits; pthread_mutex_unlock(&gw_dm);
+    fprintf(f,"kh: gfx pipelines (the gipa wrapper's count): vkCreateGraphicsPipelines %llu call(s), %llu pipeline(s), %llu failed, %llu through vkd3d's VkPipelineCache: %.1f ms of wall time in all, longest call %.1f ms, %llu call(s) of 16 ms or more, CPU time of the calling threads %.1f ms; "
+              "vkCreateComputePipelines %llu call(s), %llu pipeline(s), %llu failed, %.1f ms (vkd3d gives those no cache); VkPipelineCache objects made %llu (%.1f ms inside vkCreatePipelineCache), destroyed %llu; creation calls that waited for a cache save %llu, destroy calls that waited for one %llu\n",
+            P(g.calls),P(g.pipelines),P(g.failed),P(g.with_cache),g.wall_ns/1e6,g.wall_max_ns/1e6,P(g.over16),g.cpu_ns/1e6,P(c.calls),P(c.pipelines),P(c.failed),c.wall_ns/1e6,P(made),cns/1e6,P(gone),P(waits),P(dwaits));
+#ifdef KH_GFX_MVK_API
+    { ID3D12Device *d=exit_stat_dev();
+      if(!d) fprintf(f,"kh: gfx MoltenVK shader statistics: absent (no live swap chain to read them from)\n");
+      else { MVKPerformanceStatistics ps; memset(&ps,0,sizeof ps); size_t sz=sizeof ps; VkResult r=vkGetPerformanceStatisticsMVK(vkd3d_get_vk_device(d),&ps,&sz);
+        if(r!=VK_SUCCESS) fprintf(f,"kh: gfx MoltenVK shader statistics: ERROR (vkGetPerformanceStatisticsMVK result %d, %zu of %zu bytes: MoltenVK's private API differs from the headers' version %d)\n",(int)r,sz,sizeof ps,MVK_PRIVATE_API_VERSION);
+        else { const MVKShaderCompilationPerformance *s=&ps.shaderCompilation; const MVKPipelineCachePerformance *q=&ps.pipelineCache;
+#define TK(t) (t).count,(t).average,(t).maximum
+          fprintf(f,"kh: gfx MoltenVK shader statistics (count, mean ms, longest ms): spirvToMSL %u %.2f %.2f; mslCompile %u %.2f %.2f; mslLoad %u %.2f %.2f; shaderLibraryFromCache %u %.2f %.2f; functionRetrieval %u %.2f %.2f; functionSpecialization %u %.2f %.2f; pipelineCompile %u %.2f %.2f; "
+                    "mslCompress %u %.2f %.2f; mslDecompress %u %.2f %.2f; pipeline cache: read %u %.2f %.2f, size %u %.2f %.2f, write %u %.2f %.2f%s\n",
+                  TK(s->spirvToMSL),TK(s->mslCompile),TK(s->mslLoad),TK(s->shaderLibraryFromCache),TK(s->functionRetrieval),TK(s->functionSpecialization),TK(s->pipelineCompile),TK(s->mslCompress),TK(s->mslDecompress),
+                  TK(q->readPipelineCache),TK(q->sizePipelineCache),TK(q->writePipelineCache),
+                  (s->spirvToMSL.count|s->mslCompile.count|s->pipelineCompile.count|q->readPipelineCache.count)?"":" [every count is 0: MoltenVK's performance tracking is off: MVK_CONFIG_PERFORMANCE_TRACKING=1]");
+#undef TK
+        } } }
+#elif defined(__APPLE__)
+    fprintf(f,"kh: gfx MoltenVK shader statistics: absent (MoltenVK's statistics are read in the iPhone build only: KH_GFX_MVK_API; the pipeline counts above are the wrapper's own)\n");
+#endif
+}
 static PFN_vkVoidFunction VKAPI_PTR gw_gdpa(VkDevice d,const char *name){
     PFN_vkVoidFunction f=gw_real_gdpa(d,name);
     if(!f||!name) return f;
     if(!strcmp(name,"vkGetDeviceQueue")) return (PFN_vkVoidFunction)gw_get_device_queue;
     if(!strcmp(name,"vkQueueSubmit")) return (PFN_vkVoidFunction)gw_queue_submit;
+    /* TASK43 (step 12): the pipeline cache and the pipeline-creation counters; the device's own function is kept per VkDevice */
+    int k=!strcmp(name,"vkCreatePipelineCache")?1:!strcmp(name,"vkDestroyPipelineCache")?2:!strcmp(name,"vkGetPipelineCacheData")?3:!strcmp(name,"vkCreateGraphicsPipelines")?4:
+          !strcmp(name,"vkCreateComputePipelines")?5:!strcmp(name,"vkDestroyDevice")?6:0;
+    if(k){ pthread_mutex_lock(&gw_dm); GwDev *e=gw_dev_of(d,1);
+        switch(k){ case 1: e->create_cache=(PFN_vkCreatePipelineCache)f; f=(PFN_vkVoidFunction)gw_create_pipeline_cache; break;
+                   case 2: e->destroy_cache=(PFN_vkDestroyPipelineCache)f; f=(PFN_vkVoidFunction)gw_destroy_pipeline_cache; break;
+                   case 3: e->get_data=(PFN_vkGetPipelineCacheData)f; break;                       /* vkd3d never calls it; the save does */
+                   case 4: e->create_gp=(PFN_vkCreateGraphicsPipelines)f; f=(PFN_vkVoidFunction)gw_create_gp; break;
+                   case 5: e->create_cp=(PFN_vkCreateComputePipelines)f; f=(PFN_vkVoidFunction)gw_create_cp; break;
+                   default: e->destroy_dev=(PFN_vkDestroyDevice)f; f=(PFN_vkVoidFunction)gw_destroy_device; break; }
+        pthread_mutex_unlock(&gw_dm); }
     return f;
 }
 static PFN_vkVoidFunction VKAPI_PTR kh_vk_gipa_wrap(VkInstance inst,const char *name){
@@ -893,6 +1111,7 @@ static void census_text(char *b,size_t cap,ID3D12Device *dev){
     cen_lines++; pthread_mutex_unlock(&cen_m);
 #undef CAT
 }
+static ID3D12Device *exit_stat_dev(void){ pthread_mutex_lock(&cen_m); ID3D12Device *d=cen_dev; pthread_mutex_unlock(&cen_m); return d; }   /* TASK43: MoltenVK's statistics at exit */
 static void census_line(FILE *f,const char *when){ char b[2048]; census_text(b,sizeof b,NULL); fprintf(f,"kh: gfx memory census (%s): %s\n",when,b); }
 /* ---- review X38 n=2 (IOS-GRAPHICS-PLAN step 5; verification correction 6): the gfx-memory-low soft stop -----------------------------------
  * At every Present (kh_vkd3d_present: after the suspend gate, before the frame readback), where os_proc_available_memory exists (iOS):
@@ -1013,7 +1232,9 @@ HRESULT kh_gfxc_device_new(KCtx *g,u32 level,u64 adapter_shown,ID3D12Device **ou
  * device itself (trampoline bridge) or the guest object that wraps it (wrapped bridge). */
 void kh_vkd3d_create_device(KCtx *g){
     u32 level=(u32)A1(g); u64 riid=A2(g), pp=A3(g);
+    gw_probe_tls=!pp;                                                              /* TASK43: a capability probe's VkPipelineCache gets no cache data */
     ID3D12Device *dev=NULL; HRESULT hr=kh_gfxc_device_new(g,level,A0(g),&dev);
+    gw_probe_tls=0;
     if(FAILED(hr)){ if(pp) wr64(g,pp,0); SET_RAX(g,(u32)hr); return; }
 #if KH_GFX_TRAMP
     if(!kh_gfx_wrap_on) need_native(g,dev,"ID3D12Device");
@@ -1566,6 +1787,210 @@ int kh_gfxc_selftest_pure(KCtx *g){
     fprintf(stderr,"kh: gfx vkd3d shared-part selftest: %d checks, %d failures (bundle reference counts on 8 threads, fence events, video report, band-log edge windows)\n",n,f);
     return f;
 }
+/* ---- TASK43 (plan step 12): the disk pipeline cache on a REAL device (lavapipe here, MoltenVK on the Mac and the phone) -----------
+ * Runs last: the device of the suites above is alive and has drawn, so its VkPipelineCache holds the pipelines they made.  Run 1: its
+ * data is written (only while parked: first refused with the gate clear); run 2: a second device is handed the file and the driver
+ * takes it ("loaded N bytes"); then a truncated file, garbage, a file of another device and a driver that refuses the bytes: each by
+ * name, counted, and the device still gets a cache; a capability probe gets nothing; the cap; a creation call inside the driver holds
+ * the save off; the save at exit.  The files and the rules without a device: gfx_pipecache.c kh_pc_selftest. */
+/* Review C43: the pattern frame is drawn through the empty cache and through the loaded one (the same picture); a failed creation is
+ * loud; the three calls that must wait for a save that reads the cache do; a failing data call; the load guard's marker. */
+typedef struct { _Atomic int go; } StPcHold;
+static void *st_pc_hold(void *a){ StPcHold *h=(StPcHold*)a; gw_pipe_enter(); atomic_store(&h->go,1);
+    while(atomic_load(&h->go)!=2){ struct timespec ts={0,1000000}; nanosleep(&ts,0); }
+    gw_pipe_leave(NULL,VK_NULL_HANDLE,VK_NULL_HANDLE,0,VK_SUCCESS,0,0); atomic_store(&h->go,3); return NULL; }
+/* review C43 n=3 / n=8: a save on its own thread (it stands in the fetch, between the size call and the data call), and the three calls
+ * that must wait for it: a pipeline creation that arrives, vkDestroyPipelineCache of the cache being read, vkDestroyDevice */
+typedef struct { _Atomic int res, done; } StPcSave;
+static void *st_pc_saver(void *a){ StPcSave *s=(StPcSave*)a; atomic_store(&s->res,kh_gfx_pipecache_save(KH_PC_AT_PARKED,0)); atomic_store(&s->done,1); return NULL; }
+typedef struct { int kind; VkDevice d; VkPipelineCache pc; _Atomic int done; u64 ret_ns; } StPcWaiter;
+static void *st_pc_waiter(void *a){ StPcWaiter *w=(StPcWaiter*)a;
+    if(w->kind==0){ gw_pipe_enter(); gw_pipe_leave(NULL,VK_NULL_HANDLE,VK_NULL_HANDLE,0,VK_SUCCESS,0,0); }
+    else if(w->kind==1) gw_destroy_pipeline_cache(w->d,w->pc,NULL);
+    else gw_destroy_device(w->d,NULL);
+    w->ret_ns=kh_host_ns(); atomic_store(&w->done,1); return NULL; }
+static u32 st_le32(const u8 *p){ return (u32)p[0]|(u32)p[1]<<8|(u32)p[2]<<16|(u32)p[3]<<24; }
+static int st_pipecache_device(KCtx *g,u64 dev,u64 q,u64 fct){
+    extern void rt_imp_d3d12__ord101(KCtx*);
+    int n=0,f=0;
+#define TC(c) do{ n++; if(!(c)){ f++; fprintf(stderr,"gfx pipecache device selftest FAIL: %s (line %d)\n",#c,__LINE__); } }while(0)
+    char dir[KH_TMP_MAX], path[KH_TMP_MAX+32], mark[KH_TMP_MAX+48], why[640]; kh_tmp_path(dir,sizeof dir,"khnmc-pipecache-dev-XXXXXX");
+    if(!mkdtemp(dir)){ fprintf(stderr,"gfx pipecache device selftest FAIL: mkdtemp(%s): %s\n",dir,strerror(errno)); return 1; }
+    snprintf(path,sizeof path,"%s/pipe.bin",dir); snprintf(mark,sizeof mark,"%s.loading",path);
+    u64 m=ga_calloc(1,256); KhPcCounters c0,c1; KhPcDev id; memset(&id,0,sizeof id); struct stat st;
+    char sv_dump[sizeof dump_dir]; memcpy(sv_dump,dump_dir,sizeof sv_dump); dump_dir[0]=0; u64 sv_presents=gfx_presents;      /* the pattern frames below are presented: no dump of them, the run's present count as it was */
+    u8 *pic1=malloc(4u*96u*64u), *pic2=malloc(4u*96u*64u); int pat1=-1, pat2=-1; double dm1=0, dm2=0;
+    pthread_mutex_lock(&gw_dm); GwDev *mn=gw_cache_newest(); int have=mn!=NULL&&mn->have_id; u64 cre=mn?mn->creations:0, gpc=gw_gp.calls, gpw=gw_gp.with_cache; if(mn) id=mn->id; pthread_mutex_unlock(&gw_dm);
+    TC(have); TC(cre>0 && gpc>0 && gpw>=cre);                    /* the suites above made pipelines through this device's cache, and the wrapper counted them */
+    TC(pic1!=NULL && pic2!=NULL);
+    if(!have||!pic1||!pic2) goto out;
+    /* review C43 n=1: the selftest's pattern frame, drawn on THIS device (its cache was made empty) before the cache is saved: the file of
+     * run 1 holds what that draw's pipeline put into the cache, and the picture is the reference for the device of run 2 */
+    { pat1=kh_present_test_pattern(g,m,fct,q,pic1,&dm1);
+      pthread_mutex_lock(&gw_dm); u64 cre1=mn->creations; pthread_mutex_unlock(&gw_dm);
+      if(pat1==3) fprintf(stderr,"kh: gfx pipecache device selftest: the pattern frames are NOT RUN (KHNMC_GFX_BACKBUFFERS=committed: no VkImage of ours to read back)\n");
+      else { TC(pat1==0 && dm1<=2.0); TC(cre1>cre); cre=cre1; } }
+    /* review C43 n=2: a pipeline creation that FAILS is said by the wrapper when it happens and counted; vkd3d drops the draw (the picture
+     * is not the pattern) and goes on: the next frame creates the pipeline */
+    if(pat1==0){ pthread_mutex_lock(&gw_dm); u64 f0=gw_gp.failed, s0=gw_fail_said, k0=gw_gp.calls; pthread_mutex_unlock(&gw_dm);
+      double dmf=0; gw_test_fail_gp_next=1; int pf=kh_present_test_pattern(g,m,fct,q,pic2,&dmf);
+      pthread_mutex_lock(&gw_dm); u64 f1=gw_gp.failed, s1=gw_fail_said, k1=gw_gp.calls; pthread_mutex_unlock(&gw_dm);
+      TC(pf==0 && gw_test_fail_gp_next==0 && f1==f0+1 && k1==k0+1 && (s1==s0+1||s0>=8));
+      { int flat=1; for(u32 i=0;i<96u*64u;i++) if(pic2[4*i]!=255||pic2[4*i+1]!=0||pic2[4*i+2]!=255){ flat=0; break; } TC(flat && dmf>8.0); }   /* the frame went on without its draw: the colour under it */
+      pf=kh_present_test_pattern(g,m,fct,q,pic2,&dmf); TC(pf==0 && dmf<=2.0 && !memcmp(pic1,pic2,4u*96u*64u));       /* and without the failure the same picture again */
+      pthread_mutex_lock(&gw_dm); cre=mn->creations; f1=gw_gp.failed; pthread_mutex_unlock(&gw_dm); TC(f1==f0+1); }
+    kh_pc_test_config(path,0);
+    /* run 1.  The selftest's thread is the one that renders: with the gate clear its save is REFUSED and nothing is written */
+    TC(!kh_gfx_gate_is_set() && kh_gfx_pipecache_save(KH_PC_AT_PARKED,0)==KH_PCS_REFUSED && stat(path,&st)!=0);
+    kh_gfx_gate_set(); kh_pc_counters(&c0); int r=kh_gfx_pipecache_save(KH_PC_AT_PARKED,0); kh_pc_counters(&c1);
+    TC(r==KH_PCS_WRITTEN && c1.save_written==c0.save_written+1 && c1.save_bytes>c0.save_bytes);
+    size_t saved=(size_t)(c1.save_bytes-c0.save_bytes), len=0; uint8_t *file=NULL, *good=NULL; const uint8_t *pl=NULL;
+    TC(kh_pc_file_load(path,&id,kh_pc_cap(),&file,&pl,&len,why,sizeof why)==KH_PC_OK && len==saved && len>=16);
+    if(file&&len>=16){ good=malloc(len); if(good) memcpy(good,pl,len);
+        /* the driver's own header (VkPipelineCacheHeaderVersionOne: length, version 1, vendorID, deviceID, then the UUID) names the device
+         * our header names (the UUID only when the driver wrote that far: lavapipe writes 20 bytes) */
+        TC(st_le32(pl+4)==1 && st_le32(pl+8)==id.vendor && st_le32(pl+12)==id.device && (len<32||!memcmp(pl+16,id.uuid,16)));
+        char hx[80]; for(size_t i=0;i<len&&i<32;i++) snprintf(hx+2*i,3,"%02x",pl[i]);
+        fprintf(stderr,"kh: gfx pipecache device selftest: the driver's cache data begins %s (%zu bytes in all)\n",hx,len); }
+    free(file); file=NULL; TC(good!=NULL);
+    { u64 fd0=gw_fetch_data_calls; kh_pc_counters(&c0); TC(kh_gfx_pipecache_save(KH_PC_AT_PARKED,0)==KH_PCS_UNCHANGED); kh_pc_counters(&c1);   /* no pipeline since the save: the driver is not asked again */
+      TC(c1.save_unchanged_clean==c0.save_unchanged_clean+1 && gw_fetch_data_calls==fd0); }
+    kh_gfx_gate_clear();
+    fprintf(stderr,"kh: gfx pipecache device selftest: run 1 wrote %zu bytes of the driver's cache data (%llu pipeline creation call(s) through that cache)\n",saved,P(cre));
+    if(!good) goto out;
+    /* run 2: another device is created; the wrapped vkCreatePipelineCache hands the driver the file's bytes and the driver takes them */
+    { kh_pc_counters(&c0); pthread_mutex_lock(&gw_dm); u64 made0=gw_caches_made; pthread_mutex_unlock(&gw_dm);
+      TC((u32)GI(rt_imp_d3d12__ord101,0,0xb000,GP(&IID_ID3D12Device),m)==0); u64 d2=rd64(g,m); TC(d2!=0); kh_pc_counters(&c1);
+      TC(c1.load_ok==c0.load_ok+1 && c1.load_bytes==c0.load_bytes+saved && c1.driver_refused==c0.driver_refused && c1.load_rejected==c0.load_rejected && c1.load_missing==c0.load_missing);
+      TC(gw_init_bytes_last==(u64)saved);                                      /* the REAL vkCreatePipelineCache was called with the file's bytes as pInitialData */
+      TC(stat(mark,&st)!=0);                                                   /* review C43 n=12: the load guard's marker is gone once the driver's call is back */
+      pthread_mutex_lock(&gw_dm); GwDev *e2=gw_cache_newest(); int ok=e2&&e2!=mn&&e2->cache&&!e2->creations&&!e2->probe&&gw_caches_made==made0+1; pthread_mutex_unlock(&gw_dm); TC(ok);
+      kh_gfx_gate_set(); TC(kh_gfx_pipecache_save(KH_PC_AT_PARKED,0)==KH_PCS_UNCHANGED); kh_gfx_gate_clear();     /* the newest cache made no pipeline: nothing to write */
+      /* review C43 n=1: THE DRAW THROUGH THE LOADED CACHE.  The same pattern frame on this device, whose VkPipelineCache the driver built
+       * from the file's bytes: its pipeline is created through that cache (counted), and the picture is the first device's, byte for byte.
+       * (On lavapipe the file is a 20-byte stub; on MoltenVK it holds the MSL of the pattern's shaders, and this is the draw that uses it.) */
+      if(d2&&ok&&pat1==0){ u64 q2=0; memset(hp(g,m),0,64); TC((u32)GC(VT(d2,8),d2,m,GP(&IID_ID3D12CommandQueue),m+64)==0); q2=rd64(g,m+64); TC(q2!=0);
+          if(q2){ pthread_mutex_lock(&gw_dm); u64 w0=gw_gp.with_cache; pthread_mutex_unlock(&gw_dm);
+              pat2=kh_present_test_pattern(g,m,fct,q2,pic2,&dm2);
+              pthread_mutex_lock(&gw_dm); u64 cr2=e2->creations, w1=gw_gp.with_cache; pthread_mutex_unlock(&gw_dm);
+              TC(pat2==0 && dm2<=2.0); TC(cr2>=1 && w1>w0);                     /* a pipeline was created through the LOADED cache */
+              unsigned long long diff=0; for(u32 i=0;i<4u*96u*64u;i++) diff+=pic1[i]!=pic2[i];
+              TC(pat2==0 && diff==0);                                          /* the picture drawn through the loaded cache IS the one drawn through the empty cache */
+              fprintf(stderr,"kh: gfx pipecache device selftest: the pattern frame drawn through the LOADED cache (%zu bytes loaded, %llu pipeline creation(s) through it) against the one drawn on the first device: %llu of %u bytes differ; against the CPU-made pattern: largest difference %.2f (first device %.2f)\n",
+                      saved,P(cr2),diff,4u*96u*64u,dm2,dm1);
+              /* what the loaded cache holds after that draw: the same bytes (nothing new was compiled), or more */
+              kh_gfx_gate_set(); kh_pc_counters(&c0); r=kh_gfx_pipecache_save(KH_PC_AT_PARKED,0); kh_pc_counters(&c1); kh_gfx_gate_clear(); TC(r==KH_PCS_UNCHANGED||r==KH_PCS_WRITTEN);
+              fprintf(stderr,"kh: gfx pipecache device selftest: the loaded cache after its draw: %s\n",r==KH_PCS_UNCHANGED?"the driver's data is byte for byte the file's (the draw added nothing)":r==KH_PCS_WRITTEN?"the driver's data differs from the file's: written (see the saved line above)":"NOT SAVED");
+              TC(GC(VT(q2,2),q2)==0); } }
+      if(d2) GC(VT(d2,2),d2);
+      pthread_mutex_lock(&gw_dm); ok=gw_cache_newest()==mn; pthread_mutex_unlock(&gw_dm); TC(ok); }                 /* destroyed with its device: the table forgot it */
+    /* a capability probe (ppDevice NULL) makes and destroys a device: its cache is given nothing, the file is not even read */
+    { kh_pc_counters(&c0); TC((u32)GI(rt_imp_d3d12__ord101,0,0xb000,GP(&IID_ID3D12Device),0)==1); kh_pc_counters(&c1);
+      TC(c1.probes==c0.probes+1 && c1.load_ok==c0.load_ok && c1.load_missing==c0.load_missing && c1.load_rejected==c0.load_rejected); }
+    /* a truncated file, garbage, a file written by another device, a file whose last load never came back (the load guard's marker is
+     * still there: review C43 n=12) and a driver that refuses bytes our checks passed: each is named in the log and counted under its
+     * own name, the device gets an EMPTY cache and works */
+    for(int k=0;k<5;k++){
+        static const int kind[5]={KH_PC_TRUNCATED,KH_PC_GARBAGE,KH_PC_FOREIGN_DEVICE,KH_PC_LOAD_UNFINISHED,KH_PC_DRIVER_REFUSED}; int wrote=0;
+        if(k==0){ uint8_t *img=malloc(KH_PC_HEADER_BYTES+len); if(img){ kh_pc_header_make(img,&id,good,len); memcpy(img+KH_PC_HEADER_BYTES,good,len);
+                  FILE *fp=fopen(path,"wb"); if(fp){ size_t half=(KH_PC_HEADER_BYTES+len)/2; wrote=fwrite(img,1,half,fp)==half; fclose(fp); } free(img); } }
+        else if(k==1){ FILE *fp=fopen(path,"wb"); if(fp){ u8 gb[1000]; for(unsigned i=0;i<sizeof gb;i++) gb[i]=(u8)(i*37+k); wrote=fwrite(gb,1,sizeof gb,fp)==sizeof gb; fclose(fp); } }
+        else if(k==2){ KhPcDev other=id; other.uuid[3]^=0x5a; wrote=kh_pc_file_save(path,&other,good,len,why,sizeof why)==0; }
+        else if(k==3){ wrote=kh_pc_file_save(path,&id,good,len,why,sizeof why)==0; FILE *fp=fopen(mark,"wb"); if(fp) fclose(fp); else wrote=0; }
+        else { wrote=kh_pc_file_save(path,&id,good,len,why,sizeof why)==0; gw_test_refuse_next=1; }
+        TC(wrote); kh_pc_counters(&c0);
+        TC((u32)GI(rt_imp_d3d12__ord101,0,0xb000,GP(&IID_ID3D12Device),m)==0); u64 dk=rd64(g,m); TC(dk!=0); kh_pc_counters(&c1);
+        TC(c1.load_by[kind[k]]==c0.load_by[kind[k]]+1 && c1.load_rejected==c0.load_rejected+1 && c1.load_ok==c0.load_ok && c1.load_bytes==c0.load_bytes && (c1.driver_refused==c0.driver_refused+1)==(k==4));
+        pthread_mutex_lock(&gw_dm); GwDev *ek=gw_cache_newest(); int ok=ek&&ek!=mn&&ek->cache!=VK_NULL_HANDLE; pthread_mutex_unlock(&gw_dm); TC(ok);    /* an empty cache was made all the same */
+        TC(gw_test_refuse_next==0); TC(stat(mark,&st)!=0); if(k==3) TC(stat(path,&st)!=0);             /* no marker is left; the file of the unfinished load is gone */
+        if(dk) GC(VT(dk,2),dk); }
+    /* the cap: data above it is refused, said so, and the file keeps what it had (the good file of the last case) */
+    { kh_pc_test_config(path,16); pthread_mutex_lock(&gw_dm); mn->creations++; pthread_mutex_unlock(&gw_dm);       /* a pipeline was made: there is something to save */
+      u64 fd0=gw_fetch_data_calls;
+      kh_gfx_gate_set(); kh_pc_counters(&c0); TC(kh_gfx_pipecache_save(KH_PC_AT_PARKED,0)==KH_PCS_OVER_CAP); kh_pc_counters(&c1); TC(c1.save_over_cap==c0.save_over_cap+1 && c1.save_written==c0.save_written);
+      TC(gw_fetch_data_calls==fd0);                                            /* above the cap the driver's data is not even fetched */
+      TC(kh_pc_file_load(path,&id,KH_PC_DEFAULT_CAP,&file,&pl,&len,why,sizeof why)==KH_PC_OK && len==saved && !memcmp(pl,good,len)); free(file); file=NULL;
+      kh_pc_test_config(path,0);
+      /* a pipeline-creation call inside the driver holds the save off: skipped as busy after its bound, written once the call is back */
+      StPcHold h; atomic_store(&h.go,0); pthread_t th; int started=pthread_create(&th,NULL,st_pc_hold,&h)==0; TC(started);
+      if(started){ for(int i=0;i<5000&&atomic_load(&h.go)!=1;i++){ struct timespec ts={0,1000000}; nanosleep(&ts,0); }
+          u64 t0=kh_host_ns(); kh_pc_counters(&c0); r=kh_gfx_pipecache_save(KH_PC_AT_PARKED,0); u64 dt=kh_host_ns()-t0; kh_pc_counters(&c1);
+          TC(r==KH_PCS_BUSY && c1.save_busy==c0.save_busy+1 && dt>=(u64)(GW_SAVE_WAIT_SLICES-1)*GW_SAVE_SLICE_MS*1000000ull && gw_fetch_slices_last==GW_SAVE_WAIT_SLICES);
+          /* review C43 n=11: with the caller's bound 350 ms away the wait is cut to what is left less the margin (or, on a machine that
+           * stalled the test, the save is not even started: skipped late); it never waits all its slices */
+          kh_pc_counters(&c0); r=kh_gfx_pipecache_save(KH_PC_AT_PARKED,kh_host_ns()+350000000ull); kh_pc_counters(&c1);
+          TC((r==KH_PCS_BUSY && c1.save_busy==c0.save_busy+1 && gw_fetch_slices_last<GW_SAVE_WAIT_SLICES) || (r==KH_PCS_LATE && c1.save_late==c0.save_late+1));
+          atomic_store(&h.go,2); pthread_join(th,NULL); }
+      { const u64 ms=1000000ull, t=5000000000ull;                               /* the rule itself, on made-up times */
+        TC(gw_wait_slices(t,0)==GW_SAVE_WAIT_SLICES && gw_wait_slices(t,t+2000*ms)==GW_SAVE_WAIT_SLICES && gw_wait_slices(t,t+(KH_PC_SAVE_MARGIN_MS+GW_SAVE_WAIT_SLICES*GW_SAVE_SLICE_MS)*ms)==GW_SAVE_WAIT_SLICES);
+        TC(gw_wait_slices(t,t+(KH_PC_SAVE_MARGIN_MS+3*GW_SAVE_SLICE_MS)*ms)==3 && gw_wait_slices(t,t+(KH_PC_SAVE_MARGIN_MS+3*GW_SAVE_SLICE_MS-1)*ms)==2 && gw_wait_slices(t,t+(KH_PC_SAVE_MARGIN_MS+GW_SAVE_SLICE_MS-1)*ms)==0);
+        TC(gw_wait_slices(t,t+KH_PC_SAVE_MARGIN_MS*ms)==0 && gw_wait_slices(t,t+1)==0 && gw_wait_slices(t,t)==0 && gw_wait_slices(t,t-1000*ms)==0); }
+      TC(kh_gfx_pipecache_save(KH_PC_AT_PARKED,0)==KH_PCS_WRITTEN); TC(kh_gfx_pipecache_save(KH_PC_AT_PARKED,0)==KH_PCS_UNCHANGED);
+      /* review C43 n=3: a data call that ends VK_INCOMPLETE, writes nothing, or writes more than it announced is a named failure: nothing
+       * is written, the file is as it was, the exclusion is not left held, and the cache stays to be saved */
+      for(int k=1;k<=3;k++){ struct stat s0,s1; int h0=stat(path,&s0); pthread_mutex_lock(&gw_dm); mn->creations++; pthread_mutex_unlock(&gw_dm);
+          gw_test_data_fault=k; u64 fd0=gw_fetch_data_calls; kh_pc_counters(&c0); r=kh_gfx_pipecache_save(KH_PC_AT_PARKED,0); kh_pc_counters(&c1);
+          pthread_mutex_lock(&gw_dm); int freed=!gw_saving&&!gw_save_dev, dirty=mn->creations!=mn->saved; pthread_mutex_unlock(&gw_dm);
+          TC(r==KH_PCS_FAILED && c1.save_failed==c0.save_failed+1 && c1.save_written==c0.save_written && gw_fetch_data_calls==fd0+1 && gw_test_data_fault==0);
+          TC(freed && dirty && !h0 && !stat(path,&s1) && s0.st_ino==s1.st_ino && s0.st_size==s1.st_size); }
+      r=kh_gfx_pipecache_save(KH_PC_AT_PARKED,0); TC(r==KH_PCS_WRITTEN||r==KH_PCS_UNCHANGED);
+      kh_gfx_gate_clear(); }
+    /* review C43 n=3 / n=8: WHILE A SAVE READS THE CACHE.  Two Vulkan devices of our own on the same physical device (made and noted the
+     * way the wrapper notes vkd3d's), X with a VkPipelineCache through the wrapper (the newest live cache: the save reads it), Y without.
+     * The save stands between its size call and its data call.  A pipeline creation that arrives, vkDestroyPipelineCache of X's cache and
+     * vkDestroyDevice of Y each WAIT (counted), none returns before the save went on, and the save ends with the driver's bytes */
+    { ID3D12Device *rdv=(ID3D12Device*)real_of(g,dev,WK_DEVICE,"pipecache selftest device"); VkPhysicalDevice pd=vkd3d_get_vk_physical_device(rdv);
+      float prio=1.0f; VkDeviceQueueCreateInfo qi; memset(&qi,0,sizeof qi); qi.sType=VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO; qi.queueFamilyIndex=0; qi.queueCount=1; qi.pQueuePriorities=&prio;
+      VkDeviceCreateInfo di; memset(&di,0,sizeof di); di.sType=VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO; di.queueCreateInfoCount=1; di.pQueueCreateInfos=&qi;
+      VkDevice X=VK_NULL_HANDLE, Y=VK_NULL_HANDLE; VkPipelineCache PX=VK_NULL_HANDLE;
+      TC(gw_real_cd!=NULL && gw_real_cd(pd,&di,NULL,&X)==VK_SUCCESS && X!=VK_NULL_HANDLE); if(X) TC(gw_real_cd(pd,&di,NULL,&Y)==VK_SUCCESS && Y!=VK_NULL_HANDLE);
+      if(X&&Y){ gw_dev_note(pd,X); gw_dev_note(pd,Y);
+          PFN_vkCreatePipelineCache cpc=(PFN_vkCreatePipelineCache)gw_gdpa(X,"vkCreatePipelineCache"); PFN_vkDestroyPipelineCache dpc=(PFN_vkDestroyPipelineCache)gw_gdpa(X,"vkDestroyPipelineCache");
+          PFN_vkDestroyDevice ddx=(PFN_vkDestroyDevice)gw_gdpa(X,"vkDestroyDevice"), ddy=(PFN_vkDestroyDevice)gw_gdpa(Y,"vkDestroyDevice"); (void)gw_gdpa(X,"vkGetPipelineCacheData");
+          TC(cpc==gw_create_pipeline_cache && dpc==gw_destroy_pipeline_cache && ddx==gw_destroy_device && ddy==gw_destroy_device);
+          VkPipelineCacheCreateInfo pci; memset(&pci,0,sizeof pci); pci.sType=VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+          TC(gw_create_pipeline_cache(X,&pci,NULL,&PX)==VK_SUCCESS && PX!=VK_NULL_HANDLE);
+          pthread_mutex_lock(&gw_dm); GwDev *ex=gw_cache_newest(); int isx=ex&&ex->d==X&&ex->cache==PX; if(isx) ex->creations++;      /* something to save */
+          u64 w0=gw_pipe_waits, dw0=gw_destroy_waits, cd0=gw_caches_destroyed; pthread_mutex_unlock(&gw_dm); TC(isx);
+          StPcSave sv; atomic_store(&sv.res,-1); atomic_store(&sv.done,0); StPcWaiter wt[3]; memset(wt,0,sizeof wt); pthread_t ts_, tw[3]; int nstart=0;
+          kh_gfx_gate_set(); atomic_store(&gw_test_fetch_pause,1);
+          int sstart=isx&&pthread_create(&ts_,NULL,st_pc_saver,&sv)==0; TC(sstart);
+          if(sstart){ struct timespec ms1={0,1000000};
+              for(int i=0;i<10000&&atomic_load(&gw_test_fetch_pause)!=2&&!atomic_load(&sv.done);i++) nanosleep(&ms1,0);
+              int standing=atomic_load(&gw_test_fetch_pause)==2; TC(standing);                    /* the save stands in its fetch: gw_saving, the lock free */
+              if(standing){
+                  wt[0].kind=0; wt[1].kind=1; wt[1].d=X; wt[1].pc=PX; wt[2].kind=2; wt[2].d=Y;
+                  for(int i=0;i<3;i++) if(pthread_create(&tw[i],NULL,st_pc_waiter,&wt[i])==0) nstart++; else break;
+                  TC(nstart==3);
+                  u64 pw=0, dw=0;
+                  for(int i=0;i<10000;i++){ pthread_mutex_lock(&gw_dm); pw=gw_pipe_waits-w0; dw=gw_destroy_waits-dw0; pthread_mutex_unlock(&gw_dm);
+                      if((pw>=1&&dw>=2)||atomic_load(&wt[0].done)||atomic_load(&wt[1].done)||atomic_load(&wt[2].done)) break; nanosleep(&ms1,0); }
+                  TC(pw==1); TC(dw==2);                                                           /* each of the three found the save and waits (counted) */
+                  { struct timespec ms50={0,50000000}; nanosleep(&ms50,0); }
+                  pthread_mutex_lock(&gw_dm); int held=gw_saving&&gw_caches_destroyed==cd0&&gw_dev_of(Y,0)!=NULL&&gw_dev_of(X,0)!=NULL&&gw_dev_of(X,0)->cache==PX; pthread_mutex_unlock(&gw_dm);
+                  TC(held && !atomic_load(&wt[0].done) && !atomic_load(&wt[1].done) && !atomic_load(&wt[2].done) && !atomic_load(&sv.done)); }
+              u64 rel=kh_host_ns(); atomic_store(&gw_test_fetch_pause,3); pthread_join(ts_,NULL);
+              TC(atomic_load(&sv.res)==KH_PCS_WRITTEN||atomic_load(&sv.res)==KH_PCS_UNCHANGED);  /* the data call came back with the bytes: nothing destroyed the cache under it */
+              for(int i=0;i<nstart;i++){ pthread_join(tw[i],NULL); TC(wt[i].ret_ns>=rel); }
+              pthread_mutex_lock(&gw_dm); int after=!gw_saving&&!gw_inflight&&gw_caches_destroyed==cd0+(nstart==3)&&(nstart<3||gw_dev_of(Y,0)==NULL); pthread_mutex_unlock(&gw_dm); TC(after);
+              if(nstart==3){ PX=VK_NULL_HANDLE; Y=VK_NULL_HANDLE; } }
+          atomic_store(&gw_test_fetch_pause,0); kh_gfx_gate_clear(); }
+      if(PX) gw_destroy_pipeline_cache(X,PX,NULL); if(Y) gw_destroy_device(Y,NULL); if(X) gw_destroy_device(X,NULL);
+      pthread_mutex_lock(&gw_dm); int back=gw_cache_newest()==mn; pthread_mutex_unlock(&gw_dm); TC(back); }
+    /* at exit: refused while the process is not ending; then allowed with the gate clear (the bytes are the ones on disk: not rewritten) */
+    { pthread_mutex_lock(&gw_dm); mn->creations++; pthread_mutex_unlock(&gw_dm);
+      TC(kh_gfx_pipecache_save(KH_PC_AT_EXIT,0)==KH_PCS_REFUSED); kh_pc_test_exiting(1); r=kh_gfx_pipecache_save(KH_PC_AT_EXIT,0); kh_pc_test_exiting(0);
+      TC(r==KH_PCS_UNCHANGED||r==KH_PCS_WRITTEN); pthread_mutex_lock(&gw_dm); int clean=mn->creations==mn->saved&&!gw_saving&&!gw_inflight; pthread_mutex_unlock(&gw_dm); TC(clean); }
+out:
+    free(good); free(pic1); free(pic2); unlink(path); unlink(mark); { char t2[KH_TMP_MAX+40]; snprintf(t2,sizeof t2,"%s.tmp",path); TC(stat(t2,&st)!=0); }
+    TC(rmdir(dir)==0); kh_pc_test_config(NULL,0); ga_free(m);
+    memcpy(dump_dir,sv_dump,sizeof sv_dump); gfx_presents=sv_presents;
+    TC(!kh_gfx_gate_is_set() && kh_gfx_gate_admitted()==0);
+    f+=kh_gfxc_st_fails; kh_gfxc_st_fails=0;
+    fprintf(stderr,"kh: gfx pipecache device selftest: %d checks, %d failures (device %s: the pattern frame drawn through the empty cache and through the LOADED one: the same picture; a failed pipeline creation said and counted; run 1 writes the driver's cache data only while parked, run 2 hands it to a new device and the driver takes it; truncated, garbage, another device's file, an unfinished load and a refusing driver: named, counted, an empty cache; a probe gets nothing; the cap; a creation call in flight, the wait cut to the caller's bound; a data call that fails; a creation and both destroy calls wait for a save that reads the cache; the save at exit)\n",n,f,vk_dev_name);
+#undef TC
+    return f;
+}
 int kh_gfx_vkd3d_selftest(KCtx *g){
     extern void rt_imp_d3d12__ord101(KCtx*), rt_imp_d3d12__D3D12SerializeRootSignature(KCtx*), rt_imp_dxgi__CreateDXGIFactory1(KCtx*);
     st_checks=st_fails=0; kh_gfxc_st_fails=0; u64 nat0=kh_native_calls;
@@ -1908,6 +2333,8 @@ done:
     else fprintf(stderr,"kh: gfx present selftest: SKIPPED (the device selftest stopped before its swap chain existed)\n");
     if(kh_gfx_wrap_on) st_fails+=kh_wrap_selftest_device(g);                     /* wrapper identity, reference counts, by-value results, Map round trip */
     if(kh_gfx_wrap_on){ extern int kh_wrap_selftest_suspend(KCtx*); st_fails+=kh_wrap_selftest_suspend(g); }   /* TASK41: step 11 with real queues */
+    if(dev&&q&&fct) st_fails+=st_pipecache_device(g,dev,q,fct);                  /* TASK43: step 12 with a real driver */
+    else fprintf(stderr,"kh: gfx pipecache device selftest: SKIPPED (the device selftest stopped before its device, queue and factory existed)\n");
     return st_fails;
 }
 #endif

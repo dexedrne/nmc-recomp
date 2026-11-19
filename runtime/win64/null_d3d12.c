@@ -13,6 +13,7 @@
 #define STRICT COM_STRICT
 static int C_factory,C_adapter,C_output,C_swap,C_dev,C_queue,C_alloc,C_list,C_res,C_dheap,C_fence,C_pso,C_rootsig,C_heap,C_qheap,C_blob;
 static u64 o_adapter,o_output;
+#define NULL_ADAPTER_LUID 0x1001ull                /* DXGI_ADAPTER_DESC1.AdapterLuid of the one adapter = ID3D12Device::GetAdapterLuid of the null device */
 static _Atomic u64 res_ids=1, heap_ids=1;
 _Atomic u64 gfx_draws, gfx_clears, gfx_barriers, gfx_execs, gfx_presents, gfx_copies, gfx_psos, gfx_resources, gfx_buffers_bytes;
 /* task 30: a resource is destroyed at its last Release, as Direct3D destroys it: its buffer data (far zone) and the object itself
@@ -188,7 +189,7 @@ u64 kh_dxgi_budget_answer(void){ return DXGI_BUDGET_ANSWER; }
 static int h_adapter(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)o;(void)c;
     switch(s){
     case 7: { u32 i=(u32)A1(g); if(i==0){ out_obj(g,A2(g),o_output); SET_RAX(g,0); } else { out_obj(g,A2(g),0); SET_RAX(g,DXGI_NOT_FOUND); } return 1; }   /* EnumOutputs */
-    case 8: case 10: { u64 d=A1(g); memset(hp(g,d),0,s==8?0x118:0x138); utf8_to_gw(g,d,128,"KHNMC null GPU (headless)"); wr32(g,d+0x100,0x106b); wr32(g,d+0x104,1); wr64(g,d+0x110,8ull<<30); wr64(g,d+0x128,0x1001); SET_RAX(g,0); return 1; }   /* GetDesc / GetDesc1 */
+    case 8: case 10: { u64 d=A1(g); memset(hp(g,d),0,s==8?0x118:0x138); utf8_to_gw(g,d,128,"KHNMC null GPU (headless)"); wr32(g,d+0x100,0x106b); wr32(g,d+0x104,1); wr64(g,d+0x110,8ull<<30); wr64(g,d+0x128,NULL_ADAPTER_LUID); SET_RAX(g,0); return 1; }   /* GetDesc / GetDesc1 */
     case 14: { u64 info=ARG(g,3); wr64(g,info,DXGI_BUDGET_ANSWER); wr64(g,info+8,64ull<<20); wr64(g,info+16,3ull<<30); wr64(g,info+24,0); SET_RAX(g,0); return 1; }   /* QueryVideoMemoryInfo(node, group, info) */
     default: return 0; } }
 static int h_output(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)o;(void)c;
@@ -202,12 +203,207 @@ static int h_output(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return
     if(s==7){ u64 d=A1(g); memset(hp(g,d),0,0x60); utf8_to_gw(g,d,32,"\\\\.\\DISPLAY1"); int sw,sh; kh_screen_size(&sw,&sh);     /* task 37 (S2): 1920x1080 unless KHNMC_SCREEN */
         /* DesktopCoordinates RECT at +0x40, AttachedToDesktop +0x50 */ wr32(g,d+0x48,(u32)sw); wr32(g,d+0x4c,(u32)sh); wr32(g,d+0x50,1); wr64(g,d+0x58,0xAB0100); SET_RAX(g,0); return 1; }
     return 0; }
+/* ---- TASK43: play-mode log noise and the frame-time counter -----------------------------------------------------------------------
+ * KHNMC_GFX_FRAME_LINE_EVERY=n   the per-present line `kh: gfx frame=...` is printed for present 1 and every n-th present only
+ *                                (1..1000000; unset = every present, as always: the routes compare those lines).  At 60 presents a
+ *                                second that line alone is about 30 MB of log per hour; the play configuration sets 600.
+ * KHNMC_GFX_HITCH=N[:MS]         a measurement: over the first N presents after the field came up (the phase log's first
+ *                                FIELD_COMMAND.execute), count the Present-to-Present host-time intervals above MS milliseconds
+ *                                (default 25): the frames a pipeline built at its first draw makes late.  One line in the exit report.
+ *                                Unset: nothing is measured and nothing is printed. */
+static u64 frame_line_every=1;
+static int frame_line_wanted(u64 present,u64 every){ return every<=1||present==1||present%every==0; }
+/* "n" -> 1; 0 = malformed or out of range */
+static int frame_line_parse(const char *s,u64 *every){ if(!s||*s<'0'||*s>'9') return 0; char *e; unsigned long long v=strtoull(s,&e,10); if(*e||v<1||v>1000000) return 0; *every=v; return 1; }
+typedef struct { u64 want; double ms; int armed, done; u64 first_present, counted, over, last_ns; double max_ms, sum_ms; } Hitch;
+static Hitch hitch; static pthread_mutex_t hitch_m=PTHREAD_MUTEX_INITIALIZER;
+static int hitch_parse(const char *s,u64 *n,double *ms){
+    if(!s||*s<'0'||*s>'9') return 0; char *e; unsigned long long v=strtoull(s,&e,10); unsigned long long m=25;
+    if(*e==':'){ if(e[1]<'0'||e[1]>'9') return 0; m=strtoull(e+1,&e,10); }
+    if(*e||v<1||v>10000000||m<1||m>10000) return 0; *n=v; *ms=(double)m; return 1; }
+/* one Present: the first one with the field up is the reference point; each later one adds an interval, until `want` are counted */
+static void hitch_step(Hitch *h,u64 present,int field_up,u64 now_ns){
+    if(!h->want||h->done) return;
+    if(!h->armed){ if(!field_up) return; h->armed=1; h->first_present=present; h->last_ns=now_ns; return; }
+    double d=(double)(now_ns-h->last_ns)/1e6; h->last_ns=now_ns; h->counted++; h->sum_ms+=d; if(d>h->max_ms) h->max_ms=d; if(d>h->ms) h->over++;
+    if(h->counted>=h->want) h->done=1;
+}
+static void hitch_report(FILE *f){
+    pthread_mutex_lock(&hitch_m); Hitch h=hitch; pthread_mutex_unlock(&hitch_m);
+    if(!h.want) return;
+    if(!h.armed){ fprintf(f,"kh: gfx frame times (KHNMC_GFX_HITCH=%llu:%.0f): the field never came up in this run: nothing counted\n",(unsigned long long)h.want,h.ms); return; }
+    fprintf(f,"kh: gfx frame times (KHNMC_GFX_HITCH=%llu:%.0f): the first %llu presents after the field came up (present %llu): %llu intervals over %.0f ms of %llu counted (longest %.1f ms, mean %.2f ms)%s\n",
+            (unsigned long long)h.want,h.ms,(unsigned long long)h.want,(unsigned long long)h.first_present,(unsigned long long)h.over,h.ms,(unsigned long long)h.counted,h.max_ms,h.counted?h.sum_ms/(double)h.counted:0.0,
+            h.done?"":" [INCOMPLETE: the run ended before that many presents]");
+}
+/* ---- review C43 n=2: vkd3d's log, de-duplicated (KHNMC_GFX_VKD3D_LOG_REPEATS=n) -----------------------------------------------------
+ * vkd3d logs its run-time FAILURES at class warn (vkd3d 2.1 state.c 4127 "Failed to create Vulkan graphics pipeline", 2445 "Failed to
+ * compile shader", command.c 3691 / 3713 "Failed to begin render pass, ignoring draw call", 7206 "Failed to submit signal operation"),
+ * and at that class ONE site repeats about twice per frame (command.c 4699, FIXME_ONCE "Aliasing barriers not implemented yet").  So a
+ * play session cannot simply run vkd3d at its default level (those failures would be silent), nor at warn (thousands of lines per
+ * minute).  With this variable vkd3d hands every line to kh_vklog_callback (vkd3d_set_log_callback; twice per line: first the prefix
+ * "vkd3d:<tid>:<class>:<channel>:<function> ", then the message: libs/vkd3d-common/debug.c 193-214), and each SITE (function + format
+ * string) prints its first n lines as vkd3d would; after that its lines are counted, one line says so, and one line is printed at every
+ * power of ten.  Nothing depends on the exit report: a play session the system ends has all of it in its log.
+ * Unset: no callback is installed and vkd3d writes to stderr itself, as always. */
+#define VKLOG_SITES 256
+typedef struct { const char *fmt; char fn[64]; u64 seen, printed; } VkLogSite;
+typedef struct { u64 limit; int nsite; VkLogSite site[VKLOG_SITES]; u64 lines, printed, counted_only, untracked; FILE *out; pthread_mutex_t m; } VkLog;
+static VkLog vklog={.m=PTHREAD_MUTEX_INITIALIZER};
+static __thread char vklog_pfx[192]; static __thread int vklog_have_pfx;
+/* the c-th line (1 = the first) of a site whose limit is n: 1 = printed as it is; 2 = the first line over the limit: printed with the
+ * notice; 3 = a power of ten: printed with its count; 0 = counted only */
+static int vklog_decide(u64 c,u64 n){
+    if(c<=n) return 1; if(c==n+1) return 2;
+    for(u64 p=10;;p*=10){ if(p==c) return 3; if(p>c||p>1000000000000000000ull) return 0; }
+}
+static int vklog_parse(const char *s,u64 *n){ if(!s||*s<'0'||*s>'9') return 0; char *e; unsigned long long v=strtoull(s,&e,10); if(*e||v<1||v>1000000) return 0; *n=v; return 1; }
+/* one whole line: `prefix` as vkd3d formatted it ("" when there was none), `fmt` the message's format string (the site's identity,
+ * with the function the prefix names), `msg` the formatted message */
+static void vklog_line(VkLog *L,const char *prefix,const char *fmt,const char *msg){
+    char fn[64]; { size_t pl=strlen(prefix); while(pl&&prefix[pl-1]==' ') pl--; size_t a=pl; while(a&&prefix[a-1]!=':') a--; size_t k=pl-a; if(k>=sizeof fn) k=sizeof fn-1; memcpy(fn,prefix+a,k); fn[k]=0; }
+    size_t ml=strlen(msg); const char *nl=ml&&msg[ml-1]=='\n'?"":"\n";
+    pthread_mutex_lock(&L->m); FILE *o=L->out?L->out:stderr; L->lines++;
+    VkLogSite *s=NULL; for(int i=0;i<L->nsite;i++) if(L->site[i].fmt==fmt&&!strcmp(L->site[i].fn,fn)){ s=&L->site[i]; break; }
+    if(!s&&L->nsite<VKLOG_SITES){ s=&L->site[L->nsite++]; s->fmt=fmt; snprintf(s->fn,sizeof s->fn,"%s",fn); s->seen=s->printed=0; }
+    if(!s){ u64 k=L->untracked++; L->printed++;                               /* the table is full: this site is not limited (said once, counted) */
+        if(!k) fprintf(o,"kh: gfx vkd3d log: more than %d distinct vkd3d log sites: the lines of the others are printed without a limit (counted)\n",VKLOG_SITES);
+        fprintf(o,"%s%s",prefix,msg); pthread_mutex_unlock(&L->m); return; }
+    u64 c=++s->seen; int d=vklog_decide(c,L->limit);
+    if(d){ s->printed++; L->printed++; } else L->counted_only++;
+    if(d==1) fprintf(o,"%s%s",prefix,msg);
+    else if(d==2) fprintf(o,"kh: gfx vkd3d log: the site %s has logged more than %llu lines: from now on its lines are counted, and one is printed at every power of ten (KHNMC_GFX_VKD3D_LOG_REPEATS=%llu); line %llu: %s%s%s",
+                          fn[0]?fn:"(no function)",(unsigned long long)L->limit,(unsigned long long)L->limit,(unsigned long long)c,prefix,msg,nl);
+    else if(d==3) fprintf(o,"kh: gfx vkd3d log: line %llu of the site %s (the lines between were counted, not printed): %s%s%s",(unsigned long long)c,fn[0]?fn:"(no function)",prefix,msg,nl);
+    pthread_mutex_unlock(&L->m);
+}
+static int vklog_is_prefix(const char *fmt){ size_t n=strlen(fmt); return !strncmp(fmt,"vkd3d:",6)&&n>=3&&!strcmp(fmt+n-3,"%s "); }
+void kh_vklog_callback(const char *fmt,va_list ap){
+    char b[2048]; int n=vsnprintf(b,sizeof b,fmt,ap);
+    if(n<0) b[0]=0; else if(n>=(int)sizeof b) memcpy(b+sizeof b-6,"...\n",5);
+    if(!vklog_have_pfx&&vklog_is_prefix(fmt)){ snprintf(vklog_pfx,sizeof vklog_pfx,"%s",b); vklog_have_pfx=1; return; }   /* the first of vkd3d's two calls for a line */
+    const char *pfx=vklog_have_pfx?vklog_pfx:""; vklog_have_pfx=0;
+    vklog_line(&vklog,pfx,fmt,b);
+}
+/* start-up (gfx_vkd3d.c kh_gfxc_init_common): 1 = the callback is to be installed */
+int kh_vklog_setup(void){
+    const char *e=getenv("KHNMC_GFX_VKD3D_LOG_REPEATS"); if(!e||!*e) return 0;
+    u64 n=0; if(!vklog_parse(e,&n)) kh_fatal(NULL,"gfx-vkd3d-log-value: KHNMC_GFX_VKD3D_LOG_REPEATS=%s (a number of lines per vkd3d log site, 1..1000000; unset = vkd3d writes its log itself, every line)",e);
+    pthread_mutex_lock(&vklog.m); vklog.limit=n; pthread_mutex_unlock(&vklog.m);
+    fprintf(stderr,"kh: gfx vkd3d log: KHNMC_GFX_VKD3D_LOG_REPEATS=%llu: each vkd3d log site (function + message) prints its first %llu lines; after that its lines are counted and one is printed at every power of ten\n",(unsigned long long)n,(unsigned long long)n);
+    return 1;
+}
+static void vklog_report(FILE *f){
+    pthread_mutex_lock(&vklog.m);
+    if(vklog.limit){ int over=0; for(int i=0;i<vklog.nsite;i++) over+=vklog.site[i].seen>vklog.limit;
+        fprintf(f,"kh: gfx vkd3d log (KHNMC_GFX_VKD3D_LOG_REPEATS=%llu): %llu lines from %d site(s): %llu printed, %llu counted only; %d site(s) over the limit",(unsigned long long)vklog.limit,(unsigned long long)vklog.lines,vklog.nsite,
+                (unsigned long long)vklog.printed,(unsigned long long)vklog.counted_only,over);
+        int shown=0; for(int i=0;i<vklog.nsite&&shown<8;i++) if(vklog.site[i].seen>vklog.limit){ fprintf(f,"%s %s %llu",shown?",":":",vklog.site[i].fn[0]?vklog.site[i].fn:"(no function)",(unsigned long long)vklog.site[i].seen); shown++; }
+        if(vklog.untracked) fprintf(f,"; %llu line(s) of sites beyond the table's %d, printed without a limit",(unsigned long long)vklog.untracked,VKLOG_SITES);
+        fputc('\n',f); }
+    pthread_mutex_unlock(&vklog.m);
+}
+static void vklog_feed(const char *fmt,...){ va_list ap; va_start(ap,fmt); kh_vklog_callback(fmt,ap); va_end(ap); }
+static void *vklog_other_thread(void *a){ (void)a; vklog_feed("vkd3d:%u:%s:%s:%s ",7u,"warn","vkd3d","fn_of_another_thread"); return NULL; }
+int kh_gfx_vklog_selftest(void){
+    int n=0,f=0;
+#define TV(c) do{ n++; if(!(c)){ f++; fprintf(stderr,"gfx vkd3d log selftest FAIL: %s (line %d)\n",#c,__LINE__); } }while(0)
+    /* the rule: the first n as they are, then the notice, then the powers of ten */
+    { int a=1; for(u64 c=1;c<=8;c++) a&=vklog_decide(c,8)==1; TV(a); TV(vklog_decide(9,8)==2 && vklog_decide(10,8)==3 && vklog_decide(11,8)==0 && vklog_decide(99,8)==0 && vklog_decide(100,8)==3 && vklog_decide(101,8)==0 && vklog_decide(1000,8)==3 && vklog_decide(1000000,8)==3 && vklog_decide(999999,8)==0);
+      TV(vklog_decide(10,9)==2 && vklog_decide(10,10)==1 && vklog_decide(11,10)==2 && vklog_decide(100,10)==3 && vklog_decide(1,1)==1 && vklog_decide(2,1)==2 && vklog_decide(3,1)==0 && vklog_decide(10,1)==3);
+      TV(vklog_decide(100,1000)==1 && vklog_decide(1001,1000)==2 && vklog_decide(10000,1000)==3 && vklog_decide(~0ull,8)==0);
+      u64 v=0; TV(vklog_parse("8",&v)&&v==8); TV(vklog_parse("1000000",&v)&&v==1000000); TV(!vklog_parse("0",&v)&&!vklog_parse("1000001",&v)&&!vklog_parse("",&v)&&!vklog_parse("8x",&v)&&!vklog_parse("-1",&v)&&!vklog_parse(NULL,&v));
+      TV(vklog_is_prefix("vkd3d:%u:%s:%s:%s ")&&vklog_is_prefix("vkd3d:%s:%s:%s ")&&vklog_is_prefix("vkd3d:%04lx:%s:%s:%s ")&&!vklog_is_prefix("Failed to create Vulkan graphics pipeline, vr %d.\n")&&!vklog_is_prefix("%s ")&&!vklog_is_prefix("vkd3d: %s\n")); }
+    /* a route's worth of lines: one site 2,167 times (the aliasing-barrier note, first as fixme then as warn: ONE site), a failure three
+     * times, the same message from another function once: the failure lines are all there, word for word; the flood is 8 lines + the
+     * notice + 3 powers of ten */
+    { static const char fA[]="Aliasing barriers not implemented yet.\n", fB[]="Failed to begin render pass, ignoring draw call.\n";
+      VkLog *L=calloc(1,sizeof *L); FILE *o=kh_tmpfile(); TV(L!=NULL&&o!=NULL);
+      if(L&&o){ pthread_mutex_init(&L->m,NULL); L->limit=8; L->out=o;
+        for(int i=0;i<2167;i++){ vklog_line(L,i?"vkd3d:41:warn:vkd3d:d3d12_command_list_ResourceBarrier ":"vkd3d:41:fixme:vkd3d:d3d12_command_list_ResourceBarrier ",fA,fA);
+            if(i==5||i==700||i==2100) vklog_line(L,"vkd3d:41:warn:vkd3d:d3d12_command_list_DrawInstanced ",fB,fB);
+            if(i==900) vklog_line(L,"vkd3d:41:warn:vkd3d:d3d12_command_list_DrawIndexedInstanced ",fB,fB); }
+        TV(L->lines==2171 && L->nsite==3 && L->printed==8+1+3+3+1 && L->counted_only==2167-12 && L->untracked==0 && L->site[0].seen==2167 && L->site[0].printed==12 && L->site[1].seen==3 && L->site[1].printed==3 && L->site[2].seen==1);
+        rewind(o); char ln[512]; int tot=0, a_plain=0, a_note=0, a_ten=0, b_draw=0, b_idx=0, first_fixme=0;
+        while(fgets(ln,sizeof ln,o)){ tot++;
+            if(!strcmp(ln,"vkd3d:41:fixme:vkd3d:d3d12_command_list_ResourceBarrier Aliasing barriers not implemented yet.\n")) first_fixme+=tot==1;
+            else if(!strcmp(ln,"vkd3d:41:warn:vkd3d:d3d12_command_list_ResourceBarrier Aliasing barriers not implemented yet.\n")) a_plain++;
+            else if(!strncmp(ln,"kh: gfx vkd3d log: the site d3d12_command_list_ResourceBarrier has logged more than 8 lines",90)&&strstr(ln,"line 9: vkd3d:41:warn:")) a_note++;
+            else if(!strncmp(ln,"kh: gfx vkd3d log: line 10",26)||!strncmp(ln,"kh: gfx vkd3d log: line 100",27)||!strncmp(ln,"kh: gfx vkd3d log: line 1000",28)) a_ten+=strstr(ln,"d3d12_command_list_ResourceBarrier")!=NULL;
+            else if(!strcmp(ln,"vkd3d:41:warn:vkd3d:d3d12_command_list_DrawInstanced Failed to begin render pass, ignoring draw call.\n")) b_draw++;
+            else if(!strcmp(ln,"vkd3d:41:warn:vkd3d:d3d12_command_list_DrawIndexedInstanced Failed to begin render pass, ignoring draw call.\n")) b_idx++; }
+        TV(tot==16 && first_fixme==1 && a_plain==7 && a_note==1 && a_ten==3 && b_draw==3 && b_idx==1);
+        /* a full table: one more site is printed without a limit, said once, counted */
+        static char many[VKLOG_SITES+8]; memset(many,'m',sizeof many-1); many[sizeof many-2]='\n';
+        for(int i=L->nsite;i<VKLOG_SITES;i++) vklog_line(L,"vkd3d:1:warn:vkd3d:f ",many+i,"x\n");
+        u64 p0=L->printed; for(int i=0;i<20;i++) vklog_line(L,"vkd3d:1:warn:vkd3d:g ",many+VKLOG_SITES+1,"beyond\n");
+        TV(L->nsite==VKLOG_SITES && L->untracked==20 && L->printed==p0+20);
+        pthread_mutex_destroy(&L->m); }
+      if(o) fclose(o); free(L); }
+    /* vkd3d's two calls per line through the callback (its real argument lists), the limit, a message with no newline, a second thread's
+     * pending prefix that is not this thread's; the run's own filter state is put back */
+    { pthread_mutex_lock(&vklog.m); u64 lim0=vklog.limit, l0=vklog.lines, p0=vklog.printed, c0=vklog.counted_only, u0=vklog.untracked; int ns0=vklog.nsite; FILE *o0=vklog.out; pthread_mutex_unlock(&vklog.m);
+      FILE *o=kh_tmpfile(); TV(o!=NULL);
+      if(o){ static const char fF[]="Failed to create Vulkan graphics pipeline, vr %d.\n", fN[]="no newline %s";
+        pthread_mutex_lock(&vklog.m); vklog.limit=2; vklog.out=o; pthread_mutex_unlock(&vklog.m);
+        for(int i=0;i<4;i++){ vklog_feed("vkd3d:%u:%s:%s:%s ",123u,"warn","vkd3d","d3d12_pipeline_state_get_or_create_pipeline"); vklog_feed(fF,-3-i); }
+        vklog_feed("vkd3d:%s:%s:%s ","err","vkd3d","other_fn"); vklog_feed(fN,"here");
+        pthread_t th; TV(pthread_create(&th,NULL,vklog_other_thread,NULL)==0); pthread_join(th,NULL);
+        vklog_feed(fF,-9);                                                    /* no prefix of THIS thread is pending: the message alone, a site of its own */
+        rewind(o); char ln[600]; int k=0, ok=1;
+        static const char *const want[]={"vkd3d:123:warn:vkd3d:d3d12_pipeline_state_get_or_create_pipeline Failed to create Vulkan graphics pipeline, vr -3.\n",
+            "vkd3d:123:warn:vkd3d:d3d12_pipeline_state_get_or_create_pipeline Failed to create Vulkan graphics pipeline, vr -4.\n",
+            "kh: gfx vkd3d log: the site d3d12_pipeline_state_get_or_create_pipeline has logged more than 2 lines: from now on its lines are counted, and one is printed at every power of ten (KHNMC_GFX_VKD3D_LOG_REPEATS=2); line 3: vkd3d:123:warn:vkd3d:d3d12_pipeline_state_get_or_create_pipeline Failed to create Vulkan graphics pipeline, vr -5.\n",
+            "vkd3d:err:vkd3d:other_fn no newline hereFailed to create Vulkan graphics pipeline, vr -9.\n"};
+        while(fgets(ln,sizeof ln,o)){ if(k<4&&strcmp(ln,want[k])){ ok=0; fprintf(stderr,"gfx vkd3d log selftest: line %d is: %s",k+1,ln); } k++; }
+        TV(ok && k==4);
+        pthread_mutex_lock(&vklog.m); int ns1=vklog.nsite; u64 seen=ns1>ns0?vklog.site[ns0].seen:0; pthread_mutex_unlock(&vklog.m); TV(ns1==ns0+3 && seen==4);
+        fclose(o); }
+      pthread_mutex_lock(&vklog.m); vklog.limit=lim0; vklog.lines=l0; vklog.printed=p0; vklog.counted_only=c0; vklog.untracked=u0; vklog.nsite=ns0; vklog.out=o0; pthread_mutex_unlock(&vklog.m); }
+    fprintf(stderr,"kh: gfx vkd3d log selftest: %d checks, %d failures (KHNMC_GFX_VKD3D_LOG_REPEATS: a site's first n lines word for word, then the notice and the powers of ten; a failure line is never lost in a flood of another site; vkd3d's two calls per line; a full table)\n",n,f);
+#undef TV
+    return f;
+}
+/* the exit report's TASK43 lines, each only when it has something to say (loader.c kh_exit_process) */
+void kh_gfx_exit_report(FILE *f){
+    extern void kh_pc_report(FILE*); extern void kh_gfx_vkd3d_exit_report(FILE*);
+    if(frame_line_every>1) fprintf(f,"kh: gfx: KHNMC_GFX_FRAME_LINE_EVERY=%llu: the per-present line was printed for present 1 and every %llu-th present only (%llu presents in all)\n",(unsigned long long)frame_line_every,(unsigned long long)frame_line_every,(unsigned long long)gfx_presents);
+    hitch_report(f);
+    vklog_report(f);                                                           /* review C43 n=2: only with KHNMC_GFX_VKD3D_LOG_REPEATS */
+    if(kh_gfx_vkd3d_on) kh_gfx_vkd3d_exit_report(f);
+    kh_pc_report(f);
+}
+int kh_gfx_frameline_selftest(void){
+    int n=0,f=0;
+#define TF(c) do{ n++; if(!(c)){ f++; fprintf(stderr,"gfx frame line selftest FAIL: %s (line %d)\n",#c,__LINE__); } }while(0)
+    /* every present by default; with an interval: present 1 and every n-th, nothing else */
+    { int all=1; for(u64 p=1;p<=2000;p++) all&=frame_line_wanted(p,1)&&frame_line_wanted(p,0); TF(all);
+      int k=0; for(u64 p=1;p<=6000;p++) k+=frame_line_wanted(p,600); TF(k==11);
+      TF(frame_line_wanted(1,600)&&frame_line_wanted(600,600)&&frame_line_wanted(1200,600)&&!frame_line_wanted(2,600)&&!frame_line_wanted(599,600)&&!frame_line_wanted(601,600));
+      u64 e=0; TF(frame_line_parse("600",&e)&&e==600); TF(frame_line_parse("1",&e)&&e==1); TF(!frame_line_parse("0",&e)&&!frame_line_parse("1000001",&e)&&!frame_line_parse("",&e)&&!frame_line_parse("6x",&e)&&!frame_line_parse(NULL,&e)); }
+    /* the frame-time counter: nothing before the field; the first field present is the reference; exactly `want` intervals; over = strictly above the limit */
+    { u64 w=0; double ms=0; TF(hitch_parse("3600",&w,&ms)&&w==3600&&ms==25.0); TF(hitch_parse("5:40",&w,&ms)&&w==5&&ms==40.0);
+      TF(!hitch_parse("0",&w,&ms)&&!hitch_parse("5:",&w,&ms)&&!hitch_parse("5:0",&w,&ms)&&!hitch_parse("x",&w,&ms)&&!hitch_parse("5:3x",&w,&ms)&&!hitch_parse(NULL,&w,&ms));
+      Hitch h; memset(&h,0,sizeof h); h.want=5; h.ms=25.0; u64 t=1000000000ull;
+      hitch_step(&h,1,0,t); hitch_step(&h,2,0,t+=500000000ull); TF(!h.armed&&h.counted==0);                    /* a long frame before the field is not counted */
+      hitch_step(&h,3,1,t+=16000000ull); TF(h.armed&&h.first_present==3&&h.counted==0&&h.over==0);
+      hitch_step(&h,4,1,t+=16600000ull); hitch_step(&h,5,1,t+=30000000ull); hitch_step(&h,6,1,t+=25000000ull); hitch_step(&h,7,1,t+=25100000ull);
+      TF(h.counted==4&&h.over==2&&!h.done&&h.max_ms>29.9&&h.max_ms<30.1);
+      hitch_step(&h,8,1,t+=100000000ull); TF(h.counted==5&&h.over==3&&h.done&&h.max_ms>99.9);
+      hitch_step(&h,9,1,t+=900000000ull); TF(h.counted==5&&h.over==3&&h.max_ms<100.1);                           /* after the window: nothing more */
+      Hitch z; memset(&z,0,sizeof z); hitch_step(&z,1,1,t); hitch_step(&z,2,1,t+90000000ull); TF(!z.armed&&z.counted==0); }   /* not asked for: nothing */
+    fprintf(stderr,"kh: gfx frame line selftest: %d checks, %d failures (KHNMC_GFX_FRAME_LINE_EVERY: every present by default, present 1 and every n-th with it; KHNMC_GFX_HITCH: the window starts at the field, counts exactly N intervals, over = above the limit)\n",n,f);
+#undef TF
+    return f;
+}
 static int h_swap(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)c;
     switch(s){
     case 8: case 22: gfx_presents++;
         kh_phase_present(g,gfx_presents,gfx_draws,gfx_clears,gfx_pso_binds);
+        if(frame_line_wanted(gfx_presents,frame_line_every)){                  /* TASK43: every present unless KHNMC_GFX_FRAME_LINE_EVERY says otherwise */
         fprintf(stderr,"kh: gfx frame=%llu bundles=%llu pso-binds=%llu ",(unsigned long long)gfx_presents,(unsigned long long)gfx_bundles,(unsigned long long)gfx_pso_binds);
-        kh_gfx_report(stderr);
+        kh_gfx_report(stderr); }
+        if(__builtin_expect(hitch.want!=0,0)){ extern u64 kh_phase_field_cmds(void); pthread_mutex_lock(&hitch_m); hitch_step(&hitch,gfx_presents,kh_phase_field_cmds()!=0,kh_host_ns()); pthread_mutex_unlock(&hitch_m); }   /* TASK43: KHNMC_GFX_HITCH */
         if(gfx_presents%300==0) kh_gfx_tex_report(stderr);
         if(kh_gfx_vkd3d_on) kh_vkd3d_present(g,o,gfx_presents);            /* optional image dump of the buffer being presented */
         else kh_app_null_present_park();                                      /* TASK41 / review A41 (verification): the game stalls at its frame boundary while the app is SUSPENDED (background); a resign alone is the PC's focus loss (the game runs on); no GPU here */
@@ -284,6 +480,7 @@ static int h_dev(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1;
             if(pr) wr32(g,pr+4ull*i,rows); if(prs) wr64(g,prs+8ull*i,rowsz); run=off+pitch*(rows?rows-1:0)+rowsz; total=run-base; }
         if(pt) wr64(g,pt,total); return 1; }
     case 39: out_obj(g,ARG(g,3),new_obj(C_qheap,16)); SET_RAX(g,0); return 1;                              /* CreateQueryHeap(desc, riid, **pp) */
+    case 43: { u64 l=A1(g); wr64(g,l,NULL_ADAPTER_LUID); SET_RAX(g,l); return 1; }                          /* GetAdapterLuid(*luid): the adapter of GetDesc1 (task 44: the movie path 0x13ef00 looks its adapter up by it) */
     default: return 0; } }
 static int h_queue(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)o;(void)c;
     switch(s){
@@ -378,6 +575,16 @@ void kh_seam_gfx_init(void){
     else if(e&&!strcmp(e,"vkd3dw")) kh_gfx_wrap_init();
     else if(e&&*e&&strcmp(e,"null")) kh_fatal(NULL,"gfx-backend-unknown: KHNMC_GFX=%s (known backends: null, vkd3d, vkd3dw)",e);
     kh_present_init(kh_gfx_vkd3d_on);                                         /* TASK36 review n=5: KHNMC_GFX_PRESENT in every build, with every backend */
+    { extern void kh_pc_init(int); kh_pc_init(kh_gfx_vkd3d_on); }              /* TASK43 (plan step 12): the disk pipeline cache's file, if one is configured */
+    e=getenv("KHNMC_GFX_FRAME_LINE_EVERY");                                 /* TASK43: play mode prints the per-present line rarely */
+    if(e&&*e){ if(!frame_line_parse(e,&frame_line_every)) kh_fatal(NULL,"gfx-frame-line-value: KHNMC_GFX_FRAME_LINE_EVERY=%s (a number of presents, 1..1000000; unset = every present)",e);
+        if(frame_line_every>1) fprintf(stderr,"kh: gfx: KHNMC_GFX_FRAME_LINE_EVERY=%llu: the per-present line `kh: gfx frame=` is printed for present 1 and every %llu-th present only\n",(unsigned long long)frame_line_every,(unsigned long long)frame_line_every); }
+    if(!kh_gfx_vkd3d_on){ e=getenv("KHNMC_GFX_VKD3D_LOG_REPEATS");          /* review C43 n=2: with the vkd3d backend kh_vklog_setup reads it (gfx_vkd3d.c); without it there is no vkd3d log, and that is said */
+        if(e&&*e){ u64 n=0; if(!vklog_parse(e,&n)) kh_fatal(NULL,"gfx-vkd3d-log-value: KHNMC_GFX_VKD3D_LOG_REPEATS=%s (a number of lines per vkd3d log site, 1..1000000; unset = vkd3d writes its log itself, every line)",e);
+            fprintf(stderr,"kh: gfx vkd3d log: KHNMC_GFX_VKD3D_LOG_REPEATS=%s is set, but this run has no vkd3d backend (KHNMC_GFX): there is no vkd3d log to filter\n",e); } }
+    e=getenv("KHNMC_GFX_HITCH");                                            /* TASK43: the frame-time counter of the first field presents */
+    if(e&&*e){ if(!hitch_parse(e,&hitch.want,&hitch.ms)) kh_fatal(NULL,"gfx-hitch-value: KHNMC_GFX_HITCH=%s (N or N:MS: the first N presents after the field came up, intervals above MS milliseconds; N 1..10000000, MS 1..10000, default 25)",e);
+        fprintf(stderr,"kh: gfx: KHNMC_GFX_HITCH: the Present-to-Present intervals above %.0f ms are counted over the first %llu presents after the field came up\n",hitch.ms,(unsigned long long)hitch.want); }
     { extern void kh_app_test_init(void); kh_app_test_init(); }                /* TASK41: KHNMC_TEST_GATE / KHNMC_TEST_SUSPEND (nothing when unset) */
     C_factory=kh_com_class("dxgi:IDXGIFactory4",44,STRICT,h_factory); C_adapter=kh_com_class("dxgi:IDXGIAdapter3",24,STRICT,h_adapter); C_output=kh_com_class("dxgi:IDXGIOutput",24,STRICT,h_output);
     C_swap=kh_com_class("dxgi:IDXGISwapChain3",44,STRICT,h_swap); C_dev=kh_com_class("d3d12:ID3D12Device",48,STRICT,h_dev); C_queue=kh_com_class("d3d12:ID3D12CommandQueue",20,STRICT,h_queue);
@@ -495,6 +702,13 @@ int kh_gfx_selftest(KCtx *g){
     fail+=rd32(g,out+16)!=1 || rd32(g,out+20)!=0xa5a5a5a5u || rd64(g,out+24)!=0xa5a5a5a5a5a5a5a5ull;
     ga_free(out);
     int checks=2;
+    /* task 44: ID3D12Device::GetAdapterLuid (slot 43) writes the LUID that the one adapter's GetDesc1 reports and returns its argument:
+     * the movie path (exe 0x13ef00) finds the adapter of its D3D11 device by that comparison */
+    if(!kh_gfx_vkd3d_on){ u64 dv=kh_com_obj(C_dev,0), l=ga_alloc(16,16), d1=ga_alloc(0x138,16); wr64(g,l,0xa5a5a5a5a5a5a5a5ull); wr64(g,l+8,0x5a5a5a5a5a5a5a5aull);
+        u64 r=kh_call(g,rd64(g,rd64(g,dv)+43*8),dv,l,0,0); kh_call(g,rd64(g,rd64(g,o_adapter)+10*8),o_adapter,d1,0,0);
+        int ok=r==l&&rd64(g,l)==NULL_ADAPTER_LUID&&rd64(g,l+8)==0x5a5a5a5a5a5a5a5aull&&rd32(g,d1+0x128)==rd32(g,l)&&rd32(g,d1+0x12c)==rd32(g,l+4);
+        checks++; if(!ok){ fail++; fprintf(stderr,"kh: gfx selftest FAIL: ID3D12Device::GetAdapterLuid (null device) is not the LUID of the adapter's GetDesc1\n"); }
+        ga_free(dv); ga_free(l); ga_free(d1); }
     /* review U35 n=9: the null D3D12SerializeRootSignature reads the 40-byte D3D12_ROOT_SIGNATURE_DESC and nothing after it (it read
      * 64 bytes); the blob keeps its 0x40 bytes, the 24 after the descriptor are zero */
     if(!kh_gfx_vkd3d_on){ u64 d=ga_alloc(64,16), pp=ga_alloc(16,16); memset(hp(g,d),0xAA,64); memset(hp(g,d),0x11,40); wr64(g,pp,0); wr64(g,pp+8,0x55);

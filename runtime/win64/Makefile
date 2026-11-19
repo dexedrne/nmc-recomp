@@ -208,6 +208,12 @@ endif
 # that record the measurement M with KHNMC_ASPECT_LOG=2 (the dk loop's setScreenMode, the cam+0x84 readers), as does bgload.c's 4ad270.
 ASPECT_HOOKS += 2bd190 156f10 156e20 126fd0 126500 19d040
 FILE_HOOKS += $(ASPECT_HOOKS)
+# Task 44, review (runtime/null_mf.c): the movie seam's three pass-through hooks.  5375d0 = the movie module's command function
+# (command 0 = start: a request the game drops at its own guard is seen and said), 2cbd80 = the event's end (did the movie's event end
+# by itself, by Skip or another way; which clean-up branch), 13d690 = the player's picture (the engine never frees it: the empty
+# movie's picture is made once and handed out again).  13da10 (Movie::open) is in PHASE_HOOKS (phase_log.c tells the seam).
+MOVIE_HOOKS = 5375d0 2cbd80 13d690
+FILE_HOOKS += $(MOVIE_HOOKS)
 # ---- Task 12: mod static edits ---------------------------------------------------------------------------------------------------
 # The mod DLL patches code bytes in 28 exe functions and attaches two INLINE detours (inside 3c3fe0 and 360920).  Those 30 functions
 # are re-lifted from the patched image into $(GEN)/mod_static_lifted.c and replace the vanilla lifted bodies through the alias list

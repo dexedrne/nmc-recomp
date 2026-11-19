@@ -21,7 +21,11 @@
   7. the GFX switch (TASK38): mac/lib.sh accepts GFX=0|1 only and defines gfx_lib_check and gfx_ldflags; every xcodebuild call of
      mac/build.sh and mac/sign_app.sh passes the GFX link flags (${GX[@]+"${GX[@]}"}, filled only when GFX=1: a graphics library
      links only with them) and comes after a gfx_lib_check call in that script; mac/device_run.sh writes KHNMC_GFX=vkd3dw, VKD3D_DEBUG=warn
-     and VKD3D_SHADER_DEBUG=warn only inside `if [ "$GFX" = 1 ]`; the app project carries KHNMC_GFX_LDFLAGS empty and appends it to its
+     and VKD3D_SHADER_DEBUG=warn only inside `if [ "$GFX" = 1 ]` (TASK43 and its review: warn in the test configurations; in the play one
+     warn ONLY together with the runtime's log filter KHNMC_GFX_VKD3D_LOG_REPEATS and only when the signed app knows it, else fixme; `logcap`
+     only when the signed app knows it; the PIPECACHE lines only for their values; KHNMC_GFX_PIPECACHE_RESET never in the play
+     configuration, which stays on the phone: PIPECACHE=fresh is refused outside route mode and gfx_play_lines takes its cache line from
+     pc_play_lines, which turns the cache off until $STATE/pipecache-verified exists); the app project carries KHNMC_GFX_LDFLAGS empty and appends it to its
      OTHER_LDFLAGS (both configurations); common.sh hands GFX=1 to the Mac.  Review X38 n=3: lib.sh defines gfx_has, and no mac/*.sh
      pipes nm into grep (an unreadable file would read as "no backend").
 Exit 0 when every check holds, 1 otherwise (each failure named)."""
@@ -167,10 +171,47 @@ for f in ('mac/build.sh', 'mac/sign_app.sh'):
         check('${GX[@]+"${GX[@]}"}' in t, '%s:%d: xcodebuild without the GFX link flags ${GX[@]+"${GX[@]}"}: a GFX=1 library would not link' % (f, no))
         check(kcheck is not None and kcheck < k, '%s:%d: xcodebuild without a gfx_lib_check before it (the archive\'s backend must match GFX)' % (f, no))
 dr = lines('mac/device_run.sh')
-for env in ('KHNMC_GFX=vkd3dw', 'VKD3D_DEBUG=warn', 'VKD3D_SHADER_DEBUG=warn'):
+# TASK43 and its review: two GFX configurations: the TEST one (gfx_lines: vkd3d at warn, every line) and the PLAY one (gfx_play_lines: vkd3d
+# at warn behind the runtime's de-duplicating filter when the signed app knows it, else vkd3d's default level, fixme).
+# Each env line is written only inside `if [ "$GFX" = 1 ]`.
+for env, want in (('KHNMC_GFX=vkd3dw', 2), ('VKD3D_DEBUG=warn', 2), ('VKD3D_SHADER_DEBUG=warn', 2), ('VKD3D_DEBUG=fixme', 1), ('VKD3D_SHADER_DEBUG=fixme', 1)):
     hits = [(no, t) for no, t in dr if 'env ' + env in t]
-    check(len(hits) == 1 and re.search(r'if \[ "\$GFX" = 1 \]; then.*env ' + re.escape(env), hits[0][1]) is not None,
-          'mac/device_run.sh: `env %s` is not written exactly once, inside if [ "$GFX" = 1 ]' % env)
+    check(len(hits) == want and all(re.search(r'if \[ "\$GFX" = 1 \]; then.*env ' + re.escape(env), t) is not None for _, t in hits),
+          'mac/device_run.sh: `env %s` is not written on exactly %d line(s), each inside if [ "$GFX" = 1 ]' % (env, want))
+test_l = [t for _, t in dr if re.search(r'\bgfx_lines\(\)\{ echo', t)]; playdef = [t for _, t in dr if re.search(r'\bgfx_play_lines\(\)\{ echo', t)]
+check(len(test_l) == 1 and 'env VKD3D_DEBUG=warn' in test_l[0] and 'fixme' not in test_l[0] and 'KHNMC_GFX_VKD3D_LOG_REPEATS' not in test_l[0] and 'gfx_play_lines' not in test_l[0],
+      'mac/device_run.sh: gfx_lines (the test configurations) must run vkd3d at warn with every line (no fixme, no log filter)')
+check(len(playdef) == 1 and re.search(r'gfx_play_lines\(\)\{ echo "env KHNMC_GFX=vkd3dw"; if app_has_vklog; then echo "env VKD3D_DEBUG=warn"; echo "env VKD3D_SHADER_DEBUG=warn"; '
+                                      r'echo "env KHNMC_GFX_VKD3D_LOG_REPEATS=[1-9][0-9]*"; else echo "env VKD3D_DEBUG=fixme"; echo "env VKD3D_SHADER_DEBUG=fixme"; fi;', playdef[0]) is not None,
+      'mac/device_run.sh: gfx_play_lines must write vkd3d at warn ONLY with the runtime\'s log filter (KHNMC_GFX_VKD3D_LOG_REPEATS) and only when the signed app knows it (app_has_vklog), else fixme')
+check(sum(1 for _, t in dr if 'echo "env KHNMC_GFX_VKD3D_LOG_REPEATS' in t) == 1, 'mac/device_run.sh: KHNMC_GFX_VKD3D_LOG_REPEATS is written outside gfx_play_lines')
+check(any(re.search(r"^app_has_vklog\(\)\{ grep -a -q 'KHNMC_GFX_VKD3D_LOG_REPEATS' \"\$APP/KHNMC\"", t) for _, t in dr), 'mac/device_run.sh: app_has_vklog must look for the variable\'s name in the signed app')
+play_l = [t for _, t in dr if '> "$OUT/gfx-play.conf"' in t]
+check(len(play_l) == 1 and 'gfx_play_lines' in play_l[0] and re.search(r'(^|[; ])gfx_lines\b', play_l[0]) is None and 'quiet_lines' in play_l[0],
+      'mac/device_run.sh: the GFX play configuration is not written from gfx_play_lines + quiet_lines (it must not use the test lines: vkd3d at warn without the filter floods the play log)')
+nullplay = [t for _, t in dr if '> "$OUT/play.conf"' in t]
+check(len(nullplay) == 1 and 'quiet_lines' in nullplay[0], 'mac/device_run.sh: the null play configuration does not use quiet_lines (log cap, rare frame line)')
+ql = [t for _, t in dr if re.search(r'^quiet_lines\(\)', t)]
+check(len(ql) == 1 and re.search(r'if app_has_logcap; then echo "logcap 16M"; fi', ql[0]) is not None and 'env KHNMC_GFX_FRAME_LINE_EVERY=600' in ql[0],
+      'mac/device_run.sh: quiet_lines must write `logcap 16M` only when the signed app knows the directive (app_has_logcap) and the frame-line interval')
+check(sum(1 for _, t in dr if 'echo "logcap' in t) == 1, 'mac/device_run.sh: `logcap` is written outside quiet_lines (an older app stops at an unknown conf directive)')
+# the pipeline cache lines.  KHNMC_GFX_PIPECACHE_RESET=1 makes the app remove its cache file at EVERY start: it may only reach a route
+# run's configuration (replaced by the play configuration when the run ends), never the play configuration that stays on the phone
+reset_l = [t for _, t in dr if 'echo "env KHNMC_GFX_PIPECACHE_RESET=1"' in t]
+check(len(reset_l) == 1 and re.search(r'^pc_lines\(\)\{ case "\$PIPECACHE" in fresh\) echo "env KHNMC_GFX_PIPECACHE_RESET=1";; off\) echo "env KHNMC_GFX_PIPECACHE=off";; esac; \}', reset_l[0]) is not None,
+      'mac/device_run.sh: `env KHNMC_GFX_PIPECACHE_RESET=1` is not written exactly once, by pc_lines for PIPECACHE=fresh')
+check(len(playdef) == 1 and re.search(r'(^|[; {])pc_lines\b', playdef[0]) is None and re.search(r'; pc_play_lines; \}; fi$', playdef[0]) is not None,
+      'mac/device_run.sh: gfx_play_lines must take its cache line from pc_play_lines, never from pc_lines (the RESET line would stay on the phone and remove the cache at every icon launch)')
+check(len(play_l) == 1 and re.search(r'(^|[; {])pc_lines\b', play_l[0]) is None and 'RESET' not in play_l[0], 'mac/device_run.sh: the GFX play configuration must not get pc_lines or a RESET line')
+ppl = [t for _, t in dr if re.search(r'^pc_play_lines\(\)', t)]
+check(len(ppl) == 1 and 'RESET' not in ppl[0] and re.search(r'^pc_play_lines\(\)\{ case "\$PIPECACHE" in off\) echo "env KHNMC_GFX_PIPECACHE=off";; on\) :;; '
+                                                           r'\*\) \[ -f "\$STATE/pipecache-verified" \] \|\| echo "env KHNMC_GFX_PIPECACHE=off";; esac; \}$', ppl[0]) is not None,
+      'mac/device_run.sh: pc_play_lines must turn the cache off unless PIPECACHE=on or $STATE/pipecache-verified exists, and never write RESET')
+check(sorted(t.split('(')[0] for _, t in dr if 'echo "env KHNMC_GFX_PIPECACHE=off"' in t) == ['pc_lines', 'pc_play_lines'], 'mac/device_run.sh: `env KHNMC_GFX_PIPECACHE=off` is written outside pc_lines / pc_play_lines')
+check(any(re.search(r'^\[ "\$PIPECACHE" != fresh \] \|\| \[ "\$MODE" = route \] \|\| bad ', t) for _, t in dr), 'mac/device_run.sh: PIPECACHE=fresh outside route mode is not refused (in play mode the RESET line would stay on the phone)')
+check(any(re.search(r'^\[ "\$PIPECACHE" != on \] \|\| \[ "\$MODE" = play \] \|\| bad ', t) for _, t in dr), 'mac/device_run.sh: PIPECACHE=on outside play mode is not refused')
+check(any(re.search(r'^case "\$PIPECACHE" in \'\'\|fresh\|off\|on\) ;; \*\) bad ', t) for _, t in dr), 'mac/device_run.sh: PIPECACHE is not limited to fresh, off, on or unset')
+check(any(re.search(r'\[ -z "\$PIPECACHE" \] \|\| \[ "\$GFX" = 1 \] \|\| bad', t) for _, t in dr), 'mac/device_run.sh: PIPECACHE without GFX=1 is not refused')
 pbx = open(os.path.join(D, 'KHNMC.xcodeproj', 'project.pbxproj')).read()
 check(pbx.count('KHNMC_GFX_LDFLAGS = "";') == 2 and len(re.findall(r'"\$\(KHNMC_GFX_LDFLAGS\)",\n\t*\);', pbx)) == 2,
       'KHNMC.xcodeproj: KHNMC_GFX_LDFLAGS is not empty in both configurations, or not the last word of OTHER_LDFLAGS (python3 tools/ios/make_project.py)')

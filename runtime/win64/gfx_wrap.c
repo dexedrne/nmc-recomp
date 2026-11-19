@@ -422,6 +422,7 @@ static int w_dev(KCtx *g,ID3D12Device *d,int s){
     case 36: { u64 pp=ARG(g,4); void *out=NULL;                                  /* CreateFence(initial, flags, riid, **pp) */
         HRESULT hr=ID3D12Device_CreateFence(d,A1(g),(D3D12_FENCE_FLAGS)(u32)A2(g),iidp(g,A3(g),"CreateFence"),pp?&out:NULL); w_out(g,pp,hr,out,WK_FENCE); return 1; }
     case 37: SET_RAX(g,(u32)ID3D12Device_GetDeviceRemovedReason(d)); return 1;
+    case 43: { u64 pl=A1(g); LUID l=ID3D12Device_GetAdapterLuid(d); wr32(g,pl,(u32)l.LowPart); wr32(g,pl+4,(u32)l.HighPart); SET_RAX(g,pl); return 1; }   /* GetAdapterLuid(*luid) -> luid (task 44: the movie path 0x13ef00 asks for it) */
     case 38: { u64 pd=A1(g), pl=ARG(g,5), pr=ARG(g,6), prs=ARG(g,7), pt=ARG(g,8); u32 num=(u32)A3(g);                 /* GetCopyableFootprints(desc, first, count, base, layouts, rows, row sizes, total) */
         WX x; wx_init(&x,g); x_count(&x,num,65536,"GetCopyableFootprints subresources"); D3D12_RESOURCE_DESC rd; UINT64 total=0;
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT *L=pl?wx_alloc(&x,sizeof *L*(size_t)num):NULL; UINT *R=pr?wx_alloc(&x,4ull*num):NULL; UINT64 *RS=prs?wx_alloc(&x,8ull*num):NULL;
@@ -901,6 +902,10 @@ int kh_wrap_selftest_device(KCtx *g){
     u64 m=ga_calloc(1,2048), dev=0,q=0,f1=0,f2=0,up=0,rb=0,hrtv=0,hsrv=0,al=0,cl=0,fence=0;
     T((u32)GI(rt_imp_d3d12__ord101,0,0xb000,GP(&IID_ID3D12Device),m)==0); dev=rd64(g,m); T(dev!=0); if(!dev) goto done;
     ID3D12Device *rdev=kh_wrap_real(g,dev,WK_DEVICE,"selftest"); T(rdev!=NULL);
+    /* review of task 44: GetAdapterLuid (slot 43; the movie path 0x13ef00 finds its adapter by it) writes the REAL device's LUID into
+     * the guest's 8 bytes, nothing after them, and returns its argument (a by-value result: the hidden pointer comes back in rax) */
+    if(rdev){ u64 pl=m+1800; wr64(g,pl,0xa5a5a5a5a5a5a5a5ull); wr64(g,pl+8,0x5a5a5a5a5a5a5a5aull); LUID want=ID3D12Device_GetAdapterLuid(rdev);
+      T(GC(VT(dev,43),dev,pl)==pl); T(rd32(g,pl)==(u32)want.LowPart&&rd32(g,pl+4)==(u32)want.HighPart); T(rd64(g,pl+8)==0x5a5a5a5a5a5a5a5aull); }
     /* identity: the device is a guest object; QueryInterface for three interfaces gives that same object and one real reference each */
     T(GA_OK(dev)&&rd64(g,dev)==kh_com_vtbl(C_w[WK_DEVICE])&&(void*)(uintptr_t)dev!=(void*)rdev); T(kh_wrap_obj(g,rdev,WK_DEVICE)==dev);
     { ULONG base=real_refs(rdev); const IID *ids[3]={&IID_IUnknown,&IID_ID3D12Object,&IID_ID3D12Device};
