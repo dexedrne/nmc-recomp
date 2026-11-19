@@ -212,6 +212,10 @@ ASPECT_HOOKS += 2bd190 156f10 156e20 126fd0 126500 19d040
 # the centred 16:9 band (a menu backdrop, a dim / fade rectangle) is stretched in y to the frame's first and last row before the
 # lifted body draws it.  With nothing set or KHNMC_ASPECT=pc it is one flag test and the lifted body.
 ASPECT_HOOKS += 11a330
+# Task 49 (runtime/aspect.c, "the zoom of the tall screen"; KHNMC_FOV_ZOOM, fill mode, a screen taller than wide): 19cad0 = the camera
+# matrix build (the scene cameras' distance cam+0x40 times the zoom around it, restored), 19d010 = the distance accessor (returns the
+# distance the matrices were built with).  With KHNMC_ASPECT unset or pc both are one flag test and the lifted body.
+ASPECT_HOOKS += 19cad0 19d010
 FILE_HOOKS += $(ASPECT_HOOKS)
 # Task 44, review (runtime/null_mf.c): the movie seam's three pass-through hooks.  5375d0 = the movie module's command function
 # (command 0 = start: a request the game drops at its own guard is seen and said), 2cbd80 = the event's end (did the movie's event end

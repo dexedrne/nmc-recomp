@@ -17,6 +17,11 @@
  *                                at each present where they changed (the VRAM guard and the 16:9 fit), and the H1 counts.  Null
  *                                graphics backend (runtime/null_d3d12.c); the vkd3d bridges print their own census.
  * Any other value of these three is a named fatal.
+ *   KHNMC_FOV_ZOOM=<number>      task 49 (section "the zoom of the tall screen" below): the camera zoom of a screen TALLER THAN WIDE in
+ *                                fill mode, 1.0 .. 2.0 (plain decimal), default 1.15; 1.0 = no zoom, nothing written.  A screen that is
+ *                                not taller than wide always has zoom 1.  With KHNMC_ASPECT unset or pc the value is checked, reported
+ *                                as not applied (NOTE fov-zoom-not-applied) and changes nothing.  Malformed, or outside the range: the
+ *                                named fatals fov-zoom-value-malformed / fov-zoom-value-range.
  *
  * H1 (post-call hook on f_11c1e0, plan section 4.3).  f_11c1e0(out) is the exe's "largest 16:9 rectangle in the screen"
  * (shard_0022.c:26728): s = minss(1.0, GX+0x28); W' = GX+0x18 * s, H' = GX+0x1c * s (floats); "narrow" when 9W' < 16H' (comiss; an
@@ -117,7 +122,9 @@ void kh_aspect_test_config(const char *off,const char *nocull){
                 asp_nocull?"H2 divides m11 by 2047/208 instead of r (the no-cull reference); ":"");
 }
 void kh_aspect_drawlog_config(const char *v);
+void kh_aspect_zoom_config(const char *v);          /* task 49, below */
 void kh_aspect_init(void){ kh_aspect_config(getenv("KHNMC_ASPECT"),getenv("KHNMC_ASPECT_LOG"),getenv("KHNMC_ASPECT_TEST_H1"));
+    kh_aspect_zoom_config(getenv("KHNMC_FOV_ZOOM"));
     kh_aspect_test_config(getenv("KHNMC_ASPECT_TEST_OFF"),getenv("KHNMC_ASPECT_TEST_NOCULL"));
     kh_aspect_drawlog_config(getenv("KHNMC_ASPECT_M_DRAWLOG")); }
 
@@ -402,6 +409,185 @@ void f_2bd190(KCtx *g){
 void f_19d040(KCtx *g){
     if(__builtin_expect(kh_aspect_m,0)) m_cam(g,rd64(g,KH_RSP(g)),KH_RCX(g));
     orig_f_19d040(g);
+}
+
+/* ==== task 49: the zoom of the tall (portrait) screen ===============================================================================
+ *
+ * Below 16:9 the exe keeps the HORIZONTAL view of a 16:9 screen and adds rows (Vert+, plan sections 2 and 4), so on a portrait screen
+ * (the phone: 2007x2853, r = 2.53) the picture is very wide-angle and characters are small.  The zoom z (default 1.15 on a screen
+ * taller than wide, KHNMC_FOV_ZOOM; exactly 1 on every other screen, in pc and with nothing set) makes the scene camera's picture z
+ * times bigger about the screen centre.
+ *
+ * The one place.  A camera struct (0x184 bytes) holds its projection distance d at +0x40; the FOV angles at +0x44 / +0x48 are derived
+ * from it against the fixed 512 x 416 frame (f_19dde0, f_19df00, f_19dc50: fov_x = 2 atan(256 / (d * cam+0x4c)), fov_y = 2 atan(208 /
+ * (d * cam+0x50))) and are the GAME'S FOV state (f_19ce90 reads them back for its FOV animations and save / restore: f_177f20,
+ * f_2901a0, f_38ebc0, ...).  Every matrix of a camera is built by f_19cad0(cam) (shard_0032.c:51918) from d and nothing else of the
+ * FOV state:
+ *   f_4748b0(cam+0x00, cam+0x144, cam+0x104, d = [cam+0x40], cam+0x4c, cam+0x50, ...)  (0x14019cb3e): cam+0x104 = the projection
+ *       (f_4747a0: its x / y scales are linear in d: 0x1404747c8 `addss xmm6,xmm6` .. 0x1404747fb), cam+0x144 = the screen matrix (no
+ *       d in it), cam+0x00 = their product (f_13f850 at 0x140474a8e) = the 3D vertex shaders' ViewProjection and the matrix the
+ *       marker projector f_1abdc0 multiplies (lock-on, damage numbers, gauges over heads: f_1f3e10, f_219470, f_219900, f_430ea0);
+ *   f_19c820(cam, cam+0x84, 256 + margin, 208)  (0x14019cb78): the world-to-GS clip matrix, m00 = d * cam+0x4c / halfW (0x14019c89a),
+ *       m11 = d * cam+0x50 / halfH (0x14019c8b0: cam+0x98, the float H2 divides by r);
+ *   f_19c820(cam, cam+0xc4, 2047, 2047)  (tail jump 0x14019cb97): the guard-band clip matrix.
+ * So the hook on f_19cad0 saves the 4 bytes at cam+0x40, writes (float)(d * z), runs the lifted body and puts the saved bytes back:
+ * every matrix of that camera is, bit for bit, the game's own build for the distance d * z (the selftest compares them with the
+ * lifted body's build of a camera whose d is that float), and d, the FOV angles and every other field read back unchanged.  The
+ * copies need nothing: f_19cba0 copies 0x140ac1840[idx] to 0x140ac1220[idx] with f_186810 BEFORE it rebuilds (0x14019cbe7 /
+ * 0x14019cc7c), and the map pass copies the camera to rctx+0x38 (0x186962); a copy carries the zoomed matrices and the unzoomed d.
+ * H2 is untouched and stays exact: it divides whatever m11 the camera holds by r around the two culling passes, and the Vert+ clip of
+ * a camera with distance d * z is that camera's clip with m11 / r.  Culling follows by itself: both passes cull with cam+0x84 of the
+ * same build, so they cull exactly the zoomed view (never less than is visible).
+ *
+ * Which cameras.  f_19cad0 has 17 call sites (16 calls and the tail jump of the init f_19dc50; no pointer to it anywhere in the
+ * image); the scene cameras are the two of the camera system (f_19d050 builds exactly two with
+ * f_19dc50: 0x140ac1840 at 0x14019d140 and 0x140ac19c4 = 0x140ac1840 + 0x184 at 0x14019d18e; 0x140ac1b50, 8 bytes behind the second,
+ * is the previous-frame view array of f_19ce40(0)), the ones f_19cfc0 returns, f_19cba0 rebuilds every frame (0x14019cc7c) and the Ti minigames set
+ * (f_543020 ...).  Those two are zoomed, by address.  One more build belongs to the scene: f_188120 (the map pass, a map object with
+ * its own projection distance, flag 0x1000 at obj+0x118) copies the pass's camera rctx+0x38 to its stack, sets d from the object's
+ * matrix with f_19df00 and rebuilds (0x14018830d, return address 0x140188312); it is zoomed too, or such an object would be drawn
+ * with another scale than the scene around it.  Every other build is a camera an object owns (menu models Tz 0x2ffbb0, the
+ * sub-scenes 0x272480 / 0x290d50 / 0x2915f0, 0x535040): not zoomed, the menus stay as they are; each such build on a tall screen is
+ * counted and its return address listed in the exit report (no silent path).
+ *
+ * The distance accessor.  d is read outside the build only through f_19d010 (`movss xmm0,[rcx+0x40]`), always on a camera f_19cfc0
+ * returned (0x1401c8ef8, 0x1401ca0c4, 0x1401cb3b8, 0x1402e1516, 0x140396c8e), to turn a screen offset into a world offset at a depth
+ * (offset * depth / d: 0x140396c9a).  Those must use the distance the matrices were built with, or what they place lands z times
+ * further from the screen centre: the hook on f_19d010 returns (float)(d * z), the same bits the build wrote, for the two scene
+ * cameras and their previous-frame copies 0x140ac1220[k], and d as stored for every other camera.  f_19ce90 (the FOV angles) is left
+ * alone: its callers copy, animate and set the game's FOV; the one geometric use (f_178580: the camera keeps a target inside half the
+ * FOV minus 10 degrees, 0x1405b2300) stays inside the zoomed view for every allowed z (tan 16.6 deg = 0.30 against 0.667 / z).
+ *
+ * What follows the zoom besides the picture (measured, implementation notes): the game's own readers of the camera matrices see the zoomed
+ * view, as they would with a FOV the game had set itself: the on-screen tests of kn / YS (cam+0x84, f_1b5e30 / f_3f3ed0) test the
+ * zoomed frame, and after a lock-on the game's camera takes another path for a while (two null-backend routes: turned by more than
+ * 0.1 degrees for 84 frames, at most 8.6, then identical again).  The game's FOV state, the look-at point, the route's states, the
+ * battle's hits and the files it reads are the same with and without the zoom (the camera lines of KHNMC_ASPECT_LOG=1).
+ *
+ * Identity: with KHNMC_ASPECT unset or pc both hooks are one flag test and the lifted body; in fill mode on a screen that is not
+ * taller than wide, or with KHNMC_FOV_ZOOM=1, z is exactly 1 and nothing is written (counted). */
+#define CAM_D          0x40ull                     /* the projection distance */
+#define ZOOM_NCAM      2                           /* the scene cameras f_19d050 builds: 0x140ac1840 and 0x140ac19c4 */
+#define ZOOM_RA_MAPOBJ (GS_BASE+0x188312ull)       /* f_188120: return address of its f_19cad0 (a stack copy of the map pass's camera) */
+#define ZOOM_DEFAULT   1.15                        /* owner 2026-11-18: "a bit less than halfway" between 1.0 and 2853/2007 = 1.42 */
+enum { ZC_SCENE0=0, ZC_SCENE1=1, ZC_MAPOBJ=2, ZC_OTHER=3 };
+static double asp_zoom_tall=ZOOM_DEFAULT; static int asp_zoom_set;
+/* a KHNMC_FOV_ZOOM value: DIGITS[.DIGITS] with at most 15 digits in all and nothing else (no sign, exponent, space; no locale).
+ * 0 = *z set, 1 = malformed, 2 = a number outside 1.0 .. 2.0 */
+int kh_fov_zoom_parse(const char *s,double *z){
+    u64 n=0, den=1; int nd=0, ni=0, nf=0, dot=0;
+    if(!s) return 1;
+    for(const char *p=s;*p;p++){
+        if(*p=='.'){ if(dot||!ni) return 1; dot=1; continue; }
+        if(*p<'0'||*p>'9') return 1;
+        if(++nd>15) return 1;
+        n=n*10+(u64)(*p-'0'); if(dot){ den*=10; nf++; } else ni++; }
+    if(!ni||(dot&&!nf)) return 1;
+    double v=(double)n/(double)den;                                                  /* both exact below 2^53: the correctly rounded value */
+    if(!(v>=1.0&&v<=2.0)) return 2;
+    *z=v; return 0;
+}
+void kh_aspect_zoom_config(const char *v){
+    if(v&&*v){ double z=0; int e=kh_fov_zoom_parse(v,&z);
+        if(e==1) kh_fatal(NULL,"fov-zoom-value-malformed: KHNMC_FOV_ZOOM=%s (expected a plain decimal number from 1.0 to 2.0, such as 1.15)",v);
+        if(e) kh_fatal(NULL,"fov-zoom-value-range: KHNMC_FOV_ZOOM=%s (allowed: 1.0 to 2.0; 1.0 = no zoom)",v);
+        asp_zoom_tall=z; asp_zoom_set=1;
+        if(!asp_mode){ fprintf(stderr,"kh: aspect: NOTE: fov-zoom-not-applied: KHNMC_FOV_ZOOM=%s is set, but KHNMC_ASPECT is pc: the zoom applies in fill mode only, nothing is zoomed\n",v); return; } }
+    if(asp_mode) fprintf(stderr,"kh: aspect: zoom (task 49): %g on a screen taller than wide (%s), 1 = nothing written on every other screen; the scene cameras' distance cam+0x40 times the zoom around f_19cad0\n",
+                         asp_zoom_tall,asp_zoom_set?"KHNMC_FOV_ZOOM":"the default; KHNMC_FOV_ZOOM=1.0..2.0 changes it");
+}
+/* the zoom of a W x H screen: KHNMC_FOV_ZOOM (default 1.15) in fill mode when it is taller than wide, else exactly 1 */
+double kh_aspect_zoom(double W,double H){ return (asp_mode==1&&W>0&&H>W)?asp_zoom_tall:1.0; }
+static double gx_zoom(KCtx *g){ return kh_aspect_zoom(rdf(g,GX+0x18),rdf(g,GX+0x1c)); }
+static int zoom_class(u64 cam,u64 ra){
+    for(int k=0;k<ZOOM_NCAM;k++) if(cam==CAM_CUR+CAM_SIZE*(u64)k) return k;
+    return ra==ZOOM_RA_MAPOBJ?ZC_MAPOBJ:ZC_OTHER;
+}
+typedef struct { _Atomic u64 calls, identity, other, edited[3], inside, badcam, d_calls, d_identity, d_other, d_scaled[2], d_thread; _Atomic u32 tid; _Atomic int warned; } ZoomStat;
+static ZoomStat zs;
+typedef struct { u64 ra, n; } ZoomRa;
+static ZoomRa zra[16]; static int n_zra; static u64 zra_cut;      /* builds of other cameras on a tall screen, by return address (under mm) */
+/* the bits written for a saved distance at zoom z (the build and the accessor use this one function) */
+static u32 zoom_value(u32 saved,double z){ return fbits((float)((double)bf(saved)*z)); }
+/* KHNMC_ASPECT_LOG=1 or 2: the scene camera as the GAME set it (before the zoom), at f_19cba0's build of every 50th game frame:
+ * the distance cam+0x40, the FOV angles cam+0x44 / +0x48 and the view's eye / look-at point / roll (the view array of f_19ce40(1),
+ * 0x140ac1020 + 0x80 k: +0x48, +0x58, +0x78; f_19cba0 builds the view matrix from them at 0x14019cc9e..).  Two runs that differ only
+ * in the zoom show with these lines whether the game's FOV state and its camera stayed the same (the lines of task 49's routes). */
+#define ZOOM_RA_FRAME  (GS_BASE+0x19cc81ull)       /* f_19cba0: return address of its f_19cad0 */
+#define VIEW_CUR       (GS_BASE+0xac1020ull)
+static _Atomic u64 zoom_log_lines, zoom_log_cut;
+static void zoom_log(KCtx *g,u64 cam,u64 ra){
+    if(ra!=ZOOM_RA_FRAME) return;
+    int k=cam==CAM_CUR?0:cam==CAM_CUR+CAM_SIZE?1:-1; if(k<0) return;
+    u64 fr=kh_game_frames(); if(fr%50) return;
+    if(atomic_fetch_add(&zoom_log_lines,1)>=600){ zoom_log_cut++; return; }
+    u64 v=VIEW_CUR+0x80ull*(u64)k;
+    fprintf(stderr,"kh: aspect: zoom: camera %d at game frame %llu: distance %.9g, fov %.9g / %.9g; eye (%.9g, %.9g, %.9g), at (%.9g, %.9g, %.9g), roll %.9g\n",k,P(fr),
+            rdf(g,cam+CAM_D),rdf(g,cam+0x44),rdf(g,cam+0x48),rdf(g,v+0x48),rdf(g,v+0x4c),rdf(g,v+0x50),rdf(g,v+0x58),rdf(g,v+0x5c),rdf(g,v+0x60),rdf(g,v+0x78));
+}
+/* f_19cad0(cam = guest rcx) with the lifted body as a parameter (the selftest passes a stand-in that records cam+0x40) */
+static void zoom_build(KCtx *g,void (*body)(KCtx *)){
+    u64 cam=KH_RCX(g), ra=rd64(g,KH_RSP(g));
+    zs.calls++;
+    if(__builtin_expect(kh_aspect_log,0)) zoom_log(g,cam,ra);
+    double z=gx_zoom(g);
+    if(z==1.0){ zs.identity++; body(g); return; }                                   /* not taller than wide, or the value 1: nothing is written */
+    int k=zoom_class(cam,ra);
+    if(k==ZC_OTHER){ zs.other++;
+        pthread_mutex_lock(&mm); int i; for(i=0;i<n_zra;i++) if(zra[i].ra==ra) break;
+        if(i==n_zra){ if(n_zra<16){ zra[i].ra=ra; zra[i].n=0; n_zra++; } else zra_cut++; }
+        if(i<16) zra[i].n++; pthread_mutex_unlock(&mm);
+        body(g); return; }
+    u64 a=cam+CAM_D;
+    if(!cam||!GA_OK(a)||!GA_OK(a+3)){ zs.badcam++;
+        if(!atomic_exchange(&zs.warned,1)) fprintf(stderr,"kh: aspect: WARNING: zoom: camera pointer 0x%llx (return address 0x%llx) is not guest memory: not zoomed (counted)\n",P(cam),P(ra));
+        body(g); return; }
+    { u32 t0=0; atomic_compare_exchange_strong(&zs.tid,&t0,cur_tid()); }
+    u32 saved=rd32(g,a), w=zoom_value(saved,z);
+    wr32(g,a,w);
+    body(g);
+    u32 now=rd32(g,a);
+    if(now==w){ wr32(g,a,saved); zs.edited[k]++; }
+    else { zs.inside++;
+        if(!atomic_exchange(&zs.warned,1)) fprintf(stderr,"kh: aspect: WARNING: zoom: cam+0x40 of camera 0x%llx changed inside f_19cad0 (we wrote 0x%08x, found 0x%08x): the game's value is kept (counted)\n",P(cam),w,now); }
+}
+/* f_19d010 returned [cam+0x40] in xmm0: for a scene camera or its previous-frame copy, the distance its matrices were built with */
+static void zoom_d_post(KCtx *g,u64 cam){
+    zs.d_calls++;
+    double z=gx_zoom(g);
+    if(z==1.0){ zs.d_identity++; return; }
+    int k=-1; for(int i=0;i<ZOOM_NCAM;i++){ if(cam==CAM_CUR+CAM_SIZE*(u64)i) k=0; else if(cam==CAM_PREV+CAM_SIZE*(u64)i) k=1; }
+    if(k<0){ zs.d_other++; return; }
+    { u32 t=atomic_load(&zs.tid); if(t&&t!=cur_tid()) zs.d_thread++; }             /* reported: a read on another thread could meet the build's window */
+    u32 d; memcpy(&d,&KH_XMM(g,0),4); ret_f(g,bf(zoom_value(d,z))); zs.d_scaled[k]++;
+}
+void orig_f_19cad0(KCtx *); void orig_f_19d010(KCtx *);
+void f_19cad0(KCtx *g){
+    if(__builtin_expect(!asp_mode,1)){ orig_f_19cad0(g); return; }                 /* nothing set or pc: exactly the exe */
+    zoom_build(g,orig_f_19cad0);
+}
+void f_19d010(KCtx *g){
+    if(__builtin_expect(!asp_mode,1)){ orig_f_19d010(g); return; }
+    u64 cam=KH_RCX(g);
+    orig_f_19d010(g);
+    zoom_d_post(g,cam);
+}
+static void zoom_report(FILE *f){
+    fprintf(f,"kh: aspect report: zoom (task 49; 0x19cad0, the camera matrix build): %g on a screen taller than wide (%s); builds %llu: zoom 1, nothing written %llu; "
+              "cam+0x40 times the zoom and restored: scene camera 0x140ac1840 %llu, 0x140ac19c4 %llu, the map pass's per-object copy (return address 0x140188312) %llu; "
+              "other cameras (object-owned), not zoomed %llu; cam+0x40 changed inside the build (game's value kept) %llu; camera not guest memory %llu; first guest thread %u\n",
+            asp_zoom_tall,asp_zoom_set?"KHNMC_FOV_ZOOM":"default",P(zs.calls),P(zs.identity),P(zs.edited[ZC_SCENE0]),P(zs.edited[ZC_SCENE1]),P(zs.edited[ZC_MAPOBJ]),
+            P(zs.other),P(zs.inside),P(zs.badcam),atomic_load(&zs.tid));
+    fprintf(f,"kh: aspect report: zoom: distance accessor 0x19d010: calls %llu: zoom 1, as stored %llu; the built distance returned for a scene camera %llu, for its previous-frame copy (0x140ac1220) %llu; "
+              "another camera, as stored %llu; scaled reads on another guest thread than the builds %llu\n",
+            P(zs.d_calls),P(zs.d_identity),P(zs.d_scaled[0]),P(zs.d_scaled[1]),P(zs.d_other),P(zs.d_thread));
+    pthread_mutex_lock(&mm);
+    if(n_zra){ fprintf(f,"kh: aspect report: zoom: camera builds NOT zoomed on a tall screen, by return address:"); for(int i=0;i<n_zra;i++) fprintf(f," 0x%llx x%llu",P(zra[i].ra),P(zra[i].n));
+        if(zra_cut) fprintf(f," (+%llu calls from further return addresses: table full)",P(zra_cut)); fputc('\n',f); }
+    pthread_mutex_unlock(&mm);
+    if(zs.inside||zs.badcam) fprintf(f,"kh: aspect: WARNING: zoom: %llu builds changed cam+0x40 inside (game's value kept), %llu cameras not guest memory\n",P(zs.inside),P(zs.badcam));
+    if(kh_aspect_log) fprintf(f,"kh: aspect report: zoom: camera lines (every 50th game frame, KHNMC_ASPECT_LOG): %llu printed, %llu not printed (600 at most)\n",P(atomic_load(&zoom_log_lines)-zoom_log_cut),P(zoom_log_cut));
+    if(zs.d_thread) fprintf(f,"kh: aspect: WARNING: zoom-accessor-other-thread: %llu scaled reads of the distance on another guest thread than the camera builds (a read inside a build's window would be scaled twice)\n",P(zs.d_thread));
 }
 
 /* ---- H4 ---------------------------------------------------------------------------------------------------------------------- */
@@ -1318,6 +1504,7 @@ void kh_aspect_report(FILE *f){
         fprintf(f,"kh: aspect report: H5 (full-height scissors, 0x126fd0): calls %llu: extended %llu, other rects (left) %llu, r = 1 %llu, test aid off %llu\n",P(h5_calls),P(h5_ext),P(h5_other),P(h5_identity),P(h5_off));
         h3_report(f);                                                               /* task 42 */
         h7_report(f);                                                               /* task 46 */
+        zoom_report(f);                                                             /* task 49 */
     }
     if(kh_aspect_m) m_report(f);
     if(!kh_aspect_log) return;
@@ -1385,6 +1572,17 @@ static int fatal_case(int which,const char *expect){
         case 15: kh_aspect_m=1; kh_aspect_drawlog_config("x.tsv@5-3"); break;
         case 16: kh_aspect_m=1; kh_aspect_drawlog_config("x.tsv@1-2,"); break;
         case 17: kh_aspect_m=1; kh_aspect_drawlog_config("/nonexistent-khnmc-dir/x.tsv@1-2"); break;
+        case 18: kh_aspect_zoom_config("2.5"); break;                                      /* task 49: KHNMC_FOV_ZOOM */
+        case 19: kh_aspect_zoom_config("0.99"); break;
+        case 20: kh_aspect_zoom_config("1,15"); break;
+        case 21: kh_aspect_zoom_config("1.15x"); break;
+        /* not fatals: the value is taken and announced (22); pc: the named NOTE and no zoom (23); unset or empty: the default 1.15 (24).
+         * Exit code 3 = the state is as expected (the caller also looks for the line) */
+        case 22: asp_mode=1; asp_zoom_set=0; asp_zoom_tall=ZOOM_DEFAULT; kh_aspect_zoom_config("1.3");
+                 if(asp_zoom_tall==1.3&&asp_zoom_set&&kh_aspect_zoom(2007,2853)==1.3&&kh_aspect_zoom(2853,2007)==1.0) _exit(3); break;
+        case 23: asp_mode=0; asp_zoom_set=0; asp_zoom_tall=ZOOM_DEFAULT; kh_aspect_zoom_config("1.3"); if(kh_aspect_zoom(2007,2853)==1.0) _exit(3); break;
+        case 24: asp_mode=1; asp_zoom_set=0; asp_zoom_tall=ZOOM_DEFAULT; kh_aspect_zoom_config(NULL); kh_aspect_zoom_config("");
+                 if(asp_zoom_tall==1.15&&!asp_zoom_set&&kh_aspect_zoom(2007,2853)==1.15) _exit(3); break;
         }
         _exit(99); }
     int status=0; if(child<0){ fclose(f); return 0; } waitpid(child,&status,0);
@@ -1978,6 +2176,158 @@ static void h7_selftest(KCtx *g){
     asp_mode=sm; asp_h1_uncond=su; asp_off_h3=so3; kh_aspect_dk=sdk; kh_aspect_m=sml; kh_aspect_log=sl; atomic_store(&last3d_plus1,s3);
     wr64(g,GX+0x59b8,s59b8); wr64(g,GX+0x7c00,s7c00); memcpy(hp(g,GX+0x578c),svb,0x60); memcpy(hp(g,GX+0x4b0),s4b0,0x18); wr32(g,GX_GUARD,guard); memcpy(hp(g,GX),gxsave,0x148);
 }
+/* ---- task 49: the zoom ----------------------------------------------------------------------------------------------------------------
+ * A: zoom_build (what the hook f_19cad0 runs in fill mode) around a stand-in for the lifted body that records cam+0x40 as it sees it.
+ * B: the real hooks and the lifted bodies.  The game's own camera init f_19dc50(cam, d, sx, sy, 2048, 2048, 1, 16770000, near, far)
+ *    with the arguments f_19d050 passes for the two scene cameras (read from the image: 0x14019d05e..0x14019d140), which ends in the
+ *    tail jump to f_19cad0, i.e. the hook (0x14019dd92): every matrix of the zoomed build is compared, bit for bit, with the lifted
+ *    body's own build of a camera whose distance is d x z; and the lifted f_19d010 through its hook. */
+void f_19dc50(KCtx *);
+static u64 zt_cam; static u32 zt_seen, zt_put; static int zt_calls;
+static void zt_fn(KCtx *g){ zt_calls++; zt_seen=rd32(g,zt_cam+CAM_D); if(zt_put) wr32(g,zt_cam+CAM_D,zt_put); }
+/* zoom_build as the hook calls it (camera in guest rcx, the return address on the guest stack), around the stand-in */
+static void zt_build(KCtx *g,u64 cam,u64 ra){
+    u64 sv_sp=KH_RSP(g), sv_cx=KH_RCX(g), sp=((sv_sp-0x400)&~15ull)-8; wr64(g,sp,ra); KH_RSP(g)=sp; KH_RCX(g)=cam;
+    zoom_build(g,zt_fn); KH_RSP(g)=sv_sp; KH_RCX(g)=sv_cx;
+}
+/* the lifted f_19dc50 on cam with distance d and return address ra (its tail jump keeps ra for f_19cad0) */
+static int zt_init(KCtx *g,u64 cam,float d,u64 ra){
+    v128 sx[4]; for(int i=0;i<4;i++) sx[i]=KH_XMM(g,i);
+    float a2=rdf(g,GS_BASE+0x585c7cull), a3=rdf(g,GS_BASE+0x5b1380ull);                      /* the scales 0.8 and 0.8667 (cam+0x4c / +0x50) */
+    { v128 o=VZ; memcpy(&o,&d,4); KH_XMM(g,1)=o; } { v128 o=VZ; memcpy(&o,&a2,4); KH_XMM(g,2)=o; } { v128 o=VZ; memcpy(&o,&a3,4); KH_XMM(g,3)=o; }
+    u64 c2048=rd32(g,GS_BASE+0x5b2c08ull), one=rd32(g,GS_BASE+0x623a80ull);
+    u64 a[10]={cam,0,0,0,c2048,c2048,one,rd32(g,GS_BASE+0x5b26f0ull),one,rd32(g,GS_BASE+0x5b26ecull)};   /* near 1, far 4000000 */
+    int ok=0; st_call_ra(g,f_19dc50,ra,KH_RDI(g),a,10,&ok);
+    for(int i=0;i<4;i++) KH_XMM(g,i)=sx[i];
+    return ok;
+}
+/* the lifted f_19d010(cam) through its hook: the low 4 bytes of xmm0 (the rest must be 0, as MOVSS from memory leaves it) */
+static u32 zt_d(KCtx *g,u64 cam,int *ok){
+    v128 s0=KH_XMM(g,0); memset(&KH_XMM(g,0),0xa5,sizeof(v128)); int k=0; st_call(g,f_19d010,(u64[]){cam},1,&k);
+    u32 r[4]; memcpy(r,&KH_XMM(g,0),16); KH_XMM(g,0)=s0; *ok=k&&!r[1]&&!r[2]&&!r[3]; return r[0];
+}
+static float zt_f(const u8 *s,u32 off){ float f; memcpy(&f,s+off,4); return f; }
+static void zoom_selftest(KCtx *g){
+    /* the value: DIGITS[.DIGITS] in 1.0 .. 2.0 */
+    { double z=0;
+      ACHECK(kh_fov_zoom_parse("1.15",&z)==0&&z==1.15); ACHECK(kh_fov_zoom_parse("1",&z)==0&&z==1.0); ACHECK(kh_fov_zoom_parse("1.0",&z)==0&&z==1.0);
+      ACHECK(kh_fov_zoom_parse("2",&z)==0&&z==2.0); ACHECK(kh_fov_zoom_parse("2.000",&z)==0&&z==2.0); ACHECK(kh_fov_zoom_parse("1.42",&z)==0&&z==1.42);
+      ACHECK(kh_fov_zoom_parse("01.5",&z)==0&&z==1.5); ACHECK(kh_fov_zoom_parse("1.99999999999999",&z)==0&&z==1.99999999999999);
+      static const char *bad[]={"","1.",".",".5","1..2","1.2.3","+1.2","-1.2"," 1.2","1.2 ","1,15","1e0","0x1p0","nan","inf","1.15x","one","1.0000000000000001"};
+      z=7.0; for(size_t i=0;i<sizeof bad/sizeof *bad;i++) ACHECK(kh_fov_zoom_parse(bad[i],&z)==1&&z==7.0);
+      ACHECK(kh_fov_zoom_parse(NULL,&z)==1);
+      static const char *range[]={"0","0.99","0.999999","2.01","2.0000001","3","10","1000000","0.0"};
+      for(size_t i=0;i<sizeof range/sizeof *range;i++) ACHECK(kh_fov_zoom_parse(range[i],&z)==2&&z==7.0); }
+    int sm=asp_mode, szs=asp_zoom_set, snc=asp_nocull; double szt=asp_zoom_tall; ZoomStat sst; memcpy(&sst,&zs,sizeof sst);
+    ZoomRa sra[16]; memcpy(sra,zra,sizeof sra); int snra=n_zra; u64 scut=zra_cut;
+    u8 gxsave[0x100]; memcpy(gxsave,hp(g,GX),0x100); u32 guard=rd32(g,GX_GUARD); wr32(g,GX_GUARD,0x80000000u);
+    static u8 ccsave[ZOOM_NCAM*CAM_SIZE], cpsave[ZOOM_NCAM*CAM_SIZE]; memcpy(ccsave,hp(g,CAM_CUR),sizeof ccsave); memcpy(cpsave,hp(g,CAM_PREV),sizeof cpsave);
+    int slog=kh_aspect_log; kh_aspect_log=0;                                                 /* no camera lines from the test cases */
+    memset(&zs,0,sizeof zs); zs.warned=1; n_zra=0; zra_cut=0; asp_nocull=0;                  /* warned: no WARNING lines from the test cases */
+    /* the zoom of a screen: KHNMC_FOV_ZOOM (default 1.15) in fill mode when it is taller than wide, else exactly 1 */
+    asp_mode=1; asp_zoom_tall=ZOOM_DEFAULT;
+    ACHECK(ZOOM_DEFAULT==1.15&&kh_aspect_zoom(2007,2853)==1.15&&kh_aspect_zoom(1878,2670)==1.15&&kh_aspect_zoom(1080,1081)==1.15);
+    ACHECK(kh_aspect_zoom(2853,2007)==1.0&&kh_aspect_zoom(1920,1080)==1.0&&kh_aspect_zoom(1920,1350)==1.0&&kh_aspect_zoom(2670,1878)==1.0);
+    ACHECK(kh_aspect_zoom(2000,2000)==1.0&&kh_aspect_zoom(0,0)==1.0&&kh_aspect_zoom(0,100)==1.0&&kh_aspect_zoom(2560,1080)==1.0);
+    asp_mode=0; ACHECK(kh_aspect_zoom(2007,2853)==1.0); asp_mode=1;                             /* pc: never */
+    asp_zoom_tall=1.3; ACHECK(kh_aspect_zoom(2007,2853)==1.3&&kh_aspect_zoom(2853,2007)==1.0); asp_zoom_tall=ZOOM_DEFAULT;
+    ACHECK(zoom_value(fbits(512.0f),1.15)==fbits(588.8f)&&zoom_value(fbits(512.0f),2.0)==fbits(1024.0f)&&zoom_value(fbits(512.0f),1.5)==fbits(768.0f));
+    /* the cameras, against the image: f_19d050 builds two scene cameras (`lea rcx,[rip+..]` at 0x14019d05e and 0x14019d14c), the second
+     * ends 8 bytes before the view array of f_19ce40(0) and the previous-frame copies end at the int 0x140ac1528; f_188120's build is the
+     * call at 0x14018830d; f_19d010 is `movss xmm0,[rcx+0x40]; ret` */
+    #define LEA_T(a_) ((a_)+7+(u64)(s64)(s32)rd32(g,(a_)+3))
+    ACHECK(rd8(g,GS_BASE+0x19d05eull)==0x48&&rd8(g,GS_BASE+0x19d05full)==0x8d&&rd8(g,GS_BASE+0x19d060ull)==0x0d&&LEA_T(GS_BASE+0x19d05eull)==CAM_CUR);
+    ACHECK(rd8(g,GS_BASE+0x19d14cull)==0x48&&rd8(g,GS_BASE+0x19d14dull)==0x8d&&rd8(g,GS_BASE+0x19d14eull)==0x0d&&LEA_T(GS_BASE+0x19d14cull)==CAM_CUR+CAM_SIZE);
+    #undef LEA_T
+    ACHECK(CAM_CUR+ZOOM_NCAM*CAM_SIZE+8==GS_BASE+0xac1b50ull&&CAM_PREV+ZOOM_NCAM*CAM_SIZE==GS_BASE+0xac1528ull);
+    ACHECK(rd8(g,ZOOM_RA_MAPOBJ-5)==0xe8&&ZOOM_RA_MAPOBJ+(u64)(s64)(s32)rd32(g,ZOOM_RA_MAPOBJ-4)==GS_BASE+0x19cad0ull);
+    ACHECK(rd32(g,GS_BASE+0x19d010ull)==0x41100ff3u&&rd16(g,GS_BASE+0x19d014ull)==0xc340u);
+    ACHECK(zoom_class(CAM_CUR,0)==ZC_SCENE0&&zoom_class(CAM_CUR+CAM_SIZE,ZOOM_RA_MAPOBJ)==ZC_SCENE1&&zoom_class(CAM_CUR+2*CAM_SIZE,0)==ZC_OTHER);
+    ACHECK(zoom_class(CAM_PREV,0)==ZC_OTHER&&zoom_class(CAM_CUR+8,0)==ZC_OTHER&&zoom_class(0x1234,ZOOM_RA_MAPOBJ)==ZC_MAPOBJ&&zoom_class(0x1234,ZOOM_RA_MAPOBJ+1)==ZC_OTHER);
+    #define ZSCREEN(W_,H_) do{ wrf(g,GX+0x18,(float)(W_)); wrf(g,GX+0x1c,(float)(H_)); wrf(g,GX+0x10,(float)(W_)); wrf(g,GX+0x14,(float)(H_)); wrf(g,GX+0x20,1); wrf(g,GX+0x24,1); wrf(g,GX+0x28,1); \
+                               wrf(g,GX+0x38,512); wrf(g,GX+0x3c,416); wrf(g,GX+0x48,640); wrf(g,GX+0x4c,480); }while(0)   /* the GS frame values a run has (task 42's first-pass line) */
+    const u32 snan=0x7f812345u, v=fbits(512.0f), vz=fbits(588.8f);                              /* a signalling NaN (any write changes it), d, d x 1.15 */
+    const u64 RA=GS_BASE+0x19cc81ull;                                                          /* f_19cba0's call of f_19cad0 returns here */
+    u64 heap=ga_calloc(1,0x200);
+    /* A: the portrait screen, fill, the default zoom */
+    ZSCREEN(2007,2853);
+    for(int k=0;k<ZOOM_NCAM;k++){ u64 cam=CAM_CUR+CAM_SIZE*(u64)k; zt_cam=cam; zt_put=0; zt_calls=0;
+        wr32(g,cam+CAM_D,v); u64 e0=zs.edited[k]; zt_build(g,cam,RA);
+        ACHECK(zt_calls==1&&zt_seen==vz&&rd32(g,cam+CAM_D)==v&&zs.edited[k]==e0+1);              /* the body sees 588.8; the saved bits are back */
+        wr32(g,cam+CAM_D,snan); zt_build(g,cam,RA); ACHECK(zt_seen!=snan&&rd32(g,cam+CAM_D)==snan); /* written, and restored bit for bit */
+        zt_put=0x40490fdbu; u64 in0=zs.inside; wr32(g,cam+CAM_D,v); zt_build(g,cam,RA);
+        ACHECK(rd32(g,cam+CAM_D)==0x40490fdbu&&zs.inside==in0+1&&zs.edited[k]==e0+2); zt_put=0; }  /* the body wrote cam+0x40 itself: its value stays, counted */
+    { zt_cam=heap; wr32(g,heap+CAM_D,snan); u64 o0=zs.other; zt_build(g,heap,RA);                 /* an object-owned camera: nothing written, listed */
+      ACHECK(zt_seen==snan&&rd32(g,heap+CAM_D)==snan&&zs.other==o0+1&&n_zra==1&&zra[0].ra==RA&&zra[0].n==1);
+      zt_cam=CAM_PREV; wr32(g,CAM_PREV+CAM_D,snan); zt_build(g,CAM_PREV,RA+0x10);              /* a previous-frame copy is no build target */
+      ACHECK(zt_seen==snan&&rd32(g,CAM_PREV+CAM_D)==snan&&zs.other==o0+2&&n_zra==2&&zra[1].ra==RA+0x10);
+      zt_cam=heap; wr32(g,heap+CAM_D,v); u64 e0=zs.edited[ZC_MAPOBJ]; zt_build(g,heap,ZOOM_RA_MAPOBJ);   /* the map pass's per-object copy, by its return address */
+      ACHECK(zt_seen==vz&&rd32(g,heap+CAM_D)==v&&zs.edited[ZC_MAPOBJ]==e0+1&&zs.other==o0+2);
+      u64 b0=zs.badcam; zt_seen=0; zt_build(g,0,ZOOM_RA_MAPOBJ); ACHECK(zs.badcam==b0+1&&zt_seen==v); }   /* no camera: the body runs, counted */
+    /* identity: a screen that is not taller than wide, and the value 1 on the tall one: nothing is written at all */
+    { static const int wide[6][2]={{2853,2007},{1920,1080},{1920,1350},{2670,1878},{2000,2000},{2560,1080}}; u64 cam=CAM_CUR; zt_cam=cam;
+      for(int i=0;i<7;i++){ if(i<6) ZSCREEN(wide[i][0],wide[i][1]); else { ZSCREEN(2007,2853); asp_zoom_tall=1.0; }
+          wr32(g,cam+CAM_D,snan); u64 id0=zs.identity, c0=zs.calls, o0=zs.other; zt_seen=0; zt_build(g,cam,RA);
+          ACHECK(zt_seen==snan&&rd32(g,cam+CAM_D)==snan&&zs.identity==id0+1&&zs.calls==c0+1&&zs.other==o0); }
+      asp_zoom_tall=2.0; wr32(g,cam+CAM_D,v); zt_build(g,cam,RA); ACHECK(zt_seen==fbits(1024.0f)&&rd32(g,cam+CAM_D)==v);   /* the range's ends */
+      asp_zoom_tall=1.5; zt_build(g,cam,RA); ACHECK(zt_seen==fbits(768.0f)&&rd32(g,cam+CAM_D)==v); asp_zoom_tall=ZOOM_DEFAULT; }
+    /* B: the real hooks and the lifted bodies, on the second scene camera */
+    { u64 cam=CAM_CUR+CAM_SIZE, prev=CAM_PREV+CAM_SIZE; static u8 Spc[CAM_SIZE], Sz[CAM_SIZE], Sref[CAM_SIZE], Sa[CAM_SIZE], Sb[CAM_SIZE];
+      float d0=rdf(g,GS_BASE+0x5b1390ull); int ok=0; ACHECK(d0==512.0f);
+      ZSCREEN(2007,2853);
+      asp_mode=0; memset(hp(g,cam),0,CAM_SIZE); u64 c0=zs.calls; ACHECK(zt_init(g,cam,d0,RA)); memcpy(Spc,hp(g,cam),CAM_SIZE);   /* pc: the exe's build */
+      /* the numbers by hand: halfW = 256 + 85.33, halfH = 208; clip m00 = d sx / halfW = 512 * 0.8 / 341.33 = 1.2, m11 = d sy / 208 =
+       * 512 * 0.86667 / 208 = 2.13333; the guard band divides by 2047 */
+      ACHECK(zs.calls==c0&&rd32(g,cam+CAM_D)==v&&near(zt_f(Spc,0x7c),341.33333,1e-3)&&zt_f(Spc,0x80)==208.0f);
+      ACHECK(near(zt_f(Spc,0x84),1.2,1e-5)&&near(zt_f(Spc,0x98),2.1333333,1e-5)&&near(zt_f(Spc,0xc4),512.0*0.8/2047.0,1e-6)&&near(zt_f(Spc,0xd8),512.0*(13.0/15.0)/2047.0,1e-6));
+      asp_mode=1; memset(hp(g,cam),0,CAM_SIZE); u64 e0=zs.edited[ZC_SCENE1]; ACHECK(zt_init(g,cam,d0,RA)); memcpy(Sz,hp(g,cam),CAM_SIZE);   /* fill, tall: zoomed */
+      ACHECK(zs.edited[ZC_SCENE1]==e0+1&&zs.calls==c0+1&&rd32(g,cam+CAM_D)==v);                   /* through the hook (f_19dc50's tail jump); d reads back 512 */
+      ACHECK(!memcmp(Sz+0x40,Spc+0x40,0x44));                                                    /* d, the FOV angles, scales, near / far, halfW / halfH: the game's state is the exe's */
+      asp_mode=0; memset(hp(g,cam),0,CAM_SIZE); ACHECK(zt_init(g,cam,bf(vz),RA)); memcpy(Sref,hp(g,cam),CAM_SIZE);   /* the exe's own build for d = 588.8 */
+      ACHECK(!memcmp(Sz,Sref,0x40));                                                             /* cam+0x00, the 3D ViewProjection (and the marker projector's matrix) */
+      ACHECK(!memcmp(Sz+0x84,Sref+0x84,0x40));                                                   /* cam+0x84, the world-to-GS clip matrix (culling, on-screen tests) */
+      ACHECK(!memcmp(Sz+0xc4,Sref+0xc4,0x40));                                                   /* cam+0xc4, the guard-band clip matrix */
+      ACHECK(!memcmp(Sz+0x104,Sref+0x104,0x80));                                                 /* cam+0x104 projection, cam+0x144 screen matrix */
+      ACHECK(memcmp(Sz,Spc,0x40)!=0&&memcmp(Sz+0x84,Spc+0x84,0x40)!=0&&memcmp(Sz+0x104,Spc+0x104,0x40)!=0&&!memcmp(Sz+0x144,Spc+0x144,0x40));   /* another picture; the screen matrix has no d */
+      ACHECK(near(zt_f(Sz,0x84)/zt_f(Spc,0x84),1.15,1e-6)&&near(zt_f(Sz,0x98)/zt_f(Spc,0x98),1.15,1e-6)&&near(zt_f(Sz,0x84),1.38,1e-5)&&near(zt_f(Sz,0x98),2.4533333,1e-5));   /* both axes by the same z */
+      ACHECK(near(zt_f(Sz,0xc4)/zt_f(Spc,0xc4),1.15,1e-6)&&near(zt_f(Sz,0xd8)/zt_f(Spc,0xd8),1.15,1e-6));
+      ACHECK(near(zt_f(Sz,0x104)/zt_f(Spc,0x104),1.15,1e-6)&&near(zt_f(Sz,0x118)/zt_f(Spc,0x118),1.15,1e-6));
+      /* H2 on the zoomed camera: the zoomed m11 divided by r, restored (H2 is not changed by the zoom) */
+      { memcpy(hp(g,cam),Sz,CAM_SIZE); h2t_cam=cam; h2t_put=0; h2t_seen=0; H2Stat st={"selftest"}; st.warned=1; u32 m11=fbits(zt_f(Sz,CAM_M11)); double r=kh_aspect_r(2007,2853);
+        h2_around(g,cam,h2t_fn,&st);
+        ACHECK(st.edited==1&&h2t_seen==h2_value(m11,r)&&rd32(g,cam+CAM_M11)==m11&&near(bf(h2t_seen),2.4533333/r,1e-5)&&near(r,2.527155,1e-6)); }
+      /* the distance accessor through its hook: the built distance for the scene camera and its previous-frame copy, the stored one
+       * for any other camera, on a screen that is not taller than wide, with the value 1 and in pc */
+      memcpy(hp(g,cam),Sz,CAM_SIZE); asp_mode=1;
+      { u64 s0=zs.d_scaled[0], s1=zs.d_scaled[1], o0=zs.d_other, i0=zs.d_identity, n0=zs.d_calls;
+        ACHECK(zt_d(g,cam,&ok)==vz&&ok&&rd32(g,cam+CAM_D)==v&&zs.d_scaled[0]==s0+1);
+        ACHECK(vz==fbits(zt_f(Sref,CAM_D)));                                                     /* = the d of the reference build */
+        wr32(g,prev+CAM_D,v); ACHECK(zt_d(g,prev,&ok)==vz&&ok&&rd32(g,prev+CAM_D)==v&&zs.d_scaled[1]==s1+1);
+        wr32(g,heap+CAM_D,v); ACHECK(zt_d(g,heap,&ok)==v&&ok&&zs.d_other==o0+1);
+        wr32(g,cam+CAM_D,snan); ACHECK(zt_d(g,cam,&ok)!=snan&&ok);                              /* (a NaN shows the scaling: quieted) */
+        ZSCREEN(2853,2007); ACHECK(zt_d(g,cam,&ok)==snan&&ok&&zs.d_identity==i0+1);              /* landscape: the stored bits */
+        ZSCREEN(2007,2853); asp_zoom_tall=1.0; ACHECK(zt_d(g,cam,&ok)==snan&&ok&&zs.d_identity==i0+2); asp_zoom_tall=ZOOM_DEFAULT;
+        ACHECK(zs.d_calls==n0+6); asp_mode=0; ACHECK(zt_d(g,cam,&ok)==snan&&ok&&zs.d_calls==n0+6); asp_mode=1; }   /* pc: the hook counts nothing */
+      /* identity through the real hook: fill on screens that are not taller than wide, and the value 1 on the tall one, build what pc
+       * builds, bit for bit (all 0x184 bytes) */
+      { static const int scr[5][2]={{2853,2007},{1920,1080},{2670,1878},{1920,1350},{2007,2853}};
+        for(int i=0;i<5;i++){ ZSCREEN(scr[i][0],scr[i][1]); asp_zoom_tall=i==4?1.0:ZOOM_DEFAULT;
+            asp_mode=0; memset(hp(g,cam),0,CAM_SIZE); ACHECK(zt_init(g,cam,d0,RA)); memcpy(Sa,hp(g,cam),CAM_SIZE);
+            asp_mode=1; memset(hp(g,cam),0,CAM_SIZE); u64 id0=zs.identity; ACHECK(zt_init(g,cam,d0,RA)); memcpy(Sb,hp(g,cam),CAM_SIZE);
+            ACHECK(!memcmp(Sa,Sb,CAM_SIZE)&&zs.identity==id0+1&&near(zt_f(Sb,0x84),1.2,1e-5)); }
+        asp_zoom_tall=ZOOM_DEFAULT; }
+      /* the map pass's per-object build through the real hook (return address 0x140188312): zoomed; an object-owned camera: the exe's */
+      ZSCREEN(2007,2853); asp_mode=1;
+      memset(hp(g,heap),0,CAM_SIZE); ACHECK(zt_init(g,heap,d0,ZOOM_RA_MAPOBJ));
+      ACHECK(!memcmp(hp(g,heap),Sref,0x40)&&!memcmp((u8*)hp(g,heap)+0x84,Sref+0x84,0x100)&&rd32(g,heap+CAM_D)==v);
+      memset(hp(g,heap),0,CAM_SIZE); ACHECK(zt_init(g,heap,d0,RA)); ACHECK(!memcmp(hp(g,heap),Spc,CAM_SIZE)); }
+    #undef ZSCREEN
+    ga_free(heap);
+    memcpy(hp(g,CAM_CUR),ccsave,sizeof ccsave); memcpy(hp(g,CAM_PREV),cpsave,sizeof cpsave);
+    wr32(g,GX_GUARD,guard); memcpy(hp(g,GX),gxsave,0x100);
+    kh_aspect_log=slog; asp_mode=sm; asp_zoom_set=szs; asp_zoom_tall=szt; asp_nocull=snc; memcpy(&zs,&sst,sizeof zs); memcpy(zra,sra,sizeof zra); n_zra=snra; zra_cut=scut;
+}
+
 int kh_aspect_selftest(KCtx *g){
     sfails=schecks=0;
     /* task 46: the cases of tasks 37 / 40 / 42 below test the hooks with H7 off (the gate of H1 / H3 as those tasks made it); H7's own
@@ -2157,6 +2507,8 @@ int kh_aspect_selftest(KCtx *g){
       wr32(g,GX_GUARD,guard); memcpy(hp(g,GX+0x10),gxsave,32); }
     /* -- task 42: H3 -- */
     h3_selftest(g);
+    /* -- task 49: the zoom -- */
+    zoom_selftest(g);
     /* -- M: the RTTI names, the frame intervals, the null backend's vertex-shader kinds -- */
     { char nm[72]; rtti_name(g,GS_BASE+0x5b24f8ull,nm,sizeof nm); ACHECK(!strcmp(nm,".?AVLockOn@dk@@"));
       rtti_name(g,GS_BASE+0x5b1c28ull,nm,sizeof nm); ACHECK(!strcmp(nm,".?AVCOMMAND_DRAW@dk@@"));
@@ -2215,8 +2567,13 @@ int kh_aspect_selftest(KCtx *g){
         ACHECK(fatal_case(10,"aspect-test-nocull-value: KHNMC_ASPECT_TEST_NOCULL=yes")); ACHECK(fatal_case(11,"aspect-test-needs-fill: KHNMC_ASPECT_TEST_NOCULL=1"));
         ACHECK(fatal_case(12,"aspect-test-off-value: KHNMC_ASPECT_TEST_OFF=h4, ends with a comma")); ACHECK(fatal_case(13,"aspect-log-value: KHNMC_ASPECT_LOG=3"));
         ACHECK(fatal_case(14,"aspect-m-drawlog-needs-m: KHNMC_ASPECT_M_DRAWLOG=x.tsv@1-2")); ACHECK(fatal_case(15,"aspect-m-drawlog-value: KHNMC_ASPECT_M_DRAWLOG=x.tsv@5-3"));
-        ACHECK(fatal_case(16,"aspect-m-drawlog-value: KHNMC_ASPECT_M_DRAWLOG=x.tsv@1-2,")); ACHECK(fatal_case(17,"aspect-m-drawlog-open: KHNMC_ASPECT_M_DRAWLOG: cannot create /nonexistent-khnmc-dir/x.tsv")); }
-    else kh_selftest_not_run("aspect","the 18 named fatals of KHNMC_SCREEN / KHNMC_ASPECT* (no child process)",18);
+        ACHECK(fatal_case(16,"aspect-m-drawlog-value: KHNMC_ASPECT_M_DRAWLOG=x.tsv@1-2,")); ACHECK(fatal_case(17,"aspect-m-drawlog-open: KHNMC_ASPECT_M_DRAWLOG: cannot create /nonexistent-khnmc-dir/x.tsv"));
+        ACHECK(fatal_case(18,"fov-zoom-value-range: KHNMC_FOV_ZOOM=2.5 ")); ACHECK(fatal_case(19,"fov-zoom-value-range: KHNMC_FOV_ZOOM=0.99 "));   /* task 49 */
+        ACHECK(fatal_case(20,"fov-zoom-value-malformed: KHNMC_FOV_ZOOM=1,15 ")); ACHECK(fatal_case(21,"fov-zoom-value-malformed: KHNMC_FOV_ZOOM=1.15x "));
+        ACHECK(fatal_case(22,"kh: aspect: zoom (task 49): 1.3 on a screen taller than wide (KHNMC_FOV_ZOOM)"));
+        ACHECK(fatal_case(23,"kh: aspect: NOTE: fov-zoom-not-applied: KHNMC_FOV_ZOOM=1.3 is set, but KHNMC_ASPECT is pc"));
+        ACHECK(fatal_case(24,"kh: aspect: zoom (task 49): 1.15 on a screen taller than wide (the default")); }
+    else kh_selftest_not_run("aspect","the 18 named fatals of KHNMC_SCREEN / KHNMC_ASPECT* and the 7 KHNMC_FOV_ZOOM value cases (no child process)",25);
     asp_off_h7=0; h7_selftest(g); asp_off_h7=s_h7;
     fprintf(stderr,"kh: aspect selftest: %d checks, %d failures\n",schecks,sfails);
     return sfails;
