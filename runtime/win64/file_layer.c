@@ -83,6 +83,53 @@ static int relative(KCtx *g,const char *path,char *rel,size_t cap){
 }
 static _Atomic int player_look=-1;
 
+/* Preload can enqueue a read on another thread. Keep the decision until the
+ * game's event teardown, and serialize changes with read + HD registration. */
+static _Atomic int scene_pack; /* 0 outside, -1 missing for this event, 1 available */
+static const char *const scene_files[]={
+    KH_SCENE_MDLX, "remastered/" KH_SCENE_MDLX "/-0.dds",
+    "remastered/" KH_SCENE_MDLX "/-1.dds", "remastered/" KH_SCENE_MDLX "/-2.dds"
+};
+
+int kh_scene_path(const char *rel,char *host,size_t cap){
+    const char *root=getenv("KHNMC_SCENE_ROXAS_DIR");
+    if(!root) root="private/scene-roxas";
+    struct stat st;
+    return *root && strlen(root)+strlen(rel)+2<=cap && kh_resolve_ci(root,rel,host,cap) &&
+           !stat(host,&st) && S_ISREG(st.st_mode) && st.st_size>0 && st.st_size<=INT_MAX && !access(host,R_OK);
+}
+
+void kh_scene_pack_begin(void){
+    if(scene_pack) return;
+    pthread_mutex_lock(&files_lock);
+    if(!scene_pack){
+        char host[4096];
+        int ok=1;
+        for(size_t i=0;i<sizeof scene_files/sizeof *scene_files;i++){
+            if(kh_scene_path(scene_files[i],host,sizeof host)) continue;
+            fprintf(stderr,"kh: scene Roxas: missing overlay %s; keeping Sora for this event\n",scene_files[i]);
+            ok=0; break;
+        }
+        scene_pack=ok?1:-1;
+    }
+    pthread_mutex_unlock(&files_lock);
+}
+
+void kh_scene_pack_end(void){
+    if(!scene_pack) return;
+    pthread_mutex_lock(&files_lock);
+    scene_pack=0;
+    pthread_mutex_unlock(&files_lock);
+}
+
+int kh_scene_pack_active(void){ return scene_pack==1; }
+
+int kh_scene_key(const char *rel){
+    for(size_t i=0;i<sizeof scene_files/sizeof *scene_files;i++)
+        if(!strcasecmp(rel,scene_files[i])) return KH_SCENE_MODEL;
+    return 0;
+}
+
 void kh_look_set(int xion){
     pthread_mutex_lock(&files_lock);
     player_look=!!xion;
@@ -119,7 +166,13 @@ static const char *arena_fallback(const char *rel){
 static int loose_path(KCtx *g,const char *path,const char *what,char *host,size_t cap,const char **fallback){
     char rel[2048];
     if(!relative(g,path,rel,sizeof rel)||kh_data_denied(g,rel,what)) return 0;
-    if(kh_look_key(rel)){ kh_look_path(g,rel,host,cap); return KH_FILE_LOOK; }
+    int profile=kh_look_key(rel);
+    if(profile==KH_SCENE_MODEL){
+        if(!kh_scene_path(rel,host,cap)) kh_fatal(g,"scene-roxas-asset: overlay disappeared: %s",rel);
+        fprintf(stderr,"kh: scene Roxas: event overlay %s %s\n",what,rel);
+        return KH_FILE_LOOK;
+    }
+    if(profile){ kh_look_path(g,rel,host,cap); return KH_FILE_LOOK; }
     const char *root=getenv("KHNMC_DATA"); if(!root) root="data";
     if(strlen(root)+strlen(rel)+2>=cap) return 0;
     if(kh_resolve_ci(root,rel,host,cap)) return 1;
@@ -282,6 +335,43 @@ int kh_file_selftest(KCtx *g){
     TEST(!kh_look_key("obj/P_EX100.mset") && !kh_look_key("obj/P_EX1000.mdlx"));
     kh_look_set(0); TEST(!kh_look_key("obj/P_EX100.mdlx"));
     player_look=initial_look;
+    const char *pack_env=getenv("KHNMC_SCENE_ROXAS_DIR");
+    char *initial_pack=pack_env?strdup(pack_env):NULL;
+    char pack[KH_TMP_MAX+256],member[KH_TMP_MAX+512],resolved[4096];
+    snprintf(pack,sizeof pack,"%s/scene",dir);
+    setenv("KHNMC_SCENE_ROXAS_DIR",pack,1);
+    const char *dirs[]={"","/obj","/remastered","/remastered/obj","/remastered/" KH_SCENE_MDLX};
+    for(size_t i=0;i<sizeof dirs/sizeof *dirs;i++){
+        snprintf(member,sizeof member,"%s%s",pack,dirs[i]); TEST(mkdir(member,0700)==0);
+    }
+    for(size_t i=0;i<sizeof scene_files/sizeof *scene_files;i++){
+        snprintf(member,sizeof member,"%s/%s",pack,scene_files[i]);
+        if(i==KH_SCENE_TEXTURES){  /* model and first two textures already present */
+            kh_scene_pack_begin(); TEST(!kh_look_key(KH_SCENE_MDLX));
+        }
+        FILE *part=fopen(member,"wb"); TEST(part!=NULL);
+        if(part){ fputc('x',part); fclose(part); }
+    }
+    TEST(!kh_look_key(KH_SCENE_MDLX)); /* keep the decision for the whole event */
+    kh_scene_pack_end(); kh_scene_pack_begin();
+    TEST(kh_file_loose_path(g,KH_SCENE_MDLX,resolved,sizeof resolved)==KH_FILE_LOOK);
+    TEST(kh_file_loose_path(g,scene_files[3],resolved,sizeof resolved)==KH_FILE_LOOK && !strcmp(resolved,member));
+    TEST(kh_look_key("./OBJ//h_ex500.MDLX")==KH_SCENE_MODEL);
+    TEST(kh_look_key("remastered/obj/H_EX500.mdlx/-2.dds")==KH_SCENE_MODEL);
+    TEST(!kh_look_key("remastered/obj/H_EX500.mdlx/-3.dds") && !kh_look_key("obj/H_EX500.mset"));
+    u32 event_state=rd32(g,GS_BASE+0xb65210);
+    wr32(g,GS_BASE+0xb65210,4); /* the guest's already-ended case has no other side effects */
+    kh_call(g,GS_BASE+0x2cbd80,0,0,0,0);
+    wr32(g,GS_BASE+0xb65210,event_state);
+    TEST(!kh_look_key(KH_SCENE_MDLX) && !kh_file_loose_path(g,KH_SCENE_MDLX,resolved,sizeof resolved));
+    for(size_t i=0;i<sizeof scene_files/sizeof *scene_files;i++){
+        snprintf(member,sizeof member,"%s/%s",pack,scene_files[i]); unlink(member);
+    }
+    for(size_t i=sizeof dirs/sizeof *dirs;i>0;i--){
+        snprintf(member,sizeof member,"%s%s",pack,dirs[i-1]); rmdir(member);
+    }
+    if(initial_pack) setenv("KHNMC_SCENE_ROXAS_DIR",initial_pack,1); else unsetenv("KHNMC_SCENE_ROXAS_DIR");
+    free(initial_pack);
     TEST(kh_call(g,GS_BASE+0x1063d0,0,name,0,0)==4);
     char prefixed[2048]; snprintf(prefixed,sizeof prefixed,"%s\\.\\MIXED.BIN",gstr(g,GS_BASE+0x2bd4340));
     u64 windows=ga_strdup(prefixed); TEST(kh_call(g,GS_BASE+0x1063d0,0,windows,0,0)==4); ga_free(windows);

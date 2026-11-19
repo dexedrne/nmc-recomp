@@ -125,7 +125,8 @@ static int canon_rel(const char *in,char *out,size_t cap){
 }
 
 int kh_look_key(const char *rel){
-    if(!kh_look_enabled()) return 0;
+    int scene=kh_scene_pack_active(), xion=kh_look_enabled();
+    if(!scene && !xion) return 0;
     static const struct { const char *stem; int face; } keys[]={
         {"P_EX100",36},{"P_EX100_BTLF",47},{"P_EX100_MAGF",38},{"P_EX100_KH1F",47},
         {"P_EX100_TRIF",5},{"P_EX100_ULTF",41},{"P_EX100_HTLF",3},{"P_EX101",36},
@@ -134,6 +135,8 @@ int kh_look_key(const char *rel){
     };
     char key[2300];
     if(!canon_rel(rel,key,sizeof key)) return 0;
+    if(scene && kh_scene_key(key)) return KH_SCENE_MODEL;
+    if(!xion) return 0;
     int hd=!strncasecmp(key,"remastered/",11);
     const char *obj=key+(hd?11:0);
     if(strncasecmp(obj,"obj/",4)) return 0;
@@ -388,6 +391,25 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
     HdFile *files=NULL; int nf=0; int32_t *offs=NULL; char *served=NULL; int rc=-1;
     char sub[2700],dir[4300],full[3000]; struct stat st;
     t->look=kh_look_key(rel);
+    if(t->look==KH_SCENE_MODEL && !strcasecmp(rel,KH_SCENE_MDLX)){
+        int count=0,bad=0;
+        if(!kh_rm_offsets(rel,bytes,n,&offs,&count,&bad) || bad || count!=KH_SCENE_TEXTURES){
+            snprintf(err,cap,"scene-roxas-hd-offsets: expected %d texture offsets in %s, got %d",KH_SCENE_TEXTURES,rel,count); goto fail;
+        }
+        t->rule=R_SCAN; t->game_mod=1; t->mod_files=t->offsets=count; t->pkg_n=0;
+        t->e=calloc(count,sizeof *t->e);
+        if(!t->e){ snprintf(err,cap,"out of memory"); goto fail; }
+        for(int i=0;i<count;i++){
+            HdEnt *e=&t->e[t->n++];
+            snprintf(e->name,sizeof e->name,"-%d.dds",i);
+            snprintf(full,sizeof full,"remastered/%s/%s",KH_SCENE_MDLX,e->name);
+            if(!kh_scene_path(full,dir,sizeof dir) || stat(dir,&st)){ snprintf(err,cap,"scene-roxas-hd-asset: %s",full); goto fail; }
+            HdFile file={.host=dir,.size=st.st_size};
+            e->orig=(uint32_t)offs[i]; e->gsize=(int32_t)file.size;
+            if(mod_asset(&file,e,t,err,cap)) goto fail;
+        }
+        rc=0; goto fail;
+    }
     if(t->look<0 || (!(gmod&&nmod)&&!pt)){                                                             /* nothing to pair: no disk access */
         t->rule=R_NONE; t->unserved=nmod; t->e=calloc(1,sizeof *t->e); if(!t->e){ snprintf(err,cap,"out of memory"); goto fail; }
         *out=t; return 0;

@@ -104,7 +104,13 @@ CUTSCENES=${CUTSCENES:-}; CUTSCENES_PACK=${CUTSCENES_PACK:-}                 # T
 #   (e.g. KHNMC_PLAYER_LOOK=xion KHNMC_XION_SWAP=1 KHNMC_SCENE_ROXAS=1); only KHNMC_* names, no spaces in values.
 # LOOK_PACK=DIR (11/19, task 56): every file under DIR on this Mac goes to the app's Documents/looks/xion/<same relative path>
 #   (the default KHNMC_LOOK_DIR on iOS), one devicectl copy per file; nothing on the phone is removed.
-EXTRA_ENV=${EXTRA_ENV:-}; LOOK_PACK=${LOOK_PACK:-}
+# SCENE_ROXAS_PACK is the directory containing obj/ and remastered/ (task 64).
+EXTRA_ENV=${EXTRA_ENV:-}; LOOK_PACK=${LOOK_PACK:-}; SCENE_ROXAS_PACK=${SCENE_ROXAS_PACK:-}
+if [ -n "$SCENE_ROXAS_PACK" ]; then
+  for rel in obj/H_EX500.mdlx remastered/obj/H_EX500.mdlx/-{0,1,2}.dds; do
+    [ -s "$SCENE_ROXAS_PACK/$rel" ] || bad "SCENE_ROXAS_PACK: missing $rel"
+  done
+fi
 for kv in $EXTRA_ENV; do case "$kv" in KHNMC_*=*) k=${kv%%=*}; case "$k" in *[!A-Z0-9_]*) bad "EXTRA_ENV: bad name '$k'";; esac;; *) bad "EXTRA_ENV: '$kv' is not KHNMC_NAME=value";; esac; done
 [ -z "$LOOK_PACK" ] || [ -d "$LOOK_PACK" ] || bad "LOOK_PACK: no directory '$LOOK_PACK' on this Mac"
 case "$CUTSCENES" in ''|nmc|story) ;; *) bad "CUTSCENES is nmc or story (got '$CUTSCENES')";; esac
@@ -152,6 +158,12 @@ app_has_logcap(){ grep -a -q 'logcap needs a log directive' "$APP/KHNMC" 2>/dev/
 quiet_lines(){ if app_has_logcap; then echo "logcap 16M"; fi; echo "env KHNMC_GFX_FRAME_LINE_EVERY=600"; }
 # TASK50: the cutscenes line, in every configuration this call writes (the app must know the variable: else it plays the stubs silently)
 cut_lines(){ [ "$CUTSCENES" != story ] || echo "env KHNMC_CUTSCENES=story"; for kv in $EXTRA_ENV; do echo "env $kv"; done; }
+if [ -n "$SCENE_ROXAS_PACK" ]; then
+  for rel in obj/H_EX500.mdlx remastered/obj/H_EX500.mdlx/-{0,1,2}.dds; do
+    cp_to "$SCENE_ROXAS_PACK/$rel" "scene-roxas/$rel" || { say "scene Roxas copy failed at $rel"; exit 1; }
+  done
+  say "scene Roxas model and three textures copied to Documents/scene-roxas"
+fi
 if [ -n "$LOOK_PACK" ]; then
   n=0; ( cd "$LOOK_PACK" && find . -type f | sed 's#^\./##' ) > "$OUT/look-pack.list"
   while IFS= read -r rel; do cp_to "$LOOK_PACK/$rel" "looks/xion/$rel" || { say "copy of the look pack FAILED at $rel"; exit 1; }; n=$((n+1)); done < "$OUT/look-pack.list"

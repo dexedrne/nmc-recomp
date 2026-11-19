@@ -59,7 +59,7 @@
  * a natural end, a Skip and a soft reset), not the event's.  Counters at exit (`kh: movies:`) when a movie was requested or dropped.
  * With no movie requested the default mode does nothing the old seam did not do: its classes are registered at the first movie, not
  * at start-up, so the guest arena of a run without a movie is the same as before. */
-#include "khnmc_rt.h"
+#include "kh_look.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -189,6 +189,7 @@ void f_2cbd80(KCtx *g){
     extern void kh_cutscenes_end_snapshot(KCtx *,int);
     int reason=kh_cutscenes_end_pending(g);
     orig_f_2cbd80(g);
+    kh_scene_pack_end();
     if(reason) kh_cutscenes_end_snapshot(g,reason);
 }
 /* 1 = an empty movie's reader exists (default mode): runtime/threads.c makes SwitchToThread a 1 ms wait on the virtual clock then */
