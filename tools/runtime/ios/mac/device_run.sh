@@ -16,8 +16,8 @@
 #   4. read Documents/khnmc.status every 15 s until "exit N" (LIMIT_S, default 1500), then copy khnmc.log back.
 # CUTSCENES=story (TASK50; play and route modes): the story scenes the Nobody May Cry mod emptied come back (runtime/cutscenes.c):
 #   every configuration this call writes (play, GFX play, the route's) gets env KHNMC_CUTSCENES=story.  The game reads the pack of
-#   original scenes from Documents/data/story-events.khcs (tools/cutscene_pack.py writes it on the build-host); CUTSCENES_PACK=FILE (a file
-#   on this Mac) copies it there first.  Refused when the signed app is older than TASK50 (it would ignore the line and play the stubs).
+#   original scenes from Documents/data/story-events.khcs (tools/cutscene_pack.py writes it on the build-host); CUTSCENES_PACK=FILE (required, a file
+#   on this Mac) copies it there first.  Requires a fresh install and a matching reviewed pack digest in the signed app.
 #   CUTSCENES=nmc or unset: no line (the mod's empty scenes, as before).  A later call without CUTSCENES writes its configurations
 #   without the line, as for every other option.
 #   SKIP_INSTALL=1 skips steps 1 and 2 apart from the fresh status file (the app, the exe and the conf are already there).
@@ -103,6 +103,10 @@ CUTSCENES=${CUTSCENES:-}; CUTSCENES_PACK=${CUTSCENES_PACK:-}                 # T
 case "$CUTSCENES" in ''|nmc|story) ;; *) bad "CUTSCENES is nmc or story (got '$CUTSCENES')";; esac
 [ "$CUTSCENES" != story ] || [ "$MODE" != selftest ] || bad "CUTSCENES=story is for play and route runs (the selftest tests the switch itself)"
 [ -z "$CUTSCENES_PACK" ] || { [ "$CUTSCENES" = story ] || bad "CUTSCENES_PACK needs CUTSCENES=story"; [ -f "$CUTSCENES_PACK" ] || bad "CUTSCENES_PACK: no file '$CUTSCENES_PACK' on this Mac"; }
+if [ "$CUTSCENES" = story ]; then
+  [ "${SKIP_INSTALL:-0}" != 1 ] || bad "story mode requires installation of the verified signed app"
+  [ -s "$CUTSCENES_PACK" ] || bad "story mode needs CUTSCENES_PACK on this Mac"
+fi
 [ "$GFX" = 1 ] && [ "$GFX_APP" = 0 ] && bad "GFX=1 runs the graphics backend: GFX_APP=0 (an app without it) contradicts that"
 [ "$GFX" = 1 ] && GFX_APP=1
 for n in $FETCH; do case "$n" in *[!0-9]*|0*) bad "FETCH holds '$n', not a present number";; esac
@@ -122,6 +126,12 @@ if [ -n "$GFX_APP" ]; then gfx_has "$APP/KHNMC"; hb=$?
   [ $hb = 1 ] && [ "$GFX_APP" = 1 ] && { say "GFX$([ "$GFX" = 1 ] && echo =1 || echo _APP=1), but the signed app has no graphics backend (GFX=1 mac/build.sh iphoneos, then GFX=1 mac/sign_app.sh)"; exit 2; }
   [ $hb = 0 ] && [ "$GFX_APP" = 0 ] && { say "GFX_APP=0, but the signed app HAS the graphics backend (mac/build.sh iphoneos, then mac/sign_app.sh, both without GFX=1)"; exit 2; }
   say "the signed app $([ $hb = 0 ] && echo 'has the' || echo 'has no') graphics backend, as GFX_APP=$GFX_APP asks; this run uses the $([ "$GFX" = 1 ] && echo 'vkd3d backend (KHNMC_GFX=vkd3dw)' || echo 'null backend')"; fi
+app_has_cutscenes(){ grep -a -q "$pack_digest" "$APP/KHNMC"; }
+if [ "$CUTSCENES" = story ]; then
+  pack_digest=$(shasum -a 256 < "$CUTSCENES_PACK") || { say "cannot hash story pack"; exit 2; }
+  pack_digest=${pack_digest%% *}
+  [ "${#pack_digest}" = 64 ] && app_has_cutscenes || { say "signed app and reviewed story pack do not match"; exit 2; }
+fi
 printf 'starting\n' > "$OUT/status.init"
 if [ "${SKIP_INSTALL:-0}" != 1 ]; then
   [ -f "$KROOT/pc/kh2fm.exe" ] || { say "no $KROOT/pc/kh2fm.exe (tools/ios/sync.sh exe)"; exit 2; }
@@ -134,12 +144,10 @@ fi
 app_has_logcap(){ grep -a -q 'logcap needs a log directive' "$APP/KHNMC" 2>/dev/null; }
 quiet_lines(){ if app_has_logcap; then echo "logcap 16M"; fi; echo "env KHNMC_GFX_FRAME_LINE_EVERY=600"; }
 # TASK50: the cutscenes line, in every configuration this call writes (the app must know the variable: else it plays the stubs silently)
-app_has_cutscenes(){ grep -a -q 'KHNMC_CUTSCENES_PACK' "$APP/KHNMC" 2>/dev/null; }
 cut_lines(){ [ "$CUTSCENES" != story ] || echo "env KHNMC_CUTSCENES=story"; }
-if [ "$CUTSCENES" = story ]; then app_has_cutscenes || { say "CUTSCENES=story, but the signed app is older than TASK50 (no KHNMC_CUTSCENES in it): build and sign it from this source first"; exit 2; }
-  if [ -n "$CUTSCENES_PACK" ]; then cp_to "$CUTSCENES_PACK" data/story-events.khcs || { say "copy of the cutscene pack FAILED"; tail -5 "$OUT/devicectl.log"; exit 1; }
-    say "the cutscene pack $(basename "$CUTSCENES_PACK") ($(wc -c < "$CUTSCENES_PACK" | tr -d ' ') bytes) is Documents/data/story-events.khcs"
-  else say "CUTSCENES=story without CUTSCENES_PACK: the pack must already be Documents/data/story-events.khcs (else the game stops with the named fatal cutscenes-pack)"; fi; fi
+if [ "$CUTSCENES" = story ]; then
+  cp_to "$CUTSCENES_PACK" data/story-events.khcs || { say "copy of the cutscene pack FAILED"; exit 1; }
+fi
 play_conf(){ { echo "# the game (tools/ios/mac/device_run.sh play): the controller is pad 0, sound on, no script, no time limit"; echo "log khnmc.log"; echo "status khnmc.status"; quiet_lines; cut_lines; } > "$OUT/play.conf"; }
 [ -x "$APP/KHNMC" ] && { app_has_logcap || say "the signed app does not know the conf directive logcap (older than TASK43): the play configuration is written without a log size cap"; }
 play_conf

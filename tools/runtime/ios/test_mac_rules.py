@@ -233,9 +233,12 @@ for tgt in ('> "$OUT/play.conf"', '> "$OUT/gfx-play.conf"'):
     hit = [t for _, t in dr if tgt in t]
     check(len(hit) == 1 and 'cut_lines' in hit[0], 'mac/device_run.sh: the configuration %s does not call cut_lines' % tgt)
 check(any(re.search(r'\[ "\$DIFF" = none \] \|\| echo "env \$DV=\$DIFF"; cut_lines; fi', t) for _, t in dr), 'mac/device_run.sh: the test configuration does not call cut_lines')
-check(any(re.search(r"^app_has_cutscenes\(\)\{ grep -a -q 'KHNMC_CUTSCENES_PACK' \"\$APP/KHNMC\"", t) for _, t in dr) and
-      any(re.search(r'if \[ "\$CUTSCENES" = story \]; then app_has_cutscenes \|\| \{ say .*exit 2; \}', t) for _, t in dr),
-      'mac/device_run.sh: CUTSCENES=story must be refused (exit 2) when the signed app does not know KHNMC_CUTSCENES_PACK')
+script = '\n'.join(t for _, t in dr)
+for required in ('[ "${SKIP_INSTALL:-0}" != 1 ] || bad "story mode', '[ -s "$CUTSCENES_PACK" ] || bad',
+                 'shasum -a 256 < "$CUTSCENES_PACK"', 'grep -a -q "$pack_digest" "$APP/KHNMC"',
+                 '&& app_has_cutscenes || { say', '--destination "Documents/$2"',
+                 'cp_to "$CUTSCENES_PACK" data/story-events.khcs || { say "copy of the cutscene pack FAILED"; exit 1; }'):
+    check(required in script, 'story deployment missing ' + required)
 check(any(re.search(r'''case "\$CUTSCENES" in ''\|nmc\|story\) ;; \*\) bad ''', t) for _, t in dr), 'mac/device_run.sh: CUTSCENES must accept only nmc or story')
 
 for f in fails:

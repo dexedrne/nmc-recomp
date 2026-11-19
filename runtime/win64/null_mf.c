@@ -185,7 +185,11 @@ void f_5375d0(KCtx *g){                                                         
 void orig_f_2cbd80(KCtx *);
 void f_2cbd80(KCtx *g){
     if(cur.pending) kh_movie_event_end(g,guest_return_addr(g)-GS_BASE,rd32(g,EV_STATE)==4,rd64(g,EV_TASKED_A)!=0&&rd8(g,EV_TASKED_B)!=0);
+    extern int kh_cutscenes_end_pending(KCtx *);
+    extern void kh_cutscenes_end_snapshot(KCtx *,int);
+    int reason=kh_cutscenes_end_pending(g);
     orig_f_2cbd80(g);
+    if(reason) kh_cutscenes_end_snapshot(g,reason);
 }
 /* 1 = an empty movie's reader exists (default mode): runtime/threads.c makes SwitchToThread a 1 ms wait on the virtual clock then */
 int kh_movie_live(void){ return mv_mode==MV_END&&n_readers>n_ended; }

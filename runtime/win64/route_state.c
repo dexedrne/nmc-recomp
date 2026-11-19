@@ -630,6 +630,7 @@ void kh_route_state_tick(KCtx *g,u64 n){
     trace_menu(g,n);
     kh_route_objective_tick(g,n);                            /* task 31: `kh: objective:` when the mission or its texts change */
     u64 fc=kh_phase_field_cmds(); fc_frame=fc-fc_prev; fc_prev=fc;
+    { extern void kh_cutscenes_field_tick(KCtx *,int); kh_cutscenes_field_tick(g,fc_frame>0); }
     { int w=kh_route_world(g), a=kh_route_area(g), m=w>=0&&a>=0?(w<<8|a):-1;
       if(m>=0 && m!=map_prev){ char what[64]; if(map_prev<0) snprintf(what,sizeof what,"map %02x:%02x entered",w,a);
           else snprintf(what,sizeof what,"map %02x:%02x -> %02x:%02x",map_prev>>8,map_prev&0xff,w,a);

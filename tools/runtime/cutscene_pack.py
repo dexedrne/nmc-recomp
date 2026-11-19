@@ -11,38 +11,10 @@ ard/us folder (the 289 area files the mod replaces or keeps).  VANILLA objentry 
 mod's own files (SillyBillyMod1): only its map/ folder is read, for the rooms it rebuilt.
 Output is analysis of the owner's own data (the table) and the owner's own data (the pack): never commit either.
 
-A STUB is the mod's empty scene: the five commands project, setup, start, end frame, fade (event_refs.is_stub; the two eh03
-703 / 704 entries carry one more volume command and have no original).  Every stub of TREE/ard/us is classified from the
-commands of its ORIGINAL (the first type-22 entry of that name in the vanilla area file of the same name, as the game's lookup
-exe 0x3a1f70 takes the first):
-
-  KEEP-STUB no-original        no vanilla area file or no entry of that name (the mod's own rooms and names)
-  KEEP-STUB movie              the scene starts a pre-rendered movie (command 0x44): the owner chose the in-engine scenes only
-  KEEP-STUB unproven-command   a command type that no real scene the mod kept has (so this port never ran it with NMC's data)
-  KEEP-STUB room-replaced      the scene plays in a room whose map the mod replaced (its own area or the map of its 0x03 command):
-                               po (the Holo-Archives), the Atlantica slot (lm), the Pride Lands slot (lk), eh02 / eh03: the scene
-                               was made for geometry and a story that are not there any more
-  KEEP-STUB actor-changed      an actor (0x01, or a ReadAssets 0x38 entry) whose 00objentry row the mod changed in model, motion
-                               set or object type (Beast -> a Roxas row, Donald -> BTLNPC helper, ...): the scene would show or
-                               spawn something else than it was made for
-  KEEP-STUB missing-file       a file the scene names (event_refs.Event.files: actors, motions, voices, effects, layouts, music,
-                               sound banks, the map) is not in TREE
-  SAFE                         none of the above.  An event entry holds no jump and no flag: those are sub-commands of the
-                               AreaSettings record that names the event (tools/event_refs.py header), which stay NMC's; the
-                               event player (exe 0x2c8000..0x2e0000) has no call to the progress setter 0x39afc0 and no direct
-                               reference to the save block 0x1409a98b0..0x1409ba8b0 (implementation notes section 2)
-  SAFE-AFTER-EDIT              none: no rule above is cured by editing a command (kept for the format: class 2 in the pack)
-
-Each stub also gets its REACH from the story graph of tools/event_refs.py: started (a program that can run names it), named
-(only programs the story never runs name it), theater (only the title menu's Theater replays it), none (no program names it).
-The pack holds the SAFE scenes whose reach is not `none`; a scene no program names is never asked for and is not restored.
-
-PACK format (little endian): "KHCS", u32 version 1, u32 count, u32 0; count * 24-byte records sorted by (area, name):
-  char area[4] ("tt05"), char name[4] (the BAR entry name, NUL padded), u32 class (1 SAFE, 2 SAFE-AFTER-EDIT), u32 offset, u32 size,
-  u32 FNV-1a of the bytes; then the entries' bytes (the original event entry, unchanged), each at a 16-byte aligned offset.
-Exit status: 0 ok, 1 a check failed, 2 usage.  Python 3.6+, standard library.
+Only the PC frame/load handlers reviewed in implementation notes may be admitted. Version 2
+pins the entire pack including its sorted inventory, asset alternatives and exact stub templates.
 """
-import argparse, collections, os, struct, sys
+import hashlib, argparse, collections, os, struct, sys
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import event_refs as E
@@ -72,10 +44,45 @@ def events_of(folder):
     return out
 
 
-def stub_like(d):
-    """the mod's stub, also with music commands added (eh03 703 / 704)"""
-    c, tail = E.ev_cmds(d)
-    return tail >= 0 and [t for t, _ in c if t not in (0x2e, 0x2f, 0x30)] == [0x00, 0x0f, 0x10, 0x08, 0x12]
+# SHA-256 of the complete BAR entries, including the two-byte terminator.
+STUB_HASH = {56: '3e5404039aef14fe8ca2964e500f48fb98a2a8c3b7fa4a114292e42e5f1b80fa', 68: 'c3c55e752514bc643952cbc2d55e7b25d83991024650e2160bf8840616630c21'}
+REVIEWED_SHA = '155fa7e650a5ba0fed00bfc49555aea940446ca1a11b3645d5b314521ba90ef6'
+REVIEWED_COUNT = 0
+
+def stub_like(data):
+    return hashlib.sha256(data).hexdigest() == STUB_HASH.get(len(data))
+
+
+# PC load table 2cc31c (type - 1), frame table 2cbc2c (type - 2).
+# These records only supply the event end/start, camera key/interval or separator.
+# No ReadAssets subtypes have been approved. Only its empty list is allowed.
+# (decode/relocate, load, frame dispatch RVAs, exact payload length).
+# None means the opcode is outside that dispatcher's index range.
+PRESENTATION = {
+    0x00: (0x2c9025, None, None, 20),          # exact NMC project only
+    0x06: (0x2cb0c5, 0x2cc2b8, 0x2cb781, 8), # camera interval, 2d2660
+    0x08: (0x2cb0c5, 0x2cc232, 0x2cbbed, 4), # timeline end, 2d8dd0
+    0x0f: (0x2cb0c5, 0x2cc239, 0x2cbbed, 0), # NMC setup, 2d8fe0
+    0x10: (0x2cb0c5, 0x2cc243, 0x2cbbed, 4), # timeline start, 2d9020
+    0x12: (0x2cb0c5, 0x2cc2b8, 0x2cb7ee, 6), # fade, 2da730
+    0x14: (0x2cb0c5, 0x2cc2b8, 0x2cbbed, 2), # advances all three cursors
+    0x24: (0x2cb0b8, 0x2cc277, 0x2cbbed, 8), # empty read-assets record
+}
+
+def reviewed_command(t, pl):
+    if t not in PRESENTATION or len(pl) != PRESENTATION[t][3]:
+        return False
+    if t == 0x00:
+        # The name and project parameters select other player paths.
+        return hashlib.sha256(pl).hexdigest() == '16a128eeacd36960d853aededfca52edf714c7650862a2c143f236d3a4f406ab'
+    if t == 0x24:
+        return pl == bytes.fromhex('0000008000000000')
+    if t == 0x12:
+        return int.from_bytes(pl[4:], 'little') in (1, 4)
+    if t == 0x06:
+        camera, start, stop, pad = struct.unpack('<4H', pl)
+        return camera == pad == 0 and start <= stop <= 0x7fff
+    return True
 
 
 def objentry_rows(b):
@@ -91,60 +98,70 @@ def actor_ids(ev):
     return sorted({oid for oid, sl, nm in ev.actors})
 
 
-def classify(ev_v, proven, changed_rows, exists, replaced_rooms=frozenset()):
+def asset_groups(ev):
+    paths = {p for kind,p in ev.files() if not kind.endswith('-opt') and kind != 'layout'}
+    for name in ev.layouts:
+        paths.add('event/layout/%s/%s.2ld|event/layout/%s.2ld' % (ev.tree.lang, name, name))
+    return sorted(paths)
+
+
+def classify(ev_v, changed_rows, exists, replaced_rooms=frozenset()):
     """the original's Event -> (class, detail).  exists(rel) -> bool"""
     types = {t for t, _ in ev_v.cmds}
-    if ev_v.tail < 0: return 'KEEP-STUB', 'no-original (the vanilla entry does not decode)'
+    if ev_v.tail != 2: return 'KEEP-STUB', 'no-original (the vanilla entry does not decode)'
     if MOVIE in types: return 'KEEP-STUB', 'movie'
     rooms = {ev_v.area.lower()} | ({('%s%02d' % (ev_v.map[0], ev_v.map[1])).lower()} if ev_v.map else set())
     if rooms & set(replaced_rooms): return 'KEEP-STUB', 'room-replaced ' + ','.join(sorted(rooms & set(replaced_rooms)))
-    odd = sorted(types - proven)
+    odd = sorted({t for t, pl in ev_v.cmds if not reviewed_command(t, pl)})
     if odd: return 'KEEP-STUB', 'unproven-command ' + ','.join('%#04x' % t for t in odd)
     ch = [oid for oid in actor_ids(ev_v) if oid in changed_rows]
     if ch: return 'KEEP-STUB', 'actor-changed ' + ','.join(str(x) for x in ch)
-    miss = []
-    for kind, rel in ev_v.files():
-        if kind.endswith('-opt') or kind == 'layout': continue        # optional files; a layout is tried in two places (refs_of)
-        if '/' not in rel or not exists(rel): miss.append(rel)
-    lay = sorted(ev_v.layouts)
-    for l in lay:
-        if not (exists('event/layout/%s/%s.2ld' % (ev_v.tree.lang, l)) or exists('event/layout/%s.2ld' % l)): miss.append('event/layout/%s.2ld' % l)
+    miss = [group for group in asset_groups(ev_v) if not any('/' in path and exists(path) for path in group.split('|'))]
     if miss: return 'KEEP-STUB', 'missing-file ' + ','.join(sorted(set(miss)))
     return 'SAFE', ''
 
 
-def write_pack(path, items):
-    """items: [(area, name, class, bytes)] -> the pack file"""
-    items = sorted(items, key=lambda x: (x[0], x[1]))
-    head = PACK_MAGIC + struct.pack('<III', 1, len(items), 0)
-    off = 16 + 24 * len(items); off = (off + 15) & ~15; recs = []; body = []
-    pos = off
-    for area, name, cl, b in items:
-        a = area.encode('latin1'); n = name.encode('latin1')
-        if len(a) != 4 or not 1 <= len(n) <= 4: die('pack: bad key %s/%s' % (area, name))
-        recs.append(a + n.ljust(4, b'\0') + struct.pack('<IIII', cl, pos, len(b), fnv1a(b)))
-        pad = (-len(b)) % 16; body.append(b + b'\0' * pad); pos += len(b) + pad
-    data = head + b''.join(recs)
-    data += b'\0' * (off - len(data)) + b''.join(body)
-    with open(path + '.tmp', 'wb') as f: f.write(data)
-    os.replace(path + '.tmp', path)
-    return len(data)
+def pack_bytes(items, inventory, plain, music):
+    # Paths are NUL-terminated groups; | offers alternative locations for one file.
+    records, body = [], bytearray()
+    start = (16 + 24 * len(items) + 15) & ~15
+    for area, name, cl, data, assets in sorted(items):
+        key = area.encode('ascii') + name.encode('ascii').ljust(4, b'\0')
+        if len(key) != 8: die('cutscenes-pack: invalid key')
+        records.append(key + struct.pack('<4I', cl, start + len(body), len(data), fnv1a(data)))
+        body.extend(data)
+        for group in assets: body.extend(group.encode('ascii') + b'\0')
+        body.append(0)
+        body.extend(bytes(-len(body) % 16))
+    head = PACK_MAGIC + struct.pack('<3I', 2, len(items), start + len(body))
+    catalog = b''.join(a.encode('ascii') + n.encode('ascii').ljust(4, b'\0') for a,n in sorted(inventory))
+    return (head + b''.join(records)).ljust(start, b'\0') + body + plain + music + catalog
 
+
+def decode_pack(raw, count, digest):
+    if len(raw) < 16 or raw[:4] != PACK_MAGIC: die('cutscenes-pack: bad header')
+    ver, n, end = struct.unpack_from('<3I', raw, 4)
+    if ver != 2 or count != n: die('cutscenes-pack: version or reviewed count mismatch')
+    if hashlib.sha256(raw).hexdigest() != digest: die('cutscenes-pack: reviewed manifest mismatch')
+    if end < 16 + 24*n or end+124+8 > len(raw) or (len(raw)-end-124) % 8:
+        die('cutscenes-pack: incomplete catalog')
+    keys = [bytes(raw[i:i+8]) for i in range(end+124, len(raw), 8)]
+    if keys != sorted(set(keys)): die('cutscenes-pack: duplicate or unsorted catalog')
+    out = {}
+    previous = b''
+    for i in range(n):
+        a, k, cl, off, size, h = struct.unpack_from('<4s4s4I', raw, 16 + 24*i)
+        if a+k <= previous or a+k not in keys: die('cutscenes-pack: invalid reviewed key')
+        if cl not in (CLASS_SAFE, CLASS_EDIT): die('cutscenes-pack: invalid class')
+        previous = a+k
+        if off % 16 or off < 16+24*n or off+size >= end: die('cutscenes-pack: invalid bounds')
+        data = raw[off:off+size]
+        if fnv1a(data) != h: die('cutscenes-pack: entry checksum')
+        out[(a.decode(), k.rstrip(b'\0').decode())] = cl, data
+    return out
 
 def read_pack(path):
-    b = open(path, 'rb').read()
-    if len(b) < 16 or b[:4] != PACK_MAGIC: die('pack %s: not a KHCS pack' % path)
-    ver, n, z = struct.unpack_from('<III', b, 4)
-    if ver != 1 or 16 + 24 * n > len(b): die('pack %s: version %d / count %d does not fit' % (path, ver, n))
-    out = collections.OrderedDict()
-    for i in range(n):
-        r = b[16 + 24 * i:40 + 24 * i]; area = r[:4].decode('latin1'); name = r[4:8].rstrip(b'\0').decode('latin1')
-        cl, off, size, h = struct.unpack_from('<IIII', r, 8)
-        if off + size > len(b) or off % 16: die('pack %s: entry %s/%s out of range' % (path, area, name))
-        d = b[off:off + size]
-        if fnv1a(d) != h: die('pack %s: entry %s/%s checksum' % (path, area, name))
-        out[(area, name)] = (cl, d)
-    return out
+    with open(path, 'rb') as f: return decode_pack(f.read(), REVIEWED_COUNT, REVIEWED_SHA)
 
 
 def run(a):
@@ -158,9 +175,6 @@ def run(a):
     replaced = {f[:-4].lower() for f in os.listdir(mapdir) if f.lower().endswith('.map')}
     nrows = objentry_rows(tree._read('00objentry.bin'))
     changed = {k for k in nrows if k in vrows and nrows[k] != vrows[k]}
-    proven = set()
-    for k, d in nmc.items():
-        if not stub_like(d): proven |= {t for t, _ in E.ev_cmds(d)[0]}
     exists = lambda rel: tree.find(rel) is not None
     rows = []; counts = collections.Counter(); reach_c = collections.Counter(); pack = []
     for k in sorted(nmc):
@@ -172,24 +186,35 @@ def run(a):
         if k not in van or stub_like(van[k]):
             cl, det = 'KEEP-STUB', 'no-original'; size = 0
         else:
-            ev = E.Event(tree, area, name, van[k]); cl, det = classify(ev, proven, changed, exists, replaced); size = len(van[k])
+            size = len(van[k])
+            try:
+                ev = E.Event(tree, area, name, van[k])
+                cl, det = classify(ev, changed, exists, replaced)
+            except struct.error:
+                cl, det = 'KEEP-STUB', 'malformed-command'
+            if len(nmc[k]) == 68:
+                cl, det = 'KEEP-STUB', 'nmc-volume-stub' 
         rows.append((area, name, cl, det.split(' ')[0] if det else '', det, reach, size))
         counts[(cl, det.split(' ')[0] if det else '')] += 1; reach_c[(cl, reach)] += 1
-        if cl == 'SAFE' and reach != 'none': pack.append((area, name, CLASS_SAFE, van[k]))
+        if cl == 'SAFE' and reach != 'none': pack.append((area, name, CLASS_SAFE, van[k], asset_groups(ev)))
     if a.table:
         with open(a.table, 'w') as f:
             f.write('area\tname\tclass\treason\tdetail\treach\tvanilla_bytes\n')
             for r in rows: f.write('%s\t%s\t%s\t%s\t%s\t%s\t%d\n' % r)
-    print('stubs %d (proven command types: %d, objentry rows the mod changed: %d)' % (len(rows), len(proven), len(changed)))
+    print('exact stubs %d; changed object rows %d' % (len(rows), len(changed)))
     for (cl, why), n in sorted(counts.items()): print('  %-10s %-18s %4d' % (cl, why or '-', n))
     for cl in ('SAFE', 'KEEP-STUB'):
         print('  %s by reach: %s' % (cl, ' '.join('%s %d' % (r, reach_c[(cl, r)]) for r in ('started', 'named', 'theater', 'none'))))
     if a.pack:
-        size = write_pack(a.pack, pack)
-        back = read_pack(a.pack)
-        bad = [k for k, (cl, d) in back.items() if van.get(k) != d]
-        if len(back) != len(pack) or bad: die('pack read-back: %d entries, %d differ from the vanilla bytes' % (len(back), len(bad)))
-        print('pack %s: %d scenes, %d bytes (read back: every entry equals its vanilla entry)' % (a.pack, len(pack), size))
+        templates = {len(d): d for d in nmc.values() if stub_like(d)}
+        if set(templates) != {56, 68}: die('cutscenes-pack: missing reviewed NMC stub')
+        raw = pack_bytes(pack, [r[:2] for r in rows], templates[56], templates[68])
+        back = decode_pack(raw, REVIEWED_COUNT, REVIEWED_SHA)
+        if any(data != van[k] for k, (cl, data) in back.items()):
+            die('cutscenes-pack: original data mismatch')
+        with open(a.pack + '.tmp', 'wb') as f: f.write(raw)
+        os.replace(a.pack + '.tmp', a.pack)
+        print('reviewed pack: %d scenes, %d bytes' % (len(pack), len(raw)))
     return 0
 
 
@@ -203,54 +228,56 @@ def check_pack(a):
 
 # ---------------------------------------------------------------------------------------------------------- selftest (no game data)
 def selftest():
-    import tempfile
-    ok = [0, 0]
-    def T(c, what):
-        ok[0] += 1
-        if not c: ok[1] += 1; print('cutscene_pack selftest FAIL: %s' % what)
-    def cmd(t, pl=b''): return struct.pack('<HH', 4 + len(pl), t) + pl
-    stub = cmd(0, b'\0' * 20) + cmd(0x0f) + cmd(0x10, b'\0' * 4) + cmd(0x08, b'\x32\0\x12\0') + cmd(0x12, b'\1\0\0\0\1\0') + b'\0\0'
-    T(stub_like(stub) and E.is_stub(stub), 'the stub shape')
-    T(stub_like(stub[:-2] [:36] + cmd(0x2e, b'\0' * 8) + stub[36:]), 'stub with a volume command')
-    T(not stub_like(stub[:-2][:36] + cmd(0x14, b'\0\0') + stub[36:]), 'stub with another command is a scene')
-
-    class FakeTree:
-        lang = 'us'; objentry = {0x10: ('H_EX500', 'H_EX500.mset', (0, 0, 0, 0)), 0x11: ('P_BB000', 'P_BB000.mset', (0, 0, 0, 0))}
-    def scene(*extra):
-        body = cmd(0, b'\0' * 6 + b'zz_event_001\0\0') + cmd(0x0f) + cmd(0x10, b'\0' * 4) + cmd(0x08, b'\x10\0\0\0')
-        body += cmd(0x01, struct.pack('<HH', 0x10, 0) + b'h_ex500\0') + b''.join(extra)
-        return E.Event(FakeTree(), 'zz00', '101', body + b'\0\0')
-    files_all = lambda rel: True
-    proven = {0x00, 0x0f, 0x10, 0x08, 0x01, 0x15, 0x12}
-    T(classify(scene(), proven, set(), files_all) == ('SAFE', ''), 'a plain scene is SAFE')
-    T(classify(scene(), proven, set(), files_all, {'zz00'})[1] == 'room-replaced zz00', 'a scene in a room the mod rebuilt keeps the stub')
-    T(classify(scene(cmd(0x03, b'\x07\0zz')), proven | {0x03}, set(), files_all, {'zz07'})[1] == 'room-replaced zz07', 'a scene whose map the mod rebuilt keeps the stub')
-    T(classify(scene(cmd(0x44, b'\0\0mv\0')), proven | {0x44}, set(), files_all)[1] == 'movie', 'a movie command keeps the stub')
-    T(classify(scene(cmd(0x4e, b'\0\0')), proven, set(), files_all)[1].startswith('unproven-command 0x4e'), 'an unproven command keeps the stub')
-    T(classify(scene(), proven, {0x10}, files_all)[1] == 'actor-changed 16', 'an actor whose row the mod changed keeps the stub')
-    T(classify(scene(), proven, {0x11}, files_all) == ('SAFE', ''), 'a changed row the scene does not use')
-    miss = classify(scene(), proven, set(), lambda rel: rel != 'obj/H_EX500.mdlx')
-    T(miss[0] == 'KEEP-STUB' and miss[1] == 'missing-file obj/H_EX500.mdlx', 'a missing actor model keeps the stub')
-    voice = cmd(0x23, struct.pack('<H', 1) + b'\0' * 6 + struct.pack('<HB', 5, 0) + b'zz101a\0'.ljust(29, b'\0'))
-    T(classify(scene(voice), proven | {0x23}, set(), lambda rel: 'voice' not in rel)[1].startswith('missing-file voice/us/event/zz101a'), 'a missing voice keeps the stub')
-    bad = scene(); bad.tail = -1
-    T(classify(bad, proven, set(), files_all)[0] == 'KEEP-STUB', 'an original that does not decode keeps the stub')
-    d = tempfile.mkdtemp(prefix='cutscene-pack-st-')
-    p = os.path.join(d, 'p.khcs')
-    items = [('tt05', '406', 1, b'\x01' * 30), ('al00', '101', 1, b'\x02' * 17), ('tt05', '12a', 2, b'')]
-    write_pack(p, items); back = read_pack(p)
-    T(list(back) == [('al00', '101'), ('tt05', '12a'), ('tt05', '406')], 'pack records sorted by key')
-    T(back[('tt05', '406')] == (1, b'\x01' * 30) and back[('al00', '101')] == (1, b'\x02' * 17) and back[('tt05', '12a')] == (2, b''), 'pack round trip')
-    raw = bytearray(open(p, 'rb').read()); raw[96] ^= 0xff          # 96 = the first data byte: 16 + 3 * 24 = 88, aligned to 16
-    open(p, 'wb').write(bytes(raw))
-    import subprocess
-    r = subprocess.run([sys.executable, '-I', '-c', 'import sys; sys.path.insert(0, %r); import cutscene_pack as C; C.read_pack(%r)' % (os.path.dirname(os.path.abspath(__file__)), p)],
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    T(r.returncode == 1 and b'checksum' in r.stderr, 'a damaged pack entry is a named error')
-    for f in os.listdir(d): os.unlink(os.path.join(d, f))
-    os.rmdir(d)
-    print('cutscene_pack selftest: %d checks, %d failures' % (ok[0], ok[1]))
-    return 1 if ok[1] else 0
+    import contextlib, io
+    tests = 0
+    for t in range(256):
+        if t not in PRESENTATION:
+            assert not reviewed_command(t, bytes(8))
+            tests += 1
+    for arg in (100, 101):
+        assert not reviewed_command(0x51, struct.pack('<HHI', 0, 0, arg))
+    empty = bytes.fromhex('0000008000000000')
+    assert reviewed_command(0x24, empty)
+    assert not reviewed_command(0x24, bytes([1]) + empty[1:])
+    for sub in (0x25, 0x33, 0x4d, 0xff):
+        assert not reviewed_command(0x24, empty + struct.pack('<HH', sub, 4))
+    class Fixture:
+        tail = 2
+        area = 'aa00'
+        map = None
+        layouts = set()
+        actors = []
+        cmds = [(0x08, bytes(4))]
+        def files(self): return [('map', 'map/aa00.map')]
+    fixture = Fixture()
+    def result():
+        return classify(fixture, set(), lambda path: True)[0]
+    assert result() == 'SAFE'
+    for t in (0x33, 0x51, 0x4d, 0x2e, 0x2f, 0x30, 0xffff):
+        fixture.cmds = [(t, bytes(8))]
+        assert result() == 'KEEP-STUB', hex(t)
+    fixture.cmds = [(0x24, empty + struct.pack('<HH', 0x26, 4))]
+    assert result() == 'KEEP-STUB'
+    fixture.cmds = [(0x08, bytes(4))]
+    assert classify(fixture, set(), lambda path: False)[1].startswith('missing-file')
+    assert classify(fixture, set(), lambda p: True, {'aa00'})[1].startswith('room-replaced')
+    fixture.actors = [(42, 0, 'actor')]
+    assert classify(fixture, {42}, lambda path: True)[1].startswith('actor-changed')
+    fixture.cmds = [(MOVIE, b'')]
+    assert classify(fixture, set(), lambda path: True)[1] == 'movie'
+    key = ('aa00','101')
+    entry = b'123456'
+    raw = pack_bytes([(*key, 1, entry, ['map/aa00.map'])], [key], bytes(56), bytes(68))
+    digest = hashlib.sha256(raw).hexdigest()
+    assert decode_pack(raw, 1, digest)[key] == (1, entry)
+    for i in (8, 16, 24, 48, len(raw)-1):
+        mutated = bytearray(raw); mutated[i] ^= 1
+        with contextlib.redirect_stderr(io.StringIO()):
+            try: decode_pack(mutated, 1, digest)
+            except SystemExit: continue
+        raise AssertionError('cutscenes-pack accepted mutation at %d' % i)
+    print('cutscene_pack: rejected %d unknown opcode values; operand, subcommand and manifest mutations passed' % tests)
+    return 0
 
 
 def main():

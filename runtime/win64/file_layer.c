@@ -92,6 +92,12 @@ static FILE *open_loose(KCtx *g,const char *path,int *size,const char *what){
     }
     return f;
 }
+/* Preflight uses the same readable, case-insensitive NMC data tree as the loader. */
+int kh_cutscene_asset_exists(KCtx *g,const char *path){
+    int size=0; FILE *f=open_loose(g,path,&size,"size");
+    if(!f) return 0;
+    fclose(f); return size>0;
+}
 /* For the stream-fd layer (stream_layer.c): the same tree-relative mapping and the same file log as the loaders. */
 int kh_file_loose_path(KCtx *g,const char *path,char *host,size_t cap){
     char rel[2048]; const char *root=getenv("KHNMC_DATA"); if(!root) root="data";
