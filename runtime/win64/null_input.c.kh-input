@@ -366,7 +366,7 @@ static void route_tick(KCtx *g,u64 n){
                     goto_best=1e30f; goto_best_at=n;
                     if((n-step_t0)%s->every<s->hold){ fight_a=1; if(!was_a) fight_pages++; } }
                 else if(pos_fn(g,&x,&y,&z,&h)){
-                    float ex=0,ez=0,ed=0; int ne=enemy_fn(g,x,z,&ex,&ez,&ed); goto_seen=1; goto_x=x; goto_z=z; fight_enemies=ne;
+                    float ex=0,ez=0,ed=0; int ne=s->to_object ? object_fn(g,s->obj_name,x,z,&ex,&ez,&ed) : enemy_fn(g,x,z,&ex,&ez,&ed); goto_seen=1; goto_x=x; goto_z=z; fight_enemies=ne;
                     if(ne<=0){ goto_best=1e30f; goto_best_at=n; }                 /* nothing to fight: stand still, no A (it would talk to whoever stands near) */
                     else { float d=hypotf(x-ex,z-ez); goto_tx=ex; goto_tz=ez; goto_d=d;
                         if(d<=s->radius){ goto_best=1e30f; goto_best_at=n;           /* in reach: attack, as @press A every P hold H */
@@ -673,6 +673,10 @@ void kh_input_load(KCtx *g,const char *path){
                     i+=2; }
             } else if(!strcmp(words[0],"@fight")){                /* @fight until COND [radius R] [every P] [hold H] [stall N] [timeout N] (task 30) */
                 st.type=ST_FIGHT; st.radius=150.0f; st.every=20; st.hold=3; st.stall=600;
+                if(i<n && !strcmp(words[i],"object")){
+                    if(++i>=n || strlen(words[i])>=sizeof st.obj_name){ why="@fight object needs a model name (at most 39 characters)"; goto invalid; }
+                    st.to_object=1; snprintf(st.obj_name,sizeof st.obj_name,"%s",words[i++]);
+                }
                 while(i<n){
                     if(!strcmp(words[i],"until")){ if(st.has_until){ why="@fight: one `until` only"; goto invalid; } i++; if(!parse_cond(words,n,&i,&st.c,&why)) goto invalid; st.has_until=1; continue; }
                     long long w; if(i+1>=n || !number(words[i+1],1,100000000,&w)){ why="@fight: radius, every, hold, stall and timeout take a number"; goto invalid; }
@@ -1400,6 +1404,7 @@ int kh_input_route30_selftest(KCtx *g){
     cond_fn=t_cond; cursor_fn=t29_cur; target_fn=t29_target; pos_fn=t29_pos; yaw_fn=t29_yaw; enemy_fn=t29_enemy;
     memset(t_val,0,sizeof t_val); t29_step=0; t29_frozen=0; t29_pos_ok=t29_cam_ok=1;
     /* 1. parse: defaults, options, a relative press after it */
+    PCHECK(t_load(g,"@fight object B_EX370 until not mission\n") && steps[0].to_object && !strcmp(steps[0].obj_name,"B_EX370"));
     PCHECK(t_load(g,"@fight until not mission\n") && nsteps==1 && steps[0].type==ST_FIGHT && steps[0].has_until && steps[0].c.kind==KR_MISSION && steps[0].c.neg &&
            steps[0].radius==150.0f && steps[0].every==20 && steps[0].hold==3 && steps[0].stall==600 && steps[0].timeout==3600);
     PCHECK(t_load(g,"@fight until enemies-at-most 0 radius 80 every 10 hold 2 stall 300 timeout 5000\n+1 +2 B\n") && nsteps==1 && steps[0].c.kind==KR_ENEMIES_AT_MOST && steps[0].c.arg==0 &&

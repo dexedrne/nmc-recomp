@@ -65,6 +65,7 @@
  * block (exe 0x3b1840 reads them through a guest pointer): +0 = 0x1800819d8, +0x10 = 0x1800819e8, adjacent as in the DLL's .bss.
  * A DLL path that would fault on the PC (it never checks a pointer) is a named fatal. */
 #include "mod_config.h"
+#include "rmc.h"
 #include "xion_swap.h"
 #include <string.h>
 #include <strings.h>
@@ -549,7 +550,7 @@ static int option_value_on(char *p){
 }
 int kh_mod_b_option_on(const char *root,const char *ini,const char *key){
     char rel[300],host[4096],line[512]; snprintf(rel,sizeof rel,"dll/%s",ini);
-    if(!kh_resolve_ci(root,rel,host,sizeof host)) return -1;
+    if(!kh_data_path(root,rel,host,sizeof host)) return -1;
     FILE *f=fopen(host,"r"); if(!f) return -1;
     int res=-1, in_settings=0; size_t kn=strlen(key);
     while(fgets(line,sizeof line,f)){
@@ -580,12 +581,12 @@ void kh_mod_hooks_b_init(KCtx *g){
     /* the DLL's data files sit next to it (it takes its own path from GetModuleHandleEx / GetModuleFileName): <data>/dll/tweaks/ */
     const char *root=getenv("KHNMC_DATA"); char host[4096],err[160]="";
     kh_mod_b_check_options(g,root?root:"data");
-    if(kh_resolve_ci(root?root:"data","dll/tweaks/special_command_menu.bin",host,sizeof host))
+    if(kh_data_path(root?root:"data","dll/tweaks/special_command_menu.bin",host,sizeof host))
         kh_fatal(g,"mod-b-special-command-menu: %s exists; the DLL would load its 32-byte entries into the special-command vector used by the detours on "
                    "exe 0x4060e0 and 0x15aba0, which this port implements for the empty vector of the shipped mod only",host);
-    if(kh_resolve_ci(root?root:"data","dll/KH2_Tweaks_SpecialCommandList.ini",host,sizeof host))
+    if(kh_data_path(root?root:"data","dll/KH2_Tweaks_SpecialCommandList.ini",host,sizeof host))
         kh_fatal(g,"mod-b-special-command-list: %s exists; the DLL would read 11 command lists and icon bytes from it (0x180081860..6a), not ported: the shipped mod has no such file",host);
-    if(kh_resolve_ci(root?root:"data","dll/tweaks/command_menu_offsets.bin",host,sizeof host)){
+    if(kh_data_path(root?root:"data","dll/tweaks/command_menu_offsets.bin",host,sizeof host)){
         if(kh_mod_b_load_command_menu(host,err,sizeof err)<0) kh_fatal(g,"mod-b-command-menu: %s: %s",host,err);
     } else snprintf(cm_state,sizeof cm_state,"no file");
     fprintf(stderr,"kh: mod B: command-menu icon table (dll/tweaks/command_menu_offsets.bin): %s\n",cm_state);

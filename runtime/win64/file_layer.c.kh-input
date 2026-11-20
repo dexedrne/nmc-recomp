@@ -1,6 +1,7 @@
 /* Loose-first entry points; real packages use the untouched lifted implementation. */
 #include "khnmc_rt.h"
 #include "frame_time.h"
+#include "rmc.h"
 #include "khnmc_hd.h"
 #include "kh_look.h"
 #include "title_logo.h"
@@ -397,13 +398,16 @@ static int loose_path(KCtx *g,const char *path,const char *what,char *host,size_
     }
     if(profile){ kh_look_path(g,rel,host,cap); return KH_FILE_LOOK; }
     const char *root=getenv("KHNMC_DATA"); if(!root) root="data";
+    if(kh_rmc_path(rel,host,cap)) return KH_FILE_RMC;
     if(strlen(root)+strlen(rel)+2>=cap) return 0;
     if(kh_resolve_ci(root,rel,host,cap)) return 1;
     const char *arena=arena_fallback(rel);
-    if(!arena || kh_data_denied(g,arena,what) || !kh_resolve_ci(root,arena,host,cap)) return 0;
+    if(!arena || kh_data_denied(g,arena,what)) return 0;
+    int source=kh_rmc_path(arena,host,cap);
+    if(!source && !kh_resolve_ci(root,arena,host,cap)) return 0;
     if(fallback) *fallback=arena;
     fprintf(stderr,"kh: arena-map-fallback: %s uses %s\n",rel,arena);
-    return 1;
+    return source?source:1;
 }
 /* `what` names the kind of request for the deny list: a listed file is answered exactly as an absent one (data_deny.c) */
 static FILE *open_loose(KCtx *g,const char *path,int *size,const char *what,const char **fallback){
@@ -412,6 +416,7 @@ static FILE *open_loose(KCtx *g,const char *path,int *size,const char *what,cons
     if(source){
         f=fopen(host,"rb");
         if(f&&(fstat(fileno(f),&st)||!S_ISREG(st.st_mode)||st.st_size>INT_MAX)){ fclose(f); f=NULL; }
+        if(!f && source==KH_FILE_RMC) kh_fatal(g,"rmc-open: %s",host);
         if(!f && source==KH_FILE_LOOK) kh_fatal(g,"player-look-open: %s",host);
         if(f) *size=(int)st.st_size;
     }
@@ -639,6 +644,8 @@ int kh_file_selftest(KCtx *g){
         FILE *part=fopen(member,"wb"); TEST(part!=NULL);
         if(part){ fputc('x',part); fclose(part); }
     }
+    kh_rmc_init(pack);
+    TEST(kh_file_loose_path(g,KH_SCENE_MDLX,resolved,sizeof resolved)==KH_FILE_RMC);
     TEST(!kh_look_key(KH_SCENE_MDLX)); /* keep the decision for the whole event */
     kh_scene_pack_end(); kh_scene_pack_begin();
     TEST(kh_file_loose_path(g,KH_SCENE_MDLX,resolved,sizeof resolved)==KH_FILE_LOOK);
@@ -646,6 +653,7 @@ int kh_file_selftest(KCtx *g){
     TEST(kh_look_key("./OBJ//h_ex500.MDLX")==KH_SCENE_MODEL);
     TEST(kh_look_key("remastered/obj/H_EX500.mdlx/-2.dds")==KH_SCENE_MODEL);
     TEST(!kh_look_key("remastered/obj/H_EX500.mdlx/-3.dds") && !kh_look_key("obj/H_EX500.mset"));
+    kh_rmc_init(NULL);
     u32 event_state=rd32(g,GS_BASE+0xb65210);
     wr32(g,GS_BASE+0xb65210,4); /* the guest's already-ended case has no other side effects */
     kh_call(g,GS_BASE+0x2cbd80,0,0,0,0);
@@ -672,6 +680,26 @@ int kh_file_selftest(KCtx *g){
     if(initial_pack) setenv("KHNMC_SCENE_ROXAS_DIR",initial_pack,1); else unsetenv("KHNMC_SCENE_ROXAS_DIR");
     free(initial_pack);
     TEST(kh_call(g,GS_BASE+0x1063d0,0,name,0,0)==4);
+    {
+        char overlay[KH_TMP_MAX+32],file[KH_TMP_MAX+64];
+        snprintf(overlay,sizeof overlay,"%s/rmc",dir);
+        kh_rmc_init(overlay);
+        TEST(kh_call(g,GS_BASE+0x106700,0,name,dst,0)==4 && !memcmp(hp(g,dst),"test",4));
+        TEST(mkdir(overlay,0700)==0);
+        snprintf(file,sizeof file,"%s/MIXED.bin",overlay);
+        FILE *af=fopen(file,"wb"); TEST(af!=NULL);
+        if(af){ fputs("patch",af); fclose(af); }
+        snprintf(file,sizeof file,"%s/stale",overlay); af=fopen(file,"wb"); TEST(af!=NULL); if(af) fclose(af);
+        snprintf(file,sizeof file,"%s/rmc-pack.pending",dir);
+        af=fopen(file,"wb"); TEST(af!=NULL);
+        if(af){ fwrite("mixed.bin\0/\0",1,12,af); fclose(af); }
+        TEST(kh_rmc_sync(dir,overlay)==1 && !kh_rmc_find("stale"));
+        snprintf(file,sizeof file,"%s/stale",overlay); TEST(access(file,F_OK)!=0);
+        u64 key=ga_strdup(".\\MiXeD.BIN");
+        TEST(kh_call(g,GS_BASE+0x106700,0,key,dst,0)==5 && !memcmp(hp(g,dst),"patch",5));
+        ga_free(key); kh_rmc_init(NULL);
+        snprintf(file,sizeof file,"%s/MIXED.bin",overlay); unlink(file); rmdir(overlay);
+    }
     char prefixed[2048]; snprintf(prefixed,sizeof prefixed,"%s\\.\\MIXED.BIN",gstr(g,GS_BASE+0x2bd4340));
     u64 windows=ga_strdup(prefixed); TEST(kh_call(g,GS_BASE+0x1063d0,0,windows,0,0)==4); ga_free(windows);
     u64 parent=ga_strdup("../MiXeD.bin"); TEST((s32)kh_call(g,GS_BASE+0x106700,0,parent,dst,0)==-1); ga_free(parent);

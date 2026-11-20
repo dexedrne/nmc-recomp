@@ -78,6 +78,7 @@
  * functions are wrapper hooks.  KHNMC_MOOSE_HEAPS=0 keeps the vanilla sizes (every hook passes through to the lifted original);
  * without $KHNMC_DATA/dll/KH2Moose.ini (or $KHNMC_MOOSE_INI) nothing is changed either, and the start-up line says so. */
 #include "khnmc_rt.h"
+#include "rmc.h"
 #include <errno.h>
 #include <unistd.h>
 #include <signal.h>
@@ -342,7 +343,7 @@ void kh_moose_init(KCtx *g){
     const char *e=getenv("KHNMC_MOOSE_HEAPS"); int heaps=!(e&&*e=='0');
     const char *pe=getenv("KHNMC_MOOSE_PATCHES"); int patches=!(pe&&*pe=='0');                 /* A/B switch for the two code patches only */
     if((e=getenv("KHNMC_MOOSE_INI"))&&*e) snprintf(ini_path,sizeof ini_path,"%s",e);
-    else { const char *root=getenv("KHNMC_DATA"); snprintf(ini_path,sizeof ini_path,"%s/dll/KH2Moose.ini",root?root:"data"); }
+    else if(!kh_rmc_path("dll/KH2Moose.ini",ini_path,sizeof ini_path)){ const char *root=getenv("KHNMC_DATA"); snprintf(ini_path,sizeof ini_path,"%s/dll/KH2Moose.ini",root?root:"data"); }
     MooseCfg c; int rc=ini_parse(ini_path,&c);
     if(rc==0){ state="off (no KH2Moose.ini): vanilla pool sizes"; fprintf(stderr,"kh: moose: no ini at %s: vanilla pool sizes (cache 30 MiB, data 768 KiB), no code patch, no exception handler on the PC either\n",ini_path); return; }
     if(rc<0) kh_fatal(g,"moose: %s: %s",ini_path,c.err);

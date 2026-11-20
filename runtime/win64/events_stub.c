@@ -26,6 +26,7 @@
  * The stub's bytes are not in this source: they are read from the tree (the first 56-byte entry of that shape in KHNMC_DATA's
  * ard/us/, sorted by name).  No such entry: named fatal `events-stub-template`.  Counters at exit: `kh: events stub: ...`. */
 #include "kh_look.h"
+#include "rmc.h"
 #include <dirent.h>
 #include <errno.h>
 #include <unistd.h>
@@ -62,7 +63,8 @@ static void load_template(KCtx *g){
     if(n<0) return;
     for(int i=0;i<n&&!have_tmpl;i++){
         const char *nm=list[i]->d_name; size_t l=strlen(nm); if(l<5||strcasecmp(nm+l-4,".ard")) continue;
-        char p[4500]; snprintf(p,sizeof p,"%s/%s",dir,nm); FILE *f=fopen(p,"rb"); if(!f) continue;
+        char p[4500],rel[512]; snprintf(rel,sizeof rel,"ard/us/%s",nm);
+        if(!kh_rmc_path(rel,p,sizeof p)) snprintf(p,sizeof p,"%s/%s",dir,nm); FILE *f=fopen(p,"rb"); if(!f) continue;
         struct stat st; if(fstat(fileno(f),&st)||st.st_size<16||st.st_size>(64<<20)){ fclose(f); continue; }
         u8 *b=malloc((size_t)st.st_size); if(!b){ fclose(f); kh_fatal(g,"events-stub-template: out of memory"); }
         if(fread(b,1,(size_t)st.st_size,f)==(size_t)st.st_size&&!memcmp(b,"BAR\1",4)){
@@ -306,7 +308,8 @@ static int tree_check(KCtx *g,const char *root){
     long n_ent=0,n_pass=0,n_plain=0,n_carry=0; static const int want[5]={0x00,0x0f,0x10,0x08,0x12};
     for(int i=0;i<nf;i++){
         const char *nm=list[i]->d_name; size_t l=strlen(nm); if(l<5||strcasecmp(nm+l-4,".ard")) continue;
-        char p[4500]; snprintf(p,sizeof p,"%s/%s",dir,nm); FILE *f=fopen(p,"rb"); if(!f) kh_fatal(g,"events stub tree check: cannot read %s",p);
+        char p[4500],rel[512]; snprintf(rel,sizeof rel,"ard/us/%s",nm);
+        if(!kh_rmc_path(rel,p,sizeof p)) snprintf(p,sizeof p,"%s/%s",dir,nm); FILE *f=fopen(p,"rb"); if(!f) kh_fatal(g,"events stub tree check: cannot read %s",p);
         fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET); u8 *b=malloc((size_t)sz+1); if(!b||fread(b,1,(size_t)sz,f)!=(size_t)sz) kh_fatal(g,"events stub tree check: cannot read %s",p); fclose(f);
         u32 cnt=sz>=16&&!memcmp(b,"BAR\1",4)?(u32)(b[4]|b[5]<<8|b[6]<<16|(u32)b[7]<<24):0;
         for(u32 k=0;k<cnt&&16+16ull*(k+1)<=(u64)sz;k++){

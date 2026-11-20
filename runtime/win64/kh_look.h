@@ -13,7 +13,7 @@ int kh_scene_key(const char *rel);
 const char *kh_scene_root(void);
 const char *kh_look_root(void);
 int kh_scene_path(const char *rel,char *host,size_t cap);
-enum { KH_FILE_LOOK = 2 }; /* A selected overlay file must open successfully. */
+enum { KH_FILE_LOOK = 2, KH_FILE_RMC = 3 }; /* A selected overlay file must open successfully. */
 int kh_look_enabled(void);
 int kh_look_asset(int look,const char *rel,char *host,size_t cap);
 int kh_look_pack_ready(int look);

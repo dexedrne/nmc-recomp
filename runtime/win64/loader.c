@@ -1,4 +1,6 @@
 #include "settings.h"
+#include "rmc.h"
+#include "autosave.h"
 /* loader.c : PE image loader + process driver (main).
  *
  * Address model (KH_XLATE_MODE 0, identity): one MAP_FIXED_NOREPLACE reservation of "guest space" at 0x140000000 holds the image at
@@ -242,6 +244,11 @@ static int kh_main_body(int argc,char **argv){
         else { fprintf(stderr,"usage: %s [--exe kh2fm.exe] [--root GAMEDIR] [--docs DIR] [--entry crt|winmain|axa|ADDR] [-v] [--selftest] [--hd-check [REPORT.tsv]]\n env: KH_TRACE=file KH_TRACE_MAX=n KH_STOP_AT_GX=1 KH_DET=1\n"
                               " --hd-check: build the HD asset table of every game file of the tree KHNMC_DATA (KHNMC_HD_PACKAGES, KHNMC_HD_MODLIST as in a run) and print the totals; no game image is loaded, nothing runs\n",argv[0]); return 2; }
     }
+    const char *rmc=selftest?NULL:getenv("KHNMC_RMC_DIR");
+#if KH_IOS_PATHS
+    if(!kh_rmc_sync(kh_autosave_documents(),rmc))
+#endif
+        kh_rmc_init(rmc);
     if(hd_check){ extern int kh_hd_check(const char *); return kh_hd_check(hd_check_report); }      /* host-only: before the docs dir, the trace and the guest image */
     mkdir(kh_docs,0755);
     kh_frame_time_init();

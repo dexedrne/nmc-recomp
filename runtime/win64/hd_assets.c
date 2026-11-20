@@ -61,6 +61,7 @@
  * `khnmc --hd-check [report.tsv]` builds the table of every game file of the tree with this code (no game run) and prints the totals. */
 #define _GNU_SOURCE
 #include "khnmc_hd.h"
+#include "rmc.h"
 #include "khnmc_remaster.h"
 #include "kh_look.h"
 #include "xion_swap.h"
@@ -88,6 +89,7 @@ typedef struct { char name[32]; uint32_t orig;
                  int32_t gsize;                   /* decompressedSize field of the guest-visible entry (the game does not read it) */
                  int64_t fsize;                   /* size of the host file when the table was built */
                  char *host;                      /* NULL: no asset (scan-short padding without a file) */
+                 KhRmcFile *rmc;
                  unsigned char src; } HdEnt;
 struct HdTable {
     char *key; int64_t fsize; HdTable *next;
@@ -305,7 +307,7 @@ static void cfg_load(KCtx *g,const char *root){
     const char *p=getenv("KHNMC_HD_MODLIST");
     if(p&&!strcmp(p,"none")) prov_none_explicit=1;
     else {
-        if(!p||!*p){ if(snprintf(dflt,sizeof dflt,"%s/khnmc-hd-modlist.txt",root)>=(int)sizeof dflt) kh_fatal(g,"hd-modlist: tree path too long: %s",root); p=access(dflt,R_OK)?NULL:dflt; }
+        if(!p||!*p){ if(!kh_rmc_path("khnmc-hd-modlist.txt",dflt,sizeof dflt) && snprintf(dflt,sizeof dflt,"%s/khnmc-hd-modlist.txt",root)>=(int)sizeof dflt) kh_fatal(g,"hd-modlist: tree path too long: %s",root); p=access(dflt,R_OK)?NULL:dflt; }
         if(p){ if(prov_load_file(p,err,sizeof err)) kh_fatal(g,"hd-modlist: %s",err);
             fprintf(stderr,"kh: hd: provenance list %s: %d mod files (%d of them remastered)\n",p,prov_mods,prov_hd);
             if(prov_nohd_ignored) fprintf(stderr,"kh: hd: provenance list %s: %d `nohd` lines IGNORED (obsolete: the package tables decide which entries a file has)\n",p,prov_nohd_ignored); }
@@ -317,7 +319,7 @@ static void cfg_load(KCtx *g,const char *root){
         pkg_state=1;
         fprintf(stderr,"kh: hd: package tables OFF (KHNMC_HD_PACKAGES=none): only folders scanned from the mod get HD entries, every other file gets NONE\n");
     } else {
-        if(!p||!*p){ if(snprintf(dflt,sizeof dflt,"%s/khnmc-hd-packages.tsv",root)>=(int)sizeof dflt) kh_fatal(g,"hd-packages: tree path too long: %s",root); p=access(dflt,R_OK)?NULL:dflt; }
+        if(!p||!*p){ if(!kh_rmc_path("khnmc-hd-packages.tsv",dflt,sizeof dflt) && snprintf(dflt,sizeof dflt,"%s/khnmc-hd-packages.tsv",root)>=(int)sizeof dflt) kh_fatal(g,"hd-packages: tree path too long: %s",root); p=access(dflt,R_OK)?NULL:dflt; }
         if(p){ if(pkg_load_file(p,err,sizeof err)) kh_fatal(g,"hd-packages: %s",err);
             fprintf(stderr,"kh: hd: package tables %s: %d game files, %ld entries\n",p,pkg_files,pkg_entries); }
         else {
@@ -464,15 +466,21 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
         }
         rc=0; goto fail;
     }
-    if(t->look<0 || (!(gmod&&nmod)&&!pt)){                                                             /* nothing to pair: no disk access */
+    if(snprintf(sub,sizeof sub,"remastered/%s",rel)>=(int)sizeof sub||strlen(root)+strlen(sub)+2>=sizeof dir){ snprintf(err,cap,"path too long: %s",rel); goto fail; }
+    KhRmcFile *leaves=NULL;
+    size_t leaves_n=kh_rmc_children(sub,&leaves);
+    /* Keep the installed entry order and offsets. A new container without a
+     * package table can discover its own leaves through the existing walker. */
+    if(!pt && kh_rmc_find(rel)) gmod=t->game_mod=1;
+    if(t->look<0 || (!(gmod&&(nmod||leaves_n))&&!pt)){
         t->rule=R_NONE; t->unserved=nmod; t->e=calloc(1,sizeof *t->e); if(!t->e){ snprintf(err,cap,"out of memory"); goto fail; }
         *out=t; return 0;
     }
-    if(snprintf(sub,sizeof sub,"remastered/%s",rel)>=(int)sizeof sub||strlen(root)+strlen(sub)+2>=sizeof dir){ snprintf(err,cap,"path too long: %s",rel); goto fail; }
-    if(!kh_resolve_ci(root,sub,dir,sizeof dir)||stat(dir,&st)||!S_ISDIR(st.st_mode)){
+    int have_dir=kh_resolve_ci(root,sub,dir,sizeof dir) && !stat(dir,&st) && S_ISDIR(st.st_mode);
+    if(!have_dir && !leaves_n){
         snprintf(err,cap,"%s: %s%d file(s) below remastered/%s, but the tree %s has no such folder",rel,nmod?"the provenance list names ":"the package table has ",nmod?nmod:pt->n,rel,root); goto fail; }
-    if(nmod){                                                                           /* the mod's files of the folder, in Panacea's listing order */
-        if(scan_files(dir,&files,&nf,err,cap)) goto fail;
+    if(nmod || leaves_n){
+        if(nmod && have_dir && scan_files(dir,&files,&nf,err,cap)) goto fail;
         /* the mod's tree is NTFS: a name exists once per directory whatever its case.  Two tree files that differ only in case (they are
          * neighbours in the listing) cannot be told apart by the list: the bake must let the mod's file replace the other. */
         for(int i=0;i+1<nf;i++) if(!strcasecmp(files[i].name,files[i+1].name)){
@@ -485,10 +493,30 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
             k++;
         }
         nf=k;
-        if(nf!=nmod){ snprintf(err,cap,"the provenance list names %d mod files below remastered/%s, the tree has %d of them: list and tree do not belong together",nmod,rel,nf); goto fail; }
+        int installed=nf;
+        if(leaves_n){
+            HdFile *merged=realloc(files,(nf+leaves_n)*sizeof *files);
+            if(!merged){ snprintf(err,cap,"out of memory"); goto fail; }
+            files=merged;
+            for(size_t i=0;i<leaves_n;i++){
+                const KhRmcFile *leaf=&leaves[i];
+                if(leaf->size>INT_MAX){ snprintf(err,cap,"rmc-hd-size: %s",leaf->rel); goto fail; }
+                const char *name=leaf->rel+strlen(sub)+1;
+                if(strlen(name)>=sizeof files[nf].name){ snprintf(err,cap,"rmc-hd-name: %s",name); goto fail; }
+                int slot=0;
+                while(slot<nf && strcasecmp(files[slot].name,name)) slot++;
+                if(slot==nf){
+                    strcpy(files[nf++].name,name);
+                    if(prov_find(leaf->rel)) installed++;
+                }else free(files[slot].host);
+                files[slot].host=strdup(leaf->host); files[slot].size=leaf->size;
+                if(!files[slot].host){ snprintf(err,cap,"out of memory"); goto fail; }
+            }
+        }
+        if(installed!=nmod){ snprintf(err,cap,"the provenance list names %d mod files below remastered/%s, the tree has %d of them: list and tree do not belong together",nmod,rel,nf); goto fail; }
         served=calloc((size_t)nf+1,1); if(!served){ snprintf(err,cap,"out of memory"); goto fail; }
     }
-    if(gmod&&nmod){
+    if(gmod&&(nmod||(!pt && leaves_n))){
         /* ---- ScanRemasteredFolder ---- */
         int noffs=0,werr=0, known=kh_rm_offsets(rel,bytes,n,&offs,&noffs,&werr);
         if(werr){ snprintf(err,cap,"malformed container: the walker for %s read outside the %lld loaded bytes",rel,(long long)n); goto fail; }
@@ -563,6 +591,15 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
         free(e->host); e->host=strdup(path);
         if(!e->host){ snprintf(err,cap,"out of memory"); goto fail; }
         e->size=e->gsize=e->fsize=st.st_size;
+    }
+    if(leaves_n) for(int i=0;i<t->n;i++){
+        HdEnt *e=&t->e[i];
+        snprintf(full,sizeof full,"%s/%s",sub,e->name);
+        KhRmcFile *leaf=kh_rmc_find(full);
+        if(leaf && e->host && !strcmp(leaf->host,e->host)){
+            e->rmc=leaf;
+            e->gsize=e->size;
+        }
     }
     rc=0;
 fail:
@@ -652,6 +689,7 @@ void f_106460(KCtx *g){
     if(e->size<=0) kh_fatal(g,"hd assets: %s entry %d (%s) is an empty file",t->key,i,e->name);
     FILE *f=fopen(e->host,"rb");
     if(!f) kh_fatal(g,"hd assets: cannot open %s (entry %d \"%s\" of %s): %s",e->host,i,e->name,t->key,strerror(errno));
+    if(e->rmc) kh_rmc_report(e->rmc);
     struct stat st;
     if(fstat(fileno(f),&st)||!S_ISREG(st.st_mode)||st.st_size!=e->fsize){ fclose(f); kh_fatal(g,"hd assets: %s changed after the table was built (%lld bytes then, now %lld)",e->host,(long long)e->fsize,(long long)st.st_size); }
     u64 alloc=((u64)e->size+0xff)&~0xffull, buf=ga_alloc_src(alloc,16,GA_SRC_FILE);
@@ -747,7 +785,8 @@ int kh_hd_check(const char *report){
         const PkgTab *pt=pkg_state==2?pkg_find(rel):NULL; int gmod=prov_state==2&&prov_find(rel), nmod=prov_state==2?prov_dir_files(rel):0;
         hd_folder_modfiles+=(u64)nmod; if(pt) tabs_hit++;
         snprintf(host,sizeof host,"%s/%s",root,rel);
-        if(pt||(gmod&&nmod)){ b=read_whole(host,&n); if(!b){ fprintf(stderr,"hd-check: ERROR %s: cannot read the game file\n",rel); errors++; continue; } }
+        KhRmcFile *game=kh_rmc_find(rel);
+        if(pt||(gmod&&nmod)||game){ b=read_whole(game?game->host:host,&n); if(!b){ fprintf(stderr,"hd-check: ERROR %s: cannot read the game file\n",rel); errors++; continue; } }
         if(hd_build(root,rel,b,n,&t,err,sizeof err)){ fprintf(stderr,"hd-check: ERROR %s: %s\n",rel,err); errors++; free(b); if(rf) fprintf(rf,"%s\tERROR\t%s\t\t\t\t\t\t\t\t\t\t\t\t%s\n",rel,gmod?"mod":"package",err); continue; }
         rules[t->rule]++; src[SRC_MOD]+=(u64)t->n_mod; src[SRC_VANILLA]+=(u64)t->n_van; src[SRC_NULL]+=(u64)t->n_null; trim+=(u64)t->n_trim; modsize+=(u64)t->n_modsize;
         trunc+=(u64)t->truncated; unserved+=(u64)t->unserved; unknown+=(u64)t->unknown_ext; entries+=(u64)t->n;
@@ -961,6 +1000,24 @@ int kh_hd_selftest(KCtx *g){
         TEST(t->e[0].orig==0x00000120u&&t->e[1].orig==0x60000161u&&t->e[2].orig==0x40000200u&&t->e[3].orig==0x20000300u&&t->e[4].orig==0xffffffffu);   /* flag bits as the package has them */
         TEST(t->e[0].size==4&&t->e[1].size==2&&t->e[3].size==21&&t->e[3].fsize==32&&t->e[3].gsize==21&&t->e[4].size==4&&t->e[0].src==SRC_VANILLA); }
     table_free(t);
+    {
+        char pack[KH_TMP_MAX+32]; snprintf(pack,sizeof pack,"%s/rmc",dir);
+        TEST(mkdir(pack,0700)==0);
+        TEST(put_file(pack,"OBJ/v1.MDLX","PATCH",5));
+        TEST(put_file(pack,"REMASTERED/OBJ/v1.MDLX/-0.DDS","override",8));
+        kh_rmc_init(pack);
+        TEST(BUILD("obj/V1.mdlx",bar));
+        if(t){
+            t->key=strdup("obj/V1.mdlx"); HdTable *prev=cur_table; cur_table=t;
+            u64 sz=ga_alloc(16,16);
+            u64 b=kh_call(g,GS_BASE+0x106460,0,sz,0,0);
+            TEST(b && rd32(g,sz)==8 && !memcmp(hp(g,b),"override",8)); if(b) ga_free(b);
+            b=kh_call(g,GS_BASE+0x106460,0,sz,1,0);
+            TEST(b && rd32(g,sz)==2 && !memcmp(hp(g,b),"Dx",2)); if(b) ga_free(b);
+            ga_free(sz); cur_table=prev; table_free(t);
+        }
+        kh_rmc_init(NULL);
+    }
     /* case-insensitive game path */
     TEST(BUILD("OBJ/v1.MDLX",bar)); if(t) TEST(t->rule==R_PKG&&t->n==5); table_free(t);
     /* a table entry whose file is missing: named error; so is a vanilla file of the wrong size */

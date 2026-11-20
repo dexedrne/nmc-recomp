@@ -37,6 +37,7 @@ void f_106da0(KCtx *g){                                   /* OpenStream */
         if(fd>=0&&(fstat(fd,&st)||!S_ISREG(st.st_mode))){ close(fd); fd=-1; }
         if(fd==0){ int d=fcntl(fd,F_DUPFD_CLOEXEC,3); close(fd); fd=d; }               /* the callers treat fd <= 0 as failure */
     }
+    if(fd<0 && source==KH_FILE_RMC) kh_fatal(g,"rmc-stream-open: %s",host);
     if(fd<0 && source==KH_FILE_LOOK) kh_fatal(g,"player-look-stream-open: %s",host);
     if(fd>0){
         pthread_mutex_lock(&sm); int slot=-1; for(int i=0;i<MAXSTREAM;i++) if(streams[i].fd<=0){ slot=i; break; }

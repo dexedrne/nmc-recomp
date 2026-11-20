@@ -1,6 +1,7 @@
 /* Optional story lookup. KHCS v2 binds the room/name inventory, record table,
  * original bytes, asset paths and exact NMC templates to one reviewed digest. */
 #include "khnmc_rt.h"
+#include "rmc.h"
 #include "warp.h"
 #include "savestate.h"
 #include "route_state.h"
@@ -97,7 +98,7 @@ static int load_pack(KCtx *g,int mode){
     const char *e=getenv(theater?"KHNMC_THEATER_PACK":"KHNMC_CUTSCENES_PACK");
     if(e&&*e) snprintf(pack_path,sizeof pack_path,"%s",e);
     else { const char *root=getenv("KHNMC_DATA"); if(!root||!*root) root="data";
-           if(!kh_resolve_ci(root,name,pack_path,sizeof pack_path)) snprintf(pack_path,sizeof pack_path,"%s/%s",root,name); }
+           if(!kh_data_path(root,name,pack_path,sizeof pack_path)) snprintf(pack_path,sizeof pack_path,"%s/%s",root,name); }
     FILE *f=fopen(pack_path,"rb"); if(!f){
         kh_warn("cutscenes-pack: %s: cannot open it (%s); cutscenes disabled",pack_path,strerror(errno));
         return 0;

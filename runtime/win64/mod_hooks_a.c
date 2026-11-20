@@ -15,6 +15,7 @@
  * the DLL's own pattern/mask bytes (see implementation notes for the slot -> exe RVA table).  Logging calls in the DLL carry no game state and
  * are not reproduced.  A DLL path that would fault on a real PC (null script, null ability entry, null name entry) is a named fatal. */
 #include "mod_config.h"
+#include "rmc.h"
 
 enum { H_2FC860, H_2FC4E0, H_4014A0, H_3A7CB0, H_29EFA0, H_405440, H_3A89A0, H_3D61D0, H_3D60C0, H_N };
 static _Atomic u64 hits[H_N], extensions[H_N], shopface_missing;
@@ -148,7 +149,7 @@ void f_29efa0(KCtx *g){
     extensions[H_29EFA0]++;
     /* Counter only: the file layer resolves the same relative path loose-first (data/menu/shopface/<name>.bin). */
     const char *root=getenv("KHNMC_DATA"); char host[4096];
-    if(!kh_resolve_ci(root?root:"data",path,host,sizeof host)) shopface_missing++;
+    if(!kh_rmc_find(path) && !kh_resolve_ci(root?root:"data",path,host,sizeof host)) shopface_missing++;
     KH_RET(g);   /* full replacement: pop the return address like the original's ret */
 }
 

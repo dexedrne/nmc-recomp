@@ -351,3 +351,7 @@ In field play, click L3 and R3 together and release to switch between Roxas and 
 routes with an isolated KH_DOCS. Follow it with `@wait menu-id 3` and normal
 controller input to select and confirm a slot. An active menu or pending map
 jump raises `route-save-menu-busy`. The command itself writes no slot.
+
+Package F2 can direct the scripted melee approach at a particular model using
+`@fight object NAME until COND`. It follows the nearest instance of NAME,
+waits for it to spawn, and presses Attack within the configured radius.

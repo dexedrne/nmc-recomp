@@ -109,6 +109,9 @@ CUTSCENES=${CUTSCENES:-}; CUTSCENES_PACK=${CUTSCENES_PACK:-}                 # T
 # SCENE_ROXAS_PACK is the directory containing obj/ and remastered/ (task 64).
 EXTRA_ENV=${EXTRA_ENV:-}; LOOK_PACK=${LOOK_PACK:-}; HOODED_LOOK_PACK=${HOODED_LOOK_PACK:-}; SCENE_ROXAS_PACK=${SCENE_ROXAS_PACK:-}
 # A copied private/ tree ships its logos alongside looks/. LOGO_PACK can point elsewhere.
+# RMC_PACK is a sparse pack. An explicitly empty directory clears the phone overlay.
+RMC_PACK=${RMC_PACK:-}
+[ -z "$RMC_PACK" ] || [ -d "$RMC_PACK" ] || bad "RMC_PACK: no directory '$RMC_PACK' on this Mac"
 LOGO_PACK=${LOGO_PACK:-}
 if [ -z "$LOGO_PACK" ] && [ -d "$SRC/private/logos" ]; then LOGO_PACK=$SRC/private/logos; fi
 if [ -n "$LOGO_PACK" ]; then
@@ -199,6 +202,23 @@ if [ -n "${LOGO_PACK:-}" ]; then
       cp_to "$LOGO_PACK/$file" "logos/$file" || { say "title logo copy failed at $file"; exit 1; }
     done
   done
+fi
+if [ -n "$RMC_PACK" ]; then
+  grep -a -q 'rmc-manifest-incomplete' "$APP/KHNMC" || { say "RMC_PACK needs an app built with RMC support"; exit 2; }
+  (cd "$RMC_PACK" && find . ! -type f ! -type d -print0) > "$OUT/rmc.unsupported" || { say "cannot enumerate RMC_PACK"; exit 1; }
+  [ ! -s "$OUT/rmc.unsupported" ] || { say "RMC_PACK must contain regular files and directories; use a sparse pack"; exit 2; }
+  (cd "$RMC_PACK" && find . -type f -print0) > "$OUT/rmc.list" || { say "cannot enumerate RMC_PACK"; exit 1; }
+  : > "$OUT/rmc-pack.pending" || exit 1
+  n=0
+  while IFS= read -r -d '' rel; do
+    rel=${rel#./}
+    cp_to "$RMC_PACK/$rel" "rmc/$rel" || { say "RMC copy failed at $rel"; exit 1; }
+    printf '%s\0' "$rel" >> "$OUT/rmc-pack.pending" || exit 1
+    n=$((n+1))
+  done < "$OUT/rmc.list"
+  printf '/\0' >> "$OUT/rmc-pack.pending" || exit 1
+  cp_to "$OUT/rmc-pack.pending" rmc-pack.pending || { say "RMC inventory copy failed"; exit 1; }
+  say "RMC pack: $n files copied to Documents/rmc; launch applies the inventory"
 fi
 for costume in xion xion-hooded; do
   pack=$LOOK_PACK

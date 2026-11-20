@@ -266,6 +266,7 @@ void kh_host_env_init(int *argc,char ***argv){
     snprintf(p,sizeof p,"%s/data",he_docs); he_default("KHNMC_DATA",p,0);
     snprintf(p,sizeof p,"%s/logos",he_docs); he_default("KHNMC_TITLE_LOGO_DIR",p,0);
     snprintf(p,sizeof p,"%s/looks/xion-hooded",he_docs); he_default("KHNMC_LOOK_HOODED_DIR",p,0);
+    snprintf(p,sizeof p,"%s/rmc",he_docs); he_default("KHNMC_RMC_DIR",p,0);
     snprintf(p,sizeof p,"%s/looks/xion",he_docs); he_default("KHNMC_LOOK_DIR",p,0);
     snprintf(p,sizeof p,"%s/scene-roxas",he_docs); he_default("KHNMC_SCENE_ROXAS_DIR",p,0);
     snprintf(p,sizeof p,"%s/pkgdir",he_docs); he_default("KHNMC_PKGDIR",p,1);

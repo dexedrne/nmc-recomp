@@ -1,4 +1,5 @@
 #include "slot_disk.h"
+#include "rmc.h"
 #include "slot_hash.h"
 #include "settings.h"
 #include "kh_look.h"
@@ -80,7 +81,7 @@ static int profile_var(const char *s){
     if(strncmp(s,"KHNMC_",6)&&strncmp(s,"KH_",3)) return 0;
     const char *ignore[]={"KHNMC_BOOT_SLOT=","KH_EXE=","KH_ROOT=","KH_DOCS=","KH_RUN_","KH_DUMP_","KH_TMPDIR=",
         "KHNMC_TEST_SAVESTATE=","KHNMC_TEST_SETTINGS=","KHNMC_PHASELOG=","KHNMC_FILELOG=",
-        "KHNMC_DATA=","KHNMC_PKGDIR=","KHNMC_INPUT_SCRIPT=","KHNMC_GFX_HASHLOG=",
+        "KHNMC_DATA=","KHNMC_RMC_DIR=","KHNMC_PKGDIR=","KHNMC_INPUT_SCRIPT=","KHNMC_GFX_HASHLOG=",
         "KHNMC_GFX_DUMP","KHNMC_GFX_PIPECACHE="};
     for(unsigned i=0;i<sizeof ignore/sizeof *ignore;i++) if(!strncmp(s,ignore[i],strlen(ignore[i]))) return 0;
     return 1;
@@ -103,6 +104,8 @@ const char *kh_slot_identity(KhSlotHeader *h){
     SlotHash hash; slot_hash_init(&hash);
     const char *data=getenv("KHNMC_DATA");
     if(!tree_hash(&hash,data?data:"data")||!tree_hash(&hash,getenv("KHNMC_PKGDIR"))) return "savestate-data-tree-read";
+    KhRmcFile *first;
+    if(kh_rmc_children("",&first) && !tree_hash(&hash,getenv("KHNMC_RMC_DIR"))) return "savestate-rmc-tree-read";
     if(!appearance_hash(&hash)) return "savestate-appearance-tree-read";
     slot_hash_end(h->data,&hash);
 #ifdef __APPLE__
