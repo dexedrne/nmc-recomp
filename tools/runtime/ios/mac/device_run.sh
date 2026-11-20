@@ -108,6 +108,14 @@ CUTSCENES=${CUTSCENES:-}; CUTSCENES_PACK=${CUTSCENES_PACK:-}                 # T
 #   (the default KHNMC_LOOK_DIR on iOS), one devicectl copy per file; nothing on the phone is removed.
 # SCENE_ROXAS_PACK is the directory containing obj/ and remastered/ (task 64).
 EXTRA_ENV=${EXTRA_ENV:-}; LOOK_PACK=${LOOK_PACK:-}; HOODED_LOOK_PACK=${HOODED_LOOK_PACK:-}; SCENE_ROXAS_PACK=${SCENE_ROXAS_PACK:-}
+# A copied private/ tree ships its logos alongside looks/. LOGO_PACK can point elsewhere.
+LOGO_PACK=${LOGO_PACK:-}
+if [ -z "$LOGO_PACK" ] && [ -d "$SRC/private/logos" ]; then LOGO_PACK=$SRC/private/logos; fi
+if [ -n "$LOGO_PACK" ]; then
+  for file in {roxas,xion,xkb}.{2ld,png}; do
+    [ -s "$LOGO_PACK/$file" ] || bad "LOGO_PACK: missing $file"
+  done
+fi
 if [ -n "$SCENE_ROXAS_PACK" ]; then
   for rel in obj/H_EX500.mdlx remastered/obj/H_EX500.mdlx/-{0,1,2}.dds; do
     [ -s "$SCENE_ROXAS_PACK/$rel" ] || bad "SCENE_ROXAS_PACK: missing $rel"
@@ -183,6 +191,14 @@ if [ -n "$SCENE_ROXAS_PACK" ]; then
     cp_to "$SCENE_ROXAS_PACK/$rel" "scene-roxas/$rel" || { say "scene Roxas copy failed at $rel"; exit 1; }
   done
   say "scene Roxas model and three textures copied to Documents/scene-roxas"
+fi
+if [ -n "${LOGO_PACK:-}" ]; then
+  for logo in roxas xion xkb; do
+    for ext in 2ld png; do
+      file=$logo.$ext
+      cp_to "$LOGO_PACK/$file" "logos/$file" || { say "title logo copy failed at $file"; exit 1; }
+    done
+  done
 fi
 for costume in xion xion-hooded; do
   pack=$LOOK_PACK

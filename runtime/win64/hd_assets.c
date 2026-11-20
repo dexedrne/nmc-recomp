@@ -419,7 +419,8 @@ static int mod_asset(const HdFile *f,HdEnt *e,HdTable *t,char *err,size_t cap){
     e->size=(int32_t)f->size; e->fsize=f->size; e->src=SRC_MOD; t->n_mod++; return 0;
 }
 
-#define TITLE_LAYOUT "menu/us/title.2ld"
+#include "title_logo.h"
+#define TITLE_LAYOUT KH_TITLE_LAYOUT
 #define TITLE_IMAGE "remastered/" TITLE_LAYOUT "/-4.png"
 
 /* Only the HD table varies. The loose title layout and its other textures stay shared. */
@@ -546,6 +547,22 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
             if(!e->host){ snprintf(err,cap,"out of memory"); goto fail; }
             e->src=SRC_MOD; t->n_mod++; e->size=e->gsize=e->fsize=st.st_size;
         }
+    }
+    /* The local layout packer appends a tag and a distinct length per logo.
+     * The existing cache and savestate key already include this byte length. */
+    if(!strcasecmp(rel,TITLE_LAYOUT) && n>=5 && bytes && !memcmp(bytes+n-5,"T80L",4)){
+        int id=bytes[n-1];
+        if(id<1 || id>3 || t->n<=7 || strcasecmp(t->e[7].name,"-7.png")){
+            snprintf(err,cap,"title-logo-slot: unexpected layout or HD table"); goto fail;
+        }
+        char path[4096]; kh_title_logo_path(id,"png",path,sizeof path);
+        if(stat(path,&st) || !S_ISREG(st.st_mode) || st.st_size<=0 || st.st_size>INT_MAX){
+            snprintf(err,cap,"title-logo-atlas: %s",path); goto fail;
+        }
+        HdEnt *e=&t->e[7];
+        free(e->host); e->host=strdup(path);
+        if(!e->host){ snprintf(err,cap,"out of memory"); goto fail; }
+        e->size=e->gsize=e->fsize=st.st_size;
     }
     rc=0;
 fail:
@@ -845,6 +862,18 @@ int kh_hd_selftest(KCtx *g){
         }
         setenv("KHNMC_PLAYER_LOOK","roxas",1);
         kh_hd_begin(g,dir,TITLE_LAYOUT,bar,sizeof bar); TEST(cur_table==stock);
+        const char *logos=getenv("KHNMC_TITLE_LOGO_DIR");
+        char *savedlogos=logos?strdup(logos):NULL;
+        setenv("KHNMC_TITLE_LOGO_DIR",pack,1);
+        TEST(put_file(pack,"xkb.png","logo-xkb",8));
+        memcpy(bar+sizeof bar-6,"T80L",4); bar[sizeof bar-2]=3;
+        kh_hd_begin(g,dir,TITLE_LAYOUT,bar,sizeof bar-1);
+        TEST(cur_table!=stock && cur_table->n==8 && cur_table->e[7].size==8);
+        if(cur_table->n==8) for(int i=0;i<8;i++)
+            TEST(cur_table->e[i].orig==stock->e[i].orig &&
+                 ((strcmp(cur_table->e[i].host,stock->e[i].host)!=0)==(i==7)));
+        if(savedlogos) setenv("KHNMC_TITLE_LOGO_DIR",savedlogos,1); else unsetenv("KHNMC_TITLE_LOGO_DIR");
+        free(savedlogos);
         kh_hd_end(prev);
         HdTable **bucket=&buckets[ci_hash(TITLE_LAYOUT)&1023];
         while(*bucket){

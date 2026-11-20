@@ -2,6 +2,11 @@
 #include "khnmc_rt.h"
 #include "khnmc_hd.h"
 #include "kh_look.h"
+#include "title_logo.h"
+#include "autosave.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include "settings.h"
 #include "xion_swap.h"
 #include "route_state.h"
@@ -324,9 +329,65 @@ static const char *arena_fallback(const char *rel){
         if(!strcasecmp(rel,arenas[i][0])) return arenas[i][1];
     return NULL;
 }
+static const char *const logo_names[]={"mod","roxas","xion","xkb"};
+void kh_title_logo_path(int id,const char *suffix,char *host,size_t cap){
+    const char *root=getenv("KHNMC_TITLE_LOGO_DIR");
+    const char *data=getenv("KHNMC_DATA");
+    const char *slash=(!root && data && access("private/logos",F_OK))?strrchr(data,'/'):NULL;
+    int prefix=slash?(int)(slash-data+1):0;
+    if(snprintf(host,cap,"%.*s%s/%s.%s",prefix,data?data:"",root?root:"private/logos",logo_names[id],suffix)>=(int)cap)
+        kh_fatal(NULL,"title-logo-path: path too long");
+}
+
+static int next_logo(const char *docs,const char *mode,int count){
+    char path[4096];
+    if(snprintf(path,sizeof path,"%s/title-logo-%s",docs,mode)>=(int)sizeof path ||
+       (mkdir(docs,0700) && errno!=EEXIST)) kh_fatal(NULL,"title-logo-documents: %s",docs);
+    int fd=open(path,O_RDWR|O_CREAT,0600);
+    if(fd<0 || flock(fd,LOCK_EX)) kh_fatal(NULL,"title-logo-state-open: %s",path);
+    char c='0';
+    ssize_t n=pread(fd,&c,1,0);
+    if(n<0 || c<'0' || c>='0'+count) kh_fatal(NULL,"title-logo-state-read: %s",path);
+    int current=c-'0';
+    c='0'+(current+1)%count;
+    if(pwrite(fd,&c,1,0)!=1 || fsync(fd) || close(fd)) kh_fatal(NULL,"title-logo-state-write: %s",path);
+    return current;
+}
+
+static int choose_title_logo(const char *mode,int look,const char *docs,int selected[2]){
+    for(int i=0;i<4;i++) if(mode && !strcmp(mode,logo_names[i])) return i;
+    int cycle=mode && !strcmp(mode,"cycle");
+    if(!cycle && mode && *mode && strcmp(mode,"auto")) kh_fatal(NULL,"title-logo-mode: %s",mode);
+    if(!cycle && !look) return 1;
+    if(!selected[cycle]) selected[cycle]=(cycle?1:2)+next_logo(docs,cycle?"cycle":"xion",cycle?3:2);
+    return selected[cycle];
+}
+
+static int title_logo(void){
+    static int selected[2];
+    static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    int id=choose_title_logo(getenv("KHNMC_TITLE_LOGO"),kh_look_enabled(),kh_autosave_documents(),selected);
+    pthread_mutex_unlock(&lock);
+    if(id){   /* the logo pack is a local, optional add-on: without its files the title keeps the mod's own logo (never a stop) */
+        static _Atomic int warned;
+        char a[4096],b[4096]; struct stat st;
+        kh_title_logo_path(id,"2ld",a,sizeof a); kh_title_logo_path(id,"png",b,sizeof b);
+        if(stat(a,&st) || !S_ISREG(st.st_mode) || stat(b,&st) || !S_ISREG(st.st_mode)){
+            if(!warned++) fprintf(stderr,"kh: title logo: %s / %s not present: the mod's own logo is shown\n",a,b);
+            return 0;
+        }
+    }
+    return id;
+}
+
 static int loose_path(KCtx *g,const char *path,const char *what,char *host,size_t cap,const char **fallback){
     char rel[2048];
     if(!relative(g,path,rel,sizeof rel)||kh_data_denied(g,rel,what)) return 0;
+    if(!strcasecmp(rel,KH_TITLE_LAYOUT)){
+        int logo=title_logo();
+        if(logo){ kh_title_logo_path(logo,"2ld",host,cap); return KH_FILE_LOOK; }
+    }
     int profile=kh_look_key(rel);
     if(profile==KH_SCENE_MODEL){
         if(!kh_scene_path(rel,host,cap)) kh_fatal(g,"scene-roxas-asset: overlay disappeared: %s",rel);
@@ -541,6 +602,17 @@ int kh_file_selftest(KCtx *g){
     kh_xkb_set_mode(g,0);
     TEST(!strcmp(gstr(g,cached),roxas) && !kh_look_key("obj/H_EX510_PAJAMAS.mdlx"));
     ga_free(label); ga_free(journal);
+    for(int count=2;count<=3;count++)
+        for(int j=0;j<count*2;j++) TEST(next_logo(dir,count==2?"xion":"cycle",count)==j%count);
+    for(int launch=0;launch<6;launch++){
+        int picks[2]={0};
+        TEST(choose_title_logo(NULL,0,dir,picks)==1);
+        TEST(choose_title_logo("auto",1,dir,picks)==2+launch%2);
+        TEST(choose_title_logo("",2,dir,picks)==2+launch%2);
+        TEST(choose_title_logo("cycle",0,dir,picks)==1+launch%3);
+        TEST(choose_title_logo("cycle",2,dir,picks)==1+launch%3);
+        for(int i=0;i<4;i++) TEST(choose_title_logo(logo_names[i],2,dir,picks)==i);
+    }
     TEST(!kh_look_key("obj/P_EX100.mdlx"));
     const char *pack_env=getenv("KHNMC_SCENE_ROXAS_DIR");
     char *initial_pack=pack_env?strdup(pack_env):NULL;
