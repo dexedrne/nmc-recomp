@@ -180,6 +180,7 @@ typedef struct { int type; Cond c; ScriptPad pad, held; u64 every, hold, timeout
                  u64 started, met, waited;
                  float gx, gz, radius; u64 stall; int has_until, to_enemy; u64 stable;
                  int to_object; char obj_name[40];       /* task 31: @goto object NAME (the nearest object with that objentry model name) */
+                 int open_save_menu;
                  int slot_command, slot_issued; /* Route commands stay consumed when a load rewinds the route. */
                  int only;                               /* task 31: @if-difficulty N: -1 = always */
                  int react_id;                           /* task 31: @react [id N]: only this reaction command is answered (-1 = any) */
@@ -264,6 +265,12 @@ static void route_tick(KCtx *g,u64 n){
                 step_met(s,n,n-1);
                 { char st[1100]; kh_route_state_summary(g,n,st,sizeof st); fprintf(stderr,"kh: route: @expect line %u read at game frame %llu: %s\n",s->line,(unsigned long long)n,st); } }   /* what it read: the evidence in the log */
             else if(s->type==ST_WAIT && ok){
+                if(s->open_save_menu){
+                    if(rd8(g,GS_BASE+0x9006b0) || rd64(g,GS_BASE+0x9ba928) || rd8(g,GS_BASE+0x9ba8d1))
+                        route_fatal_state(g,n,"route-save-menu-busy",s,"a menu or map jump is active");
+                    KCtx call=*g;
+                    kh_call(&call,GS_BASE+0x2e4950,1,0,0,0); /* menu table 0x5ba190 selects the game's save UI */
+                }
                 if(s->slot_command && !s->slot_issued){
                     if(kh_cut_menu_request(s->slot_command<0,abs(s->slot_command)))
                         route_fatal_state(g,n,"route-slot-unavailable",s,"numbered slot command refused");
@@ -565,11 +572,14 @@ void kh_input_load(KCtx *g,const char *path){
         if(!strcmp(words[0],"@clock")){ if(n!=2||strcmp(words[1],"game-frames")||clock_game) goto invalid; clock_game=1; if(!first_frame_line) first_frame_line=lineno; continue; }
         if(!strcmp(words[0],"@timeout")){ long long v; if(n!=2||!number(words[1],1,100000000,&v)){ why="@timeout takes a number of game frames"; goto invalid; } timeout_default=(u64)v; continue; }
         if(!strcmp(words[0],"@difficulty")){ long long v; if(n!=2||!number(words[1],0,3,&v)||route_difficulty>=0){ why="@difficulty takes 0..3, once"; goto invalid; } route_difficulty=(int)v; route_difficulty_from=" (@difficulty)"; continue; }
-        if(!strcmp(words[0],"@wait")||!strcmp(words[0],"@expect")||!strcmp(words[0],"@press")||!strcmp(words[0],"@select")||!strcmp(words[0],"@goto")||!strcmp(words[0],"@fight")||!strcmp(words[0],"@skip")||!strcmp(words[0],"@talk")||!strcmp(words[0],"@react")||!strcmp(words[0],"@warp")||!strcmp(words[0],"@slot")){
+        if(!strcmp(words[0],"@wait")||!strcmp(words[0],"@expect")||!strcmp(words[0],"@press")||!strcmp(words[0],"@select")||!strcmp(words[0],"@goto")||!strcmp(words[0],"@fight")||!strcmp(words[0],"@skip")||!strcmp(words[0],"@talk")||!strcmp(words[0],"@react")||!strcmp(words[0],"@warp")||!strcmp(words[0],"@slot")||!strcmp(words[0],"@save-menu")){
             Step st; memset(&st,0,sizeof st); st.line=lineno; st.timeout=timeout_default; st.every=8; st.hold=2; st.radius=100.0f; st.stall=240; st.c.kind=-1; st.react_id=-1; st.only=only;
             snprintf(st.text,sizeof st.text,"%s",t0);
             int i=1;
-            if(!strcmp(words[0],"@slot")){
+            if(!strcmp(words[0],"@save-menu")){
+                if(n!=1){ why="@save-menu takes no arguments"; goto invalid; }
+                st.type=ST_WAIT; st.c=(Cond){KR_FIELD,0,0}; st.open_save_menu=1;
+            }else if(!strcmp(words[0],"@slot")){
                 long long slot;
                 if(n!=3 || (strcmp(words[1],"save") && strcmp(words[1],"load")) || !number(words[2],1,3,&slot)){
                     why="@slot save|load 1..3"; goto invalid;
@@ -2028,6 +2038,7 @@ int kh_input_route33_selftest(KCtx *g){
 #define WCHECK(c) do{ checks++; if(!(c)){ fails++; fprintf(stderr,"input route S33 selftest FAIL: %s (line %d)\n",#c,__LINE__); } }while(0)
     char *sv_env=getenv("KHNMC_ROUTE_DIFFICULTY"); char sv_envv[16]=""; if(sv_env) snprintf(sv_envv,sizeof sv_envv,"%s",sv_env); unsetenv("KHNMC_ROUTE_DIFFICULTY");
     KhWarpProbe fp={w33_cond,w33_jbusy,w33_place,w33_request}; kh_warp_set_probe(&fp);
+    WCHECK(t_load(g,"@save-menu\n") && nsteps==1 && steps[0].open_save_menu && steps[0].c.kind==KR_FIELD);
     /* 1. a single warp: parsed, met when the field has stayed up `settle` frames in the new room, counted in the report */
     WCHECK(t_load(g,"@timeout 500\n@warp mu 13 door 1 map 0x4f settle 5\n+1 +1 A\n") && nsteps==1 && steps[0].type==ST_WARP && steps[0].nwarp==1 &&
            steps[0].warp[0].world==8 && steps[0].warp[0].room==13 && steps[0].warp[0].door==1 && steps[0].warp[0].prog[0]==0x4f && steps[0].warp[0].prog[1]==0xffff &&

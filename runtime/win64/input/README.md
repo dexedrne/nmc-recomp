@@ -346,3 +346,8 @@ whose place names no map, btl or evt program of its room's area file (nothing of
 In field play, click L3 and R3 together and release to switch between Roxas and Xion on the current moveset. The Xion look pack goes in `Documents/looks/xion` on the phone. The Options entry **Player appearance** uses the same switch and saves the choice in `khnmc.conf`. With **Hold L3 + R3 to hide HUD** enabled, hold both for at least 0.6 seconds to hide the gauges and release to restore them. In Xion Knows Best, a click while rescue Xion is in control shows **Can't switch now**. The appearance choice stays with Roxas when he takes over again.
 
 `route-xion-fight.txt` checks the controller with `player-char 4` (Xion) and `player-char 1` (Roxas), checks canonical EXP with `save-exp-at-least N`, and writes a slot in the run's private Documents directory. Start a fresh process with that same `KH_DOCS` and `route-xion-reload.txt` to check native loading. `route-xion-event.txt` exercises the automatic return before the armor-shop scene.
+
+`@save-menu` requests the native Save menu from a field frame, for checkpoint
+routes with an isolated KH_DOCS. Follow it with `@wait menu-id 3` and normal
+controller input to select and confirm a slot. An active menu or pending map
+jump raises `route-save-menu-busy`. The command itself writes no slot.
