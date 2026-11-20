@@ -14,3 +14,5 @@ void kh_xion_frame(KCtx *g,u16 buttons);
 u64 kh_xion_progress_player(void);
 u64 kh_xion_recovery_sheet(KCtx *g,u64 sheet);
 void kh_xion_save_portrait(KCtx *g,u64 buffer);
+void kh_save_difficulty_init(void);
+u64 kh_encode_menu_text(const char *src,int compact);

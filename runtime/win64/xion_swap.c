@@ -25,22 +25,27 @@ u64 kh_xkb_message(int id){
     return kh_xkb_menu && (index<4 || index==6) ? messages[index] : 0;
 }
 
+u64 kh_encode_menu_text(const char *src,int compact){
+    u64 addr=ga_alloc(strlen(src)+1+(compact?2:0),16);
+    u8 *dst=(u8 *)(gs_bias+addr);
+    if(compact){ *dst++=0x0b; *dst++=76; } /* KH TextWidth, keeps the font height. */
+    while(*src){
+        char c=*src++;
+        if(c>='a'&&c<='z') *dst++=0x9a+c-'a';
+        else if(c>='A'&&c<='Z') *dst++=0x2e + c-'A';
+        else if(c==' ') *dst++=1;
+        else if(c=='\n') *dst++=2;
+        else if(c=='.') *dst++=0x4f;   /* 0x4f = '.'; 0x4e is the Japanese full stop (OpenKH InternationalSystemDecode) */
+        else kh_fatal(NULL,"kh-menu-text-encoding");
+    }
+    *dst=0;
+    return addr;
+}
+
 static void prepare_menu(KCtx *g){
     if(!messages[0]){
         for(unsigned i=0;i<7;i++){
-            const char *src=lines[i];
-            messages[i]=ga_alloc(strlen(src)+1,16);
-            u8 *dst=GUEST_PTR(messages[i]);
-            while(*src){
-                char c=*src++;
-                if(c>='a'&&c<='z') *dst++=0x9a+c-'a';
-                else if(c>='A'&&c<='Z') *dst++=0x2e + c-'A';
-                else if(c==' ') *dst++=1;
-                else if(c=='\n') *dst++=2;
-                else if(c=='.') *dst++=0x4f;   /* 0x4f = '.'; 0x4e is the Japanese full stop (OpenKH InternationalSystemDecode) */
-                else kh_fatal(g,"xkb-message-encoding");
-            }
-            *dst=0;
+            messages[i]=kh_encode_menu_text(lines[i],0);
         }
     }
     for(unsigned i=0;i<8;i++) wr32(g,VA(0x5b870c)+4*i,0x8000|refs[i]);
@@ -95,6 +100,7 @@ void kh_xion_init(void){
     const char *e=getenv("KHNMC_XKB_MENU");
     if(e&&*e&&strcmp(e,"0")&&strcmp(e,"1")) kh_fatal(NULL,"xkb-menu-mode: expected 0 or 1");
     kh_xkb_menu=e&&!strcmp(e,"1");
+    kh_save_difficulty_init();
 }
 
 static int field_supported(int world,int area,int map,int btl,int evt){

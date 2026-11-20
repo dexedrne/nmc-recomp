@@ -153,13 +153,10 @@ void f_3a0660(KCtx *g){
     close(dir);
 }
 
-void kh_autosave_load(KCtx *g){
-    if(!slots) return;
-    u16 buttons=kh_input_buttons();
-    if(!(buttons&0x20)) return;
+static int read_checkpoint(KCtx *g,int previous,int load,u32 *level,int *tag){
     int dir=open_directory(0);
     int n=dir<0 ? -1 : newest(dir);
-    if(n>0 && (buttons&0x100)) n=slots==1 ? -1 : (n==1 ? slots : n-1);
+    if(n>0 && previous) n=slots==1 ? -1 : (n==1 ? slots : n-1);
     char name[40]="newest";
     int fd=-1;
     if(n>0){ filename(name,n); fd=openat(dir,name,O_RDONLY|O_NOFOLLOW|O_NONBLOCK); }
@@ -177,6 +174,10 @@ void kh_autosave_load(KCtx *g){
             if(ok && tagged) ok=fread(trailer,sizeof trailer,1,f)==1 && !memcmp(trailer,mode_trailer,4) &&
                 trailer[4]>=1 && trailer[4]<=3 && rd32(g,candidate+0x2498)==trailer[4];
             if(ok){
+                *level=rd32(g,candidate+0x2498);
+                *tag=tagged ? trailer[4] : 0;
+            }
+            if(ok && load){
                 kh_xkb_set_mode(g,kh_xkb_menu && tagged);
                 memcpy(GUEST_PTR(SAVE),data,SAVE_SIZE);
                 kh_warn("autosave-load: %s %.2s%02u",name,kh_warp_world_names[data[12]],data[13]);
@@ -185,8 +186,25 @@ void kh_autosave_load(KCtx *g){
         }
         fclose(f);
     } else if(fd>=0) close(fd);
-    if(!ok) kh_warn("autosave-fallback: %s missing or invalid, using selected save",name);
+    if(!ok && load) kh_warn("autosave-fallback: %s missing or invalid, using selected save",name);
     if(dir>=0) close(dir);
+    return ok;
+}
+
+int kh_autosave_shortcut(void){
+    if(!slots) return 0;
+    u16 buttons=kh_input_buttons();
+    return buttons&0x20 ? 1+!!(buttons&0x100) : 0;
+}
+
+int kh_autosave_preview(KCtx *g,int shortcut,u32 *level,int *tag){
+    return read_checkpoint(g,shortcut==2,0,level,tag);
+}
+
+void kh_autosave_load(KCtx *g){
+    int shortcut=kh_autosave_shortcut();
+    u32 level; int tag;
+    if(shortcut) read_checkpoint(g,shortcut==2,1,&level,&tag);
 }
 
 int kh_autosave_selftest(KCtx *g){
