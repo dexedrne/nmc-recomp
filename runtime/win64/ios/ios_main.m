@@ -167,13 +167,34 @@ static BOOL options_input(unsigned short buttons){
     return NO;
 }
 
+/* Owner 2026-11-19 with a Switch Pro Controller: "triangle plus square are swapped".  The system reports a Nintendo controller's face
+ * buttons by their printed letters, so its top button arrives as buttonX and its left one as buttonY: swap them back to positions.
+ * KHNMC_PAD_SWAP_XY / KHNMC_PAD_SWAP_AB = 1 / 0 force a swap on / off for any controller (unset: X/Y swapped for Nintendo controllers
+ * only, A/B left alone).  KHNMC_PAD_LOG=1 logs every element change with the system's own element name (to check triggers etc.). */
+static int pad_swap_xy, pad_swap_ab, pad_log;
+static void pad_layout(GCController *c){
+    NSString *cat=c.productCategory?:@"", *name=c.vendorName?:@"";
+    BOOL nintendo=[cat rangeOfString:@"Switch" options:NSCaseInsensitiveSearch].location!=NSNotFound ||
+                  [cat rangeOfString:@"Joy-Con" options:NSCaseInsensitiveSearch].location!=NSNotFound ||
+                  [name rangeOfString:@"Pro Controller" options:NSCaseInsensitiveSearch].location!=NSNotFound ||
+                  [name rangeOfString:@"Joy-Con" options:NSCaseInsensitiveSearch].location!=NSNotFound;
+    const char *xy=getenv("KHNMC_PAD_SWAP_XY"), *ab=getenv("KHNMC_PAD_SWAP_AB"), *lg=getenv("KHNMC_PAD_LOG");
+    pad_swap_xy=xy&&*xy ? (*xy=='1') : nintendo;
+    pad_swap_ab=ab&&*ab ? (*ab=='1') : 0;
+    pad_log=lg&&*lg=='1';
+    fprintf(stderr,"kh: ios: controller layout: '%s' (category '%s')%s: swap X/Y %s, swap A/B %s%s\n",name.UTF8String,cat.UTF8String,
+            nintendo?" Nintendo":"",pad_swap_xy?"on":"off",pad_swap_ab?"on":"off",pad_log?", element log on":"");
+}
 static unsigned short pad_buttons(GCExtendedGamepad *p){
     unsigned short b=0;
     if(p.dpad.up.pressed) b|=0x0001; if(p.dpad.down.pressed) b|=0x0002; if(p.dpad.left.pressed) b|=0x0004; if(p.dpad.right.pressed) b|=0x0008;
     if(p.buttonMenu.pressed) b|=0x0010; if(p.buttonOptions.pressed) b|=0x0020;
     if(p.leftThumbstickButton.pressed) b|=0x0040; if(p.rightThumbstickButton.pressed) b|=0x0080;
     if(p.leftShoulder.pressed) b|=0x0100; if(p.rightShoulder.pressed) b|=0x0200;
-    if(p.buttonA.pressed) b|=0x1000; if(p.buttonB.pressed) b|=0x2000; if(p.buttonX.pressed) b|=0x4000; if(p.buttonY.pressed) b|=0x8000;
+    BOOL a=p.buttonA.pressed, bb=p.buttonB.pressed, x=p.buttonX.pressed, y=p.buttonY.pressed;
+    if(pad_swap_ab){ BOOL t=a; a=bb; bb=t; }
+    if(pad_swap_xy){ BOOL t=x; x=y; y=t; }
+    if(a) b|=0x1000; if(bb) b|=0x2000; if(x) b|=0x4000; if(y) b|=0x8000;
     return b;
 }
 static void pad_send(GCExtendedGamepad *p){
@@ -192,8 +213,14 @@ static int pad_attach(GCController *c){
     if(!p){ fprintf(stderr,"kh: ios: controller '%s' has no extended gamepad profile: not used\n",c.vendorName.UTF8String?:"?"); return 0; }
     if(pad_active && pad_active!=c){ fprintf(stderr,"kh: ios: controller '%s' connected: not used (another controller is pad 0)\n",c.vendorName.UTF8String?:"?"); return 0; }
     pad_active=c;
+    pad_layout(c);
     c.handlerQueue=dispatch_get_main_queue();
-    p.valueChangedHandler=^(GCExtendedGamepad *gp,GCControllerElement *el){ (void)el; if(gp==pad_active.extendedGamepad) pad_send(gp); };
+    p.valueChangedHandler=^(GCExtendedGamepad *gp,GCControllerElement *el){
+        if(pad_log && el){
+            float v=[el isKindOfClass:[GCControllerButtonInput class]]?((GCControllerButtonInput *)el).value:-1.0f;
+            fprintf(stderr,"kh: ios: pad element '%s' value %.2f\n",(el.localizedName?:@"?").UTF8String,v);
+        }
+        if(gp==pad_active.extendedGamepad) pad_send(gp); };
     previous_buttons=pad_buttons(p);
     pad_send(p);
     fprintf(stderr,"kh: ios: controller connected: %s (pad 0)\n",c.vendorName.UTF8String?:"?");
