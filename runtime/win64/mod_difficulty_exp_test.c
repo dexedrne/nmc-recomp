@@ -6,6 +6,7 @@ static void exp_wf(KCtx *g,u64 p,float f){ u32 bits; memcpy(&bits,&f,4); wr32(g,
 static s32 wrapmul(s32 a,s32 b){ return (s32)((u32)a*(u32)b); }
 int kh_mod_exp_selftest(KCtx *g){
     int checks=0,failures=0;
+    double exp_saved=kh_settings_swap_exp(1);
 #define ET(c) do{ checks++; if(!(c)){ failures++; fprintf(stderr,"AddExp selftest FAIL line %d: %s\n",__LINE__,#c); }}while(0)
     const u32 globals[]={0x2a0ff68,0x2a105d0,0x2a171c8,0x2ae5980,0x2ae5768,0x2a25030,0x2a25300};
     u64 saved[7]; for(int i=0;i<7;i++) saved[i]=rd64(g,GS_BASE+globals[i]);
@@ -118,5 +119,6 @@ int kh_mod_exp_selftest(KCtx *g){
     const u64 allocs[]={player,source,sheet,params,objects,bar,sstm,args}; for(unsigned i=0;i<8;i++) ga_free(allocs[i]);
     fprintf(stderr,"kh: AddExp selftest: %d checks, %d failures\n",checks,failures);
 #undef ET
+    kh_settings_swap_exp(exp_saved);
     return failures;
 }

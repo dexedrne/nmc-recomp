@@ -140,6 +140,8 @@ const char *kh_setting_unavailable(int i){
 }
 int kh_setting_menu_count(void){return kh_option_count-(debug_enabled?(allow_reset?0:1):DEBUG_COUNT);}
 static _Atomic double values[COUNT]={[EXP]=1,[DROP]=1};
+/* Selftests pin the live EXP cheat so a player's saved multiplier cannot change their expected values. */
+double kh_settings_swap_exp(double v){ double old=values[EXP]; values[EXP]=v; return old; }
 double kh_live_setting_value(int i){ return atomic_load(&values[i]); }
 int kh_setting_live(int index){return index>=0 && index<COUNT;}
 

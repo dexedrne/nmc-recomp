@@ -36,6 +36,7 @@ double kh_live_setting_value(int index);
 int kh_settings_look(void);
 void kh_settings_reset_look(void);
 int kh_settings_hooded(void);
+double kh_settings_swap_exp(double v);
 const uint8_t *kh_look_notice(void);
 void kh_look_font_loaded(const char *path,const uint8_t *bar,size_t size);
 extern uint8_t kh_look_font[65536];
