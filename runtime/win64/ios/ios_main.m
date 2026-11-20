@@ -40,6 +40,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <CoreMotion/CoreMotion.h>
 #include "portrait.h"
+#include "touch_layout.h"
 #include "../pad_layout.h"
 #import <AVFoundation/AVFoundation.h>
 #import <GameController/GameController.h>
@@ -69,6 +70,9 @@ static short pad_axis(float v){ if(!(v>=-1.0f)) v=-1.0f; if(v>1.0f) v=1.0f; retu
 static unsigned char pad_trigger(float v){ if(!(v>=0.0f)) v=0.0f; if(v>1.0f) v=1.0f; return (unsigned char)lrintf(v*255.0f); }
 static UILabel *test_label;
 static GCController *pad_active;
+static GCVirtualController *virtual_pad;
+static __weak GCController *touch_controller;
+static unsigned short touch_held(void);
 static BOOL pad_nintendo;
 void kh_input_host_nintendo(int on);
 static GCControllerButtonInput *capture_button;
@@ -100,7 +104,7 @@ static void pad_extras(GCExtendedGamepad *p){
     }
 }
 static unsigned short pad_buttons(GCExtendedGamepad *p){
-    unsigned short b=0;
+    unsigned short b=(pad_active && pad_active==virtual_pad.controller)?touch_held():0;
     if(p.dpad.up.pressed) b|=0x0001; if(p.dpad.down.pressed) b|=0x0002; if(p.dpad.left.pressed) b|=0x0004; if(p.dpad.right.pressed) b|=0x0008;
     if(p.buttonMenu.pressed) b|=0x0010; if(p.buttonOptions.pressed || touchpad_click(p).pressed || capture_button.pressed) b|=0x0020;
     if(p.leftThumbstickButton.pressed) b|=0x0040; if(p.rightThumbstickButton.pressed) b|=0x0080;
@@ -123,13 +127,22 @@ static int pad_attach(GCController *c){
     if(pad_active && pad_active!=c){ fprintf(stderr,"kh: ios: controller '%s' connected: not used (another controller is pad 0)\n",c.vendorName.UTF8String?:"?"); return 0; }
     pad_active=c;
     pad_layout(c);
-    kh_input_host_nintendo(pad_nintendo);
-    NSString *device=c.vendorName ?: c.productCategory;
+    kh_title_pad_family(pad_nintendo,[p isKindOfClass:GCDualShockGamepad.class] || [p isKindOfClass:GCDualSenseGamepad.class]);
+    BOOL touch=(c==virtual_pad.controller);
+    /* A negative layout family keeps GC positions and the separate confirm/back preference. */
+    kh_input_host_nintendo(!touch && pad_nintendo?1:-1);
+    NSString *device=touch?@"Touch controls":(c.vendorName ?: c.productCategory);
     kh_menu_input_device(device.UTF8String,NULL);
     pad_extras(p);
     c.handlerQueue=dispatch_get_main_queue();
+    __block unsigned shoulder_state=0;
     p.valueChangedHandler=^(GCExtendedGamepad *gp,GCControllerElement *el){
         if(gp!=pad_active.extendedGamepad) return;
+        if(touch){
+            unsigned held=gp.leftShoulder.pressed | (gp.rightShoulder.pressed<<1) | (gp.leftTrigger.pressed<<2) | (gp.rightTrigger.pressed<<3);
+            if(held & ~shoulder_state) [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight] impactOccurred];
+            shoulder_state=held;
+        }
         NSString *element=el.unmappedLocalizedName ?: el.localizedName ?: el.aliases.anyObject;
         if(el) kh_menu_input_device(device.UTF8String,element.UTF8String);
         const char *log=getenv("KHNMC_PAD_LOG");
@@ -152,23 +165,196 @@ static void sim_controller_pages(void){
     BOOL ok=(kh_menu_map_buttons(pad_buttons(p),0)&0xc000)!=0 && pad_trigger(p.rightTrigger.value)==128;
     NSString *path=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/controller-pages.txt"];
     NSString *result=ok?@"PASS":@"FAIL: simulator controller menu or mapped input";
-    if(![result writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil])
+    if(![result writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL])
         fprintf(stderr,"kh: simulator-controller-pages: could not write result\n");
     pad_active=nil;
 }
 #endif
-static void setup_controllers(void){
-    for(GCController *c in GCController.controllers) if(pad_attach(c)) break;
-    [[NSNotificationCenter defaultCenter] addObserverForName:GCControllerDidConnectNotification object:nil queue:NSOperationQueue.mainQueue
-        usingBlock:^(NSNotification *n){ pad_attach((GCController *)n.object); }];
-    [[NSNotificationCenter defaultCenter] addObserverForName:GCControllerDidDisconnectNotification object:nil queue:NSOperationQueue.mainQueue
+/* Only buttons in this window intercept touches. Both native sticks and the shoulders
+ * underneath keep receiving independent fingers while a button is held. */
+@interface KHTouchWindow : UIWindow
+@end
+@implementation KHTouchWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit=[super hitTest:point withEvent:event];
+    return [hit isKindOfClass:UIButton.class] ? hit : nil;
+}
+@end
+
+@interface KHTouchButtons : UIViewController
+@property(nonatomic,copy) NSArray<UIButton *> *buttons;
+@end
+static KHTouchWindow *touch_window;
+static __weak UIWindow *game_window;
+static int touch_mode=0,touch_size=1,touch_opacity=65;
+static BOOL touch_ready, touch_connecting;
+static NSHashTable<GCController *> *retired;
+static id pad_connect_observer,pad_disconnect_observer;
+static unsigned short touch_held(void){
+    unsigned short mask=0;
+    for(UIButton *button in ((KHTouchButtons *)touch_window.rootViewController).buttons)
+        if(button.selected) mask|=button.tag;
+    return mask;
+}
+@implementation KHTouchButtons
+- (void)button:(UIButton *)b pressed:(BOOL)pressed {
+    if(!pad_active || pad_active!=virtual_pad.controller || b.selected==pressed) return;
+    b.selected=pressed;
+    if(pressed) [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight] impactOccurred];
+    kh_menu_input_device("Touch controls",b.accessibilityLabel.UTF8String);
+    pad_send(pad_active.extendedGamepad);
+}
+- (void)down:(UIButton *)b { [self button:b pressed:YES]; }
+- (void)up:(UIButton *)b { [self button:b pressed:NO]; }
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor=UIColor.clearColor;
+    NSArray *labels=@[@"↑",@"↓",@"←",@"→",@"A",@"B",@"X",@"Y",@"Menu",@"RMC",@"R3"];
+    NSArray *names=@[@"Up",@"Down",@"Left",@"Right",@"Cross",@"Circle",@"Square",@"Triangle",@"Options",@"Roxas May Cry menu",@"Right stick click"];
+    const unsigned short bits[]={1,2,4,8,0x1000,0x2000,0x4000,0x8000,0x10,0x50,0x80};
+    NSMutableArray *buttons=[NSMutableArray arrayWithCapacity:labels.count];
+    for(NSUInteger i=0;i<labels.count;i++){
+        UIButton *b=[UIButton buttonWithType:UIButtonTypeCustom];
+        b.tag=bits[i]; b.accessibilityLabel=names[i];
+        [b setTitle:labels[i] forState:UIControlStateNormal];
+        [b setTitleColor:UIColor.systemYellowColor forState:UIControlStateSelected];
+        b.backgroundColor=UIColor.darkGrayColor;
+        [b addTarget:self action:@selector(down:) forControlEvents:UIControlEventTouchDown|UIControlEventTouchDragEnter];
+        [b addTarget:self action:@selector(up:) forControlEvents:UIControlEventTouchUpInside|UIControlEventTouchUpOutside|UIControlEventTouchCancel|UIControlEventTouchDragExit];
+        [self.view addSubview:b];
+        [buttons addObject:b];
+    }
+    self.buttons=buttons;
+}
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    CGRect area=self.view.safeAreaLayoutGuide.layoutFrame;
+    if(area.size.width<=12 || area.size.height<=0) return;
+    int i=0;
+    for(UIButton *b in self.buttons){
+        double x,y,d;
+        kh_touch_button_frame(i,touch_size,area.size.width,area.size.height,&x,&y,&d);
+        b.bounds=CGRectMake(0,0,d,d);
+        b.center=CGPointMake(CGRectGetMinX(area)+x,CGRectGetMinY(area)+y);
+        b.layer.cornerRadius=d/2;
+        b.alpha=touch_opacity/100.0;
+        i++;
+    }
+}
+- (BOOL)prefersStatusBarHidden { return YES; }
+- (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
+@end
+
+static void pad_release(void){
+    pad_active.extendedGamepad.valueChangedHandler=nil;
+    pad_active=nil; capture_button=nil;
+    kh_input_host_pad_neutral();
+    kh_menu_input_device(NULL,NULL);
+}
+static void pad_select(GCController *controller){
+    if(controller==pad_active) return;
+    pad_release();
+    if(controller) pad_attach(controller);
+}
+static void reconcile_pads(GCController *excluded){
+    if(!game_window) return;
+    if(excluded && excluded==pad_active) pad_release();
+    GCController *vc=virtual_pad.controller;
+    GCController *physical=nil;
+    for(GCController *c in GCController.controllers){
+        if(c==excluded || c==vc || [retired containsObject:c] || !c.extendedGamepad) continue;
+        if(!physical || c==pad_active) physical=c;
+    }
+    BOOL visible=touch_ready && kh_touch_visible(touch_mode,physical!=nil);
+    if(!visible){
+        touch_window.hidden=YES; touch_window=nil;
+        pad_select(physical);
+        if(!touch_connecting && virtual_pad){
+            if(vc) [retired addObject:vc];
+            GCVirtualController *old=virtual_pad;
+            virtual_pad=nil; touch_controller=nil;
+            [old disconnect];
+        }
+        return;
+    }
+    if(touch_connecting) return;
+    if(!virtual_pad){
+        GCVirtualControllerConfiguration *config=[GCVirtualControllerConfiguration new];
+        config.elements=[NSSet setWithArray:@[GCInputLeftThumbstick,GCInputRightThumbstick,
+            GCInputLeftShoulder,GCInputRightShoulder,GCInputLeftTrigger,GCInputRightTrigger]];
+        virtual_pad=[[GCVirtualController alloc] initWithConfiguration:config];
+        touch_connecting=YES;
+        GCVirtualController *request=virtual_pad;
+        [request connectWithReplyHandler:^(NSError *error){
+            dispatch_async(dispatch_get_main_queue(),^{
+                if(request!=virtual_pad){
+                    if(request.controller) [retired addObject:request.controller];
+                    [request disconnect];
+                    return;
+                }
+                touch_connecting=NO;
+                if(error || !virtual_pad.controller.extendedGamepad){
+                    fprintf(stderr,"kh: ios: virtual-pad-connect: %s\n",error.localizedDescription.UTF8String?:"missing extended gamepad");
+                    GCVirtualController *failed=virtual_pad;
+                    virtual_pad=nil;
+                    if(failed.controller) [retired addObject:failed.controller];
+                    [failed disconnect];
+                    return;
+                }
+                reconcile_pads(nil);
+            });
+        }];
+        return;
+    }
+    touch_controller=vc;
+    pad_select(vc);
+    if(!touch_window){
+        touch_window=[[KHTouchWindow alloc] initWithWindowScene:game_window.windowScene];
+        touch_window.windowLevel=UIWindowLevelAlert;
+        touch_window.rootViewController=[KHTouchButtons new];
+        touch_window.backgroundColor=UIColor.clearColor;
+        touch_window.hidden=NO;
+    }
+    [touch_window.rootViewController.view setNeedsLayout];
+#if TARGET_OS_SIMULATOR
+    static BOOL tested;
+    if(!tested && [NSProcessInfo.processInfo.arguments containsObject:@"--test-controller-pages"]){
+        tested=YES;
+        UIView *controls=touch_window.rootViewController.view;
+        UIButton *rmc=(UIButton *)[controls viewWithTag:0x50], *r3=(UIButton *)[controls viewWithTag:0x80];
+        GCExtendedGamepad *p=vc.extendedGamepad;
+        BOOL ok=p && vc==pad_active && p.leftThumbstick && p.rightThumbstick && p.leftShoulder && p.rightShoulder && p.leftTrigger && p.rightTrigger;
+        rmc.selected=YES; r3.selected=YES;
+        ok &= (pad_buttons(p)&0xd0)==0xd0;
+        rmc.selected=NO;
+        ok &= (pad_buttons(p)&0xd0)==0x80;
+        r3.selected=NO;
+        ok &= !(pad_buttons(p)&0xd0);
+        NSString *path=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/touch-controller.txt"];
+        if(![(ok?@"PASS":@"FAIL: virtual profile or touch buttons") writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL])
+            fprintf(stderr,"kh: simulator-touch-controller: could not write result\n");
+    }
+#endif
+}
+static void touch_settings_changed(int mode,int size,int opacity){
+    dispatch_async(dispatch_get_main_queue(),^{
+        touch_mode=mode; touch_size=size; touch_opacity=opacity; touch_ready=YES;
+        reconcile_pads(nil);
+    });
+}
+static void setup_controllers(UIWindow *window){
+    game_window=window;
+    if(!retired) retired=[NSHashTable weakObjectsHashTable];
+    reconcile_pads(nil);
+    pad_connect_observer=[NSNotificationCenter.defaultCenter addObserverForName:GCControllerDidConnectNotification object:nil queue:NSOperationQueue.mainQueue
+        usingBlock:^(NSNotification *n){ if(!touch_connecting && n.object!=virtual_pad.controller) reconcile_pads(nil); }];
+    pad_disconnect_observer=[NSNotificationCenter.defaultCenter addObserverForName:GCControllerDidDisconnectNotification object:nil queue:NSOperationQueue.mainQueue
         usingBlock:^(NSNotification *n){
-            GCController *c=(GCController *)n.object; if(c!=pad_active) return;
-            if(c.extendedGamepad) c.extendedGamepad.valueChangedHandler=nil;
-            pad_active=nil; capture_button=nil;
-            kh_menu_input_device(NULL,NULL);
-            kh_input_host_pad_set(0,0,0,0,0,0,0); fprintf(stderr,"kh: ios: controller disconnected: pad 0 released\n");
-            for(GCController *o in GCController.controllers) if(o!=c && pad_attach(o)) break; }];
+            if(n.object==pad_active && n.object==touch_controller){
+                touch_window.hidden=YES; touch_window=nil; virtual_pad=nil; touch_controller=nil;
+            }
+            reconcile_pads(n.object);
+        }];
 }
 /* TASK41: after a suspension the CURRENT state of pad 0 (a button that came up meanwhile sent no event), or neutral without one */
 static void pad_resync(void){
@@ -389,9 +575,21 @@ static void start_display_link(void){
 #if TARGET_OS_SIMULATOR
     sim_controller_pages();
 #endif
-    setup_controllers();
+    setup_controllers(w);
     setup_audio_interruptions();
     /* the game starts after the view's first layout (KHGameViewController viewDidLayoutSubviews) */
+}
+- (void)sceneDidDisconnect:(UIScene *)scene {
+    if(scene!=game_window.windowScene) return;
+    [NSNotificationCenter.defaultCenter removeObserver:pad_connect_observer];
+    [NSNotificationCenter.defaultCenter removeObserver:pad_disconnect_observer];
+    pad_connect_observer=nil; pad_disconnect_observer=nil;
+    game_window=nil; touch_window.hidden=YES; touch_window=nil;
+    pad_release();
+    GCVirtualController *old=virtual_pad;
+    if(old.controller) [retired addObject:old.controller];
+    virtual_pad=nil; touch_controller=nil; touch_connecting=NO;
+    [old disconnect];
 }
 - (void)windowScene:(UIWindowScene *)scene didUpdateCoordinateSpace:(id<UICoordinateSpace>)oldSpace interfaceOrientation:(UIInterfaceOrientation)oldOrientation traitCollection:(UITraitCollection *)oldTraits {
     (void)scene; (void)oldSpace; (void)oldOrientation; (void)oldTraits;
@@ -399,6 +597,7 @@ static void start_display_link(void){
 }
 - (void)sceneWillResignActive:(UIScene *)scene {
     (void)scene; _left=YES;
+    for(UIButton *button in ((KHTouchButtons *)touch_window.rootViewController).buttons) button.selected=NO;
     kh_app_will_resign_active();                               /* the gate is set and the focus lost; returns at once */
 }
 - (void)sceneDidEnterBackground:(UIScene *)scene {
@@ -407,7 +606,8 @@ static void start_display_link(void){
 }
 - (void)sceneDidBecomeActive:(UIScene *)scene {
     (void)scene;
-    if(!_left) return;                                         /* the first activation at launch: nothing was suspended */
+    reconcile_pads(nil);
+    if(!_left){ pad_resync(); return; }                         /* deliver any buttons held at launch */
     _left=NO;
     [(KHGameViewController *)self.window.rootViewController reportSize];   /* the layer's size before our swapchain is rebuilt */
     kh_app_resume(KH_APP_RESUME_BOUND_MS);                     /* bounded: stale swapchain, the PC's restore, audio (also after an interruption), focus, gate cleared */
@@ -453,6 +653,8 @@ static void exclude_game_data_from_backup(void){
 
 int main(int argc,char *argv[]){
     @autoreleasepool {
+        extern void (*kh_ios_touch_changed)(int,int,int);
+        kh_ios_touch_changed=touch_settings_changed;
         exclude_game_data_from_backup();
         setenv("KHNMC_INPUT","host",0);       /* the controller is pad 0 (a route script, when set, wins; never in a selftest) */
         setenv("KHNMC_AUDIO","pull",0);       /* khnmc.conf may still set another mode (env KHNMC_AUDIO=null for silent test runs) */

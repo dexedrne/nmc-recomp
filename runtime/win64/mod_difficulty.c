@@ -509,7 +509,7 @@ void kh_mod_difficulty_init(KCtx *g){
     }
 }
 void f_1523a0(KCtx *g){
-    if(kh_xion_enabled) kh_xion_reset(g);
+    kh_xion_reset(g);
     orig_f_1523a0(g);
     if(forced_difficulty>=0){ wr32(g,GS_BASE+0x9abd48,forced_difficulty); fprintf(stderr,"kh: difficulty forced=%d after init-save\n",forced_difficulty); }
 }

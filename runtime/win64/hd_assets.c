@@ -445,7 +445,8 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
     t->game_mod=gmod; t->mod_files=nmod; t->pkg_n=pt?pt->n:0; t->offsets=-1;
     HdFile *files=NULL; int nf=0; int32_t *offs=NULL; char *served=NULL; int rc=-1;
     char sub[2700],dir[4300],full[3000]; struct stat st;
-    t->look=hd_look(rel);
+    int styles=!strcasecmp(rel,TITLE_LAYOUT) && bytes && n>=4 && !memcmp(bytes+n-4,"T89L",4);
+    t->look=styles?0:hd_look(rel);
     t->hooded=t->look>0 && kh_look_enabled()==2;
     if(t->look==KH_SCENE_MODEL && !strcasecmp(rel,KH_SCENE_MDLX)){
         int count=0,bad=0;
@@ -525,6 +526,8 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
             for(int i=0;i<noffs;i++) offs[i]=(int32_t)pt->e[i].orig;
             t->unknown_ext=1;
         }
+        if(styles && noffs!=19){snprintf(err,cap,"title-style-texture-count: %d",noffs);goto fail;}
+        if(styles) noffs=9;
         t->offsets=noffs;
         for(int i=0;i<nf;i++) if(strlen(files[i].name)>31){ snprintf(err,cap,"mod file name longer than 31 characters in a scanned folder: %s (folder of %s); Panacea keeps names in 32 bytes",files[i].name,rel); goto fail; }
         t->e=calloc((size_t)(noffs?noffs:1),sizeof *t->e); if(!t->e){ snprintf(err,cap,"out of memory"); goto fail; }
@@ -556,6 +559,30 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
             else if(vanilla_asset(dir,rel,&pt->e[i],e,t,err,cap)) goto fail;
         }
         for(int k=0;k<nf;k++) if(!served[k]) t->unserved++;
+    }
+    if(styles){
+        int count=0,bad=0;
+        free(offs);offs=NULL;
+        if(t->n!=9 || !kh_rm_offsets(rel,bytes,n,&offs,&count,&bad) || bad || count!=19){
+            snprintf(err,cap,"title-style-hd-layout: expected 9 original, 3 controller and 7 alternate slots");goto fail;
+        }
+        HdEnt *entries=realloc(t->e,count*sizeof *entries);
+        if(!entries){snprintf(err,cap,"title-style-hd-memory");goto fail;}
+        t->e=entries;t->offsets=count;
+        for(int i=0;i<count;i++){
+            if(i>=9){
+                static const int files[]={5,1,2,3,6,7,8};
+                char path[4096];
+                if(i<12) snprintf(path,sizeof path,"%s",entries[8].host);
+                else kh_title_logo_path(files[i-12],"png",path,sizeof path);
+                if(stat(path,&st) || st.st_size<=0 || st.st_size>INT_MAX){snprintf(err,cap,"title-style-hd-file: %s",path);goto fail;}
+                HdEnt *e=&entries[t->n++];memset(e,0,sizeof *e);
+                snprintf(e->name,sizeof e->name,"-%d.png",i);e->gsize=st.st_size;
+                HdFile image={.host=path,.size=st.st_size};
+                if(mod_asset(&image,e,t,err,cap)) goto fail;
+            }
+            entries[i].orig=(uint32_t)offs[i];
+        }
     }
     if(t->look>0){
         int slot=t->look-1;
@@ -615,7 +642,8 @@ HdTable *kh_hd_begin(KCtx *g,const char *root,const char *rel_in,const unsigned 
     char err[1500]; HdTable *prev=cur_table; st_begin++;
     char rel[2300]; if(!canon_rel(rel_in,rel,sizeof rel)||!*rel) kh_fatal(g,"hd assets: no usable tree path in \"%s\"",rel_in);
     pthread_mutex_lock(&hd_lock);
-    int look=hd_look(rel),hooded=look>0 && kh_look_enabled()==2;
+    int styles=!strcasecmp(rel,TITLE_LAYOUT) && bytes && n>=4 && !memcmp(bytes+n-4,"T89L",4);
+    int look=styles?0:hd_look(rel),hooded=look>0 && kh_look_enabled()==2;
     unsigned b=(ci_hash(rel)+hooded)&1023; HdTable *t;
     for(t=buckets[b];t;t=t->next) if(t->hooded==hooded&&t->look==look&&t->fsize==n&&key_eq(t->key,rel)) break;
     if(t&&t->gent){ st_cache_hit++; pthread_mutex_unlock(&hd_lock); cur_table=t; return prev; }
@@ -878,10 +906,11 @@ int kh_hd_selftest(KCtx *g){
 
     /* Exercise the real HD cache across a look change, including packs predating title art. */
     {
-        const char *oldroot=getenv("KHNMC_LOOK_DIR"), *oldlook=getenv("KHNMC_PLAYER_LOOK");
-        char *savedroot=oldroot?strdup(oldroot):NULL, *savedlook=oldlook?strdup(oldlook):NULL;
+        const char *oldroot=getenv("KHNMC_LOOK_DIR");
+        int savedlook=kh_look_enabled();
+        char *savedroot=oldroot?strdup(oldroot):NULL;
         char pack[KH_TMP_MAX+32]; snprintf(pack,sizeof pack,"%s/pack",dir); mkdir(pack,0700);
-        setenv("KHNMC_LOOK_DIR",pack,1); setenv("KHNMC_PLAYER_LOOK","roxas",1);
+        setenv("KHNMC_LOOK_DIR",pack,1); kh_look_set(g,0);
         make_bar(bar,8,0);
         TEST(prov_add(TITLE_LAYOUT));
         for(int i=0;i<8;i++){
@@ -890,7 +919,7 @@ int kh_hd_selftest(KCtx *g){
         }
         HdTable *prev=kh_hd_begin(g,dir,TITLE_LAYOUT,bar,sizeof bar), *stock=cur_table;
         TEST(stock && stock->n==8 && stock->look==0);
-        setenv("KHNMC_PLAYER_LOOK","xion",1);
+        kh_look_set(g,1);
         TEST(!hd_look(TITLE_LAYOUT) && put_file(pack,TITLE_IMAGE,"variant",7));
         kh_hd_begin(g,dir,TITLE_LAYOUT,bar,sizeof bar);
         HdTable *variant=cur_table;
@@ -899,7 +928,7 @@ int kh_hd_selftest(KCtx *g){
             TEST(variant->e[i].orig==stock->e[i].orig &&
                  ((strcmp(variant->e[i].host,stock->e[i].host)!=0)==(i==4)));
         }
-        setenv("KHNMC_PLAYER_LOOK","roxas",1);
+        kh_look_set(g,0);
         kh_hd_begin(g,dir,TITLE_LAYOUT,bar,sizeof bar); TEST(cur_table==stock);
         const char *logos=getenv("KHNMC_TITLE_LOGO_DIR");
         char *savedlogos=logos?strdup(logos):NULL;
@@ -920,8 +949,8 @@ int kh_hd_selftest(KCtx *g){
             ga_free(entry->gent); table_free(entry);
         }
         if(savedroot) setenv("KHNMC_LOOK_DIR",savedroot,1); else unsetenv("KHNMC_LOOK_DIR");
-        if(savedlook) setenv("KHNMC_PLAYER_LOOK",savedlook,1); else unsetenv("KHNMC_PLAYER_LOOK");
-        free(savedroot); free(savedlook); prov_clear();
+        kh_look_set(g,savedlook);
+        free(savedroot); prov_clear();
     }
     /* ---- helpers: canonical paths, the walker-against-package classes ---- */
     { char c[64]; TEST(canon_rel("./obj//X.mdlx/",c,sizeof c)&&!strcmp(c,"obj/X.mdlx")); TEST(canon_rel("a/./b",c,sizeof c)&&!strcmp(c,"a/b")); TEST(!canon_rel("0123456789",c,8)); }

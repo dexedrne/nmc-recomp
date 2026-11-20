@@ -320,6 +320,7 @@ void f_2ed0e0(KCtx *g){
     orig_f_2ed0e0(g);
     if(menu_load){
         if(kh_xkb_menu) kh_xkb_load(g);
+        else kh_xkb_set_mode(g,0);
         kh_autosave_load(g);
         if(kh_xion_enabled) prepare_menu(g);
     }

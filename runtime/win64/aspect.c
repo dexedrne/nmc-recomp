@@ -905,6 +905,50 @@ void kh_aspect_title_config(const char *v){
     if(asp_mode) fprintf(stderr,"kh: aspect: title layout (task 53): %s on a screen taller than wide (%s); every other screen: the band\n",asp_title_band?"band (today's placement)":"portrait",
                          asp_title_set?"KHNMC_TITLE_LAYOUT":"the default; KHNMC_TITLE_LAYOUT=band keeps today's");
 }
+#include "title_logo.h"
+#include "settings.h"
+static _Atomic int title_pad_slot=16;
+void kh_title_pad_family(int nintendo,int playstation){title_pad_slot=nintendo?18:playstation?17:16;}
+
+/* f_194550 binds each property to one 0x1a0-byte sequence. Rebind just
+ * its image before f_1948c0 draws it, retaining the current animation time. */
+void orig_f_1948c0(KCtx *);
+void f_1948c0(KCtx *g){
+    u64 layout=A0(g),obj=layout-0x50;
+    if((obj==rd64(g,T_LAYOUT_PTR) || obj==rd64(g,T_MENU_PTR)) && kh_phase_title_alive() &&
+       rd32(g,obj+0x40)==19 && rd32(g,layout+0x38)==112){
+        u64 lay=rd64(g,layout+0x10),geometry=lay+79260;
+        if(rd32(g,geometry)!=0x47393854) kh_fatal(g,"title-style-geometry");
+        int picture,logo=kh_title_variant(&picture);
+        u64 seq=lay+rd32(g,rd64(g,layout+0x30)+6*4);
+        u64 source=geometry+4+136*logo;
+        memcpy(hp(g,seq+rd32(g,seq+12)+2*44+4),hp(g,source),16);
+        memcpy(hp(g,seq+rd32(g,seq+20)),hp(g,source+16),120);
+        int group=rd32(g,layout+0x78);
+        u64 active=rd64(g,layout+0x58),textures=rd64(g,obj+0x48);
+        if(group>=0 && group<20 && active && textures){
+            u64 record=rd64(g,layout+0x28)+20*group;
+            unsigned first=rd16(g,record),count=rd32(g,layout+0x60);
+            if(count>rd16(g,record+2) || first+count>112) kh_fatal(g,"title-style-properties");
+            u64 prop=rd64(g,layout+0x20)+24*first;
+            for(unsigned i=0;i<count;i++){
+                int slot=rd32(g,prop+24*i);
+                if(slot==4) slot=picture?12:4;
+                else if(slot==7) slot=logo?12+logo:7;
+                else if(slot==16) slot=title_pad_slot;
+                else continue;
+                wr64(g,active+i*0x1a0+0x60,textures+256*slot);
+            }
+            static int last=-1;
+            if(getenv("KHNMC_TEST_CHEAT_LOG") && last!=logo*2+picture){
+                last=logo*2+picture;
+                fprintf(stderr,"kh: title art frame=%llu picture=%s logo=%d\n",P(kh_game_frames()),picture?"Xion":"Roxas",logo);
+            }
+        }
+    }
+    orig_f_1948c0(g);
+}
+
 /* the portrait layout of a W x H screen: 0 = none (not fill, not taller than wide, band chosen, or too short: *tooshort = 1);
  * else per element the scale s[e] and the target T (tx, ty) of its anchor point */
 typedef struct { double s[TT_N], tx[TT_N], ty[TT_N]; } TtLay;
@@ -927,7 +971,7 @@ int kh_aspect_title_elem(const float *bb){
     double x0=bb[0], x1=bb[1], y0=bb[2], y1=bb[3], cx=(x0+x1)/2.0, cy=(y0+y1)/2.0;
     if(!(x1>=x0&&y1>=y0)) return -1;
     if(x0>=194.0&&x0<=196.0&&x1>=594.0&&x1<=596.0&&y0>=-1.0&&y0<=1.0&&y1>=399.0&&y1<=401.0) return TT_PIC;   /* the 400 x 400 picture */
-    if(x0>=330.0&&x1<=610.0&&y0>=5.0&&y1<=45.0) return TT_SET;                        /* GAME SETTINGS (344..597 x 14..36) */
+    if(((x0>=87 && x0<=89 && x1>=340 && x1<=342) || x0>=330.0)&&x1<=610.0&&y0>=5.0&&y1<=45.0) return TT_SET;                        /* GAME SETTINGS (344..597 x 14..36) */
     if(y0>=288.0&&y1-y0<=140.0) return TT_MENU;                                       /* the rows 295..402, their glow, the cursor; sliding down in the exit animation (to 447) */
     if(y1-y0<=420.0&&cy>=30.0&&cy<=290.0&&cx>=-600.0&&cx<=360.0) return TT_LOGO;       /* the logo block, its credits and sweep line (sliding out to the left in the exit animation, x -413) and its exit flash; not the backdrops (479 tall) nor the fade-in flashes (511 / 639) */
     return -1;

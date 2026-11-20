@@ -14,6 +14,7 @@ int kh_cut_menu_request(int load,int slot);
 const char *kh_cut_menu_unavailable(void);
 const char *kh_cut_menu_status(void);
 enum { KH_TITLE_CLOSED, KH_TITLE_LIST, KH_TITLE_SETTINGS };
+void kh_title_pad_family(int nintendo,int playstation);
 void kh_menu_title(int screen);
 int kh_title_settings_key(void);
 int kh_menu_active(void);
@@ -33,7 +34,7 @@ int kh_setting_live(int index);
 double kh_live_setting_value(int index);
 
 int kh_settings_look(void);
-int kh_settings_look_locked(void);
+void kh_settings_reset_look(void);
 int kh_settings_hooded(void);
 const uint8_t *kh_look_notice(void);
 void kh_look_font_loaded(const char *path,const uint8_t *bar,size_t size);

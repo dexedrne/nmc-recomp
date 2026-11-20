@@ -92,7 +92,7 @@ static int relative(KCtx *g,const char *path,char *rel,size_t cap){
     for(char *p=rel;*p;){ size_t n=strcspn(p,"/"); if(n>=512||(n==2&&!strncmp(p,"..",2))) return 0; p+=n; if(*p) p++; }
     return 1;
 }
-static _Atomic int player_look=-1;
+static _Atomic int player_look;
 _Thread_local int kh_loading_look=-1;
 
 /* Preload can enqueue a read on another thread. Keep the decision until the
@@ -262,20 +262,18 @@ void kh_look_path(KCtx *g,const char *rel,char *host,size_t cap){
 }
 
 void kh_xkb_set_mode(KCtx *g,int enabled){
-    if(kh_xion_enabled==enabled) return;
+    kh_settings_reset_look();
     int previous=kh_look_enabled();
     kh_xion_enabled=enabled;
-    kh_look_set(g,player_look);
+    kh_look_set(g,enabled);
+    kh_warn("player appearance: mode default %s",enabled?"Xion":"Roxas");
     if((previous!=0)!=(kh_look_enabled()!=0)){ KCtx ctx=*g; kh_look_voice_bind(&ctx); }
 }
 
 int kh_look_enabled(void){
-    if(kh_xion_enabled) return 1;
     if(kh_loading_look>=0) return kh_loading_look;
     int selected=player_look;
-    if(selected>=0) return selected;
-    const char *env=getenv("KHNMC_PLAYER_LOOK");
-    return env && !strcmp(env,"xion-hooded")?2:env && !strcmp(env,"xion");
+    return selected<0?!!kh_xion_enabled:selected; /* older rewind snapshots used -1 */
 }
 
 static const char *const banks[]={
@@ -391,7 +389,7 @@ static const char *arena_fallback(const char *rel){
         if(!strcasecmp(rel,arenas[i][0])) return arenas[i][1];
     return NULL;
 }
-static const char *const logo_names[]={"mod","roxas","xion","xkb"};
+static const char *const logo_names[]={"mod","roxas","xion","xkb","styles","painting","prompt-LB","prompt-L1","prompt-L"};
 void kh_title_logo_path(int id,const char *suffix,char *host,size_t cap){
     const char *root=getenv("KHNMC_TITLE_LOGO_DIR");
     const char *data=getenv("KHNMC_DATA");
@@ -425,6 +423,22 @@ static int choose_title_logo(const char *mode,int look,const char *docs,int sele
     return selected[cycle];
 }
 
+static _Atomic(const char *) loaded_logo_mode;
+
+int kh_title_variant(int *picture){
+    static int selected[2];
+    const char *style=kh_menu_choice("KHNMC_TITLE_STYLE"),*mode=atomic_load(&loaded_logo_mode);
+    *picture=kh_look_enabled()!=0;
+    if(style && !strcmp(style,"roxas")){*picture=0;return 1;}
+    if(style && !strcmp(style,"xion")){
+        *picture=1;
+        if(mode && !strcmp(mode,"xkb")) return 3;
+        if(mode && strcmp(mode,"cycle") && strcmp(mode,"auto")) return 2;
+        mode="auto";
+    }
+    return choose_title_logo(mode,*picture,kh_autosave_documents(),selected);
+}
+
 static int title_logo(void){
     static int selected[2];
     static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
@@ -447,6 +461,13 @@ static int loose_path(KCtx *g,const char *path,const char *what,char *host,size_
     char rel[2048];
     if(!relative(g,path,rel,sizeof rel)||kh_data_denied(g,rel,what)) return 0;
     if(!strcasecmp(rel,KH_TITLE_LAYOUT)){
+        kh_title_logo_path(4,"2ld",host,cap);
+        if(!access(host,R_OK)){
+            loaded_logo_mode=kh_menu_choice("KHNMC_TITLE_LOGO");
+            return KH_FILE_LOOK;
+        }
+        const char *style=kh_menu_choice("KHNMC_TITLE_STYLE");
+        if(style && strcmp(style,"auto")) kh_fatal(g,"title-style-pack-missing: %s",host);
         int logo=title_logo();
         if(logo){ kh_title_logo_path(logo,"2ld",host,cap); return KH_FILE_LOOK; }
     }
@@ -685,7 +706,14 @@ int kh_file_selftest(KCtx *g){
     else unsetenv("KHNMC_LOOK_NAMES");
     kh_xkb_set_mode(g,1);
     TEST(!strcmp(gstr(g,cached),xion) && kh_look_key("obj/H_EX510_PAJAMAS.mdlx")==-1);
+    kh_look_set(g,0);
+    TEST(kh_xion_enabled && !kh_look_enabled() && !strcmp(gstr(g,cached),roxas));
+    kh_xkb_set_mode(g,1); /* a second load of the same mode also resets its appearance */
+    TEST(kh_xion_enabled && kh_look_enabled()==1);
     kh_xkb_set_mode(g,0);
+    kh_look_set(g,2);
+    kh_xkb_set_mode(g,0);
+    TEST(!kh_xion_enabled && !kh_look_enabled());
     TEST(!strcmp(gstr(g,cached),roxas) && !kh_look_key("obj/H_EX510_PAJAMAS.mdlx"));
     ga_free(label); ga_free(journal);
     for(int count=2;count<=3;count++)
@@ -746,9 +774,7 @@ int kh_file_selftest(KCtx *g){
     kh_scene_pack_end();
     if(initial_dir) setenv("KHNMC_LOOK_DIR",initial_dir,1); else unsetenv("KHNMC_LOOK_DIR");
     free(initial_dir);
-    const char *look_option=getenv("KHNMC_PLAYER_LOOK");
-    kh_look_set(g,initial_look<0?(look_option && !strcmp(look_option,"xion")):initial_look);
-    player_look=initial_look;
+    kh_look_set(g,initial_look);
     for(size_t i=0;i<sizeof scene_files/sizeof *scene_files;i++){
         snprintf(member,sizeof member,"%s/%s",pack,scene_files[i]); unlink(member);
     }

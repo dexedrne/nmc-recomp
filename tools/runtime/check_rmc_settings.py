@@ -29,8 +29,9 @@ def verify(primary, advanced, cold):
     for log in (game, extra, reload):
         complete(log)
     live = config(primary)
-    assert len(live) == 25 and live["KHNMC_PLAYER_LOOK"] == "xion"
-    assert values(game, "") == {k: v for k, v in live.items() if k != "KHNMC_PLAYER_LOOK"}
+    assert len(live) == 24 and "KHNMC_PLAYER_LOOK" not in live
+    assert values(game, "") == live
+    assert "field-character chose" not in game, "opening forced form accepted an appearance change"
     assert game.count("save-character chose 1") == 1 and "look-commit " in game
     assert game.index("save-character chose 1") > game.index("Change Character")
     assert "menu 3 " in game

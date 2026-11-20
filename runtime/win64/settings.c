@@ -5,6 +5,7 @@
 #include "pad_layout.h"
 #include "xion_swap.h"
 #include "kh_look.h"
+#include "title_logo.h"
 #include "mod_config.h"
 #include "route_state.h"
 #include <math.h>
@@ -16,7 +17,7 @@
 
 extern int kh_run_is_selftest;
 extern u64 kh_game_frames(void);
-enum { LOOK, HP, MP, EXP, DROP, HUD_COMBO, COUNT, PAD=COUNT, SWAP_AB, STYLE, RAISE, ENEMY, SUB, LOWER, MENU_LAYOUT, LOGO, CREDIT, TUTORIAL, AUTO_SAVE, NAMES, DIFF_LABEL, FRAME_WORK, FRAME_LOG };
+enum { LOOK, HP, MP, EXP, DROP, DRIVE, HUD_COMBO, COUNT, PAD=COUNT, SWAP_AB, STYLE, RAISE, ENEMY, SUB, LOWER, MENU_LAYOUT, LOGO, CREDIT, TITLE_STYLE, TUTORIAL, AUTO_SAVE, NAMES, DIFF_LABEL, FRAME_WORK, FRAME_LOG, TOUCH_MODE, TOUCH_SIZE, TOUCH_OPACITY };
 #define BOOL_OPT(name,label,initial) {"KHNMC_" name,label,initial,"0|1",0,1,1}
 #define TWEAK_OPT(name,label,initial) {"KHNMC_TWEAK_" name,label,initial,"off|on",0,1,1}
 #define NUMBER(name,label,initial,min,max,step) {"KHNMC_" name,label,initial,NULL,min,max,step}
@@ -24,6 +25,7 @@ const struct kh_option kh_options[]={
     {"KHNMC_PLAYER_LOOK","Character","roxas","roxas|xion|xion-hooded",0,0,0},
     BOOL_OPT("CHEAT_INF_HP","Infinite HP","0"), BOOL_OPT("CHEAT_INF_MP","Infinite MP","0"),
     NUMBER("EXP_MULT","EXP multiplier","1",0.5,10,0.5), NUMBER("DROP_MULT","Item drop multiplier","1",0.5,10,0.5),
+    BOOL_OPT("CHEAT_INF_DRIVE","Infinite Drive","0"),
     BOOL_OPT("HUD_HIDE_COMBO","Hold L3 + R3 to hide HUD","0"),
     {"KHNMC_PAD_LAYOUT","Face buttons","auto","auto|positions|letters",0,0,0},
     BOOL_OPT("PAD_SWAP_AB","Swap confirm / back (A-B)","0"),
@@ -35,12 +37,18 @@ const struct kh_option kh_options[]={
     {"KHNMC_MENU_LAYOUT","Portrait menu layout","portrait","portrait|band"},
     {"KHNMC_TITLE_LOGO","Title logo","auto","auto|cycle|mod|roxas|xion|xkb"},
     {"KHNMC_TITLE_CREDIT","Title credit","show","show|hide"},
+    {"KHNMC_TITLE_STYLE","Title style","auto","auto|roxas|xion"},
     {"KHNMC_TUTORIAL_FIGHT","Tutorial fight","real","real|mod"},
     BOOL_OPT("AUTOSAVE","Autosave","0"),
     {"KHNMC_LOOK_NAMES","Names in text","all","all|menus"},
     BOOL_OPT("SAVE_DIFFICULTY","Save difficulty labels","1"),
     BOOL_OPT("FRAME_WORK","Frame workload log","0"),
     BOOL_OPT("FRAME_TIME","Frame time log","1"),
+#if KH_IOS_PATHS
+    {"KHNMC_TOUCH_MODE","Touch controls","Auto","Auto|Always|Off"},
+    {"KHNMC_TOUCH_SIZE","Touch button size","M","S|M|L"},
+    {"KHNMC_TOUCH_OPACITY","Touch button opacity","65","35|65|100"},
+#endif
     TWEAK_OPT("DEBUG_DEBUG_ON","Enable debug commands","off"),
     TWEAK_OPT("DEBUG_SOFT_RESET","Allow debug reset to title","off"),
     NUMBER("TWEAK_DEBUG_TURBO_SPEED","Debug turbo speed","7.5",0.1,100,0.1),
@@ -220,7 +228,7 @@ static void load_saved_options(void){
         char *v=strchr(p,'=');
         if(!v) continue;
         *v++=0;v[strcspn(v,"\r\n")]=0;
-        for(int i=0;i<kh_option_count-DEBUG_COUNT-STATE_ACTIONS;i++) if(!strcmp(p,kh_options[i].name)){
+        for(int i=0;i<kh_option_count-DEBUG_COUNT-STATE_ACTIONS;i++) if(i!=LOOK && !strcmp(p,kh_options[i].name)){
             if(setenv(p,v,1)) kh_fatal(NULL,"settings-config-env: %s",p);
             if(test_log) fprintf(stderr,"kh: RMC restored %s=%s\n",p,v);
             break;
@@ -230,7 +238,17 @@ static void load_saved_options(void){
     free(line);fclose(in);
 }
 static _Atomic int look_request=-1;
-int kh_settings_look_locked(void){return kh_xion_enabled!=0;}
+static int finishing_look=-1;
+static int gauge_pending;
+static u64 deferred_resources;
+static u64 waiting_since;
+void kh_settings_reset_look(void){
+    int request=atomic_exchange(&look_request,-1);
+    if(request>=0) kh_warn("player appearance: dropped %d place-changed",request%3);
+    waiting_since=0;
+    finishing_look=-1;
+}
+
 int kh_settings_hooded(void){return kh_look_pack_ready(2);}
 int kh_settings_look(void){
     int request=atomic_load(&look_request);
@@ -238,11 +256,19 @@ int kh_settings_look(void){
 }
 /* f_321e40 creates a four-row list. f_2eb490 builds two or three
  * stock rows, ending with Title Screen even when World Map is hidden. */
-static int character_row=-1, picking_character;
+static int character_row=-1;
 static _Atomic int enter_character;
 static u16 choice_place;
-static u64 character_labels[6], root_labels[4];
-enum { CHANGE_LABEL=3, LOCK_LABEL, BACK_LABEL, CHARACTER_MSG=30016 };
+/* A native Save reaction can open beyond the old 60-unit prototype radius. */
+static struct { float x,y,z; int valid; } choice_position;
+static int at_choice_point(KCtx *g){
+    float x,y,z,yaw;
+    if(choice_position.valid && kh_route_player_pos(g,&x,&y,&z,&yaw) &&
+       fabsf(x-choice_position.x)<1 && fabsf(y-choice_position.y)<1 && fabsf(z-choice_position.z)<1) return 1;
+    return kh_route_at_save_point(g);
+}
+static u64 character_labels[6];
+enum { CHANGE_LABEL=3, CHARACTER_MSG=30016 };
 u64 kh_save_character_text(unsigned id){
     unsigned i=(id&0x7fff)-CHARACTER_MSG;
     return i<6?character_labels[i]:0;
@@ -256,13 +282,12 @@ void f_2f8e20(KCtx *g){
     if(rd64(g,sp)!=GS_BASE+0x2eb508 || rd32(g,sp+0x30)!=0x8a81 ||
        rd32(g,GS_BASE+0x900724)!=3){orig_f_2f8e20(g);return;}
     if(!character_labels[0]){
-        const char *labels[]={"Roxas","Xion","Xion (hooded)","Change Character","Xion (locked)","Back"};
-        for(int i=0;i<6;i++) character_labels[i]=kh_encode_menu_text(labels[i],i==CHANGE_LABEL);
+        const char *labels[]={"Roxas","Xion","Xion (hooded)","Change Character"};
+        for(int i=0;i<4;i++) character_labels[i]=kh_encode_menu_text(labels[i],i==CHANGE_LABEL);
     }
     character_row=(int)A1(g)+1;
     if(character_row<2 || character_row>3) kh_fatal(g,"save-character-row: %d",character_row);
     if(getenv("KHNMC_TEST_LOOK_DIGEST")) kh_warn("save-character built row %d",character_row);
-    picking_character=0;
     KCtx ctx=*g;
     /* f_2f8e20 reuses its fifth stack argument for the tail call to f_2f8ab0. */
     u64 args[4];
@@ -272,7 +297,7 @@ void f_2f8e20(KCtx *g){
     wr64(&ctx,KH_RSP(&ctx),GS_BASE+0x2eb508);
     memcpy(hp(&ctx,KH_RSP(&ctx)+0x28),args,sizeof args);
     A1(&ctx)=character_row;
-    wr32(&ctx,KH_RSP(&ctx)+0x30,0x8000| (CHARACTER_MSG+(kh_settings_look_locked()?LOCK_LABEL:CHANGE_LABEL)));
+    wr32(&ctx,KH_RSP(&ctx)+0x30,0x8000| (CHARACTER_MSG+CHANGE_LABEL));
     orig_f_2f8e20(&ctx);
     u64 widget=save_widget(&ctx,menu,character_row);
     kh_call(&ctx,GS_BASE+0x2f8db0,menu,character_row,0,0xffffffffu);
@@ -285,36 +310,27 @@ void f_2eb620(KCtx *g){
     u64 menu=rd64(g,GS_BASE+0xbef650);
     if(character_row>=0 && menu && rd32(g,GS_BASE+0x900724)==3 &&
        !kh_call(&ctx,GS_BASE+0x2f5f30,0,0,0,0) &&
-       (picking_character || kh_call(&ctx,GS_BASE+0x2f7fb0,menu,0,0,0)==character_row)){
-        int label=kh_settings_look_locked()?LOCK_LABEL:CHANGE_LABEL;
-        kh_call(&ctx,GS_BASE+0x2fa1d0,0x8000|(CHARACTER_MSG+label),1,0,0);
+       kh_call(&ctx,GS_BASE+0x2f7fb0,menu,0,0,0)==character_row){
+        kh_call(&ctx,GS_BASE+0x2fa1d0,0x8000|(CHARACTER_MSG+CHANGE_LABEL),1,0,0);
         KH_RET(g);return;
     }
     orig_f_2eb620(g);
 }
 void orig_f_2f9440(KCtx *);
 void f_2f9440(KCtx *g){
-    u64 menu=A0(g),caller=rd64(g,KH_RSP(g));
+    u64 caller=rd64(g,KH_RSP(g));
     orig_f_2f9440(g);
     if(caller!=GS_BASE+0x2e9ebf || character_row<0 || rd32(g,GS_BASE+0x900724)!=3) return;
     int row=(s32)KH_RAX(g);
-    if(!picking_character && row==character_row){
+    if(row==character_row){
         KH_RAX(g)=(u32)-1;
-        if(!kh_settings_look_locked()) atomic_store(&enter_character,1);
-    }else if(picking_character && (row>=0 || row==-2 || row==-4)){
-        if(row>=0 && row<3 && !kh_settings_look_locked()){
-            choice_place=rd16(g,GS_BASE+0x717008);
-            atomic_store(&look_request,3+row); /* save-menu requests must remain at the point */
-            if(getenv("KHNMC_TEST_LOOK_DIGEST")) kh_warn("save-character chose %d",row);
-        }
-        for(int i=0;i<=character_row;i++) wr64(g,save_widget(g,menu,i)+0x1f8,root_labels[i]);
-        picking_character=0;
-        KH_RAX(g)=(u32)-1;
+        atomic_store(&enter_character,1);
     }
 }
 
 static int menu_catalog_test(void);
 static int notice_selftest(KCtx *g);
+static int look_gate_selftest(KCtx *g);
 static int next_multiplier(double,int);
 int kh_settings_selftest(KCtx *g){
     char dir[KH_TMP_MAX],path[KH_TMP_MAX+16],data[200];
@@ -361,6 +377,10 @@ int kh_settings_selftest(KCtx *g){
     fail|=kh_stick_step(&state,&start,0xc0,1500000000)!=CHORD_HOLD;
     fail|=kh_stick_step(&state,&start,0,1500000001)!=CHORD_IDLE;
     fail|=LOOK!=0;
+    fail|=validate("KHNMC_TITLE_STYLE","auto",&v)!=TITLE_STYLE ||
+          validate("KHNMC_TITLE_STYLE","roxas",&v)!=TITLE_STYLE ||
+          validate("KHNMC_TITLE_STYLE","xion",&v)!=TITLE_STYLE ||
+          validate("KHNMC_TITLE_STYLE","cycle",&v)>=0;
     fail|=validate("KHNMC_PLAYER_LOOK","xion",&v)!=LOOK || v!=1;
     const int presets[]={1,2,3,5,10};
     for(int i=0;i<5;i++)
@@ -369,12 +389,25 @@ int kh_settings_selftest(KCtx *g){
     fail|=next_multiplier(2.5,1)!=3 || next_multiplier(2.5,0)!=2;
     fail|=menu_catalog_test();
     fail|=notice_selftest(g);
+    fail|=look_gate_selftest(g);
     unlink(path);rmdir(dir);
     fprintf(stderr,"kh: settings persistence and vector validation: %d failures\n",fail);
     return fail;
 }
 static pthread_mutex_t config_lock=PTHREAD_MUTEX_INITIALIZER;
 static int kh_save_live_option(const char *,const char *,int,double);
+#if KH_IOS_PATHS
+/* The app shell installs this before the game thread starts. Values come from validated catalog entries. */
+void (*kh_ios_touch_changed)(int mode,int size,int opacity);
+static int touch_settings[3]={0,1,65};
+static void touch_setting(int i,const char *v){
+    touch_settings[i-TOUCH_MODE]=i==TOUCH_MODE?(!strcmp(v,"Off")?2:!strcmp(v,"Always")):
+        i==TOUCH_SIZE?(!strcmp(v,"L")?2:!strcmp(v,"M")):atoi(v);
+}
+static void publish_touch(void){
+    if(kh_ios_touch_changed) kh_ios_touch_changed(touch_settings[0],touch_settings[1],touch_settings[2]);
+}
+#endif
 static _Atomic(const char *) live_choices[FRAME_LOG+1];
 const char *kh_menu_choice(const char *name){
     for(int i=PAD;i<=FRAME_LOG;i++) if(!strcmp(name,kh_options[i].name)){
@@ -403,17 +436,24 @@ int kh_setting_set(const char *name,const char *value){
         debug_pending=i-(kh_option_count-DEBUG_COUNT);
         pthread_mutex_unlock(&config_lock);return 0;
     }
-    if(i==LOOK){atomic_store(&look_request,(int)v); return 0;}
+    if(i==LOOK){
+        int empty=-1;
+        if(finishing_look>=0 || !atomic_compare_exchange_strong(&look_request,&empty,(int)v)) return -2;
+        return 0;
+    }
     return kh_save_live_option(name,value,i,v);
 }
 static int kh_save_live_option(const char *name,const char *value,int i,double v){
     const char *dir=option_dir();
     pthread_mutex_lock(&config_lock);
     int result=kh_run_is_selftest?0:save_option(dir,name,value);
+#if KH_IOS_PATHS
+    if(!result && i>=TOUCH_MODE && i<=TOUCH_OPACITY){touch_setting(i,value);publish_touch();}
+#endif
     if(!result && kh_setting_live(i)) atomic_store(&values[i],v);
     if(!result && ((i>=PAD && i<=FRAME_LOG) || strstr(name,"HUD_SCALE_") || !strcmp(name,"KHNMC_FOV_ZOOM"))){
         /* The render and controller threads can keep reading these immutable strings. */
-        if(i==PAD || i==SWAP_AB || i==LOGO || i==NAMES || i==AUTO_SAVE){
+        if(i==PAD || i==SWAP_AB || i==LOGO || i==TITLE_STYLE || i==NAMES || i==AUTO_SAVE){
             static const char *const choices[]={"auto","positions","letters","0","1","cycle","mod","roxas","xion","xkb","all","menus"};
             for(size_t j=0;j<sizeof choices/sizeof *choices;j++) if(!strcmp(value,choices[j])) live_choices[i]=choices[j];
         }
@@ -437,6 +477,9 @@ void kh_settings_init(void){
     init_notice_text();
     test_log=getenv("KHNMC_TEST_CHEAT_LOG") && !strcmp(getenv("KHNMC_TEST_CHEAT_LOG"),"1");
     load_saved_options();
+    char title_pack[4096];
+    kh_title_logo_path(4,"2ld",title_pack,sizeof title_pack);
+    if(access(title_pack,R_OK)) unavailable[TITLE_STYLE]="Title style pack missing";
     /* Older phone configs use the shorter spelling. */
     const char *present=getenv("KHNMC_PRESENT");
     if(present && *present && !getenv("KHNMC_GFX_PRESENT"))
@@ -465,7 +508,7 @@ void kh_settings_init(void){
     }
     for(int i=0;i<kh_option_count-DEBUG_COUNT-STATE_ACTIONS;i++){
         const char *key=kh_options[i].name,*v=getenv(key);
-        if(!v) continue;
+        if(!v || i==LOOK) continue;
         double n;
         const char *reason=NULL;
         if(!strncmp(key,"KHNMC_TWEAK_",12) && kh_options[i].choices){
@@ -473,7 +516,6 @@ void kh_settings_init(void){
                strcasecmp(v,"off") && strcasecmp(v,"false") && strcmp(v,"0"))
                 reason="Expected on or off";
         }else if(validate(key,v,&n)<0) reason="Invalid configured value";
-        else if(i==LOOK && n && !kh_look_pack_ready((int)n)) reason="Xion asset pack incomplete";
         else if(!strcmp(key,"KHNMC_SCENE_ROXAS") && n && !kh_scene_pack_ready()) reason="Scene asset pack incomplete";
         if(!reason && (!strcmp(key,"KHNMC_FOV_ZOOM") || !strcmp(key,"KHNMC_HUD_SCALE_CMD") || !strcmp(key,"KHNMC_HUD_SCALE_HP"))){
             const char *aspect=getenv("KHNMC_ASPECT");
@@ -485,6 +527,10 @@ void kh_settings_init(void){
             unsetenv(key);
         }
     }
+#if KH_IOS_PATHS
+    for(int i=TOUCH_MODE;i<=TOUCH_OPACITY;i++) touch_setting(i,getenv(kh_options[i].name)?:kh_options[i].initial);
+    publish_touch();
+#endif
     extern int kh_tweak_boolean(KCtx *,const char *,int);
     debug_enabled=kh_tweak_boolean(NULL,"KHNMC_TWEAK_DEBUG_DEBUG_ON",0);
     allow_reset=kh_tweak_boolean(NULL,"KHNMC_TWEAK_DEBUG_SOFT_RESET",0);
@@ -495,7 +541,7 @@ void kh_settings_init(void){
         char *end;errno=0;mp_probe=strtoull(probe,&end,10);
         if(*probe<'0'||*probe>'9'||errno||*end||!mp_probe) kh_fatal(NULL,"settings-mp-probe-frame: %s",probe);
     }
-    for(int i=0;i<COUNT;i++){
+    for(int i=HP;i<COUNT;i++){
         const char *name=kh_options[i].name,*v=getenv(name);
         if(v){double n; if(validate(name,v,&n)<0) kh_fatal(NULL,"setting-value: %s=%s",name,v); values[i]=n;}
     }
@@ -537,9 +583,9 @@ void kh_settings_init(void){
 _Atomic int kh_hide_hud;
 /* f_18deb0 replaces the active INFORMATION line. Keep transient feedback off
  * that widget so mission scripts retain their own message and timing. */
-enum { NOTICE_XION, NOTICE_ROXAS, NOTICE_FIELD, NOTICE_BUSY, NOTICE_ACTOR, NOTICE_PACK, NOTICE_XKB, NOTICE_HOODED, NOTICE_COUNT };
+enum { NOTICE_XION, NOTICE_ROXAS, NOTICE_FIELD, NOTICE_BUSY, NOTICE_ACTOR, NOTICE_PACK, NOTICE_HOODED, NOTICE_COUNT };
 static const char *const notice_lines[]={"Xion","Roxas","Can't switch now: outside field","Can't switch now: busy",
-    "Can't switch now: player unavailable","Can't switch now: missing art","Can't switch now: XKB","Xion (hooded)"};
+    "Can't switch now: player unavailable","Can't switch now: missing art","Xion (hooded)"};
 static u8 look_text[NOTICE_COUNT][40];
 static _Atomic u64 notice;
 u8 kh_look_font[65536];
@@ -644,7 +690,7 @@ uint32_t kh_menu_texel(unsigned x,unsigned y,uint32_t bg){
 enum { ROOT, CHARACTER, CHEATS, CONTROLLER, DISPLAY, GAMEPLAY, ABOUT, ADVANCED, INPUT_TEST };
 static const char *const pages[]={"Roxas May Cry","Character","Cheats","Controller","Display","Gameplay","About","Advanced","Input test"};
 static _Atomic int title_screen,menu_open;
-static int page,row,component,advanced_row,direct_character,preview_look;
+static int page,row,component,advanced_row,direct_character,preview_look,first_section;
 enum { VALUE_CAP=1001 }; /* validate() caps persisted strings at 1000 bytes. */
 static char chosen[sizeof kh_options/sizeof *kh_options][VALUE_CAP];
 static const char *feedback;
@@ -659,8 +705,8 @@ void kh_menu_input_device(const char *device,const char *element){
 unsigned short kh_menu_map_buttons(unsigned short buttons,int nintendo){
     const char *layout=kh_menu_choice("KHNMC_PAD_LAYOUT")?:"auto";
     const char *ab=kh_menu_choice("KHNMC_PAD_SWAP_AB");
-    int xy=kh_pad_swap_xy(layout,nintendo,getenv("KHNMC_PAD_SWAP_XY"));
-    int swap=(!strcmp(layout,"letters")) ^ (ab && *ab=='1');
+    int xy=nintendo>=0 && kh_pad_swap_xy(layout,nintendo,getenv("KHNMC_PAD_SWAP_XY"));
+    int swap=(nintendo>=0 && !strcmp(layout,"letters")) ^ (ab && *ab=='1');
     return (buttons&0xfff) | kh_pad_faces(buttons&0x1000,buttons&0x2000,buttons&0x4000,buttons&0x8000,xy,swap);
 }
 static u8 panel_text[KH_MENU_TEXT_SIZE];
@@ -677,13 +723,17 @@ static int section_rows(int section,int *ids){
     for(int i=0;i<kh_setting_menu_count();i++){
         int group=ADVANCED;
         if(i==LOOK) group=CHARACTER;
-        else if(i>=HP && i<=DROP) group=CHEATS;
+        else if(i>=HP && i<=DRIVE) group=CHEATS;
+#if KH_IOS_PATHS
+        else if(i>=TOUCH_MODE && i<=TOUCH_OPACITY) group=CONTROLLER;
+#endif
         else if(i==PAD || i==SWAP_AB) group=CONTROLLER;
-        else if(i==HUD_COMBO || (i>=STYLE && i<=CREDIT) || (i==FRAME_WORK || i==FRAME_LOG) ||
+        else if(i==HUD_COMBO || (i>=STYLE && i<=TITLE_STYLE) || (i==FRAME_WORK || i==FRAME_LOG) ||
                 strstr(kh_options[i].name,"HUD_SCALE_") || !strcmp(kh_options[i].name,"KHNMC_FOV_ZOOM")) group=DISPLAY;
         else if(i>=TUTORIAL && i<=DIFF_LABEL) group=GAMEPLAY;
-        if(group==section) ids[n++]=i;
+        if(group==section && i!=TITLE_STYLE) ids[n++]=i;
     }
+    if(section==DISPLAY) ids[n++]=TITLE_STYLE;
     if(section==CONTROLLER) ids[n++]=INPUT_ROW;
     if(section==GAMEPLAY) ids[n++]=ADVANCED_ROW;
     return n;
@@ -701,22 +751,109 @@ static int menu_catalog_test(void){
         double value;
         if(seen[i]!=1 || validate(kh_options[i].name,kh_options[i].initial,&value)!=i) return 1;
     }
+#if KH_IOS_PATHS
+    int n=section_rows(CONTROLLER,ids);
+    if(n!=6 || ids[2]!=TOUCH_MODE || ids[3]!=TOUCH_SIZE || ids[4]!=TOUCH_OPACITY || ids[5]!=INPUT_ROW) return 1;
+    int saved[3];
+    memcpy(saved,touch_settings,sizeof saved);
+    touch_setting(TOUCH_MODE,"Always"); touch_setting(TOUCH_SIZE,"L"); touch_setting(TOUCH_OPACITY,"35");
+    int ok=touch_settings[0]==1 && touch_settings[1]==2 && touch_settings[2]==35;
+    touch_setting(TOUCH_MODE,"Off"); touch_setting(TOUCH_SIZE,"S");
+    ok=ok && touch_settings[0]==2 && touch_settings[1]==0;
+    memcpy(touch_settings,saved,sizeof saved);
+    const char *layout=atomic_exchange(&live_choices[PAD],"letters");
+    const char *ab=atomic_exchange(&live_choices[SWAP_AB],"0");
+    ok=ok && kh_menu_map_buttons(0x5050,-1)==0x5050 && kh_menu_map_buttons(0x5050,1)==0xa050;
+    live_choices[SWAP_AB]="1";
+    ok=ok && kh_menu_map_buttons(0x5050,-1)==0x6050;
+    live_choices[PAD]=layout; live_choices[SWAP_AB]=ab;
+    if(!ok) return 1;
+#endif
     return 0;
 }
 static void option_text(int i,char *out,size_t cap){
     if(i==LOOK){
         static const char *const names[]={"roxas","xion","xion-hooded"};
-        snprintf(out,cap,"%s",kh_settings_look_locked()?"Xion (locked)":names[direct_character?preview_look:kh_settings_look()]);
-    }else if(kh_setting_live(i)) snprintf(out,cap,"%g",kh_live_setting_value(i));
+        snprintf(out,cap,"%s",names[direct_character?preview_look:kh_settings_look()]);
+    }else if(i==TITLE_STYLE) snprintf(out,cap,"%s",kh_menu_choice(kh_options[i].name)?:"auto");
+    else if(kh_setting_live(i)) snprintf(out,cap,"%g",kh_live_setting_value(i));
     else snprintf(out,cap,"%s",chosen[i][0]?chosen[i]:getenv(kh_options[i].name)?:kh_options[i].initial);
 }
-static const char *timing(int i,int point){
+static const char *field_blocked(KCtx *g,int native_menu){
+    if(!g) return "Outside field";
+    if(rd8(g,GS_BASE+0x9006b0) && !native_menu) return "Game menu open";
+    if(rd64(g,GS_BASE+0x2a11268)) return "Special player active";
+    if(rd64(g,GS_BASE+0x9ba928) || rd8(g,GS_BASE+0x9ba8d1) ||
+       rd64(g,GS_BASE+0x2a11478) || kh_scene_pack_active()) return "Cutscene active";
+    if(rd64(g,GS_BASE+0x2a244d8) || rd8(g,GS_BASE+0x2a11428) ||
+       rd64(g,GS_BASE+0x2ae9fa8) || rd32(g,GS_BASE+0x2a10504)) return "Field transition";
+    u64 cmds; int windows,waiting;
+    kh_route_field_parts(g,&cmds,&windows,&waiting);
+    if(!native_menu && (!cmds || windows)) return "Waiting for field";
+    return NULL;
+}
+static const char *look_blocked(KCtx *g,int native_menu){
+    const char *blocked=field_blocked(g,native_menu);
+    if(blocked) return blocked;
+    if(rd16(g,GS_BASE+0x9acdd4)) return "Drive Form active";
+    /* f_3abb20 supplies the native field/battle state to the music and command menus. */
+    if(rd32(g,GS_BASE+0x2a11404)) return "Battle active";
+    KhPlayerSheet player;
+    char stem[40],path[64];
+    if(!kh_route_player_sheet(g,&player) || player.hp<=0 ||
+       !kh_route_object_name(g,player.obj,stem,sizeof stem)) return "Player unavailable";
+    snprintf(path,sizeof path,"obj/%s.mdlx",stem);
+    if(kh_player_asset_key(path)!=-1) return "Special player active";
+    /* Forced forms such as the opening P_EX100_BTLF can leave the saved form word zero. */
+    size_t len=strlen(stem);
+    return len && stem[len-1]=='F'?"Drive Form active":NULL;
+}
+static const char *picker_reason(KCtx *g,int save){
+    if(atomic_load(&look_request)>=0 || finishing_look>=0 || gauge_pending || deferred_resources)
+        return "Character still loading";
+    return look_blocked(g,save);
+}
+static int look_gate_selftest(KCtx *g){
+    static const struct { u32 address; const char *reason; int native_menu; } cases[]={
+        {0x9006b0,"Game menu open",0}, {0x9ba8d1,"Cutscene active",1},
+        {0x2a11428,"Field transition",1}, {0x9acdd4,"Drive Form active",1},
+        {0x2a11404,"Battle active",1}
+    };
+    int fail=0;
+    for(size_t i=0;i<sizeof cases/sizeof *cases;i++){
+        u64 addr=GS_BASE+cases[i].address;
+        u8 previous=rd8(g,addr);
+        wr8(g,addr,1);
+        const char *reason=picker_reason(g,cases[i].native_menu);
+        fail|=!reason || strcmp(reason,cases[i].reason)!=0;
+        wr8(g,addr,previous);
+    }
+    int previous=finishing_look;
+    finishing_look=2;
+    fail|=strcmp(picker_reason(g,0),"Character still loading")!=0 ||
+        kh_setting_set("KHNMC_PLAYER_LOOK","roxas")!=-2 || atomic_load(&look_request)!=-1;
+    finishing_look=previous;
+    return fail;
+}
+static void select_look(KCtx *g,int target,int save){
+    if(save){
+        float yaw;
+        choice_place=rd16(g,GS_BASE+0x717008);
+        choice_position.valid=kh_route_player_pos(g,&choice_position.x,&choice_position.y,&choice_position.z,&yaw);
+    }
+    atomic_store(&look_request,target+(save?3:0));
+    kh_warn("%s-character chose %d",save?"save":"field",target);
+}
+static const char *timing(int i,const char *blocked){
     if(i<0) return "A to open";
-    if(i==LOOK) return kh_settings_look_locked()?"Character locked":point?(direct_character?"A to confirm   B to cancel":"Applies when menu closes"):
-                       title_screen?"Left / Right to change (next game)":"Change at a save point";
+    if(i==LOOK) return blocked?:direct_character?"A to confirm   B to cancel":"Left / Right to switch";
     const char *reason=kh_setting_unavailable(i);
     if(reason) return reason;
     if(kh_setting_action(i)) return "A to queue on close";
+#if KH_IOS_PATHS
+    if(i>=TOUCH_MODE && i<=TOUCH_OPACITY) return "Applies immediately";
+#endif
+    if(i==TITLE_STYLE) return "Auto follows Character";
     if(i==LOGO) return "Next title load";
     if(i==NAMES) return "Next text lookup";
     if(i==TUTORIAL) return "Next tutorial fight";
@@ -724,11 +861,9 @@ static const char *timing(int i,int point){
     if(i==HUD_COMBO || i<=FRAME_LOG || strstr(kh_options[i].name,"HUD_SCALE_") || !strcmp(kh_options[i].name,"KHNMC_FOV_ZOOM")) return "Applies immediately";
     return "Applies on next launch";
 }
-static void edit_row(KCtx *g,int i,int direction,int point){
+static void edit_row(KCtx *g,int i,int direction,const char *blocked){
     const struct kh_option *o=&kh_options[i];
-    /* Owner 2026-11-20 ("its only on xion hooded i cant change it", on the title): no game is loaded at the title, so Character can
-     * change there too (stored for the next New Game / Load); in a game it still needs a save point. */
-    if(kh_setting_unavailable(i) || (i==LOOK && ((!point && !title_screen) || kh_settings_look_locked()))) return;
+    if(kh_setting_unavailable(i) || (i==LOOK && blocked)) return;
     char old[VALUE_CAP],value[VALUE_CAP];option_text(i,old,sizeof old);
     if(o->choices){
         char list[128];snprintf(list,sizeof list,"%s",o->choices);
@@ -749,14 +884,7 @@ static void edit_row(KCtx *g,int i,int direction,int point){
     if(i==LOOK){
         int target=!strcmp(value,"roxas")?0:!strcmp(value,"xion")?1:2;
         if(target && !kh_look_pack_ready(target)){feedback="Missing character pack";return;}
-        if(title_screen && !point){
-            kh_look_set(g,target);
-            if(kh_save_live_option(o->name,value,i,target)){kh_warn("settings-save: %s",o->name); feedback="Could not save option";return;}
-            feedback="Set for the next game you start or load";
-        }else{
-            choice_place=rd16(g,GS_BASE+0x717008);
-            atomic_store(&look_request,3+target);
-        }
+        select_look(g,target,0);
     }else if(!strcmp(o->name,"KHNMC_SCENE_ROXAS") && !strcmp(value,"1") && !kh_scene_pack_ready()){
         feedback="Scene asset pack incomplete"; return;
     }else if(!kh_setting_action(i) && kh_setting_set(o->name,value)){
@@ -771,20 +899,29 @@ int kh_menu_pad(struct KCtx *g,unsigned buttons,int lt,int rt,int lx,int ly,int 
     if(releasing){releasing=buttons!=0;return releasing;}
     int chord=(buttons&0x50)==0x50 && (down&0x50);
     if(!menu_open){
+        if(title_screen==KH_TITLE_LIST && !unavailable[TITLE_STYLE] && (buttons&0x100) && !(buttons&~0x100)){
+            if(down&0x100){
+                const char *style=kh_menu_choice("KHNMC_TITLE_STYLE");
+                int xion=style && strcmp(style,"auto")?!strcmp(style,"xion"):kh_look_enabled()!=0;
+                if(kh_setting_set("KHNMC_TITLE_STYLE",xion?"roxas":"xion")) kh_fatal(g,"title-style-save");
+            }
+            return 1;
+        }
         direct_character=atomic_exchange(&enter_character,0);
         if(!direct_character && !chord && !(title_screen && (down&0x200))) return 0;
         if(!direct_character && !title_screen && !rd8(g,GS_BASE+0x9006b0)){
             if(!kh_route_cond_eval(g,KR_FIELD,0,kh_game_frames(),NULL)) return 0;
             if(rd64(g,GS_BASE+0x9ba928) || rd8(g,GS_BASE+0x9ba8d1)) return 0;
         }
+        first_section=title_screen?CHEATS:CHARACTER;
         preview_look=kh_settings_look();
         load_camp_art(g);
         page=direct_character?CHARACTER:ROOT;row=component=0;feedback=NULL;menu_open=1;down=0;chord=0;
     }
     int ids[sizeof kh_options/sizeof *kh_options+1];
-    int n=page==ROOT?ABOUT:section_rows(page,ids);
+    int n=page==ROOT?ABOUT-first_section+1:section_rows(page,ids);
     int i=n && page!=ROOT?ids[row]:-1;
-    int point=!title_screen && g && page==CHARACTER && kh_route_at_save_point(g);
+    const char *blocked=page==CHARACTER?picker_reason(g,direct_character):NULL;
     if(down && page!=INPUT_TEST){
         KCtx ctx=*g;
         kh_call(&ctx,GS_BASE+0x2eb740,(down&0x2000)?3:(down&0x1000)?2:1,1,0,0);
@@ -792,37 +929,32 @@ int kh_menu_pad(struct KCtx *g,unsigned buttons,int lt,int rt,int lx,int ly,int 
     int before=page;
     if(down) feedback=NULL;
     if(page==INPUT_TEST){
-        if(chord){page=CONTROLLER;row=2;}
+        if(chord){page=CONTROLLER;row=section_rows(CONTROLLER,ids)-1;}
     }else if(title_screen && page==CHEATS && (down&0x200)){
         menu_open=0;releasing=1;return 1;
     }else if(chord || (down&0x2000)){
         if(page==ROOT || chord || direct_character){menu_open=0;releasing=1;return 1;}
         if(page==ADVANCED){page=GAMEPLAY;row=advanced_row;}
-        else {row=page-1;page=ROOT;}
+        else {row=page-first_section;page=ROOT;}
         component=0;
-    }else if(direct_character && (down&15) && point && !kh_settings_look_locked()){
+    }else if(direct_character && (down&15) && !blocked){
         preview_look=(preview_look+((down&5)?2:1))%3;
     }else if(n && (down&3)){row=(row+n+((down&1)?-1:1))%n;component=0;}
     else if(down&0x1000){
         if(direct_character){
-            if(point && !kh_settings_look_locked() && preview_look!=kh_settings_look()){
-                if(preview_look && !kh_look_pack_ready(preview_look)){feedback="Missing character pack";}
-                else{
-                    choice_place=rd16(g,GS_BASE+0x717008);
-                    atomic_store(&look_request,3+preview_look);
-                    if(getenv("KHNMC_TEST_LOOK_DIGEST")) kh_warn("save-character chose %d",preview_look);
-                }
-            }
+            if(blocked) feedback=blocked;
+            else if(preview_look && !kh_look_pack_ready(preview_look)) feedback="Missing character pack";
+            else select_look(g,preview_look,1);
             if(!feedback){menu_open=0;releasing=1;return 1;}
         }
-        if(page==ROOT){page=row+1;row=0;}
+        if(page==ROOT){page=row+first_section;row=0;}
         else if(i==ADVANCED_ROW){advanced_row=row;page=ADVANCED;row=0;}
         else if(i==INPUT_ROW && page==CONTROLLER) page=INPUT_TEST;
         else if(i>=0 && kh_setting_action(i)){
             char value[VALUE_CAP];option_text(i,value,sizeof value);
             feedback=kh_setting_set(kh_options[i].name,value)?"Command unavailable":"Command queued";
         }
-    }else if(page!=ROOT && i>=0 && (down&12)) edit_row(g,i,(down&8)?1:-1,point);
+    }else if(page!=ROOT && i>=0 && (down&12)) edit_row(g,i,(down&8)?1:-1,blocked);
     else if(page==ADVANCED && i>=0 && (down&0x300)){
         int fields=1;for(const char *p=kh_options[i].initial;*p;p++) fields+=*p==',';
         component=(component+fields+((down&0x200)?1:-1))%fields;
@@ -841,16 +973,20 @@ int kh_menu_pad(struct KCtx *g,unsigned buttons,int lt,int rt,int lx,int ly,int 
         snprintf(buf+used,sizeof buf-used,"\nLT %d  RT %d\nLeft %d / %d\nRight %d / %d\nL3 and Options to return",lt,rt,lx,ly,rx,ry);
     }
     else{
-        n=page==ROOT?ABOUT:section_rows(page,ids);
+        n=page==ROOT?ABOUT-first_section+1:section_rows(page,ids);
         int first=row<5?0:row-4;
         for(int j=first;j<n && j<first+6;j++){
             int opt=page==ROOT?-1:ids[j];
-            const char *label=page==ROOT?pages[j+1]:opt==INPUT_ROW?"Input test":opt==ADVANCED_ROW?"Advanced":kh_options[opt].label;
+            const char *label=page==ROOT?pages[j+first_section]:opt==INPUT_ROW?"Input test":opt==ADVANCED_ROW?"Advanced":kh_options[opt].label;
             char value[VALUE_CAP]="";
             if(opt>=0) option_text(opt,value,sizeof value);
+            if(opt==TITLE_STYLE){
+                const char *style=!strcmp(value,"auto")?"Auto (follow Character)":!strcmp(value,"xion")?"Xion":"Roxas";
+                snprintf(value,sizeof value,"%s",style);
+            }
             used+=snprintf(buf+used,sizeof buf-used,"%c %.42s%s%.32s\n",j==row?'>':' ',label,opt>=0?": ":"",value);
         }
-        const char *hint=page==ROOT?"A to open   B to close":timing(ids[row],point);
+        const char *hint=page==ROOT?"A to open   B to close":timing(ids[row],blocked);
         if(page==ADVANCED && strchr(kh_options[ids[row]].initial,',')){
             char value[VALUE_CAP];option_text(ids[row],value,sizeof value);
             char *part=value;
@@ -921,7 +1057,7 @@ struct look_art { char stem[40]; int mode; u64 body,face; };
 static struct look_art art[48];
 static u64 face_actor,face_instance,face_model,face_bar;
 static u64 last_switch;
-static int gauge_pending, finishing_look=-1;
+
 /* A frame already submitted may still reference the old instance. Retire it
  * with the actor, at the same native teardown boundary as the active one. */
 static struct idle_render { u64 owner,instance[3]; } idle[80]; /* native sheet pool */
@@ -987,7 +1123,7 @@ static struct look_art *look_art(KCtx *g,const char *stem,int target,u64 body,u6
 
 /* The native cache owns +0x10/+0x18 and releases them by pointer at f_3e61e0.
  * Keep those references until teardown while all consumers see the selected BARs. */
-static u64 held_resources, deferred_resources;
+static u64 held_resources;
 static void forget_deferred(KCtx *g,u64 resource){
     u64 prev=0;
     for(u64 e=deferred_resources;e;prev=e,e=rd64(g,e)){
@@ -1115,16 +1251,8 @@ static void look_frame(KCtx *g,int request,u64 frame){
     }else if(target==kh_look_enabled()) return;
     KhPlayerSheet player;
     char stem[40],path[64];
-    u64 cmds; int windows,waiting;
-    kh_route_field_parts(g,&cmds,&windows,&waiting);
-    int notice_index=NOTICE_FIELD;
-    if(kh_xion_enabled && !refresh){notice_index=NOTICE_XKB; goto feedback;}
-    if(!cmds) goto feedback;
-    notice_index=NOTICE_BUSY;
-    if(windows || rd64(g,GS_BASE+0x2a244d8) || rd8(g,GS_BASE+0x9ba8d1) || rd8(g,GS_BASE+0x2a11428) || rd8(g,GS_BASE+0x9006b0) || rd64(g,GS_BASE+0x2a11478) ||
-       rd64(g,GS_BASE+0x2ae9fa8) || rd64(g,GS_BASE+0x2a11268) || /* Roxas parked during XKB ownership */
-       rd32(g,GS_BASE+0x2a10504) || rd64(g,GS_BASE+0x9ba928) || kh_scene_pack_active()) goto feedback;
-    notice_index=NOTICE_ACTOR;
+    if(refresh && field_blocked(g,0)) return;
+    int notice_index=NOTICE_ACTOR;
     if(!kh_route_player_sheet(g,&player) || player.hp<=0 ||
        !kh_route_object_name(g,player.obj,stem,sizeof stem)) goto feedback;
     snprintf(path,sizeof path,"obj/%s.mdlx",stem);
@@ -1167,19 +1295,27 @@ static void look_frame(KCtx *g,int request,u64 frame){
     return;
 feedback:
     if(refresh) return;
-    static int last_feedback=-1;
-    if(notice_index>=NOTICE_FIELD && notice_index<NOTICE_XKB){
-        int empty=-1;
-        atomic_compare_exchange_strong(&look_request,&empty,request);
-        if(last_feedback==notice_index) return;
-    }
-    last_feedback=notice_index;
-    kh_warn("player appearance: %s (frame %llu)",notice_lines[notice_index],(unsigned long long)frame);
+    kh_warn("player appearance: dropped %d %s",target,notice_lines[notice_index]);
     show_look_notice(notice_index,frame);
+}
+static void refill_drive(KCtx *g,u64 actor){
+    u64 sheet=actor?rd64(g,actor+0x5c0):0;
+    if(!sheet) return;
+    u8 max=rd8(g,sheet+0x1b2);
+    if(max){
+        wr8(g,sheet+0x1b1,max);
+        wr8(g,sheet+0x1b0,100);
+    }
+    /* f_3c2740 initializes mode 2 for forms. Mode 3 spends the summon timer. */
+    if(rd8(g,sheet+0x1af)==2) wr32(g,sheet+0x1b4,rd32(g,sheet+0x1b8));
 }
 void kh_settings_frame(KCtx *g,uint64_t frame){
     int voice_busy=kh_look_voice_retry(g);
     if(g){
+        if(values[DRIVE]){
+            refill_drive(g,rd64(g,GS_BASE+0x2a105d0));
+            refill_drive(g,kh_xion_progress_player());
+        }
         retry_gauge(g);
         for(u64 e=deferred_resources,next;e;e=next){
             next=rd64(g,e);
@@ -1190,35 +1326,40 @@ void kh_settings_frame(KCtx *g,uint64_t frame){
     if(finishing_look>=0 && !voice_busy && !gauge_pending && !deferred_resources){
         int target=finishing_look;
         finishing_look=-1;
-        if(!kh_settings_look_locked()){
-            const char *value=target==2?"xion-hooded":target?"xion":"roxas";
-            if(kh_save_live_option("KHNMC_PLAYER_LOOK",value,LOOK,target))
-                kh_warn("appearance changed for this session: unable to save setting");
-            int id=target==2?NOTICE_HOODED:target?NOTICE_XION:NOTICE_ROXAS;
-            show_look_notice(id,frame);
-        }
+        int id=target==2?NOTICE_HOODED:target?NOTICE_XION:NOTICE_ROXAS;
+        show_look_notice(id,frame);
     }
     while(pending && pending->frame<=frame){
         struct change *c=pending; pending=c->next;
-        if(kh_setting_set(c->name,c->value)) kh_fatal(NULL,"settings-save: %s",c->name);
+        int result=kh_setting_set(c->name,c->value);
+        if(result==-2 && !strcmp(c->name,kh_options[LOOK].name)) kh_warn("player appearance: ignored while loading");
+        else if(result) kh_fatal(NULL,"settings-save: %s",c->name);
         fprintf(stderr,"kh: settings frame %llu %s=%s\n",c->frame,c->name,c->value);
         free(c);
     }
     if(schedule_storage && !pending){free(schedule_storage);schedule_storage=NULL;}
     int action=kh_stick_action(frame);
     atomic_store(&kh_hide_hud,action==CHORD_HOLD && values[HUD_COMBO]!=0);
-    if(g && !rd8(g,GS_BASE+0x9006b0)){
-        character_row=-1;
-        picking_character=0;
-    }
+    if(g && !rd8(g,GS_BASE+0x9006b0)) character_row=-1;
     if(g && !voice_busy && !gauge_pending && !deferred_resources){
         int request=atomic_load(&look_request);
-        if(request>=3){
-            if(menu_open || rd8(g,GS_BASE+0x9006b0) || kh_route_cond_eval(g,KR_BATTLE,0,frame,NULL)) request=-1;
-            else if(rd16(g,GS_BASE+0x717008)!=choice_place || !kh_route_at_save_point(g) || kh_settings_look_locked()){
-                atomic_compare_exchange_strong(&look_request,&request,-1);
-                request=-1;
-            }else if(!kh_route_cond_eval(g,KR_FIELD,0,frame,NULL)) request=-1;
+        if(request>=0){
+            int save=request>=3;
+            const char *drop=NULL;
+            if(save && rd16(g,GS_BASE+0x717008)!=choice_place) drop="place-changed";
+            else if(save && (menu_open || rd8(g,GS_BASE+0x9006b0))) request=-1;
+            else if(save && !at_choice_point(g)) drop="not-save-point";
+            else {
+                const char *why=look_blocked(g,0);
+                if(why && save){
+                    if(!waiting_since || frame<waiting_since) waiting_since=frame;
+                    if(frame-waiting_since<=KR_BATTLE_RECENT) request=-1;
+                    else drop=!strcmp(why,"Battle active")?"battle-timeout":why;
+                }else drop=why;
+            }
+            if(drop){kh_warn("player appearance: dropped %d %s",request%3,drop);
+                atomic_store(&look_request,-1);request=-1;waiting_since=0;}
+            if(request>=0) waiting_since=0;
         }
         if(request>=0 && !atomic_compare_exchange_strong(&look_request,&request,-1)) request=-1;
         if(request>=0 || last_switch) look_frame(g,request,frame);
@@ -1323,10 +1464,18 @@ void kh_rewind_look(KhRecords *r){
     KH_RECORD(r,held_resources);
     KH_RECORD(r,deferred_resources);
     KH_RECORD(r,character_labels);
-    KH_RECORD(r,root_labels);
+    u64 legacy_root_labels[4]={0};
+    if(!r->loading) memcpy(legacy_root_labels,&choice_position,sizeof choice_position);
+    KH_RECORD(r,legacy_root_labels);
+    if(r->loading){
+        memcpy(&choice_position,legacy_root_labels,sizeof choice_position);
+        choice_position.valid=choice_position.valid==1;
+        waiting_since=0;
+    }
     KH_RECORD(r,character_row);
     KH_RECORD(r,choice_place);
-    KH_RECORD(r,picking_character);
+    int legacy_picker=0;
+    KH_RECORD(r,legacy_picker);
     KH_RECORD(r,gauge_pending);
     KH_RECORD(r,finishing_look);
     int request=atomic_load(&look_request);

@@ -69,7 +69,7 @@ DATA=$(xcrun simctl get_app_container "$UDID" "$BUNDLE_ID" data) || { say "no da
 DOCS="$DATA/Documents"; mkdir -p "$DOCS"
 ln -s "$KROOT/pc/kh2fm.exe" "$DOCS/kh2fm.exe"
 { echo "# written by tools/ios/mac/sim_run.sh ($MODE)"; echo "log khnmc.log"; echo "status khnmc.status"
-  if [ "$MODE" = selftest ]; then echo "arg --selftest"
+  if [ "$MODE" = selftest ]; then echo "arg --selftest"; echo "env KHNMC_TOUCH_MODE=Always"
   else ln -s "$KROOT/route-data/data" "$DOCS/data"; ln -s "$KROOT/route-data/pkgdir" "$DOCS/pkgdir"; cp runtime/task20-field-input.txt "$DOCS/input.txt"
     echo "env KHNMC_INPUT_SCRIPT=@DOCS@/input.txt"; echo "env KH_RUN_GAME_FRAMES=7000"; echo "env KH_RUN_SECONDS=900"; echo "env KH_DUMP_THREADS=1"
     echo "env KHNMC_PHASELOG=@DOCS@/phase.log"; echo "env KHNMC_FILELOG=@DOCS@/files.log"; [ "$DIFF" = none ] || echo "env KHNMC_DIFFICULTY=$DIFF"; fi
@@ -94,6 +94,11 @@ case "$st" in
 esac
 grep -a "guest space\|host dirs\|NOT RUN:\|selftest: [0-9]* checks\|SKIPPED\|FAIL\|process exit\|kh: gfx: draws" "$OUT/run.out" 2>/dev/null | cut -c1-240 | tail -80
 if [ "$MODE" = selftest ]; then
+  if cp "$DOCS/touch-controller.txt" "$OUT/touch-controller.txt" && grep -qx PASS "$OUT/touch-controller.txt"; then
+    say "virtual extended profile and simultaneous touch button masks passed"
+  else
+    say "simulator-touch-controller: missing or failed result"; [ "$rc" != 0 ] || rc=1
+  fi
   echo "selftest exit=$rc" >> "$OUT/run.out"
   if cp "$DOCS/controller-pages.txt" "$OUT/controller-pages.txt" && grep -qx PASS "$OUT/controller-pages.txt"; then
     say "simulator controller button and trigger mapping passed"
