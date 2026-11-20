@@ -259,10 +259,12 @@ void kh_mod_syscalls_dump(void){
 }
 /* N_EX940_BTL installs ENMP 130 through table 2 trap 9. Change only this
  * spawned sheet, after native initialization and before its AI resumes. */
+static _Atomic int tutorial_real;
+void kh_menu_tutorial(int real){tutorial_real=real;}
 static void tutorial_set_sheet(KCtx *g){
     u64 args=A0(g);
     int battle;
-    if(rd32(g,args+8)!=130 || kh_route_world(g)!=18 || kh_route_area(g)!=3 ||
+    if(!tutorial_real || rd32(g,args+8)!=130 || kh_route_world(g)!=18 || kh_route_area(g)!=3 ||
        !kh_route_programs(g,NULL,NULL,&battle,NULL) || battle!=0x1301){
         kh_dispatch(g,GS_BASE+0x431a70);
         return;
@@ -285,11 +287,13 @@ static void tutorial_set_sheet(KCtx *g){
 }
 void kh_mod_syscalls_init(KCtx *g){
     const char *tutorial=getenv("KHNMC_TUTORIAL_FIGHT");
-    if(!tutorial || !strcmp(tutorial,"real")){
+    tutorial_real=!tutorial || !strcmp(tutorial,"real");
+    if(!tutorial_real && strcmp(tutorial,"mod")) kh_fatal(g,"tutorial-fight-mode: expected real or mod");
+    {
         u64 trap=rd64(g,GS_BASE+0x7534a0)+9*16;
         if(rd64(g,trap)!=GS_BASE+0x431a70) kh_fatal(g,"tutorial-fight-trap");
         wr64(g,trap,kh_host_fn("tutorial-set-sheet",tutorial_set_sheet));
-    }else if(strcmp(tutorial,"mod")) kh_fatal(g,"tutorial-fight-mode: expected real or mod");
+    }
     if(table) kh_fatal(g,"mod syscall table initialized twice");
     if(rd64(g,GS_BASE+0x7534a8)) kh_fatal(g,"expected empty vanilla syscall table 3");
     table=ga_calloc(114,16); drive_multiplier=ga_alloc(4,16); sstm_name=ga_strdup("sstm");

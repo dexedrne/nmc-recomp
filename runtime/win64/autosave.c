@@ -1,3 +1,4 @@
+#include "settings.h"
 /* Native port of equations19's auto-save, based on Denhonator's KHPCSpeedrunTools. */
 #include "autosave.h"
 #include "xion_swap.h"
@@ -14,7 +15,7 @@
 #define CONTINUE (GS_BASE+0x29fb580)
 #define SAVE (GS_BASE+0x9a98b0)
 enum { SAVE_SIZE=0x10fc0 };
-static int slots,indicator;
+static _Atomic int slots,indicator;
 static _Atomic u64 indicator_until;
 static int indicator_visible(u64 now,u64 until){ return now<until; }
 int kh_autosave_indicator(void){
@@ -25,7 +26,7 @@ int kh_autosave_indicator(void){
 
 void kh_autosave_init(void){
     slots=0; indicator=0; atomic_store(&indicator_until,0);
-    const char *e=getenv("KHNMC_AUTOSAVE");
+    const char *e=kh_menu_choice("KHNMC_AUTOSAVE");
     if(!e || !*e || !strcmp(e,"0")) return;
     if(strcmp(e,"1")){ kh_warn("autosave disabled: KHNMC_AUTOSAVE expects 0 or 1"); return; }
     e=getenv("KHNMC_AUTOSAVE_INDICATOR");
@@ -131,7 +132,8 @@ void orig_f_3a0660(KCtx *);
 void kh_retry_before_3a0660(KCtx *g);                 /* tweak_options.c (task 60): retry's checkpoint, before the refresh */
 void f_3a0660(KCtx *g){
     kh_retry_before_3a0660(g);
-    if(!slots||kh_theater_active()){ orig_f_3a0660(g); return; }
+    int count=slots;
+    if(!count||kh_theater_active()){ orig_f_3a0660(g); return; }
     u32 before=rd32(g,CONTINUE+12);
     orig_f_3a0660(g);
     if(rd32(g,CONTINUE+12)==before) return;
@@ -144,7 +146,7 @@ void f_3a0660(KCtx *g){
     int dir=open_directory(1);
     if(dir<0){ kh_warn("autosave-write: %s: %s",kh_slot_autosave_documents(),strerror(errno)); return; }
     int last=newest(dir);
-    int n=last<0 ? 1 : last%slots+1;
+    int n=last<0 ? 1 : last%count+1;
     if((last<0 && errno!=ENOENT) || !publish(dir,n,p)) kh_warn("autosave-write: %s: %s",kh_slot_autosave_documents(),strerror(errno));
     else {
         if(indicator) atomic_store(&indicator_until,kh_host_ns()+1500000000ull);

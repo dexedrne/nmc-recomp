@@ -12,7 +12,7 @@
 #   * on every way out (trap: normal end, error, SIGTERM from maclock.py when the ssh session drops) the app is uninstalled and
 #     the simulator is shut down and DELETED; the UDID is kept in ~/Developer/KHNMC/state/sim.udid until the delete succeeded, so
 #     a later run (or cleanup.sh) can finish a delete that did not happen.
-# What the app is told comes from Documents/khnmc.conf (runtime/host_env.c); the run's log, status file, phase log and file log
+# What the app is told comes from Documents/khnmc-defaults.conf (runtime/host_env.c); the run's log, status file, phase log and file log
 # are written into Documents and copied to ~/Developer/KHNMC/run/sim-<mode>-<time>/ ; the data is LINKED into the container, not
 # copied (the Simulator is a macOS process and follows links out of the container), so no game data leaves ~/Developer/KHNMC.
 # Exit status: the app's (from its status file); 124 = no status within the time limit; 1 = a simulator step failed.
@@ -73,8 +73,8 @@ ln -s "$KROOT/pc/kh2fm.exe" "$DOCS/kh2fm.exe"
   else ln -s "$KROOT/route-data/data" "$DOCS/data"; ln -s "$KROOT/route-data/pkgdir" "$DOCS/pkgdir"; cp runtime/task20-field-input.txt "$DOCS/input.txt"
     echo "env KHNMC_INPUT_SCRIPT=@DOCS@/input.txt"; echo "env KH_RUN_GAME_FRAMES=7000"; echo "env KH_RUN_SECONDS=900"; echo "env KH_DUMP_THREADS=1"
     echo "env KHNMC_PHASELOG=@DOCS@/phase.log"; echo "env KHNMC_FILELOG=@DOCS@/files.log"; [ "$DIFF" = none ] || echo "env KHNMC_DIFFICULTY=$DIFF"; fi
-} > "$DOCS/khnmc.conf"
-cp "$DOCS/khnmc.conf" "$OUT/khnmc.conf"
+} > "$DOCS/khnmc-defaults.conf"
+cp "$DOCS/khnmc-defaults.conf" "$OUT/khnmc.conf"
 say "container $DATA; launching $BUNDLE_ID"
 set --
 if [ "$MODE" = selftest ]; then set -- --test-controller-pages; fi
@@ -96,7 +96,7 @@ grep -a "guest space\|host dirs\|NOT RUN:\|selftest: [0-9]* checks\|SKIPPED\|FAI
 if [ "$MODE" = selftest ]; then
   echo "selftest exit=$rc" >> "$OUT/run.out"
   if cp "$DOCS/controller-pages.txt" "$OUT/controller-pages.txt" && grep -qx PASS "$OUT/controller-pages.txt"; then
-    say "controller Options and Input test pages passed"
+    say "simulator controller button and trigger mapping passed"
   else
     say "simulator-controller-pages: missing or failed result"; [ "$rc" != 0 ] || rc=1
   fi

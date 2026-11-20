@@ -224,7 +224,6 @@ static void *guest_main(void *arg){
 static int kh_main_body(int argc,char **argv){
     setvbuf(stderr,NULL,_IOLBF,0);
     kh_host_env_init(&argc,&argv);
-    kh_settings_init();                  /* host_env.c: nothing unless KH_IOS_PATHS (app container directories, Documents/khnmc.conf) */
     { extern void kh_ordered_mem_startup(void); kh_ordered_mem_startup(); }   /* every build: which memory-ordering variant this is, in the log too (review Y39 n=3) */
     const char *e;
     if((e=getenv("KH_EXE"))) snprintf(exe_path,sizeof exe_path,"%s",e);
@@ -251,6 +250,7 @@ static int kh_main_body(int argc,char **argv){
         kh_rmc_init(rmc);
     if(hd_check){ extern int kh_hd_check(const char *); return kh_hd_check(hd_check_report); }      /* host-only: before the docs dir, the trace and the guest image */
     mkdir(kh_docs,0755);
+    kh_settings_init();
     kh_frame_time_init();
     kh_trace_init(); kh_install_signals();
     kh_vclock_init();

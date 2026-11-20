@@ -9,9 +9,9 @@
 #   KH_RUN_GAME_FRAMES (default 7000), DIFFICULTY none (default) or 0..3, on the game data that tools/ios/push_data.sh put into
 #   Documents/data and Documents/pkgdir; phase.log and files.log come back with the log.
 #   play: the game as the owner plays it: no script, the controller as pad 0, sound on, no time limit; started and left running.
-#   After every selftest or route run the PLAY configuration is put back into Documents/khnmc.conf, so that tapping the app's icon
+#   After every selftest or route run the PLAY configuration is put back into Documents/khnmc-defaults.conf, so that tapping the app's icon
 #   always starts the game, never the last test.
-#   1. install the app; 2. put khnmc.conf (`arg --selftest`, log + status file), a fresh status file and kh2fm.exe into the app's
+#   1. install the app; 2. put khnmc-defaults.conf (`arg --selftest`, log + status file), a fresh status file and kh2fm.exe into the app's
 #      Documents; 3. start it, retrying every 20 s while iOS refuses because the phone is LOCKED (WAIT_UNLOCK_S, default 1800);
 #   4. read Documents/khnmc.status every 15 s until "exit N" (LIMIT_S, default 1500), then copy khnmc.log back.
 # CUTSCENES=theater THEATER_PACK=FILE installs the isolated Theater pack.
@@ -28,7 +28,7 @@
 # iOS suspends it otherwise.
 # First runs 2026-11-18 (iPhone, A20 Pro, iOS 27.2): 169,479 checks, 0 failures, about 16 s; 381 checks need fork() and are NOT RUN.
 # GFX=1 (TASK38; IOS-GRAPHICS-PLAN steps 4-5): the signed app has the graphics backend (GFX=1 mac/build.sh iphoneos, GFX=1
-#   mac/sign_app.sh; checked here) and the selftest or route runs on it: khnmc.conf gets env KHNMC_GFX=vkd3dw (the wrapped bridge; in an
+#   mac/sign_app.sh; checked here) and the selftest or route runs on it: khnmc-defaults.conf gets env KHNMC_GFX=vkd3dw (the wrapped bridge; in an
 #   Apple app build MoltenVK is the default driver), VKD3D_DEBUG=warn and VKD3D_SHADER_DEBUG=warn (vkd3d's err / fixme / warn lines go to
 #   khnmc.log and are counted here), MVK_CONFIG_PERFORMANCE_TRACKING=1 (MoltenVK counts gpuMemoryAllocated, the census reads it, only
 #   with it).  The device report (`kh: gfx device report:` block, the presentation-extensions line, any `kh: FATAL: gfx-...` line,
@@ -39,7 +39,7 @@
 #   FETCH="240 920 2000 2600" copies those presents' pictures back into frames/ (each a multiple of n, each must be in this run's index);
 #   HASHLOG=1 -> KHNMC_GFX_HASHLOG=@DOCS@/hash.tsv, fetched; CLOCK=frames -> KHNMC_CLOCK=frames.  Each of these without GFX=1 route is
 #   refused, and GFX=1 play is refused (no picture reaches the screen before plan step 10).  Without GFX=1 every run is as before.
-# PRESENT=1 (TASK41, IOS-GRAPHICS-PLAN step 10; needs GFX=1): the picture on the phone's screen.  khnmc.conf also gets
+# PRESENT=1 (TASK41, IOS-GRAPHICS-PLAN step 10; needs GFX=1): the picture on the phone's screen.  khnmc-defaults.conf also gets
 #   env KHNMC_GFX_PRESENT=layer (the presenter draws into the game view's CAMetalLayer), env KHNMC_SCREEN=layer (the game's screen is the
 #   layer's drawable: the shell hands its size over before the game starts) and env KHNMC_ASPECT=fill (task 37: the game fills that
 #   screen); PRESENT_CHECK=n adds env KHNMC_GFX_PRESENT_CHECK=n (every n-th present checked against a readback, when the surface reports
@@ -252,14 +252,14 @@ if [ "$MODE" = play ] && [ "$PRESENT" = 1 ]; then
   if grep -q '^env KHNMC_GFX_PIPECACHE=off$' "$OUT/gfx-play.conf"; then say "the disk pipeline cache is OFF in this play configuration (PIPECACHE=off, or no $STATE/pipecache-verified yet: MAC-STEPS-43.md sections 2 and 3 first, then touch that file; PIPECACHE=on decides for this call)"
   else say "the disk pipeline cache is ON in this play configuration (the app's own file, Library/Caches/khnmc/pipe.bin)"; fi
   if grep -q '^env KHNMC_GFX_VKD3D_LOG_REPEATS=' "$OUT/gfx-play.conf"; then say "vkd3d logs at warn behind the runtime's filter (8 lines per site, then counted)"; else say "the signed app does not know KHNMC_GFX_VKD3D_LOG_REPEATS (older than the TASK43 review): vkd3d logs at its default level, its warn-class failure lines are NOT in the play log"; fi
-  cp_to "$OUT/gfx-play.conf" khnmc.conf || { say "copy of the GFX play configuration FAILED"; tail -5 "$OUT/devicectl.log"; exit 1; }
+  cp_to "$OUT/gfx-play.conf" khnmc-defaults.conf || { say "copy of the GFX play configuration FAILED"; tail -5 "$OUT/devicectl.log"; exit 1; }
   # NOLAUNCH=1 (owner not playing right now): leave the configuration on the phone and do not start the game; the icon starts it
   if [ "${NOLAUNCH:-0}" = 1 ]; then say "the play configuration with the picture is on the phone; NOT launched (NOLAUNCH=1): the icon starts it"; echo "$OUT"; exit 0; fi
   xcrun devicectl device process launch --device "$DEVICE" --timeout 60 --terminate-existing "$BUNDLE_ID" >> "$OUT/devicectl.log" 2>&1 || { say "launch FAILED (phone locked?)"; tail -5 "$OUT/devicectl.log"; exit 1; }
   say "the game is running on the phone with its picture (GFX=1 PRESENT=1 play); its log: Documents/khnmc.log (fetch it with SKIP_INSTALL=1 ... or devicectl copy from)"; echo "$OUT"; exit 0
 fi
 if [ "$MODE" = play ]; then
-  cp_to "$OUT/play.conf" khnmc.conf || { say "copy of the play configuration FAILED"; tail -5 "$OUT/devicectl.log"; exit 1; }
+  cp_to "$OUT/play.conf" khnmc-defaults.conf || { say "copy of the play configuration FAILED"; tail -5 "$OUT/devicectl.log"; exit 1; }
   xcrun devicectl device process launch --device "$DEVICE" --timeout 60 --terminate-existing "$BUNDLE_ID" >> "$OUT/devicectl.log" 2>&1 || { say "launch FAILED (phone locked?)"; tail -5 "$OUT/devicectl.log"; exit 1; }
   say "the game is running on the phone (play mode); its log: Documents/khnmc.log"; echo "$OUT"; exit 0
 fi
@@ -282,14 +282,14 @@ IX0=0
 if [ -n "$DUMP_EVERY" ]; then mkdir -p "$OUT/frames"
   if cp_from frames/index.tsv; then IX0=$(wc -l < "$OUT/frames/index.tsv" | tr -d ' '); mv "$OUT/frames/index.tsv" "$OUT/frames/index-before.tsv"; fi
   say "Documents/frames/index.tsv held $IX0 lines before this run (this run's are appended after them)"; fi
-cp_to "$OUT/khnmc.conf" khnmc.conf || { say "copy of khnmc.conf FAILED"; tail -5 "$OUT/devicectl.log"; exit 1; }
+cp_to "$OUT/khnmc.conf" khnmc-defaults.conf || { say "copy of khnmc.conf FAILED"; tail -5 "$OUT/devicectl.log"; exit 1; }
 if [ "$MODE" = route ]; then cp "$INPUT" "$OUT/input.txt"; cp_to "$OUT/input.txt" input.txt || { say "copy of the input script FAILED"; exit 1; }; fi
 cp_to "$OUT/status.init" khnmc.status || { say "copy of the status file FAILED"; tail -5 "$OUT/devicectl.log"; exit 1; }
 tw=$SECONDS; n=0
 until xcrun devicectl device process launch --device "$DEVICE" --timeout 60 --terminate-existing "$BUNDLE_ID" >> "$OUT/devicectl.log" 2>&1; do
   n=$((n+1)); [ $n = 1 ] && say "launch refused (phone locked?): retrying every 20 s"
   [ $((SECONDS-tw)) -ge "${WAIT_UNLOCK_S:-1800}" ] && { say "launch FAILED for $((SECONDS-tw)) s"; tail -5 "$OUT/devicectl.log"
-    cp_to "$OUT/play.conf" khnmc.conf || say "WARNING: the play configuration could not be put back"; exit 1; }   # review r9: the icon starts the game, not this test
+    cp_to "$OUT/play.conf" khnmc-defaults.conf || say "WARNING: the play configuration could not be put back"; exit 1; }   # review r9: the icon starts the game, not this test
   sleep 20
 done
 say "launched after $n refused attempts"
@@ -330,7 +330,7 @@ if [ "$GFX" = 1 ]; then
     else say "Documents/frames/index.tsv could not be fetched: no picture of this run is known"; xrc=1; fi
   fi
 fi
-cp_to "$OUT/play.conf" khnmc.conf || say "WARNING: the play configuration could not be put back: the icon would start this test again"
+cp_to "$OUT/play.conf" khnmc-defaults.conf || say "WARNING: the play configuration could not be put back: the icon would start this test again"
 say "status after $((SECONDS-t0)) s: '${st:-<none>}'; log lines: $(wc -l < "$OUT/khnmc.log" 2>/dev/null | tr -d ' ')"
 echo "$OUT"
 case "$st" in "exit 0") exit $xrc;; "exit "*) exit 1;; *) exit 124;; esac

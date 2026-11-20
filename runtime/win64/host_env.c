@@ -253,7 +253,8 @@ void kh_host_env_init(int *argc,char ***argv){
     if(!he_isdir(he_docs)||!he_isdir(root)) kh_fatal(NULL,"app-home-not-writable: cannot create %s and %s",he_docs,root);
     /* the conf first: its `log` moves every later line into the log file, its `env` lines win over the defaults below */
     he_argc=0; for(int i=0;i<*argc&&he_argc<HE_MAXARG;i++) he_argv[he_argc++]=(*argv)[i];
-    snprintf(p,sizeof p,"%s/khnmc.conf",he_docs);
+    snprintf(p,sizeof p,"%s/khnmc-defaults.conf",he_docs);
+    if(access(p,F_OK)) snprintf(p,sizeof p,"%s/khnmc.conf",he_docs);
     if(!access(p,F_OK)){
         int nd=he_conf(p,1,err,sizeof err);
         if(nd<0) kh_fatal(NULL,"host-conf: %s",err);

@@ -604,7 +604,7 @@ void kh_cut_frame(KCtx *g,u64 frame){
     extern _Atomic u64 gfx_presents;
     extern size_t kh_phase_files_seen(void);
     if(!trigger_head && theater_enabled) theater_frame(g,frame);
-    if(!trigger_head && !atomic_load(&theater_reserved)) take_menu_request(frame);
+    if(!trigger_head && !kh_menu_active() && !atomic_load(&theater_reserved)) take_menu_request(frame);
     if((theater_enabled||!kh_vclock_on) && !trigger_head && !getenv("KHNMC_TEST_THEATER_HASH")) return;
     int due=trigger_head&&frame>=trigger_head->frame;
     if(due&&!at_dispatch&&game_chain_known(g)) longjmp(*game_dispatch,1);

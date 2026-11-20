@@ -130,7 +130,7 @@ void kh_aspect_hud_config(const char *cmd,const char *hpv);   /* task 53, below 
 void kh_aspect_title_config(const char *v);                   /* task 53, below */
 static void zoom_storage_init(void);
 static int test_event_bars;
-static int hide_title_credit;
+static _Atomic int hide_title_credit;
 static _Atomic u64 hidden_credit_batches;
 static void portrait_config(void);
 void kh_aspect_init(void){
@@ -518,7 +518,7 @@ void f_19d040(KCtx *g){
 #define ZOOM_MAX       1.89                        /* review finding 3: f_178580's limit inside the picture for every FOV (above) */
 #define ZOOM_STACK     0x1000ull                   /* the guest stack below the call that the two builds may write (put back) */
 enum { ZC_SCENE0=0, ZC_SCENE1=1, ZC_MAPOBJ=2, ZC_OTHER=3 };
-static double asp_zoom_tall=ZOOM_DEFAULT; static int asp_zoom_set;
+static _Atomic double asp_zoom_tall=ZOOM_DEFAULT; static int asp_zoom_set;
 /* a KHNMC_FOV_ZOOM value: DIGITS[.DIGITS] with at most 15 digits in all and nothing else (no sign, exponent, space; no locale).
  * 0 = *z set, 1 = malformed, 2 = a number outside 1.0 .. 1.89 */
 int kh_fov_zoom_parse(const char *s,double *z){
@@ -788,7 +788,7 @@ static void zoom_report(FILE *f){
 #define HUD_CMD_DEFAULT 1.25                       /* owner 2026-11-18: "the command menu 25% bigger" */
 #define HUD_HP_DEFAULT  1.5                        /* owner 2026-11-18: "hp portrait thing 50% bigger" */
 enum { HUD_CMD=0, HUD_HP=1, HUD_N };
-static double hud_s[HUD_N]={HUD_CMD_DEFAULT,HUD_HP_DEFAULT}; static int hud_set[HUD_N];
+static _Atomic double hud_s[HUD_N]={HUD_CMD_DEFAULT,HUD_HP_DEFAULT}; static int hud_set[HUD_N];
 static const char *hud_env[HUD_N]={"KHNMC_HUD_SCALE_CMD","KHNMC_HUD_SCALE_HP"};
 static const char *hud_what[HUD_N]={"command menu (dk groups 1, 2)","player gauges (dk groups 3, 4, 5)"};
 static const float hud_px[HUD_N]={-70.0f,590.0f}, hud_py[HUD_N]={416.0f,405.0f};       /* the pivots, GS frame (measured: above) */
@@ -807,13 +807,15 @@ static int decimal_range(const char *s,double *v,double lo,double hi){
     *v=x; return 0;
 }
 int kh_hud_scale_parse(const char *s,double *v){ return decimal_range(s,v,0.5,3.0); }
-static double style_scale=2,style_raise=0.25,enemy_scale=1.5,sub_scale=1.5,sub_lower=0.06;
-static int menu_band;
-static void portrait_number(const char *key,double *value,double lo,double hi){
+static _Atomic double style_scale=2,style_raise=0.25,enemy_scale=1.5,sub_scale=1.5,sub_lower=0.06;
+static _Atomic int menu_band;
+static void portrait_number(const char *key,_Atomic double *value,double lo,double hi){
     const char *s=getenv(key);
     if(!s || !*s) return;
-    int e=decimal_range(s,value,lo,hi);
+    double number;
+    int e=decimal_range(s,&number,lo,hi);
     if(e) kh_fatal(NULL,"portrait-value-%s: %s=%s (plain decimal %g..%g)",e==1?"malformed":"range",key,s,lo,hi);
+    *value=number;
 }
 static void portrait_config(void){
     portrait_number("KHNMC_HUD_SCALE_STYLE",&style_scale,0.5,3);
@@ -824,6 +826,18 @@ static void portrait_config(void){
     const char *s=getenv("KHNMC_MENU_LAYOUT");
     menu_band=s && !strcmp(s,"band");
     if(s && *s && !menu_band && strcmp(s,"portrait")) kh_fatal(NULL,"menu-layout-value: KHNMC_MENU_LAYOUT=%s (known: portrait, band)",s);
+}
+void kh_menu_display_apply(const char *name,const char *value){
+    if(!strcmp(name,"KHNMC_HUD_SCALE_CMD")) hud_s[HUD_CMD]=atof(value);
+    else if(!strcmp(name,"KHNMC_HUD_SCALE_HP")) hud_s[HUD_HP]=atof(value);
+    else if(!strcmp(name,"KHNMC_TITLE_CREDIT")) hide_title_credit=!strcmp(value,"hide");
+    else if(!strcmp(name,"KHNMC_FOV_ZOOM")) asp_zoom_tall=atof(value);
+    else if(!strcmp(name,"KHNMC_HUD_SCALE_STYLE")) style_scale=atof(value);
+    else if(!strcmp(name,"KHNMC_HUD_STYLE_RAISE")) style_raise=atof(value);
+    else if(!strcmp(name,"KHNMC_HUD_SCALE_ENEMY")) enemy_scale=atof(value);
+    else if(!strcmp(name,"KHNMC_SUB_SCALE")) sub_scale=atof(value);
+    else if(!strcmp(name,"KHNMC_SUB_LOWER")) sub_lower=atof(value);
+    else if(!strcmp(name,"KHNMC_MENU_LAYOUT")) menu_band=!strcmp(value,"band");
 }
 void kh_aspect_hud_config(const char *cmd,const char *hpv){
     const char *v[HUD_N]={cmd,hpv};

@@ -1,3 +1,4 @@
+#include "settings.h"
 /* Keep the guest's initial save/profile files with the replay history. A
  * bootstrap must neither consume a later profile nor overwrite player saves. */
 #include "slot_disk.h"
@@ -111,7 +112,7 @@ static const char *capture_tree(KhBootDocs *d,const char *root,const char *sub,i
 }
 const char *kh_slot_docs_capture(KhBootDocs *d){
     const char *error=capture_tree(d,kh_slot_documents(),PROFILE,0);
-    const char *enabled=getenv("KHNMC_AUTOSAVE");
+    const char *enabled=kh_menu_choice("KHNMC_AUTOSAVE");
     if(!error && enabled && !strcmp(enabled,"1"))
         error=capture_tree(d,kh_slot_autosave_documents(),"autosave",1);
     return error;

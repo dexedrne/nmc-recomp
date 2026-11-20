@@ -5,11 +5,13 @@
 _Atomic u64 kh_display_ticks, kh_present_ns, kh_acquire_ns, kh_slot_wait_ns;
 extern _Atomic u64 gfx_draws;
 
-int kh_frame_work;
+_Atomic int kh_frame_work,kh_frame_log=1;
 _Atomic u64 kh_vertices, kh_blend_vertices, kh_texture_uploads, kh_file_reads, kh_bg_wait_ns;
 void kh_frame_time_init(void){
     const char *v=getenv("KHNMC_FRAME_WORK");
     if(v && strcmp(v,"0") && strcmp(v,"1")) kh_fatal(NULL,"frame-work-value: expected 0 or 1");
+    const char *log=getenv("KHNMC_FRAME_TIME");
+    kh_frame_log=!log || !strcmp(log,"1");
     kh_frame_work=v && *v=='1';
 }
 
@@ -19,7 +21,7 @@ typedef struct {
 } FrameStats;
 
 static void emit(const char *kind,int world,int area,int look,const FrameStats *s,int display){
-    if(!s->frames) return;
+    if(!kh_frame_log || !s->frames) return;
     unsigned i=0;
     u64 cumulative=s->hist[0], rank=s->frames-s->frames/20;
     while(cumulative<rank && i<256) cumulative+=s->hist[++i];

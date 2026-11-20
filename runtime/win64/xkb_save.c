@@ -184,14 +184,16 @@ static const char *const difficulties[]={
     "Beginner","Standard","Critical","Less Than Nothing","Xion Knows Best","Xion Always Cries"
 };
 static u64 difficulty_text[6],autosave_title[2];
-static int show_difficulty,trace_rows;
+static _Atomic int show_difficulty;
+static int trace_rows;
+void kh_menu_difficulty_labels(int on){show_difficulty=on;}
 
 void kh_save_difficulty_init(void){
     const char *e=getenv("KHNMC_SAVE_DIFFICULTY");
     if(e&&*e&&strcmp(e,"0")&&strcmp(e,"1")) kh_fatal(NULL,"save-difficulty-switch: expected 0 or 1");
     show_difficulty=!e||strcmp(e,"0");
     trace_rows=getenv("KHNMC_ROUTE_TRACE")!=NULL;
-    if(show_difficulty){
+    {
         /* The three long names share a column with up to 99,999 Munny. */
         for(unsigned i=0;i<6;i++) difficulty_text[i]=kh_encode_menu_text(difficulties[i],i>=3);
         autosave_title[0]=kh_encode_menu_text("Latest autosave",0);
