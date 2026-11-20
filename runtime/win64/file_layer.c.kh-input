@@ -613,6 +613,11 @@ int kh_file_selftest(KCtx *g){
         TEST(choose_title_logo("cycle",2,dir,picks)==1+launch%3);
         for(int i=0;i<4;i++) TEST(choose_title_logo(logo_names[i],2,dir,picks)==i);
     }
+    {   /* the logo counters live in the test directory: remove them so the directory can be removed (app-way scratch check) */
+        char counter[KH_TMP_MAX+64];
+        snprintf(counter,sizeof counter,"%s/title-logo-xion",dir); TEST(unlink(counter)==0);
+        snprintf(counter,sizeof counter,"%s/title-logo-cycle",dir); TEST(unlink(counter)==0);
+    }
     TEST(!kh_look_key("obj/P_EX100.mdlx"));
     const char *pack_env=getenv("KHNMC_SCENE_ROXAS_DIR");
     char *initial_pack=pack_env?strdup(pack_env):NULL;

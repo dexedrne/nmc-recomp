@@ -40,8 +40,10 @@
 #import <QuartzCore/QuartzCore.h>
 #import <CoreMotion/CoreMotion.h>
 #include "portrait.h"
+#include "../pad_layout.h"
 #import <AVFoundation/AVFoundation.h>
 #import <GameController/GameController.h>
+#import <TargetConditionals.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -71,6 +73,19 @@ static int selected_option,selected_component;
 static unsigned short previous_buttons;
 static BOOL suppress_buttons;
 static NSString *pending_character;
+static GCController *pad_active;
+static BOOL input_test, pad_nintendo;
+static NSString *raw_element;
+static NSArray<GCControllerButtonInput *> *extra_buttons;
+static GCControllerButtonInput *capture_button;
+static unsigned short pad_buttons(GCExtendedGamepad *p);
+static void show_input_test(void);
+static NSString *pad_name(void){
+    return pad_active.vendorName ?: pad_active.productCategory ?: @"No controller connected";
+}
+static BOOL controller_option(int index){
+    return !strncmp(kh_options[index].name,"KHNMC_PAD_",10);
+}
 static NSString *option_value(int index){
     const struct kh_option *o=&kh_options[index];
     if(!strcmp(o->name,"KHNMC_PLAYER_LOOK")) return pending_character ?: (@[@"roxas",@"xion",@"xion-hooded"][kh_settings_look()]);
@@ -79,14 +94,23 @@ static NSString *option_value(int index){
     return chosen ?: @(configured ?: o->initial);
 }
 static void show_options(NSString *error){
+    if(input_test){show_input_test();return;}
     NSMutableString *text=[NSMutableString stringWithString:@"Options\n\n"];
     int first=MAX(0,MIN(selected_option-2,kh_setting_menu_count()-5));
     for(int i=first;i<MIN(first+5,kh_setting_menu_count());i++){
         const char *reason=kh_setting_unavailable(i);
+        if(controller_option(i)){
+            if(i==first || !controller_option(i-1)) [text appendFormat:@"Controller  ·  %@\n",pad_name()];
+            NSString *v=option_value(i);
+            NSDictionary *names=@{@"auto":@"Auto",@"positions":@"Positions (Xbox-PlayStation layout)",
+                                  @"letters":@"Printed letters (Nintendo layout)",@"1":@"On",@"0":@"Off"};
+            [text appendFormat:@"%@%@: %@\n",i==selected_option?@"▶  ":@"     ",@(kh_options[i].label),names[v] ?: v];
+            continue;
+        }
         [text appendFormat:@"%@%@: %@\n",i==selected_option?@"▶  ":@"     ",@(kh_options[i].label),i==0 && kh_settings_look_locked()?@"Xion (Xion Knows Best)":reason?[NSString stringWithFormat:@"Unavailable (%s)",reason]:i==0 && [option_value(i) isEqualToString:@"xion-hooded"]?@"Xion (hooded)":i==0?option_value(i).capitalizedString:option_value(i)];
     }
     [text appendFormat:@"\n%@\nD-pad to select and change   •   Circle to close",
-     error ?: (selected_option==0 && kh_settings_look_locked()?@"Character is locked":selected_option==0?@"Applies when you close Options":kh_setting_action(selected_option)?@"Cross to execute when play resumes":kh_setting_live(selected_option)?@"Applies immediately":@"Applies on the next launch")];
+     error ?: (controller_option(selected_option)?@"Applies immediately   •   Cross for Input test":selected_option==0 && kh_settings_look_locked()?@"Character is locked":selected_option==0?@"Applies when you close Options":kh_setting_action(selected_option)?@"Cross to execute when play resumes":kh_setting_live(selected_option)?@"Applies immediately":@"Applies on the next launch")];
     if(strchr(kh_options[selected_option].initial,',')){
         [text appendFormat:@"\nL1/R1 to select value %d",selected_component+1];
     }
@@ -116,33 +140,39 @@ static void adjust_option(int direction){
     if(selected_option==0) pending_character=value;
     else if(!kh_setting_action(selected_option) && kh_setting_set(o->name,value.UTF8String)){show_options(@"Could not save this value");return;}
     chosen_options[@(o->name)]=value;
+    if(controller_option(selected_option)) previous_buttons=pad_buttons(pad_active.extendedGamepad);
     show_options(nil);
+}
+static void menu_input(unsigned short buttons,unsigned short down){
+    if(input_test){
+        if((buttons&0x40) && (down&0x10)) input_test=NO;
+        show_options(nil);
+    }else if((down&0x1000) && controller_option(selected_option)){
+        input_test=YES; show_input_test();
+    }else if(down&0x2000){
+        if(pending_character && kh_setting_set(kh_options[0].name,pending_character.UTF8String)){show_options(@"Could not apply Character");return;}
+        pending_character=nil;
+        [options_label removeFromSuperview]; options_label=nil; suppress_buttons=YES;
+        kh_app_resume(KH_APP_RESUME_BOUND_MS);
+    }else if((down&0x1000) && kh_setting_action(selected_option)){
+        int result=kh_setting_set(kh_options[selected_option].name,option_value(selected_option).UTF8String);
+        if(result==-2) show_options(@(kh_setting_unavailable(selected_option) ?: "Unavailable"));
+        else if(result) show_options(@"A command is already queued");
+        else show_options(@"Queued. Circle to resume.");
+    }else if(down&3){
+        selected_option=(selected_option+((down&1)?-1:1)+kh_setting_menu_count())%kh_setting_menu_count();
+        selected_component=0; show_options(nil);
+    }else if(down&0x300){
+        int count=(int)[option_value(selected_option) componentsSeparatedByString:@","].count;
+        selected_component=(selected_component+((down&0x200)?1:-1)+count)%count;show_options(nil);
+    }else if(down&12) adjust_option((down&8)?1:-1);
 }
 static BOOL options_input(unsigned short buttons){
     unsigned short down=buttons & ~previous_buttons;
     previous_buttons=buttons;
     if(suppress_buttons){if(!buttons) suppress_buttons=NO;return YES;}
     if(UIApplication.sharedApplication.applicationState!=UIApplicationStateActive) return YES;
-    if(options_label){
-        if(down&0x2000){
-            if(pending_character && kh_setting_set(kh_options[0].name,pending_character.UTF8String)){show_options(@"Could not apply Character");return YES;}
-            pending_character=nil;
-            [options_label removeFromSuperview]; options_label=nil; suppress_buttons=YES;
-            kh_app_resume(KH_APP_RESUME_BOUND_MS);
-        }else if((down&0x1000) && kh_setting_action(selected_option)){
-            int result=kh_setting_set(kh_options[selected_option].name,option_value(selected_option).UTF8String);
-            if(result==-2) show_options(@(kh_setting_unavailable(selected_option) ?: "Unavailable"));
-            else if(result) show_options(@"A command is already queued");
-            else show_options(@"Queued. Circle to resume.");
-        }else if(down&3){
-            selected_option=(selected_option+((down&1)?-1:1)+kh_setting_menu_count())%kh_setting_menu_count();
-            selected_component=0; show_options(nil);
-        }else if(down&0x300){
-            int count=(int)[option_value(selected_option) componentsSeparatedByString:@","].count;
-            selected_component=(selected_component+((down&0x200)?1:-1)+count)%count;show_options(nil);
-        }else if(down&12) adjust_option((down&8)?1:-1);
-        return YES;
-    }
+    if(options_label){menu_input(buttons,down);return YES;}
     /* Hold L3 first, then press the DualSense Options button (GC buttonMenu). */
     if((buttons&0x40) && (down&0x10) && test_label.superview && kh_app_game_presented()){
         const char *life=getenv("KHNMC_APP_LIFE");
@@ -167,35 +197,77 @@ static BOOL options_input(unsigned short buttons){
     return NO;
 }
 
-/* Owner 2026-11-19 with a Switch Pro Controller: "triangle plus square are swapped".  The system reports a Nintendo controller's face
- * buttons by their printed letters, so its top button arrives as buttonX and its left one as buttonY: swap them back to positions.
- * KHNMC_PAD_SWAP_XY / KHNMC_PAD_SWAP_AB = 1 / 0 force a swap on / off for any controller (unset: X/Y swapped for Nintendo controllers
- * only, A/B left alone).  KHNMC_PAD_LOG=1 logs every element change with the system's own element name (to check triggers etc.). */
-static int pad_swap_xy, pad_swap_ab, pad_log;
 static void pad_layout(GCController *c){
     NSString *cat=c.productCategory?:@"", *name=c.vendorName?:@"";
-    BOOL nintendo=[cat rangeOfString:@"Switch" options:NSCaseInsensitiveSearch].location!=NSNotFound ||
-                  [cat rangeOfString:@"Joy-Con" options:NSCaseInsensitiveSearch].location!=NSNotFound ||
-                  [name rangeOfString:@"Pro Controller" options:NSCaseInsensitiveSearch].location!=NSNotFound ||
-                  [name rangeOfString:@"Joy-Con" options:NSCaseInsensitiveSearch].location!=NSNotFound;
-    const char *xy=getenv("KHNMC_PAD_SWAP_XY"), *ab=getenv("KHNMC_PAD_SWAP_AB"), *lg=getenv("KHNMC_PAD_LOG");
-    pad_swap_xy=xy&&*xy ? (*xy=='1') : nintendo;
-    pad_swap_ab=ab&&*ab ? (*ab=='1') : 0;
-    pad_log=lg&&*lg=='1';
-    fprintf(stderr,"kh: ios: controller layout: '%s' (category '%s')%s: swap X/Y %s, swap A/B %s%s\n",name.UTF8String,cat.UTF8String,
-            nintendo?" Nintendo":"",pad_swap_xy?"on":"off",pad_swap_ab?"on":"off",pad_log?", element log on":"");
+    pad_nintendo=[cat rangeOfString:@"Switch" options:NSCaseInsensitiveSearch].location!=NSNotFound ||
+                 [cat rangeOfString:@"Joy-Con" options:NSCaseInsensitiveSearch].location!=NSNotFound ||
+                 [name rangeOfString:@"Pro Controller" options:NSCaseInsensitiveSearch].location!=NSNotFound ||
+                 [name rangeOfString:@"Joy-Con" options:NSCaseInsensitiveSearch].location!=NSNotFound;
+}
+static GCControllerButtonInput *touchpad_click(GCExtendedGamepad *p){
+    if([p isKindOfClass:GCDualSenseGamepad.class]) return ((GCDualSenseGamepad *)p).touchpadButton;
+    if([p isKindOfClass:GCDualShockGamepad.class]) return ((GCDualShockGamepad *)p).touchpadButton;
+    return nil;
+}
+/* Optional profile elements have stable aliases even when their display names are localized.
+ * Keep system gestures enabled. Home, PS and Mute have no game binding. */
+static void pad_extras(GCExtendedGamepad *p){
+    NSMutableOrderedSet *extra=[NSMutableOrderedSet new];
+    capture_button=nil;
+    for(NSString *key in [p.buttons.allKeys sortedArrayUsingSelector:@selector(compare:)]){
+        GCControllerButtonInput *v=p.buttons[key];
+        if(v==p.buttonA || v==p.buttonB || v==p.buttonX || v==p.buttonY ||
+           v==p.leftShoulder || v==p.rightShoulder || v==p.leftTrigger || v==p.rightTrigger ||
+           v==p.leftThumbstickButton || v==p.rightThumbstickButton ||
+           v==p.buttonMenu || v==p.buttonOptions ||
+           v==p.dpad.left || v==p.dpad.right || v==p.dpad.up || v==p.dpad.down) continue;
+        [extra addObject:v];
+        if(v!=p.buttonHome && ([key.lowercaseString containsString:@"share"] ||
+                               [key.lowercaseString containsString:@"capture"])) capture_button=v;
+    }
+    extra_buttons=extra.array;
 }
 static unsigned short pad_buttons(GCExtendedGamepad *p){
     unsigned short b=0;
     if(p.dpad.up.pressed) b|=0x0001; if(p.dpad.down.pressed) b|=0x0002; if(p.dpad.left.pressed) b|=0x0004; if(p.dpad.right.pressed) b|=0x0008;
-    if(p.buttonMenu.pressed) b|=0x0010; if(p.buttonOptions.pressed) b|=0x0020;
+    if(p.buttonMenu.pressed) b|=0x0010; if(p.buttonOptions.pressed || touchpad_click(p).pressed || capture_button.pressed) b|=0x0020;
     if(p.leftThumbstickButton.pressed) b|=0x0040; if(p.rightThumbstickButton.pressed) b|=0x0080;
     if(p.leftShoulder.pressed) b|=0x0100; if(p.rightShoulder.pressed) b|=0x0200;
-    BOOL a=p.buttonA.pressed, bb=p.buttonB.pressed, x=p.buttonX.pressed, y=p.buttonY.pressed;
-    if(pad_swap_ab){ BOOL t=a; a=bb; bb=t; }
-    if(pad_swap_xy){ BOOL t=x; x=y; y=t; }
-    if(a) b|=0x1000; if(bb) b|=0x2000; if(x) b|=0x4000; if(y) b|=0x8000;
-    return b;
+    const char *layout=[chosen_options[@"KHNMC_PAD_LAYOUT"] UTF8String] ?: getenv("KHNMC_PAD_LAYOUT") ?: "auto";
+    const char *ab=[chosen_options[@"KHNMC_PAD_SWAP_AB"] UTF8String] ?: getenv("KHNMC_PAD_SWAP_AB");
+    int xy=kh_pad_swap_xy(layout,pad_nintendo,getenv("KHNMC_PAD_SWAP_XY"));
+    int swap_ab=(!strcmp(layout,"letters")) ^ (ab && *ab=='1');
+    return b | kh_pad_faces(p.buttonA.pressed,p.buttonB.pressed,p.buttonX.pressed,p.buttonY.pressed,xy,swap_ab);
+}
+static void show_input_test(void){
+    GCExtendedGamepad *p=pad_active.extendedGamepad;
+    unsigned short b=pad_buttons(p);
+    NSMutableString *text=[NSMutableString stringWithFormat:@"Input test  ·  %@\n\n",pad_name()];
+    static const struct { unsigned mask; const char *name; } keys[]={
+        {0x1000,"Cross"},{0x2000,"Circle"},{0x4000,"Square"},{0x8000,"Triangle"},
+        {0x40,"L3"},{0x80,"R3"},
+        {0x10,"Options"},{0x20,"Create"},
+        {1,"↑"},{2,"↓"},{4,"←"},{8,"→"}
+    };
+    for(unsigned i=0;i<sizeof keys/sizeof *keys;i++){
+        if(i==8) [text appendString:@"D-pad   "];
+        [text appendFormat:@"%@ %s  ",(b & keys[i].mask)?@"●":@"○",keys[i].name];
+        if(i==3 || i==7 || i==11) [text appendString:@"\n"];
+    }
+    [text appendFormat:@"%@ L1 %u/255     %@ R1 %u/255\n",
+     (b&0x100)?@"●":@"○",pad_trigger(p.leftShoulder.value),
+     (b&0x200)?@"●":@"○",pad_trigger(p.rightShoulder.value)];
+    [text appendFormat:@"%@ L2 %u/255     %@ R2 %u/255\n",
+     p.leftTrigger.value>0?@"●":@"○",pad_trigger(p.leftTrigger.value),
+     p.rightTrigger.value>0?@"●":@"○",pad_trigger(p.rightTrigger.value)];
+    [text appendFormat:@"Left stick (%+d, %+d)\nRight stick (%+d, %+d)\n",
+     pad_axis(p.leftThumbstick.xAxis.value),pad_axis(p.leftThumbstick.yAxis.value),
+     pad_axis(p.rightThumbstick.xAxis.value),pad_axis(p.rightThumbstick.yAxis.value)];
+    for(GCControllerButtonInput *v in extra_buttons){
+        [text appendFormat:@"%@ %@   ",v.pressed?@"●":@"○",v.unmappedLocalizedName ?: v.localizedName ?: v.aliases.anyObject];
+    }
+    [text appendFormat:@"\nRaw element: %@\nHold L3 and press Options to return",raw_element ?: @"—"];
+    options_label.text=text;
 }
 static void pad_send(GCExtendedGamepad *p){
     unsigned short b=pad_buttons(p);
@@ -207,25 +279,70 @@ static void pad_send(GCExtendedGamepad *p){
 /* ONE controller drives pad 0 (review r9: a second controller, or the disconnect of another one, must not change or release it): the
  * first connected controller with an extended gamepad profile; when it disconnects, the pad is released and the next connected one
  * (if any) takes over.  Everything here runs on the main queue. */
-static GCController *pad_active;
 static int pad_attach(GCController *c){
     GCExtendedGamepad *p=c.extendedGamepad;
     if(!p){ fprintf(stderr,"kh: ios: controller '%s' has no extended gamepad profile: not used\n",c.vendorName.UTF8String?:"?"); return 0; }
     if(pad_active && pad_active!=c){ fprintf(stderr,"kh: ios: controller '%s' connected: not used (another controller is pad 0)\n",c.vendorName.UTF8String?:"?"); return 0; }
     pad_active=c;
     pad_layout(c);
+    pad_extras(p);
+    raw_element=nil;
     c.handlerQueue=dispatch_get_main_queue();
     p.valueChangedHandler=^(GCExtendedGamepad *gp,GCControllerElement *el){
-        if(pad_log && el){
+        if(gp!=pad_active.extendedGamepad) return;
+        if(options_label && el){
+            NSString *name=el.unmappedLocalizedName ?: el.localizedName;
+            NSString *alias=el.aliases.anyObject;
+            raw_element=name && alias && ![name isEqualToString:alias] ?
+                [NSString stringWithFormat:@"%@ (%@)",name,alias] : name ?: alias;
+        }
+        const char *log=getenv("KHNMC_PAD_LOG");
+        if(log && *log=='1' && el){
             float v=[el isKindOfClass:[GCControllerButtonInput class]]?((GCControllerButtonInput *)el).value:-1.0f;
             fprintf(stderr,"kh: ios: pad element '%s' value %.2f\n",(el.localizedName?:@"?").UTF8String,v);
         }
-        if(gp==pad_active.extendedGamepad) pad_send(gp); };
+        pad_send(gp); };
     previous_buttons=pad_buttons(p);
     pad_send(p);
+    if(options_label) show_options(nil);
     fprintf(stderr,"kh: ios: controller connected: %s (pad 0)\n",c.vendorName.UTF8String?:"?");
     return 1;
 }
+#if TARGET_OS_SIMULATOR
+/* Runs once, before connecting a real pad, in sim_run.sh's disposable selftest container. */
+static void sim_controller_pages(void){
+    if(![NSProcessInfo.processInfo.arguments containsObject:@"--test-controller-pages"]) return;
+    pad_active=[GCController controllerWithExtendedGamepad];
+    GCExtendedGamepad *p=pad_active.extendedGamepad;
+    options_label=[UILabel new];
+    chosen_options=[@{@"KHNMC_PAD_LAYOUT":@"positions",@"KHNMC_PAD_SWAP_AB":@"0"} mutableCopy];
+    while(selected_option<kh_setting_menu_count() && !controller_option(selected_option)) selected_option++;
+    BOOL ok=p && selected_option<kh_setting_menu_count();
+    if(ok){
+        show_options(nil);
+        ok=[options_label.text containsString:@"Positions (Xbox-PlayStation layout)"] &&
+           [options_label.text containsString:@"Swap confirm / back"];
+        menu_input(0x1000,0x1000);
+        [p.buttonY setValue:1]; [p.rightTrigger setValue:0.5f];
+        raw_element=p.buttonY.unmappedLocalizedName ?: p.buttonY.localizedName ?: @"Y";
+        menu_input(pad_buttons(p),0x8000);
+        ok=ok && input_test && [options_label.text containsString:@"● Triangle"] &&
+           [options_label.text containsString:@"R2 128/255"] && [options_label.text containsString:raw_element];
+        chosen_options[@"KHNMC_PAD_LAYOUT"]=@"letters";
+        menu_input(pad_buttons(p),0);
+        ok=ok && [options_label.text containsString:@"● Square"] && [options_label.text containsString:@"○ Triangle"];
+        menu_input(0x2000,0x2000);
+        ok=ok && input_test;
+        menu_input(0x50,0x10);
+        ok=ok && !input_test && [options_label.text containsString:@"Printed letters (Nintendo layout)"];
+    }
+    NSString *path=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/controller-pages.txt"];
+    NSString *result=ok?@"PASS":@"FAIL: simulator controller menu or mapped input";
+    if(![result writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil])
+        fprintf(stderr,"kh: simulator-controller-pages: could not write result\n");
+    input_test=NO; selected_option=0; raw_element=nil; options_label=nil; chosen_options=nil; pad_active=nil;
+}
+#endif
 static void setup_controllers(void){
     for(GCController *c in GCController.controllers) if(pad_attach(c)) break;
     [[NSNotificationCenter defaultCenter] addObserverForName:GCControllerDidConnectNotification object:nil queue:NSOperationQueue.mainQueue
@@ -234,7 +351,9 @@ static void setup_controllers(void){
         usingBlock:^(NSNotification *n){
             GCController *c=(GCController *)n.object; if(c!=pad_active) return;
             if(c.extendedGamepad) c.extendedGamepad.valueChangedHandler=nil;
-            pad_active=nil; previous_buttons=0; suppress_buttons=NO; kh_input_host_pad_set(0,0,0,0,0,0,0); fprintf(stderr,"kh: ios: controller disconnected: pad 0 released\n");
+            pad_active=nil; raw_element=nil; extra_buttons=nil; capture_button=nil;
+            if(options_label) show_options(nil);
+            previous_buttons=0; suppress_buttons=NO; kh_input_host_pad_set(0,0,0,0,0,0,0); fprintf(stderr,"kh: ios: controller disconnected: pad 0 released\n");
             for(GCController *o in GCController.controllers) if(o!=c && pad_attach(o)) break; }];
 }
 /* TASK41: after a suspension the CURRENT state of pad 0 (a button that came up meanwhile sent no event), or neutral without one */
@@ -453,6 +572,9 @@ static void start_display_link(void){
     UIWindow *w=[[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
     w.rootViewController=[[KHGameViewController alloc] init]; self.window=w; [w makeKeyAndVisible];
     [UIApplication sharedApplication].idleTimerDisabled=YES;   /* a game: the screen must not dim and lock while it runs (iOS suspends a locked app) */
+#if TARGET_OS_SIMULATOR
+    sim_controller_pages();
+#endif
     setup_controllers();
     setup_audio_interruptions();
     /* the game starts after the view's first layout (KHGameViewController viewDidLayoutSubviews) */
@@ -476,7 +598,7 @@ static void start_display_link(void){
     if(!_left) return;                                         /* the first activation at launch: nothing was suspended */
     _left=NO;
     previous_buttons=pad_buttons(pad_active.extendedGamepad);
-    if(options_label) return;
+    if(options_label){show_options(nil);return;}
     [(KHGameViewController *)self.window.rootViewController reportSize];   /* the layer's size before our swapchain is rebuilt */
     kh_app_resume(KH_APP_RESUME_BOUND_MS);                     /* bounded: stale swapchain, the PC's restore, audio (also after an interruption), focus, gate cleared */
     pad_resync();                                              /* every controller's CURRENT state */

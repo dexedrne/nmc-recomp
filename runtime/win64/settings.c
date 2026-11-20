@@ -1,5 +1,6 @@
 #include "khnmc_rt.h"
 #include "settings.h"
+#include "pad_layout.h"
 #include "xion_swap.h"
 #include "kh_look.h"
 #include "mod_config.h"
@@ -20,6 +21,8 @@ const struct kh_option kh_options[]={
     BOOL_OPT("CHEAT_INF_HP","Infinite HP","0"), BOOL_OPT("CHEAT_INF_MP","Infinite MP","0"),
     NUMBER("EXP_MULT","EXP multiplier","1",0.5,10,0.5), NUMBER("DROP_MULT","Item drop multiplier","1",0.5,10,0.5),
     BOOL_OPT("HUD_HIDE_COMBO","Hold L3 + R3 to hide HUD","0"),
+    {"KHNMC_PAD_LAYOUT","Face buttons","auto","auto|positions|letters",0,0,0},
+    BOOL_OPT("PAD_SWAP_AB","Swap confirm / back (A-B)","0"),
     TWEAK_OPT("DEBUG_DEBUG_ON","Enable debug commands","off"),
     TWEAK_OPT("DEBUG_SOFT_RESET","Allow debug reset to title","off"),
     NUMBER("TWEAK_DEBUG_TURBO_SPEED","Debug turbo speed","7.5",0.1,100,0.1),
@@ -217,11 +220,13 @@ int kh_settings_selftest(KCtx *g){
     FILE *f=fopen(path,"w");int fail=!f;
     if(f){fputs("# keep\n env KHNMC_EXP_MULT=1\narg --selftest",f);fail|=fclose(f)!=0;}
     if(!fail) fail=save_option(dir,"KHNMC_EXP_MULT","2")!=0;
+    if(!fail) fail=save_option(dir,"KHNMC_PAD_LAYOUT","auto") ||
+                   save_option(dir,"KHNMC_PAD_SWAP_AB","1") || save_option(dir,"KHNMC_PAD_LAYOUT","positions");
     f=fopen(path,"r");
     if(!f) fail=1;
     else{
         size_t n=fread(data,1,sizeof data-1,f);data[n]=0;fclose(f);
-        fail|=strcmp(data,"# keep\narg --selftest\nenv KHNMC_EXP_MULT=2\n")!=0;
+        fail|=strcmp(data,"# keep\narg --selftest\nenv KHNMC_EXP_MULT=2\nenv KHNMC_PAD_SWAP_AB=1\nenv KHNMC_PAD_LAYOUT=positions\n")!=0;
     }
     double v;
     fail|=validate("KHNMC_SAVE_STATE","1",&v)<0 || v!=1;
@@ -231,6 +236,19 @@ int kh_settings_selftest(KCtx *g){
     fail|=validate("KHNMC_TWEAK_WORLDS_SYMBOL_ZZ","12,1,2,3,256",&v)>=0;
     fail|=validate("KHNMC_TWEAK_FORMS_VALOR_GROWTH","1,2",&v)>=0;
     fail|=validate("KHNMC_TWEAK_DEBUG_TURBO_SPEED","7.5",&v)<0;
+    fail|=validate("KHNMC_PAD_LAYOUT","positions",&v)<0 || validate("KHNMC_PAD_LAYOUT","letters",&v)<0 ||
+          validate("KHNMC_PAD_LAYOUT","auto",&v)<0 || validate("KHNMC_PAD_LAYOUT","unknown",&v)>=0;
+    fail|=validate("KHNMC_PAD_SWAP_AB","1",&v)<0 || v!=1;
+    fail|=kh_pad_swap_xy("auto",0,NULL) || !kh_pad_swap_xy("auto",1,NULL) ||
+          kh_pad_swap_xy("auto",1,"0") || !kh_pad_swap_xy("auto",0,"1") ||
+          kh_pad_swap_xy("positions",1,"1") || !kh_pad_swap_xy("letters",0,"0");
+    for(int xy=0;xy<2;xy++) for(int ab=0;ab<2;ab++) for(int mask=0;mask<16;mask++){
+        unsigned mapped=kh_pad_faces(mask&1,mask&2,mask&4,mask&8,xy,ab);
+        unsigned recovered=kh_pad_faces(mapped&0x1000,mapped&0x2000,mapped&0x4000,mapped&0x8000,xy,ab);
+        fail|=recovered!=(unsigned)(mask<<12);
+    }
+    fail|=kh_pad_faces(1,0,1,0,0,0)!=0x5000 || kh_pad_faces(1,0,1,0,1,0)!=0x9000 ||
+          kh_pad_faces(1,0,1,0,0,1)!=0x6000;
     int state=0; u64 start=0;
     fail|=kh_stick_step(&state,&start,0x40,1)!=CHORD_IDLE;
     fail|=kh_stick_step(&state,&start,0xc0,2)!=CHORD_PRESS;

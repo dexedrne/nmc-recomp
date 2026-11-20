@@ -76,7 +76,9 @@ ln -s "$KROOT/pc/kh2fm.exe" "$DOCS/kh2fm.exe"
 } > "$DOCS/khnmc.conf"
 cp "$DOCS/khnmc.conf" "$OUT/khnmc.conf"
 say "container $DATA; launching $BUNDLE_ID"
-xcrun simctl launch "$UDID" "$BUNDLE_ID" > "$OUT/launch.txt" 2>&1 || { say "simctl launch failed: $(cat "$OUT/launch.txt")"; exit 1; }
+set --
+if [ "$MODE" = selftest ]; then set -- --test-controller-pages; fi
+xcrun simctl launch "$UDID" "$BUNDLE_ID" "$@" > "$OUT/launch.txt" 2>&1 || { say "simctl launch failed: $(cat "$OUT/launch.txt")"; exit 1; }
 t0=$SECONDS; st=""
 while [ $((SECONDS-t0)) -lt $LIMIT ]; do
   st=$(cat "$DOCS/khnmc.status" 2>/dev/null); case "$st" in "exit "*) break;; esac
@@ -91,6 +93,13 @@ case "$st" in
      xcrun simctl spawn "$UDID" log show --last 3m --style compact --predicate 'process == "KHNMC"' 2>/dev/null | tail -200 > "$OUT/oslog-tail.txt";;
 esac
 grep -a "guest space\|host dirs\|NOT RUN:\|selftest: [0-9]* checks\|SKIPPED\|FAIL\|process exit\|kh: gfx: draws" "$OUT/run.out" 2>/dev/null | cut -c1-240 | tail -80
-if [ "$MODE" = selftest ]; then echo "selftest exit=$rc" >> "$OUT/run.out"; fi
+if [ "$MODE" = selftest ]; then
+  echo "selftest exit=$rc" >> "$OUT/run.out"
+  if cp "$DOCS/controller-pages.txt" "$OUT/controller-pages.txt" && grep -qx PASS "$OUT/controller-pages.txt"; then
+    say "controller Options and Input test pages passed"
+  else
+    say "simulator-controller-pages: missing or failed result"; [ "$rc" != 0 ] || rc=1
+  fi
+fi
 say "results in $OUT"; disk_note
 exit "$rc"
