@@ -315,6 +315,7 @@ void orig_f_3ad9a0(KCtx *);
 void f_3ad9a0(KCtx *g){
     int id=(s32)A0(g);
     u64 overlay=kh_xkb_message(id);
+    if(!overlay) overlay=kh_save_character_text(id);
     if(overlay){ SET_RAX(g,overlay); KH_RET(g); }
     else {
         orig_f_3ad9a0(g);

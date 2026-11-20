@@ -6,6 +6,7 @@
 #include "mod_config.h"
 #include "route_state.h"
 #include <math.h>
+#include <zlib.h>
 #include <stdatomic.h>
 #include <errno.h>
 #include <unistd.h>
@@ -209,8 +210,92 @@ int kh_settings_look_locked(void){return kh_xion_enabled!=0;}
 int kh_settings_hooded(void){return kh_look_pack_ready(2);}
 int kh_settings_look(void){
     int request=atomic_load(&look_request);
-    return request>=0?request:kh_look_enabled();
+    return request>=0?request%3:kh_look_enabled();
 }
+/* f_321e40 creates a four-row list. f_2eb490 builds two or three
+ * stock rows, ending with Title Screen even when World Map is hidden. */
+static int character_row=-1, picking_character;
+static u16 choice_place;
+static u64 character_labels[6], root_labels[4];
+enum { CHANGE_LABEL=3, LOCK_LABEL, BACK_LABEL, CHARACTER_MSG=30016 };
+u64 kh_save_character_text(unsigned id){
+    unsigned i=(id&0x7fff)-CHARACTER_MSG;
+    return i<6?character_labels[i]:0;
+}
+static u64 save_widget(KCtx *g,u64 menu,int row){
+    return rd64(g,rd64(g,menu+0x28)+8*row);
+}
+void orig_f_2f8e20(KCtx *);
+void f_2f8e20(KCtx *g){
+    u64 sp=KH_RSP(g),menu=A0(g);
+    if(rd64(g,sp)!=GS_BASE+0x2eb508 || rd32(g,sp+0x30)!=0x8a81 ||
+       rd32(g,GS_BASE+0x900724)!=3){orig_f_2f8e20(g);return;}
+    if(!character_labels[0]){
+        const char *labels[]={"Roxas","Xion","Xion (hooded)","Change Character","Xion (locked)","Back"};
+        for(int i=0;i<6;i++) character_labels[i]=kh_encode_menu_text(labels[i],i==CHANGE_LABEL);
+    }
+    character_row=(int)A1(g)+1;
+    if(character_row<2 || character_row>3) kh_fatal(g,"save-character-row: %d",character_row);
+    if(getenv("KHNMC_TEST_LOOK_DIGEST")) kh_warn("save-character built row %d",character_row);
+    picking_character=0;
+    KCtx ctx=*g;
+    /* f_2f8e20 reuses its fifth stack argument for the tail call to f_2f8ab0. */
+    u64 args[4];
+    memcpy(args,hp(g,sp+0x28),sizeof args);
+    orig_f_2f8e20(g);
+    KH_RSP(&ctx)=sp-0x100;
+    wr64(&ctx,KH_RSP(&ctx),GS_BASE+0x2eb508);
+    memcpy(hp(&ctx,KH_RSP(&ctx)+0x28),args,sizeof args);
+    A1(&ctx)=character_row;
+    wr32(&ctx,KH_RSP(&ctx)+0x30,0x8000| (CHARACTER_MSG+(kh_settings_look_locked()?LOCK_LABEL:CHANGE_LABEL)));
+    orig_f_2f8e20(&ctx);
+    u64 widget=save_widget(&ctx,menu,character_row);
+    kh_call(&ctx,GS_BASE+0x2f8db0,menu,character_row,0,0xffffffffu);
+    kh_call(&ctx,GS_BASE+0x166ba0,widget,0,0,0);
+    kh_call(&ctx,GS_BASE+0x1672c0,widget,0,0,0);
+}
+void orig_f_2eb620(KCtx *);
+void f_2eb620(KCtx *g){
+    KCtx ctx=*g;
+    u64 menu=rd64(g,GS_BASE+0xbef650);
+    if(character_row>=0 && menu && rd32(g,GS_BASE+0x900724)==3 &&
+       !kh_call(&ctx,GS_BASE+0x2f5f30,0,0,0,0) &&
+       (picking_character || kh_call(&ctx,GS_BASE+0x2f7fb0,menu,0,0,0)==character_row)){
+        int label=kh_settings_look_locked()?LOCK_LABEL:CHANGE_LABEL;
+        kh_call(&ctx,GS_BASE+0x2fa1d0,0x8000|(CHARACTER_MSG+label),1,0,0);
+        KH_RET(g);return;
+    }
+    orig_f_2eb620(g);
+}
+void orig_f_2f9440(KCtx *);
+void f_2f9440(KCtx *g){
+    u64 menu=A0(g),caller=rd64(g,KH_RSP(g));
+    orig_f_2f9440(g);
+    if(caller!=GS_BASE+0x2e9ebf || character_row<0 || rd32(g,GS_BASE+0x900724)!=3) return;
+    int row=(s32)KH_RAX(g);
+    if(!picking_character && row==character_row){
+        KH_RAX(g)=(u32)-1;
+        if(kh_settings_look_locked()) return;
+        picking_character=1;
+        KCtx ctx=*g;
+        for(int i=0;i<=character_row;i++){
+            u64 field=save_widget(g,menu,i)+0x1f8;
+            root_labels[i]=rd64(g,field);
+            wr64(g,field,kh_call(&ctx,GS_BASE+0x3ad9a0,0x8000|(CHARACTER_MSG+(i==3?BACK_LABEL:i)),0,0,0));
+        }
+        kh_call5(&ctx,GS_BASE+0x2f8c90,menu,kh_settings_look(),1,0,2);
+    }else if(picking_character && (row>=0 || row==-2 || row==-4)){
+        if(row>=0 && row<3 && !kh_settings_look_locked()){
+            choice_place=rd16(g,GS_BASE+0x717008);
+            atomic_store(&look_request,3+row); /* save-menu requests must remain at the point */
+            if(getenv("KHNMC_TEST_LOOK_DIGEST")) kh_warn("save-character chose %d",row);
+        }
+        for(int i=0;i<=character_row;i++) wr64(g,save_widget(g,menu,i)+0x1f8,root_labels[i]);
+        picking_character=0;
+        KH_RAX(g)=(u32)-1;
+    }
+}
+
 static int notice_selftest(KCtx *g);
 int kh_settings_selftest(KCtx *g){
     char dir[KH_TMP_MAX],path[KH_TMP_MAX+16],data[200];
@@ -412,9 +497,9 @@ void kh_settings_init(void){
 _Atomic int kh_hide_hud;
 /* f_18deb0 replaces the active INFORMATION line. Keep transient feedback off
  * that widget so mission scripts retain their own message and timing. */
-enum { NOTICE_XION, NOTICE_ROXAS, NOTICE_FIELD, NOTICE_BUSY, NOTICE_ACTOR, NOTICE_PACK, NOTICE_XKB, NOTICE_COUNT };
+enum { NOTICE_XION, NOTICE_ROXAS, NOTICE_FIELD, NOTICE_BUSY, NOTICE_ACTOR, NOTICE_PACK, NOTICE_XKB, NOTICE_HOODED, NOTICE_COUNT };
 static const char *const notice_lines[]={"Xion","Roxas","Can't switch now: outside field","Can't switch now: busy",
-    "Can't switch now: player unavailable","Can't switch now: missing art","Can't switch now: XKB"};
+    "Can't switch now: player unavailable","Can't switch now: missing art","Can't switch now: XKB","Xion (hooded)"};
 static u8 look_text[NOTICE_COUNT][40];
 static _Atomic u64 notice;
 u8 kh_look_font[65536];
@@ -422,7 +507,7 @@ static void init_notice_text(void){
     for(int i=0;i<NOTICE_COUNT;i++){
         for(size_t j=0;notice_lines[i][j];j++){
             char c=notice_lines[i][j];
-            look_text[i][j]=c==' '?1:c=='\''?0x57:c==':'?0x52:c>='a'?0x9a+c-'a':0x2e + c-'A';
+            look_text[i][j]=c=='('?0x5a:c==')'?0x5b:c==' '?1:c=='\''?0x57:c==':'?0x52:c>='a'?0x9a+c-'a':0x2e + c-'A';
         }
     }
 }
@@ -493,9 +578,10 @@ struct look_art { char stem[40]; int mode; u64 body,face; };
 static struct look_art art[48];
 static u64 face_actor,face_instance,face_model,face_bar;
 static u64 last_switch;
+static int gauge_pending, finishing_look=-1;
 /* A frame already submitted may still reference the old instance. Retire it
  * with the actor, at the same native teardown boundary as the active one. */
-static struct idle_render { u64 owner,instance; } idle[80]; /* native sheet pool */
+static struct idle_render { u64 owner,instance[3]; } idle[80]; /* native sheet pool */
 static void free_render(KCtx *g,u64 inst){
     u64 model=rd64(g,inst+0x20),allocator=kh_call(g,GS_BASE+0x152590,0,0,0,0);
     kh_call(g,rd64(g,rd64(g,model)+0x48),model,allocator,inst,0);
@@ -505,7 +591,7 @@ static void end_look_actor(KCtx *g){
     if(A0(g)==face_actor) face_actor=face_instance=face_model=face_bar=0;
     for(size_t i=0;i<80;i++) if(idle[i].owner==A0(g)){
         KCtx ctx=*g;
-        free_render(&ctx,idle[i].instance);
+        for(int j=0;j<3;j++) if(idle[i].instance[j]) free_render(&ctx,idle[i].instance[j]);
         idle[i]=(struct idle_render){0};
         break;
     }
@@ -527,6 +613,8 @@ static u64 look_bar(KCtx *g,const char *stem,const char *ext,u64 native){
     char name[72];
     int n=snprintf(name,sizeof name,"obj/%s.%s",stem,ext);
     if(n<0 || (size_t)n>=sizeof name) return 0;
+    char host[4096];
+    if(kh_look_enabled() && !kh_look_available(name,host,sizeof host)) return 0;
     u64 path=ga_strdup(name);
     int size=(s32)kh_call(g,GS_BASE+0x3a09b0,path,0,0,0);
     u64 bar=size>=16?ga_alloc(size,128):0;
@@ -535,6 +623,9 @@ static u64 look_bar(KCtx *g,const char *stem,const char *ext,u64 native){
     }
     ga_free(path);
     if(bar){
+        if(getenv("KHNMC_TEST_LOOK_DIGEST"))
+            fprintf(stderr,"kh: look-resource mode=%d path=%s crc=%08lx bar=%llx\n",kh_look_enabled(),name,
+                    (unsigned long)crc32(0,hp(g,bar+16),size-16),(unsigned long long)bar);
         wr8(g,bar+3,(rd8(g,bar+3)&63)|(rd8(g,native+3)&192));
         kh_call(g,GS_BASE+0x3a64f0,bar,0,0,0);
         kh_call(g,GS_BASE+0x3a6840,bar,0,0,0);
@@ -553,7 +644,15 @@ static struct look_art *look_art(KCtx *g,const char *stem,int target,u64 body,u6
 
 /* The native cache owns +0x10/+0x18 and releases them by pointer at f_3e61e0.
  * Keep those references until teardown while all consumers see the selected BARs. */
-static u64 held_resources;
+static u64 held_resources, deferred_resources;
+static void forget_deferred(KCtx *g,u64 resource){
+    u64 prev=0;
+    for(u64 e=deferred_resources;e;prev=e,e=rd64(g,e)){
+        if(rd64(g,e+8)!=resource) continue;
+        if(prev) wr64(g,prev,rd64(g,e)); else deferred_resources=rd64(g,e);
+        ga_free(e);return;
+    }
+}
 static void publish_art(KCtx *g,u64 resource,u64 body,u64 face){
     u64 entry=held_resources;
     while(entry && rd64(g,entry+8)!=resource) entry=rd64(g,entry);
@@ -570,6 +669,7 @@ static void publish_art(KCtx *g,u64 resource,u64 body,u64 face){
 void orig_f_3e61e0(KCtx *);
 void f_3e61e0(KCtx *g){
     u64 prior=0,resource=A0(g);
+    forget_deferred(g,resource);
     for(u64 e=held_resources;e;prior=e,e=rd64(g,e)) if(rd64(g,e+8)==resource){
         wr64(g,resource+16,rd64(g,e+16)); wr64(g,resource+24,rd64(g,e+24));
         if(prior) wr64(g,prior,rd64(g,e)); else held_resources=rd64(g,e);
@@ -578,21 +678,31 @@ void f_3e61e0(KCtx *g){
     orig_f_3e61e0(g);
 }
 void orig_f_3e6120(KCtx *);
-void f_3e6120(KCtx *g){
-    u64 resource=A0(g);
-    orig_f_3e6120(g);
-    if(!last_switch && !kh_scene_pack_active()) return;
+static int bind_resource(KCtx *g,u64 resource){
+    if(!last_switch && !kh_scene_pack_active()) return 1;
     u64 row=rd64(g,resource+8),body=rd64(g,resource+16),face=rd64(g,resource+24);
-    if(!row || !body) return;
+    if(!row || !body) return 1;
     char stem[33],path[64];
     memcpy(stem,hp(g,row+8),32); stem[32]=0;
     snprintf(path,sizeof path,"obj/%s.mdlx",stem);
     int high=kh_scene_pack_active() && !strcmp(path,KH_SCENE_MDLX);
-    if(!high && (!last_switch || kh_player_asset_key(path)!=-1)) return;
+    if(!high && (!last_switch || kh_player_asset_key(path)!=-1)) return 1;
     KCtx ctx=*g;
     struct look_art *a=look_art(&ctx,stem,kh_look_enabled(),body,high?0:face);
-    if(!a) kh_fatal(g,"look-resource-bind: %s",stem);
+    if(!a) return 0;
     publish_art(g,resource,a->body,high?face:(face?a->face:0));
+    return 1;
+}
+void f_3e6120(KCtx *g){
+    u64 resource=A0(g);
+    orig_f_3e6120(g);
+    if(bind_resource(g,resource)) return;
+    for(u64 e=deferred_resources;e;e=rd64(g,e)) if(rd64(g,e+8)==resource) return;
+    u64 entry=ga_alloc(16,16);
+    if(!entry) kh_fatal(g,"look-resource-retry-allocation");
+    wr64(g,entry,deferred_resources); wr64(g,entry+8,resource);
+    deferred_resources=entry;
+    kh_warn("look-resource-bind deferred");
 }
 static int bind_look(KCtx *g,KhPlayerSheet p,const char *stem,int target){
     u64 obj=p.obj,inst=rd64(g,obj+0x7b0);
@@ -616,17 +726,20 @@ static int bind_look(KCtx *g,KhPlayerSheet p,const char *stem,int target){
     if(changed){
         size_t slot=(p.sheet-(GS_BASE+0x2a17290))/0x278;
         if(slot>=80 || (idle[slot].owner && idle[slot].owner!=obj)) return 0;
-        u64 other=idle[slot].instance;
-        if(!other || rd64(g,other+0x20)!=model){
+        u64 *spare=idle[slot].instance;
+        int j=0;
+        while(j<3 && spare[j] && rd64(g,spare[j]+0x20)!=model) j++;
+        if(j==3) return 0;
+        u64 other=spare[j];
+        if(!other){
             u64 allocator=kh_call(g,GS_BASE+0x152590,0,0,0,0);
             u64 next=kh_call(g,rd64(g,rd64(g,model)+0x40),model,allocator,0,0);
             if(!next) return 0;
             kh_call(g,GS_BASE+0x1a4bb0,next,tex,0,0);
             kh_call(g,GS_BASE+0x1a4e30,next,0,0,0);
-            if(other) free_render(g,other);
             other=next;
         }
-        idle[slot]=(struct idle_render){obj,inst};
+        idle[slot].owner=obj; spare[j]=inst;
         inst=other;
         wr64(g,obj+0xa88,model);
         wr64(g,obj+0x7b0,inst);
@@ -634,17 +747,20 @@ static int bind_look(KCtx *g,KhPlayerSheet p,const char *stem,int target){
     }
     publish_art(g,obj+0x910,selected_body,face);
     face_bar=face; face_actor=obj; face_instance=inst; face_model=model;
-    if(!changed) return 1;
-    /* f_180900 refreshes dk::FACE separately from gauge visibility (f_16c250). */
-    u64 gauge=rd64(g,GS_BASE+0xabd248);
-    if(gauge && rd64(g,gauge+0x40)==obj){
-        u64 widget=gauge+0x50;
-        kh_call(g,GS_BASE+0x17eb30,widget,obj,rd32(g,gauge+0x20),0);
-        if(!rd8(g,widget+0x304)) kh_fatal(g,"look-gauge-face-bind: %s",stem);
-    }
+    gauge_pending=1;
     return 1;
 }
-static void look_frame(KCtx *g,int target,u64 frame){
+static void retry_gauge(KCtx *g){
+    if(!gauge_pending) return;
+    u64 gauge=rd64(g,GS_BASE+0xabd248);
+    if(!face_actor){gauge_pending=0;return;}
+    if(!gauge || rd64(g,gauge+0x40)!=face_actor){gauge_pending=0;return;}
+    KCtx ctx=*g;
+    kh_call(&ctx,GS_BASE+0x17eb30,gauge+0x50,face_actor,rd32(g,gauge+0x20),0);
+    gauge_pending=!rd8(g,gauge+0x50+0x304);
+}
+static void look_frame(KCtx *g,int request,u64 frame){
+    int target=request%3;
     int previous=kh_look_enabled();
     int refresh=target<0;
     if(refresh){
@@ -664,14 +780,18 @@ static void look_frame(KCtx *g,int target,u64 frame){
     notice_index=NOTICE_BUSY;
     if(windows || rd64(g,GS_BASE+0x2a244d8) || rd8(g,GS_BASE+0x9ba8d1) || rd8(g,GS_BASE+0x2a11428) || rd8(g,GS_BASE+0x9006b0) || rd64(g,GS_BASE+0x2a11478) ||
        rd64(g,GS_BASE+0x2ae9fa8) || rd64(g,GS_BASE+0x2a11268) || /* Roxas parked during XKB ownership */
-       rd32(g,GS_BASE+0x2a10504) || rd64(g,GS_BASE+0x9ba928) ||
-       (!refresh && last_switch && frame>=last_switch && frame-last_switch<60)) goto feedback;
+       rd32(g,GS_BASE+0x2a10504) || rd64(g,GS_BASE+0x9ba928) || kh_scene_pack_active()) goto feedback;
     notice_index=NOTICE_ACTOR;
     if(!kh_route_player_sheet(g,&player) || player.hp<=0 ||
        !kh_route_object_name(g,player.obj,stem,sizeof stem)) goto feedback;
     snprintf(path,sizeof path,"obj/%s.mdlx",stem);
     if(kh_player_asset_key(path)!=-1) goto feedback;
     if(target){
+        static int validated[3];
+        if(!validated[target]){
+            if(!kh_look_switch_ready(target)){notice_index=NOTICE_PACK;goto feedback;}
+            validated[target]=1;
+        }
         char face[96],host[4096];
         if(!kh_look_asset(target,path,host,sizeof host)) {notice_index=NOTICE_PACK; goto feedback;}
         snprintf(path,sizeof path,"obj/%s.a.us",stem);
@@ -681,25 +801,60 @@ static void look_frame(KCtx *g,int target,u64 frame){
         }
     }
     KCtx ctx=*g;
-    if(!refresh) kh_look_set(&ctx,target);
-    if(!bind_look(&ctx,player,stem,target)){
-        if(!refresh) kh_look_set(&ctx,previous);
+    kh_loading_look=target;
+    int bound=bind_look(&ctx,player,stem,target);
+    kh_loading_look=-1;
+    if(!bound){
         notice_index=NOTICE_PACK;
         goto feedback;
     }
     if(refresh) return;
+    kh_look_set(&ctx,target);
+    retry_gauge(&ctx);
     if((previous!=0)!=(target!=0)) kh_look_voice_bind(&ctx);
-    notice_index=target?0:1;
-    if(kh_save_live_option("KHNMC_PLAYER_LOOK",target==2?"xion-hooded":target?"xion":"roxas",LOOK,target))
-        kh_warn("appearance changed for this session: unable to save setting");
+    finishing_look=target;
     last_switch=frame;
+    if(getenv("KHNMC_TEST_LOOK_DIGEST")){
+        u64 name=kh_call(&ctx,GS_BASE+0x3ad9a0,0x851f,0,0,0);
+        const char *text=gstr(&ctx,name);
+        fprintf(stderr,"kh: look-commit frame=%llu mode=%d stem=%s body=%llx face=%llx name=%08lx gauge=%d\n",
+                (unsigned long long)frame,target,stem,(unsigned long long)rd64(g,player.obj+0x920),
+                (unsigned long long)face_bar,(unsigned long)crc32(0,(const u8 *)text,strlen(text)),!gauge_pending);
+    }
+    return;
 feedback:
     if(refresh) return;
+    static int last_feedback=-1;
+    if(notice_index>=NOTICE_FIELD && notice_index<NOTICE_XKB){
+        int empty=-1;
+        atomic_compare_exchange_strong(&look_request,&empty,request);
+        if(last_feedback==notice_index) return;
+    }
+    last_feedback=notice_index;
     kh_warn("player appearance: %s (frame %llu)",notice_lines[notice_index],(unsigned long long)frame);
     show_look_notice(notice_index,frame);
 }
 void kh_settings_frame(KCtx *g,uint64_t frame){
-    kh_look_voice_retry(g);
+    int voice_busy=kh_look_voice_retry(g);
+    if(g){
+        retry_gauge(g);
+        for(u64 e=deferred_resources,next;e;e=next){
+            next=rd64(g,e);
+            u64 resource=rd64(g,e+8);
+            if(bind_resource(g,resource)) forget_deferred(g,resource);
+        }
+    }
+    if(finishing_look>=0 && !voice_busy && !gauge_pending && !deferred_resources){
+        int target=finishing_look;
+        finishing_look=-1;
+        if(!kh_settings_look_locked()){
+            const char *value=target==2?"xion-hooded":target?"xion":"roxas";
+            if(kh_save_live_option("KHNMC_PLAYER_LOOK",value,LOOK,target))
+                kh_warn("appearance changed for this session: unable to save setting");
+            int id=target==2?NOTICE_HOODED:target?NOTICE_XION:NOTICE_ROXAS;
+            show_look_notice(id,frame);
+        }
+    }
     while(pending && pending->frame<=frame){
         struct change *c=pending; pending=c->next;
         if(kh_setting_set(c->name,c->value)) kh_fatal(NULL,"settings-save: %s",c->name);
@@ -709,8 +864,22 @@ void kh_settings_frame(KCtx *g,uint64_t frame){
     if(schedule_storage && !pending){free(schedule_storage);schedule_storage=NULL;}
     int action=kh_stick_action(frame);
     atomic_store(&kh_hide_hud,action==CHORD_HOLD && values[HUD_COMBO]!=0);
-    int target=atomic_exchange(&look_request,-1);
-    if(g && (target>=0 || last_switch)) look_frame(g,target,frame);
+    if(g && !rd8(g,GS_BASE+0x9006b0)){
+        character_row=-1;
+        picking_character=0;
+    }
+    if(g && !voice_busy && !gauge_pending && !deferred_resources){
+        int request=atomic_load(&look_request);
+        if(request>=3){
+            if(rd8(g,GS_BASE+0x9006b0) || kh_route_cond_eval(g,KR_BATTLE,0,frame,NULL)) request=-1;
+            else if(rd16(g,GS_BASE+0x717008)!=choice_place || !kh_route_at_save_point(g) || kh_settings_look_locked()){
+                atomic_compare_exchange_strong(&look_request,&request,-1);
+                request=-1;
+            }
+        }
+        if(request>=0 && !atomic_compare_exchange_strong(&look_request,&request,-1)) request=-1;
+        if(request>=0 || last_switch) look_frame(g,request,frame);
+    }
     if(mp_probe && frame==mp_probe){
         KhPlayerSheet p;
         if(!kh_route_player_sheet(g,&p) || p.mp<2) kh_fatal(g,"settings-mp-probe: no active player with MP");
@@ -809,6 +978,17 @@ void kh_rewind_look(KhRecords *r){
     if(r->loading) atomic_store(&notice,0);
     KH_RECORD(r,art);
     KH_RECORD(r,held_resources);
+    KH_RECORD(r,deferred_resources);
+    KH_RECORD(r,character_labels);
+    KH_RECORD(r,root_labels);
+    KH_RECORD(r,character_row);
+    KH_RECORD(r,choice_place);
+    KH_RECORD(r,picking_character);
+    KH_RECORD(r,gauge_pending);
+    KH_RECORD(r,finishing_look);
+    int request=atomic_load(&look_request);
+    KH_RECORD(r,request);
+    if(r->loading) atomic_store(&look_request,request);
     KH_RECORD(r,idle);
     KH_RECORD(r,face_actor);
     KH_RECORD(r,face_instance);

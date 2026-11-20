@@ -185,7 +185,7 @@ PLACE_HOOKS = 3b64d0 3b6510 3b6420 3b6560 3b3200 3da940 419230
 INPUT_HOOKS += $(PLACE_HOOKS)
 # Task 31 (runtime/route_objective.c): 0x17b710 shows a line in the INFORMATION bar; the hook logs the line's text (`kh: information:`) and passes the call through
 # and 0x3ad9a0 (message id -> text) is noted while a system menu runs: the camp menu's labels (`kh: menu text:`)
-INFO_HOOKS = 17b710 3ad9a0
+INFO_HOOKS = 2f8e20 2f9440 2eb620 17b710 3ad9a0
 INPUT_HOOKS += $(INFO_HOOKS)
 FILE_HOOKS = 3afd90 3e6120 3e61e0 3b43c0 3b4ec0 3b57b0 1f9a80 3a9cf0 131ef0 106000 1063d0 106700 106790 106870 $(HD_HOOKS) $(PHASE_HOOKS) $(DIFFICULTY_HOOKS) $(MOD_A_HOOKS) $(MOD_B_HOOKS) $(MOD_PARAMS_HOOKS) $(STREAM_HOOKS) $(BGLOAD_HOOKS) $(INPUT_HOOKS)
 # object-id table guard (runtime/idtable.c): 0x4ad390 registers a 32 MiB window in the game's 64-slot id table and encodes the pointer

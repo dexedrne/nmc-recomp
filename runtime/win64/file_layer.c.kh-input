@@ -4,6 +4,7 @@
 #include "rmc.h"
 #include "khnmc_hd.h"
 #include "kh_look.h"
+#include <zlib.h>
 #include "title_logo.h"
 #include "autosave.h"
 #include <errno.h>
@@ -92,6 +93,7 @@ static int relative(KCtx *g,const char *path,char *rel,size_t cap){
     return 1;
 }
 static _Atomic int player_look=-1;
+_Thread_local int kh_loading_look=-1;
 
 /* Preload can enqueue a read on another thread. Keep the decision until the
  * game's event teardown, and serialize changes with read + HD registration. */
@@ -135,8 +137,10 @@ void kh_scene_pack_begin(void){
         char host[4096];
         int ok=1;
         if(kh_look_enabled()){
-            if(!kh_look_available(KH_SCENE_MDLX,host,sizeof host))
-                kh_fatal(NULL,"scene-xion-asset: missing %s from look pack (tools/xion/scene_model.py)",KH_SCENE_MDLX);
+            if(!kh_look_available(KH_SCENE_MDLX,host,sizeof host)){
+                kh_warn("scene-xion-asset: %s unavailable for this event",KH_SCENE_MDLX);
+                ok=0;
+            }
         }else for(size_t i=0;i<sizeof scene_files/sizeof *scene_files;i++){
             if(kh_scene_path(scene_files[i],host,sizeof host)) continue;
             fprintf(stderr,"kh: scene Roxas: missing overlay %s; keeping Sora for this event\n",scene_files[i]);
@@ -267,6 +271,7 @@ void kh_xkb_set_mode(KCtx *g,int enabled){
 
 int kh_look_enabled(void){
     if(kh_xion_enabled) return 1;
+    if(kh_loading_look>=0) return kh_loading_look;
     int selected=player_look;
     if(selected>=0) return selected;
     const char *env=getenv("KHNMC_PLAYER_LOOK");
@@ -276,6 +281,13 @@ int kh_look_enabled(void){
 static const char *const banks[]={
 #include "look_voice.inc"
 };
+int kh_look_switch_ready(int target){
+    char host[4096];
+    if(!kh_look_pack_ready(target) || !kh_look_asset(target,KH_SCENE_MDLX,host,sizeof host)) return 0;
+    for(size_t i=0;i<sizeof banks/sizeof *banks;i++)
+        if(!kh_look_asset(target,banks[i],host,sizeof host)) return 0;
+    return 1;
+}
 int kh_player_voice(const char *path){
     if(strncasecmp(path,"voice/",6) && strncasecmp(path,"remastered/obj/P_EX1",20)) return 0;
     for(size_t i=0;i<sizeof banks/sizeof *banks;i++) if(!strcasecmp(path,banks[i])) return (int)i+1;
@@ -284,55 +296,88 @@ int kh_player_voice(const char *path){
 
 /* f_3cde50 keys these slots by character and costume, even across worlds. */
 static int voice_slot[4];
-static int voice_retry, voice_retry_frames;   /* a failed re-registration retries from kh_settings_frame (game thread) */
+static unsigned voice_pending, voice_retired, voice_wait_reported;
 static struct { u64 bytes; int size; } voice_data[2][sizeof banks/sizeof *banks];
 void kh_look_voice_request(KCtx *g){
     if(A2(g)!=GS_BASE+0x3cddf0) return;
     unsigned slot=(unsigned)A3(g);
     if(slot>=4) kh_fatal(g,"look-voice-slot: %u",slot);
+    voice_pending &= ~(1u<<slot); /* the native request owns this slot again */
     voice_slot[slot]=kh_player_voice(gstr(g,A0(g)));
 }
-void kh_look_voice_bind(KCtx *g){
+int kh_look_voice_retry(KCtx *g){
+    if(!g || !voice_pending) return 0;
+    KCtx ctx=*g; g=&ctx;
     for(unsigned slot=0;slot<4;slot++){
         int id=voice_slot[slot];
-        if(!id || !(rd32(g,GS_BASE+0x2a244a8+12*slot)&1)) continue;
+        unsigned bit=1u<<slot;
+        if(!(voice_pending & bit)) continue;
+        if(!id || !(rd32(g,GS_BASE+0x2a244a8+12*slot)&1)){voice_pending &= ~bit;continue;}
         const char *key=banks[id-1];
         int selected=!!kh_look_enabled();
         u64 bytes=voice_data[selected][id-1].bytes;
         int size=voice_data[selected][id-1].size;
         if(!bytes){
             u64 path=ga_strdup(key);
+            char host[4096];
+            if(selected && !kh_look_available(key,host,sizeof host)){ga_free(path);continue;}
             size=(int)kh_call(g,GS_BASE+0x3a09b0,path,0,0,0);
             if(size<80 || !(bytes=ga_alloc(size,16)) ||
-               (int)kh_call(g,GS_BASE+0x3f9850,path,bytes,0,0)!=size ||
-               memcmp(hp(g,bytes),"SEDBSSCF",8) || rd32(g,bytes+16)!=(u32)size)
+               (int)kh_call(g,GS_BASE+0x3f9850,path,bytes,0,0)!=size){
+                if(bytes) ga_free(bytes);
+                ga_free(path);continue;
+            }
+            if(memcmp(hp(g,bytes),"SEDBSSCF",8) || rd32(g,bytes+16)!=(u32)size)
                 kh_fatal(g,"look-voice-load: %s",key);
             ga_free(path);
             voice_data[selected][id-1].bytes=bytes;
             voice_data[selected][id-1].size=size;
         }
         /* f_1dcae0 stops slot voices, then f_1df560 retires the bank.
-         * f_13b2e0 argument five selects the synchronous, borrowed-buffer path. */
-        kh_call(g,GS_BASE+0x1de4a0,slot,0,0,0);
-        kh_call(g,GS_BASE+0x1363b0,slot,0xffffffffu,0,0);
-        int handle=(int)kh_call5(g,GS_BASE+0x13b2e0,slot,bytes,size,0xffffffffu,1);
+         * f_136060 frees mode 1 buffers at +0x58. Give each registration
+         * its own copy so a retiring voice can never free the cached SCD. */
+        if(!(voice_retired & bit)){
+            if(getenv("KHNMC_TEST_LOOK_DIGEST")){
+                /* Match the live playback records f_1de4a0 stops for this slot. */
+                for(u64 v=rd64(g,GS_BASE+0xad93b0);v;v=kh_call(g,GS_BASE+0x4ad270,rd32(g,v+0x20),0,0,0)){
+                    if(rd64(g,v+0x18)==slot && rd8(g,v+0x35)==5){
+                        kh_warn("look-voice: retiring playing slot %u %s",slot,key);
+                        break;
+                    }
+                }
+            }
+            kh_call(g,GS_BASE+0x1de4a0,slot,0,0,0);
+            kh_call(g,GS_BASE+0x1363b0,slot,0xffffffffu,0,0);
+            voice_retired |= bit;
+        }
+        int handle=0;
+        u64 copy=ga_alloc(size,16);
+        if(copy){
+            memcpy(hp(g,copy),hp(g,bytes),size);
+            handle=(int)kh_call5(g,GS_BASE+0x13b2e0,slot,copy,size,0xffffffffu,1);
+            if(handle<=0){
+                u64 head=rd64(g,GS_BASE+0x713450);
+                if(head && rd64(g,head+0x58)==copy)
+                    kh_call(g,GS_BASE+0x1363b0,slot,0xffffffffu,0,0);
+                else ga_free(copy);
+            }
+        }
         if(handle<=0){
-            /* Owner 2026-11-20: a quick second Character switch crashed here (handle 0 while the sound system was still retiring
-             * the old bank).  Not a reason to stop the game: retry on the following frames, give up quietly after ~10 s. */
-            if(voice_retry_frames<600) voice_retry_frames++, voice_retry=1;
-            if(voice_retry_frames==1 || voice_retry_frames==600)
-                kh_warn("look-voice: slot %u %s not ready (handle %d): %s",slot,key,handle,
-                        voice_retry_frames<600?"retrying on the next frames":"gave up; the next room change reloads it");
+            if(!(voice_wait_reported & bit)) kh_warn("look-voice: slot %u %s waiting for registration",slot,key);
+            voice_wait_reported |= bit;
             continue;
         }
-        voice_retry_frames=0;
+        if(getenv("KHNMC_TEST_LOOK_DIGEST")) fprintf(stderr,"kh: look-bank mode=%d slot=%u key=%s crc=%08lx\n",
+                kh_look_enabled(),slot,key,(unsigned long)crc32(0,hp(g,bytes),size));
+        voice_pending &= ~bit;
         kh_warn("look-voice: slot %u %s size %d handle %d",slot,key,size,handle);
     }
+    return voice_pending!=0;
 }
-void kh_look_voice_retry(KCtx *g){
-    if(!g || !voice_retry) return;
-    voice_retry=0;
-    kh_look_voice_bind(g);
+void kh_look_voice_bind(KCtx *g){
+    voice_pending=15;
+    voice_retired=voice_wait_reported=0;
+    kh_look_voice_retry(g);
 }
 
 /* Restaged PC fights have their own ARD and mission but omit the arena files. */
@@ -581,6 +626,24 @@ int kh_file_selftest(KCtx *g){
     setenv("KHNMC_LOOK_NAMES","all",1);
     int initial_look=player_look;
     kh_look_set(g,1);
+    /* Exercise the native handle-zero branch past the old 600-frame cutoff. */
+    u64 service=GS_BASE+0x8bbd08,active=GS_BASE+0x2a244a8;
+    u64 saved_service=rd64(g,service);
+    u32 saved_active=rd32(g,active);
+    u64 scd=ga_calloc(1,80);
+    memcpy(hp(g,scd),"SEDBSSCF",8); wr32(g,scd+16,80);
+    wr64(g,service,0); wr32(g,active,1);
+    voice_slot[0]=1;
+    voice_data[1][0].bytes=scd; voice_data[1][0].size=80;
+    kh_look_voice_bind(g);
+    for(int i=0;i<650;i++) kh_look_voice_retry(g);
+    TEST(voice_pending==1 && voice_retired==1);
+    wr32(g,active,0);
+    TEST(!kh_look_voice_retry(g));
+    wr32(g,active,saved_active); wr64(g,service,saved_service);
+    voice_slot[0]=0; voice_data[1][0].bytes=0; voice_data[1][0].size=0;
+    voice_retired=voice_wait_reported=0;
+    ga_free(scd);
     TEST(kh_look_key("./OBJ//p_ex100.MDLX")==-1 && kh_look_key("obj/P_EX100_WI_KH1F.a.us")==40);
     TEST(kh_look_key("remastered/obj/P_EX100.a.us/-36.dds")==37 && !kh_look_key("remastered/obj/P_EX100.a.us/-37.dds"));
     TEST(kh_look_key("voice/us/battle/TT0_ROXAS.win32.scd")==-1);
@@ -783,6 +846,7 @@ int kh_file_selftest(KCtx *g){
 
 #include "rewind.h"
 void kh_rewind_files(KhRecords *r){
+    KH_RECORD(r,voice_pending); KH_RECORD(r,voice_retired);
     KH_RECORD(r,voice_slot); KH_RECORD(r,voice_data);
     KH_RECORD(r,real_packages);
     KH_RECORD(r,scene_pack);

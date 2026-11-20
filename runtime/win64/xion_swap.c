@@ -27,12 +27,15 @@ u64 kh_xkb_message(int id){
 
 u64 kh_encode_menu_text(const char *src,int compact){
     u64 addr=ga_alloc(strlen(src)+1+(compact?2:0),16);
+    if(!addr) kh_fatal(NULL,"kh-menu-text-allocation");
     u8 *dst=(u8 *)(gs_bias+addr);
     if(compact){ *dst++=0x0b; *dst++=76; } /* KH TextWidth, keeps the font height. */
     while(*src){
         char c=*src++;
         if(c>='a'&&c<='z') *dst++=0x9a+c-'a';
         else if(c>='A'&&c<='Z') *dst++=0x2e + c-'A';
+        else if(c=='(') *dst++=0x5a;
+        else if(c==')') *dst++=0x5b;
         else if(c==' ') *dst++=1;
         else if(c=='\n') *dst++=2;
         else if(c=='.') *dst++=0x4f;   /* 0x4f = '.'; 0x4e is the Japanese full stop (OpenKH InternationalSystemDecode) */

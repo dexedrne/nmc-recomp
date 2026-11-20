@@ -72,7 +72,7 @@ static NSMutableDictionary<NSString *,NSString *> *chosen_options;
 static int selected_option,selected_component;
 static unsigned short previous_buttons;
 static BOOL suppress_buttons;
-static NSString *pending_character;
+
 static GCController *pad_active;
 static BOOL input_test, pad_nintendo;
 static NSString *raw_element;
@@ -88,7 +88,7 @@ static BOOL controller_option(int index){
 }
 static NSString *option_value(int index){
     const struct kh_option *o=&kh_options[index];
-    if(!strcmp(o->name,"KHNMC_PLAYER_LOOK")) return pending_character ?: (@[@"roxas",@"xion",@"xion-hooded"][kh_settings_look()]);
+    if(!strcmp(o->name,"KHNMC_PLAYER_LOOK")) return (@[@"roxas",@"xion",@"xion-hooded"][kh_settings_look()]);
     NSString *chosen=chosen_options[@(o->name)];
     const char *configured=getenv(o->name);
     return chosen ?: @(configured ?: o->initial);
@@ -107,22 +107,21 @@ static void show_options(NSString *error){
             [text appendFormat:@"%@%@: %@\n",i==selected_option?@"▶  ":@"     ",@(kh_options[i].label),names[v] ?: v];
             continue;
         }
-        [text appendFormat:@"%@%@: %@\n",i==selected_option?@"▶  ":@"     ",@(kh_options[i].label),i==0 && kh_settings_look_locked()?@"Xion (Xion Knows Best)":reason?[NSString stringWithFormat:@"Unavailable (%s)",reason]:i==0 && [option_value(i) isEqualToString:@"xion-hooded"]?@"Xion (hooded)":i==0?option_value(i).capitalizedString:option_value(i)];
+        [text appendFormat:@"%@%@: %@\n",i==selected_option?@"▶  ":@"     ",@(kh_options[i].label),i==0 && kh_settings_look_locked()?@"Xion (locked)":reason?[NSString stringWithFormat:@"Unavailable (%s)",reason]:i==0 && [option_value(i) isEqualToString:@"xion-hooded"]?@"Xion (hooded)":i==0?option_value(i).capitalizedString:option_value(i)];
     }
     [text appendFormat:@"\n%@\nD-pad to select and change   •   Circle to close",
-     error ?: (controller_option(selected_option)?@"Applies immediately   •   Cross for Input test":selected_option==0 && kh_settings_look_locked()?@"Character is locked":selected_option==0?@"Applies when you close Options":kh_setting_action(selected_option)?@"Cross to execute when play resumes":kh_setting_live(selected_option)?@"Applies immediately":@"Applies on the next launch")];
+     error ?: (controller_option(selected_option)?@"Applies immediately   •   Cross for Input test":selected_option==0?@"Change at a save point":kh_setting_action(selected_option)?@"Cross to execute when play resumes":kh_setting_live(selected_option)?@"Applies immediately":@"Applies on the next launch")];
     if(strchr(kh_options[selected_option].initial,',')){
         [text appendFormat:@"\nL1/R1 to select value %d",selected_component+1];
     }
     options_label.text=text;
 }
 static void adjust_option(int direction){
-    if(kh_setting_unavailable(selected_option) || (selected_option==0 && kh_settings_look_locked())) return;
+    if(kh_setting_unavailable(selected_option) || selected_option==0) return;
     const struct kh_option *o=&kh_options[selected_option];
     NSString *current=option_value(selected_option),*value;
     if(o->choices){
         NSArray<NSString *> *choices=[@(o->choices) componentsSeparatedByString:@"|"];
-        if(selected_option==0 && !kh_settings_hooded()) choices=@[@"roxas",@"xion"];
         NSInteger index=[choices indexOfObject:current];
         if(index==NSNotFound) index=0;
         index=(index+direction+(NSInteger)choices.count)%(NSInteger)choices.count;
@@ -137,8 +136,7 @@ static void adjust_option(int direction){
         parts[selected_component]=part;
         value=[parts componentsJoinedByString:@","];
     }
-    if(selected_option==0) pending_character=value;
-    else if(!kh_setting_action(selected_option) && kh_setting_set(o->name,value.UTF8String)){show_options(@"Could not save this value");return;}
+    if(!kh_setting_action(selected_option) && kh_setting_set(o->name,value.UTF8String)){show_options(@"Could not save this value");return;}
     chosen_options[@(o->name)]=value;
     if(controller_option(selected_option)) previous_buttons=pad_buttons(pad_active.extendedGamepad);
     show_options(nil);
@@ -150,8 +148,6 @@ static void menu_input(unsigned short buttons,unsigned short down){
     }else if((down&0x1000) && controller_option(selected_option)){
         input_test=YES; show_input_test();
     }else if(down&0x2000){
-        if(pending_character && kh_setting_set(kh_options[0].name,pending_character.UTF8String)){show_options(@"Could not apply Character");return;}
-        pending_character=nil;
         [options_label removeFromSuperview]; options_label=nil; suppress_buttons=YES;
         kh_app_resume(KH_APP_RESUME_BOUND_MS);
     }else if((down&0x1000) && kh_setting_action(selected_option)){
@@ -189,7 +185,7 @@ static BOOL options_input(unsigned short buttons){
         options_label.adjustsFontSizeToFitWidth=YES; options_label.minimumScaleFactor=0.7;
         [parent addSubview:options_label];
         if(!chosen_options) chosen_options=[NSMutableDictionary new];
-        selected_option=selected_component=0; pending_character=nil;
+        selected_option=selected_component=0;
         const char *status=kh_cut_menu_status();
         show_options(status?@(status):nil);
         return YES;
