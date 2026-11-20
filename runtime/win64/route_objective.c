@@ -420,14 +420,20 @@ int kh_route_object_name(KCtx *g,u64 obj,char *out,size_t cap){
     size_t i=0; for(;i<32 && i+1<cap;i++){ u8 c=rd8(g,e+8+i); if(!c) break; out[i]=c>=33&&c<127?(char)c:'?'; }
     out[i]=0; return i>0;
 }
+/* f_3b5b40 returns the matrix translation for an actor attached to a parent. */
+static u64 object_position(KCtx *g,u64 object){
+    u32 parent=rd32(g,object+0x6a0);
+    return object+(parent && decode_id(g,parent)?0x70:0x670);
+}
 /* objects of the list whose objentry model name is `name` (the nearest one to (px, pz) through nx / nz / nd); -1 = no map */
 static int objects_named(KCtx *g,const char *name,float px,const float *py,float pz,float *nx,float *nz,float *nd){
     if(rd8(g,NOW_WORLD)==0xff) return -1;
     u64 o=rd64(g,OBJ_HEAD); int n=0; float best=1e30f; char nm[40];
     for(int k=0;k<512 && o && readable(o,0xe00);k++){
         if(kh_route_object_name(g,o,nm,sizeof nm) && !strcmp(nm,name)){
-            float x=rdf(g,o+0x670),z=rdf(g,o+0x678);
-            if(isfinite(x)&&isfinite(z)){ n++; float d=hypotf(x-px,z-pz); if(py) d=hypotf(d,rdf(g,o+0x674)-*py); if(d<best){ best=d; if(nx) *nx=x; if(nz) *nz=z; } } }
+            u64 pos=object_position(g,o);
+            float x=rdf(g,pos),z=rdf(g,pos+8);
+            if(isfinite(x)&&isfinite(z)){ n++; float d=hypotf(x-px,z-pz); if(py) d=hypotf(d,rdf(g,pos+4)-*py); if(d<best){ best=d; if(nx) *nx=x; if(nz) *nz=z; } } }
         u32 id=rd32(g,o+0xa90); if(!id) break; o=decode_id(g,id);
     }
     if(nd) *nd=best; return n;
@@ -456,7 +462,7 @@ void kh_route_objective_trace(KCtx *g,u64 n){
     u64 ob=rd64(g,OBJ_HEAD); float px=0,py=0,pz=0,ph=0; kh_route_player_pos(g,&px,&py,&pz,&ph);
     char buf[6000]; size_t b=(size_t)snprintf(buf,sizeof buf,"kh: route names game-frame=%llu:",(unsigned long long)n); int k=0;
     while(ob && readable(ob,0xe00) && k<128 && b<sizeof buf-120){ char nm[40];
-        kh_route_object_name(g,ob,nm,sizeof nm); float x=rdf(g,ob+0x670),z=rdf(g,ob+0x678);
+        kh_route_object_name(g,ob,nm,sizeof nm); u64 pos=object_position(g,ob); float x=rdf(g,pos),z=rdf(g,pos+8);
         b+=(size_t)snprintf(buf+b,sizeof buf-b," [%s %.0f,%.0f d%.0f]",nm[0]?nm:"?",x,z,hypotf(x-px,z-pz));
         u32 id=rd32(g,ob+0xa90); k++; if(!id) break; ob=decode_id(g,id); }
     fprintf(stderr,"%s (%d objects)\n",buf,k);
