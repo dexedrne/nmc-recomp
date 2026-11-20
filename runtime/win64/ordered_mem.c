@@ -40,7 +40,7 @@ static OmCount om_count(void){
     while(p<e){ if(!*p){ p++; continue; }
         size_t n=strnlen(p,(size_t)(e-p));
         if(n>7&&!memcmp(p,"kh-om1:",7)){ const char *nm=p+7, *sl=strrchr(nm,'/'); if(sl) nm=sl+1; c.total++;
-            if(!strncmp(nm,"shard_",6)) c.shards++; else if(!strcmp(nm,"mod_static_lifted.c")) c.relifted++;
+            if(!strncmp(nm,"shard_",6)) c.shards++; else if(!strcmp(nm,"mod_static_lifted.c") || !strcmp(nm,"tweak_static.c")) c.relifted++;
             else { c.runtime++; if(!strcmp(nm,"khrt_cpu.c")) c.lifter_cpu=1; } }
         p+=n; }
     return c; }

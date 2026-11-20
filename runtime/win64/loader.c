@@ -8,6 +8,7 @@
  * set gs_bias = host - 0x140000000 in every KCtx; guest addresses (and so relocations, IAT values, vtables, saved pointers) never change.
  */
 #include "khnmc_rt.h"
+#include "frame_time.h"
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -243,6 +244,7 @@ static int kh_main_body(int argc,char **argv){
     }
     if(hd_check){ extern int kh_hd_check(const char *); return kh_hd_check(hd_check_report); }      /* host-only: before the docs dir, the trace and the guest image */
     mkdir(kh_docs,0755);
+    kh_frame_time_init();
     kh_trace_init(); kh_install_signals();
     kh_vclock_init();
     { extern void kh_bgload_init(void); kh_bgload_init(); }

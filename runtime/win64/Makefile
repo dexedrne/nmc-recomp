@@ -284,6 +284,7 @@ MOD_MOOSE_EDITS = $(GEN)/mod_moose_edits.json
 MOD_LIFT_FUNCS += $(MOD_MOOSE_FUNCS)
 MOD_LIFT_CHAINED += $(MOD_MOOSE_FUNCS)
 FILE_HOOKS += 92680
+FILE_HOOKS += 13f900
 MOD_EXTRA_EDITS = --extra-edits $(MOD_NEVERLAND_EDITS) --extra-edits $(MOD_MOOSE_EDITS)
 MOD_TWEAKS_DLL ?= /home/user/projects/SillyBillyMod1/dll/KH2Tweaks_Refactor.dll
 # FILE_HOOKS can name an RVA twice (a runtime hook that forwards to a re-lifted body is in two sub-lists): the hook tools get each RVA once
@@ -569,6 +570,7 @@ $(GEN)/mod_static_lifted.c: tools/mod_static_lift.py $(MOD_EDITS) $(MOD_NEVERLAN
 	KH_UNIVERSE=$(KH_UNIVERSE) $(KHLIFT_PY) tools/mod_static_lift.py --khlift $(KHLIFT) --edits $(MOD_EDITS) --exe $(MOD_EXE) $(MOD_EXTRA_EDITS) \
 	    --funcs "$(MOD_LIFT_FUNCS)" --chained "$(MOD_LIFT_CHAINED)" --vanilla-shards $(LIFTED)/shards --out $@ --report $(GEN)/mod_static_lift.json
 endif
+$(addprefix $(O)/,frame_time.o null_input.o null_d3d12.o gfx_present.o gfx_vkd3d.o gfx_wrap.o loader.o loader_app.o bgload.o file_layer.o): $(ROOT)/runtime/frame_time.h
 $(O)/file_layer.o $(O)/hd_assets.o: $(ROOT)/runtime/title_logo.h
 $(O)/file_layer.o: $(ROOT)/runtime/look_voice.inc
 $(O)/xion_swap.o: $(ROOT)/runtime/xion_fields.inc

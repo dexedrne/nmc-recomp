@@ -31,6 +31,7 @@
  * KHNMC_BGLOAD_CHAOS=n pauses the loader's walk at every n-th step for KHNMC_BGLOAD_CHAOS_US microseconds (default 3000), exactly
  * where a preemption would park it (after 4ad270 returned the next node, before the node is read): the stress variant of the route. */
 #include "khnmc_rt.h"
+#include "frame_time.h"
 #include <errno.h>
 #include <time.h>
 #include <unistd.h>
@@ -72,7 +73,8 @@ static void bg_lock(KCtx *g){
         atomic_fetch_add(&c_contended,1); u64 t0=kh_host_ns();
         int rc=kh_tmutex_lock_stuck(&bg_m,BG_LOCK_WAIT_MAX_S);                 /* in slices (kh_compat.h): a stopped process loses one slice, not the budget */
         if(rc) kh_fatal(g,"bgload: waited %d slices (about that many seconds of this process running) for the load-list lock (held by thread %u, pthread rc %d): a holder is blocked, which the design excludes",BG_LOCK_WAIT_MAX_S,atomic_load(&bg_owner_tid),rc);
-        u64 w=kh_host_ns()-t0, m=atomic_load(&c_wait_ns_max); while(w>m && !atomic_compare_exchange_weak(&c_wait_ns_max,&m,w)){}
+        u64 w=kh_host_ns()-t0, m=atomic_load(&c_wait_ns_max); if(kh_frame_work) kh_bg_wait_ns+=w;
+        while(w>m && !atomic_compare_exchange_weak(&c_wait_ns_max,&m,w)){}
     }
     KThread *th=cur_thread(); atomic_store(&bg_owner_tid,th?th->tid:1);
 }

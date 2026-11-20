@@ -4,6 +4,7 @@
  * persistent maps work, copyable footprints computed from the resource description.  Anything outside the documented surface is a named fatal.
  * Also: d3dcompiler_47!D3DStripShader (copy), D3D12SerializeRootSignature (blob holding the desc), D3D11CreateDevice (movie decode device). */
 #include "khnmc_rt.h"
+#include "frame_time.h"
 #include "khnmc_app.h"
 #include "savestate.h"
 #include "gfx_present.h"
@@ -480,14 +481,31 @@ static void pso_log(KCtx *g,u64 d){
             (unsigned long long)kh_game_frames(),(unsigned long long)gfx_presents,t?t->tid:0,(unsigned long long)pso_fnv(g,vs,vsn),(unsigned long long)pso_fnv(g,ps,psn),(unsigned long long)st,
             (unsigned long long)vsn,(unsigned long long)psn,rd32(g,d+0x244),rd32(g,d+0x240),rd32(g,d+0x264),rd32(g,d+0x23c),sites);
 }
+/* The model shaders accept either explicit blend weights or one POSITION
+ * stream per influence. Count vertices submitted with either input layout. */
+static int blend_layout(KCtx *g,u64 desc){
+    u64 elems=rd64(g,desc+0x228);
+    u32 count=rd32(g,desc+0x230);
+    for(u32 i=0;elems && i<count && i<32;i++){
+        u64 e=elems+32ull*i;
+        if(!GA_OK(e) || !GA_OK(e+31)) return 0;
+        u64 name=rd64(g,e);
+        if(!GA_OK(name) || !GA_OK(name+11)) continue;
+        const char *s=hp(g,name);
+        if(!strncmp(s,"BLENDWEIGHT",12) || (rd32(g,e+8)>0 && !strncmp(s,"POSITION",9))) return 1;
+    }
+    return 0;
+}
 static int h_dev(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)o;(void)c;
     switch(s){
     case 8: { u64 q=new_obj(C_queue,32); out_obj(g,ARG(g,3),q); SET_RAX(g,0); return 1; }                  /* CreateCommandQueue(desc, riid, **pp) */
     case 9: out_obj(g,ARG(g,3),new_obj(C_alloc,16)); SET_RAX(g,0); return 1;                               /* CreateCommandAllocator(type, riid, **pp) */
     case 10: { if(__builtin_expect(log_pso,0)) pso_log(g,A1(g));
-             u64 p=new_obj(C_pso,16); if(__builtin_expect(kh_aspect_m,0)) m_pso(g,A1(g),p);                  /* task 40: M */
+             u64 p=new_obj(C_pso,16); if(kh_frame_work) wr32(g,p+40,blend_layout(g,A1(g)));
+             if(__builtin_expect(kh_aspect_m,0)) m_pso(g,A1(g),p);                  /* task 40: M */
              out_obj(g,ARG(g,3),p); gfx_psos++; SET_RAX(g,0); return 1; }                                   /* CreateGraphicsPipelineState(desc, riid, **pp) */
-    case 12: out_obj(g,ARG(g,6),new_obj(C_list,16)); SET_RAX(g,0); return 1;                               /* CreateCommandList(node,type,alloc,pso,riid,**pp) */
+    case 12: { u64 l=new_obj(C_list,16); if(kh_frame_work && A4(g)) wr32(g,l+32,rd32(g,A4(g)+40));
+               out_obj(g,ARG(g,6),l); SET_RAX(g,0); return 1; }                               /* CreateCommandList(node,type,alloc,pso,riid,**pp) */
     case 13: { u32 feat=(u32)A1(g); u64 d=A2(g); u32 sz=(u32)A3(g);
         if(feat==4){ u32 sc=rd32(g,d+4); wr32(g,d+12,sc<=8?1:0); }                                          /* MULTISAMPLE_QUALITY_LEVELS: NumQualityLevels */
         else memset(hp(g,d),0,sz); SET_RAX(g,0); return 1; }
@@ -535,9 +553,15 @@ static int h_alloc(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 
 static int h_list(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1; (void)o;(void)c;
     if(__builtin_expect(kh_aspect_m,0)) m_list_call(g,o,s);                                                 /* task 40: M (records only) */
     switch(s){
-    case 9: case 10: SET_RAX(g,0); return 1;                                                                /* Close / Reset */
-    case 11: return 1;                                                                                      /* ClearState */
-    case 12: case 13: gfx_draws++; return 1;                                                                /* Draw(Indexed)Instanced */
+    case 9: case 10: if(kh_frame_work && s==10) wr32(g,o+32,A2(g)?rd32(g,A2(g)+40):0); SET_RAX(g,0); return 1;                                                                /* Close / Reset */
+    case 11: if(kh_frame_work) wr32(g,o+32,A1(g)?rd32(g,A1(g)+40):0); return 1; /* ClearState */
+    case 12: case 13:
+        if(kh_frame_work){
+            u64 vertices=(u64)(u32)A1(g)*(u32)A2(g);
+            kh_vertices+=vertices;
+            if(rd32(g,o+32)) kh_blend_vertices+=vertices;
+        }
+        gfx_draws++; return 1;                                                                /* Draw(Indexed)Instanced */
     case 16: gfx_copies++; { /* CopyTextureRegion(this, pDst, x, y, z, pSrc, pSrcBox) */
         u64 dl=A1(g),sl=ARG(g,5);
         if(!GA_OK(dl)||!GA_OK(sl)) kh_fatal(g,"null d3d12: CopyTextureRegion with invalid location pointers (dst=%llx src=%llx)",(unsigned long long)dl,(unsigned long long)sl);
@@ -546,6 +570,7 @@ static int h_list(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1
             if(!GA_OK(dr)||kh_com_cls_of(g,dr)!=C_res) kh_fatal(g,"null d3d12: CopyTextureRegion destination %llx is not a resource",(unsigned long long)dr);
             u32 fmt=rd32(g,dr+R_FMT),dim=rd32(g,dr+R_DIM); u32 bw,bpb; u32 ffmt=rd32(g,sl+24),fw=rd32(g,sl+28),fh=rd32(g,sl+32),fd=rd32(g,sl+36),pitch=rd32(g,sl+40);
             fmt_info(ffmt,&bw,&bpb); u64 bytes=(u64)pitch*(((u64)fh+bw-1)/bw)*(fd?fd:1);
+            if(kh_frame_work) kh_texture_uploads++;
             tx_up_calls++; tx_up_total_bytes+=bytes;
             if(fmt<128){ tx_up[fmt]++; tx_up_bytes[fmt]+=bytes; }
             { u64 w=rd64(g,dr+R_DESC+16); u32 h=rd32(g,dr+R_DESC+24); tx_up_sized[dim==3?size_class(w,h):7]++; }
@@ -557,7 +582,7 @@ static int h_list(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1
     case 27:
         if(!A1(g)||kh_com_cls_of(g,A1(g))!=C_list) kh_fatal(g,"null d3d12: ExecuteBundle requires a command list");
         gfx_bundles++; return 1; /* Bundle commands already update the null recorder when recorded. */
-    case 25: gfx_pso_binds++; return 1;
+    case 25: if(kh_frame_work) wr32(g,o+32,A1(g)?rd32(g,A1(g)+40):0); gfx_pso_binds++; return 1;
     case 20: case 21: case 22: case 23: case 24: return 1;                                         /* topology, viewports, scissors, blend factor, stencil ref, SetPipelineState */
     case 26: gfx_barriers+=A1(g); return 1;                                                                 /* ResourceBarrier */
     case 28: case 30: case 32: case 38: case 43: case 44: case 46: return 1;                                /* SetDescriptorHeaps, root signature, tables, CBVs, IA buffers, OMSetRenderTargets */

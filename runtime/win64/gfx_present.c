@@ -54,6 +54,7 @@
 #include <vkd3d_utils.h>
 #endif
 #include "khnmc_rt.h"
+#include "frame_time.h"
 #include "gfx_present.h"
 #include <errno.h>
 #include <time.h>
@@ -404,7 +405,7 @@ static void vs_tick(KhVsync *v,u64 ns){ pthread_mutex_lock(&v->m); v->ticks++; v
 static void vs_register(KhVsync *v){ pthread_mutex_lock(&v->m); if(!v->registered){ v->registered=1; v->last_tick_ns=kh_host_ns(); } pthread_mutex_unlock(&v->m); }
 void kh_vsync_register(void){ pthread_once(&vs_once,vs_proc_init); vs_register(&vs_proc);
     fprintf(stderr,"kh: vsync: a display tick source is registered: WaitForVBlank (host clock) now waits for its ticks (period %llu ns; time-out 2 periods, then the last tick's grid)\n",P_(vs_proc.period_ns)); }
-void kh_vsync_tick(uint64_t host_ns){ pthread_once(&vs_once,vs_proc_init); vs_tick(&vs_proc,host_ns); }
+void kh_vsync_tick(uint64_t host_ns){ pthread_once(&vs_once,vs_proc_init); vs_tick(&vs_proc,host_ns); atomic_fetch_add_explicit(&kh_display_ticks,1,memory_order_relaxed); }
 /* Display-link ticks continue while disk I/O holds the guest. Consume them as
  * a baseline so the first post-cut wait is for the next physical tick. */
 void kh_vsync_forget_ticks(void){ vs_forget_thread(&vs_proc); }
@@ -925,12 +926,15 @@ int kh_present_frame(KCtx *g,KhPresenter *p,u32 idx,u64 n){
         if(!p->sc||p->stale) swapchain_build(p);                                              /* (b) */
         if(!p->sc){ pthread_mutex_unlock(&p->m); atomic_fetch_add(&c_zero_size,1); return 0; }   /* zero-size drawable: nothing to present (counted) */
         s=&p->slot[p->frames%PSLOTS];
+        u64 slot_start=kh_host_ns();
         slot_wait(p,s,"slot reuse");                                                          /* (c) the slot's semaphore and command buffer are free again */
+        atomic_fetch_add_explicit(&kh_slot_wait_ns,kh_host_ns()-slot_start,memory_order_relaxed);
         if(!slot_consume(p,s,"presenter: consume a parked acquire")){ pthread_mutex_unlock(&p->m); continue; }   /* gate set: back to (a) */
         u64 t0=kh_host_ns(); VkResult r;
         if(test_inject_acquire){ r=test_inject_acquire; test_inject_acquire=0; }             /* selftest: a result the headless surface never gives */
         else r=v->AcquireNextImageKHR(v->dev,p->sc,(u64)kh_stuck_slice_ms*1000000ull,s->acq,VK_NULL_HANDLE,&ii);
         t_acq=kh_host_ns()-t0;
+        atomic_fetch_add_explicit(&kh_acquire_ns,t_acq,memory_order_relaxed);
         if(r==VK_TIMEOUT||r==VK_NOT_READY){
             int free_=kh_gfx_gate_is_set()||kh_host_ns()-kh_gfx_gate_last_clear_ns()<(u64)kh_stuck_slice_ms*1000000ull;
             if(free_) atomic_fetch_add(&c_to_free,1); else { atomic_fetch_add(&c_to_counted,1); if(++p->counted_timeouts>=5) kh_fatal(NULL,"gfx-present-acquire: vkAcquireNextImageKHR timed out %d times in a row (slices of %u ms) with the gate clear",p->counted_timeouts,kh_stuck_slice_ms); }
@@ -1037,6 +1041,7 @@ int kh_present_frame(KCtx *g,KhPresenter *p,u32 idx,u64 n){
         else if(pr==VK_ERROR_OUT_OF_DATE_KHR){ atomic_fetch_add(&c_sc_outdated,1); p->stale=1; p->stale_reason=RC_OUTDATED; }
         else if(pr==VK_ERROR_SURFACE_LOST_KHR) surface_drop(p);              /* review V36 n=3: the surface is made anew at the next present */
         else if(pr!=VK_SUCCESS) kh_fatal(NULL,"gfx-present-vk: vkQueuePresentKHR failed: VkResult %d",(int)pr);
+        atomic_fetch_add_explicit(&kh_present_ns,cost,memory_order_relaxed);
         pthread_mutex_lock(&pm_g); st_cost_n++; st_cost_sum+=cost; if(cost>st_cost_max) st_cost_max=cost; st_acq_sum+=t_acq; if(t_acq>st_acq_max) st_acq_max=t_acq;
         st_hold_sum+=hold; if(hold>st_hold_max) st_hold_max=hold; u64 b=cost/10000; cost_hist[b>HBUCK?HBUCK:b]++; pthread_mutex_unlock(&pm_g);
         p->frames++;                                                        /* the report line comes with the backend's every 300 presents (null_d3d12.c) */

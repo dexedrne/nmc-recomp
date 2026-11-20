@@ -64,6 +64,7 @@
 #include <vkd3d_utils.h>
 #endif
 #include "khnmc_rt.h"
+#include "frame_time.h"
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
@@ -791,11 +792,12 @@ static int w_list(KCtx *g,ID3D12GraphicsCommandList *canonical,int s){
         if(SUCCEEDED(hr)) kh_gfxc_track_reset(g,U(l));
         SET_RAX(g,(u32)hr); return 1; }
     case 11: ID3D12GraphicsCommandList_ClearState(l,(ID3D12PipelineState*)kh_wrap_real(g,A1(g),WK_PSO,"ClearState")); return 1;
-    case 12: ID3D12GraphicsCommandList_DrawInstanced(l,(UINT)A1(g),(UINT)A2(g),(UINT)A3(g),(UINT)ARG(g,4)); atomic_fetch_add(&gfx_draws,1); return 1;
-    case 13: ID3D12GraphicsCommandList_DrawIndexedInstanced(l,(UINT)A1(g),(UINT)A2(g),(UINT)A3(g),(INT)ARG(g,4),(UINT)ARG(g,5)); atomic_fetch_add(&gfx_draws,1); return 1;
+    case 12: if(kh_frame_work) kh_vertices+=(u64)(u32)A1(g)*(u32)A2(g); ID3D12GraphicsCommandList_DrawInstanced(l,(UINT)A1(g),(UINT)A2(g),(UINT)A3(g),(UINT)ARG(g,4)); atomic_fetch_add(&gfx_draws,1); return 1;
+    case 13: if(kh_frame_work) kh_vertices+=(u64)(u32)A1(g)*(u32)A2(g); ID3D12GraphicsCommandList_DrawIndexedInstanced(l,(UINT)A1(g),(UINT)A2(g),(UINT)A3(g),(INT)ARG(g,4),(UINT)ARG(g,5)); atomic_fetch_add(&gfx_draws,1); return 1;
     case 15: ID3D12GraphicsCommandList_CopyBufferRegion(l,RES(A1(g),"CopyBufferRegion: destination"),A2(g),RES(A3(g),"CopyBufferRegion: source"),ARG(g,4),ARG(g,5)); atomic_fetch_add(&gfx_copies,1); return 1;
     case 16: { WX x; wx_init(&x,g); D3D12_BOX box;                               /* CopyTextureRegion(dst location, x, y, z, src location, src box) */
         const D3D12_TEXTURE_COPY_LOCATION *dst=x_copyloc(&x,A1(g),"CopyTextureRegion: destination"), *src=x_copyloc(&x,ARG(g,5),"CopyTextureRegion: source");
+        if(kh_frame_work && dst && src && dst->Type==D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX && src->Type==D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) kh_texture_uploads++;
         ID3D12GraphicsCommandList_CopyTextureRegion(l,dst,(UINT)A2(g),(UINT)A3(g),(UINT)ARG(g,4),src,CP(box,ARG(g,6))); wx_done(&x); atomic_fetch_add(&gfx_copies,1); return 1; }
     case 17: ID3D12GraphicsCommandList_CopyResource(l,RES(A1(g),"CopyResource: destination"),RES(A2(g),"CopyResource: source")); atomic_fetch_add(&gfx_copies,1); return 1;
     case 19: ID3D12GraphicsCommandList_ResolveSubresource(l,RES(A1(g),"ResolveSubresource: destination"),(UINT)A2(g),RES(A3(g),"ResolveSubresource: source"),(UINT)ARG(g,4),(DXGI_FORMAT)(u32)ARG(g,5));

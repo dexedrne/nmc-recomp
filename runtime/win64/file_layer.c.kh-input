@@ -1,5 +1,6 @@
 /* Loose-first entry points; real packages use the untouched lifted implementation. */
 #include "khnmc_rt.h"
+#include "frame_time.h"
 #include "khnmc_hd.h"
 #include "kh_look.h"
 #include "title_logo.h"
@@ -426,7 +427,7 @@ int kh_cutscene_asset_exists(KCtx *g,const char *path){
 int kh_file_loose_path(KCtx *g,const char *path,char *host,size_t cap){
     return loose_path(g,path,"stream",host,cap,NULL);
 }
-void kh_file_log_entry(KCtx *g,const char *path,const char *source,long long size){ file_log(g,path,source,size>INT_MAX?INT_MAX:(int)size); }
+void kh_file_log_entry(KCtx *g,const char *path,const char *source,long long size){ if(kh_frame_work && source) kh_file_reads++; file_log(g,path,source,size>INT_MAX?INT_MAX:(int)size); }
 int kh_file_package_fallback(const char *path){ return package_fallback(path); }
 static int register_resource(KCtx *g,u64 path,int n,u64 dst,const char *fallback){
     /* HD sidecars: the lifted ResourceEntry constructor runs inside SetResourceItem on this thread and pulls GetRemasteredCount/Entry/Asset (hd_assets.c). */
@@ -472,7 +473,7 @@ static void live_note(u64 dst,int n,const char *path){
     livef_loads++; livef_bytes+=(u64)n;
     pthread_mutex_unlock(&live_lock);
 }
-void kh_file_live_note(u64 dst,u64 n,const char *what){ live_note(dst,n>INT_MAX?INT_MAX:(int)n,what); }   /* hd_assets.c: the HD asset buffers */
+void kh_file_live_note(u64 dst,u64 n,const char *what){ if(kh_frame_work) kh_file_reads++; live_note(dst,n>INT_MAX?INT_MAX:(int)n,what); }   /* hd_assets.c: the HD asset buffers */
 static int live_cmp(const void *a,const void *b){ const LiveFile *x=a,*y=b; return x->n<y->n?1:x->n>y->n?-1:0; }
 /* the kind of a held buffer, for the totals: its directory (obj, map, menu, event, effect, ...) and whether it is an HD asset (an HD
  * asset's note is `<archive>#<index>:<name>`, a plain file's note its path) */
@@ -515,6 +516,7 @@ static void load(KCtx *g,int bounded,int allocate){
             int size=allocate?(s32)rd32(g,sizeptr):(s32)KH_RAX(g);
             int hit=allocate?(KH_RAX(g)!=0||(oldsize==-1&&size>=0)):(size>0);
             u64 data=allocate?KH_RAX(g):dst;
+            if(kh_frame_work && hit && data && size>0) kh_file_reads++;
             if(hit && data && size>0) kh_look_font_loaded(gstr(g,path),hp(g,data),size);
             file_log(g,gstr(g,path),hit?"PACKAGE":NULL,size);
             pthread_mutex_unlock(&files_lock); return;
@@ -528,6 +530,7 @@ static void load(KCtx *g,int bounded,int allocate){
         if(allocate){ ga_free(dst); wr32(g,sizeptr,-2); } else result=-2;
         goto close;
     }
+    if(kh_frame_work) kh_file_reads++;
     kh_look_font_loaded(gstr(g,path),hp(g,dst),n);
     result=allocate?dst:n;
     if(allocate) live_note(dst,n,gstr(g,path));

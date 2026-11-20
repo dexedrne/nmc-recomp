@@ -79,6 +79,7 @@
 #endif
 #endif
 #include "khnmc_rt.h"
+#include "frame_time.h"
 #include "rewind.h"
 #include <unistd.h>
 #include <errno.h>
@@ -875,8 +876,8 @@ void kh_gfxc_bundle_replay(KCtx *g,ID3D12GraphicsCommandList *l,u64 bo){
         if(kh_native_trace){ fprintf(stderr,"kh: bundle %llx replay on %p: %s(%llx, %llx, %llx, %llx, %llx)",P(bo),(void*)l,list_names[c->slot],P(c->a[0]),P(c->a[1]),P(c->a[2]),P(c->a[3]),P(c->a[4]));
             if(p){ fprintf(stderr," data:"); for(u32 k=0;k<c->blen&&k<64;k+=8){ u64 v=0; memcpy(&v,(const u8*)p+k,c->blen-k<8?c->blen-k:8); fprintf(stderr," %llx",P(v)); } } fputc('\n',stderr); }
         switch(c->slot){
-        case 12: ID3D12GraphicsCommandList_DrawInstanced(l,(UINT)c->a[0],(UINT)c->a[1],(UINT)c->a[2],(UINT)c->a[3]); atomic_fetch_add(&gfx_draws,1); break;
-        case 13: ID3D12GraphicsCommandList_DrawIndexedInstanced(l,(UINT)c->a[0],(UINT)c->a[1],(UINT)c->a[2],(INT)c->a[3],(UINT)c->a[4]); atomic_fetch_add(&gfx_draws,1); break;
+        case 12: if(kh_frame_work) kh_vertices+=(u64)(u32)c->a[0]*(u32)c->a[1]; ID3D12GraphicsCommandList_DrawInstanced(l,(UINT)c->a[0],(UINT)c->a[1],(UINT)c->a[2],(UINT)c->a[3]); atomic_fetch_add(&gfx_draws,1); break;
+        case 13: if(kh_frame_work) kh_vertices+=(u64)(u32)c->a[0]*(u32)c->a[1]; ID3D12GraphicsCommandList_DrawIndexedInstanced(l,(UINT)c->a[0],(UINT)c->a[1],(UINT)c->a[2],(INT)c->a[3],(UINT)c->a[4]); atomic_fetch_add(&gfx_draws,1); break;
         case 20: ID3D12GraphicsCommandList_IASetPrimitiveTopology(l,(D3D12_PRIMITIVE_TOPOLOGY)c->a[0]); break;
         case 23: ID3D12GraphicsCommandList_OMSetBlendFactor(l,(const FLOAT*)p); break;
         case 24: ID3D12GraphicsCommandList_OMSetStencilRef(l,(UINT)c->a[0]); break;
