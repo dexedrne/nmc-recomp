@@ -22,6 +22,7 @@ int kh_player_asset_key(const char *canonical);
 int kh_player_voice(const char *rel);
 void kh_look_voice_request(KCtx *g);
 void kh_look_voice_bind(KCtx *g);
+void kh_look_voice_retry(KCtx *g);   /* a voice bank that was not ready at a switch: retried each frame for ~10 s */
 int kh_look_key(const char *rel);
 int kh_look_available(const char *rel,char *host,size_t cap);
 void kh_look_path(KCtx *g,const char *rel,char *host,size_t cap);

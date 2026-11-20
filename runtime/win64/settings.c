@@ -699,6 +699,7 @@ feedback:
     show_look_notice(notice_index,frame);
 }
 void kh_settings_frame(KCtx *g,uint64_t frame){
+    kh_look_voice_retry(g);
     while(pending && pending->frame<=frame){
         struct change *c=pending; pending=c->next;
         if(kh_setting_set(c->name,c->value)) kh_fatal(NULL,"settings-save: %s",c->name);

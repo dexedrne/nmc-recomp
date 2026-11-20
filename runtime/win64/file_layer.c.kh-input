@@ -284,6 +284,7 @@ int kh_player_voice(const char *path){
 
 /* f_3cde50 keys these slots by character and costume, even across worlds. */
 static int voice_slot[4];
+static int voice_retry, voice_retry_frames;   /* a failed re-registration retries from kh_settings_frame (game thread) */
 static struct { u64 bytes; int size; } voice_data[2][sizeof banks/sizeof *banks];
 void kh_look_voice_request(KCtx *g){
     if(A2(g)!=GS_BASE+0x3cddf0) return;
@@ -315,9 +316,23 @@ void kh_look_voice_bind(KCtx *g){
         kh_call(g,GS_BASE+0x1de4a0,slot,0,0,0);
         kh_call(g,GS_BASE+0x1363b0,slot,0xffffffffu,0,0);
         int handle=(int)kh_call5(g,GS_BASE+0x13b2e0,slot,bytes,size,0xffffffffu,1);
-        if(handle<=0) kh_fatal(g,"look-voice-register: slot %u %s handle %d",slot,key,handle);
+        if(handle<=0){
+            /* Owner 2026-11-20: a quick second Character switch crashed here (handle 0 while the sound system was still retiring
+             * the old bank).  Not a reason to stop the game: retry on the following frames, give up quietly after ~10 s. */
+            if(voice_retry_frames<600) voice_retry_frames++, voice_retry=1;
+            if(voice_retry_frames==1 || voice_retry_frames==600)
+                kh_warn("look-voice: slot %u %s not ready (handle %d): %s",slot,key,handle,
+                        voice_retry_frames<600?"retrying on the next frames":"gave up; the next room change reloads it");
+            continue;
+        }
+        voice_retry_frames=0;
         kh_warn("look-voice: slot %u %s size %d handle %d",slot,key,size,handle);
     }
+}
+void kh_look_voice_retry(KCtx *g){
+    if(!g || !voice_retry) return;
+    voice_retry=0;
+    kh_look_voice_bind(g);
 }
 
 /* Restaged PC fights have their own ARD and mission but omit the arena files. */
