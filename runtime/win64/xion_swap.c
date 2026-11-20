@@ -13,21 +13,21 @@
 
 _Atomic int kh_xion_enabled;
 int kh_xkb_menu;
-static u64 messages[6];
+static u64 messages[7];
 static const char *const lines[]={
-    "Standard","Critical","Xion Knows Best","Play as Xion.\nRoxas steps in when needed.",
-    "Roxas steps in","Xion returns"
+    "Critical","Xion Knows Best","Xion Always Cries","Play as Xion on Critical.",
+    "Roxas steps in","Xion returns","Play as Xion on Less Than Nothing."
 };
-static const u16 refs[]={30000,30001,20019,30002,17205,17206,20020,30003};
+static const u16 refs[]={30000,20019,30001,30002,17206,20020,30003,30006};
 
 u64 kh_xkb_message(int id){
     unsigned index=(id&0x7fff)-30000u;
-    return kh_xkb_menu && index<4 ? messages[index] : 0;
+    return kh_xkb_menu && (index<4 || index==6) ? messages[index] : 0;
 }
 
 static void prepare_menu(KCtx *g){
     if(!messages[0]){
-        for(unsigned i=0;i<6;i++){
+        for(unsigned i=0;i<7;i++){
             const char *src=lines[i];
             messages[i]=ga_alloc(strlen(src)+1,16);
             u8 *dst=GUEST_PTR(messages[i]);
@@ -55,8 +55,8 @@ void f_2b88c0(KCtx *g){
     if(!kh_xkb_menu){orig_f_2b88c0(g);return;}
     u32 index=rd32(g,VA(0xb1d810));
     if(index>=4) kh_fatal(g,"xkb-menu-choice: %u",index);
-    kh_xkb_set_mode(g,index==3);
-    wr32(g,VA(0xb1d810),index==3?1:index+1);
+    kh_xkb_set_mode(g,index>=2);
+    wr32(g,VA(0xb1d810),2+(index&1));
     orig_f_2b88c0(g);
     wr32(g,VA(0xb1d810),index);
     kh_warn("xkb-choice: row %u level %u XKB %d",index,rd32(g,VA(0x9abd48)),kh_xion_enabled);

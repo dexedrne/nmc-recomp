@@ -92,7 +92,7 @@ typedef struct { char name[32]; uint32_t orig;
 struct HdTable {
     char *key; int64_t fsize; HdTable *next;
     int n; HdEnt *e; u64 gent;
-    int look, rule, game_mod, mod_files, pkg_n;        /* mod_files: the mod's files in the folder (provenance); pkg_n: entries of the package table */
+    int hooded, look, rule, game_mod, mod_files, pkg_n;        /* mod_files: the mod's files in the folder (provenance); pkg_n: entries of the package table */
     int offsets;                                 /* walker offsets of a scanned folder, -1 when nothing was walked */
     int unknown_ext;                             /* scanned folder of a file type without a walker: the package's origOffsets were used */
     int truncated;                               /* scan: mod files beyond the offset count */
@@ -135,6 +135,7 @@ int kh_look_key(const char *rel){
         return KH_SCENE_MODEL;
     }
     if(!xion) return 0;
+    if(kh_player_voice(key)) return -1;
     if(kh_xion_enabled){
         static const char *const story[]={"obj/P_EX110.mdlx","obj/P_EX110_NPC_PAJAMAS.mdlx",
                                            "obj/H_EX510.mdlx","obj/H_EX510_PAJAMAS.mdlx"};
@@ -161,15 +162,15 @@ static const struct { const char *stem; int face; } keys[]={
         {"P_EX101_BTLF",47},{"P_EX110_BTLF",0},{"P_EX121",36},{"P_EX100_WI",36},
         {"P_EX100_WI_MAGF",38},{"P_EX100_WI_KH1F",39},{"P_EX100_WI_ULTF",41}
     };
-int kh_look_pack_ready(void){
+int kh_look_pack_ready(int look){
     char rel[128],host[4096];
     for(size_t i=0;i<sizeof keys/sizeof *keys;i++){
         snprintf(rel,sizeof rel,"obj/%s.mdlx",keys[i].stem);
-        if(!kh_look_available(rel,host,sizeof host)) return 0;
+        if(!kh_look_asset(look,rel,host,sizeof host)) return 0;
         snprintf(rel,sizeof rel,"obj/%s.a.us",keys[i].stem);
-        if(!kh_look_available(rel,host,sizeof host)) return 0;
+        if(!kh_look_asset(look,rel,host,sizeof host)) return 0;
         snprintf(rel,sizeof rel,"remastered/obj/%s.a.us/-%d.dds",keys[i].stem,keys[i].face);
-        if(!kh_look_available(rel,host,sizeof host)) return 0;
+        if(!kh_look_asset(look,rel,host,sizeof host)) return 0;
     }
     return 1;
 }
@@ -442,6 +443,7 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
     HdFile *files=NULL; int nf=0; int32_t *offs=NULL; char *served=NULL; int rc=-1;
     char sub[2700],dir[4300],full[3000]; struct stat st;
     t->look=hd_look(rel);
+    t->hooded=t->look>0 && kh_look_enabled()==2;
     if(t->look==KH_SCENE_MODEL && !strcasecmp(rel,KH_SCENE_MDLX)){
         int count=0,bad=0;
         if(!kh_rm_offsets(rel,bytes,n,&offs,&count,&bad) || bad || count!=KH_SCENE_TEXTURES){
@@ -533,14 +535,17 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
         if(slot>=t->n || strcasecmp(t->e[slot].name,name)){
             snprintf(err,cap,"player-look-hd-slot: %s lacks texture entry %s",rel,name); goto fail;
         }
-        snprintf(key,sizeof key,"remastered/%s/%s",rel,name);
-        kh_look_path(NULL,key,path,sizeof path);
-        HdEnt *e=&t->e[slot];
-        if(stat(path,&st)){ snprintf(err,cap,"player-look-hd-stat: %s",path); goto fail; }
-        if(e->src==SRC_MOD) t->n_mod--; else if(e->src==SRC_VANILLA) t->n_van--; else t->n_null--;
-        free(e->host); e->host=strdup(path);
-        if(!e->host){ snprintf(err,cap,"out of memory"); goto fail; }
-        e->src=SRC_MOD; t->n_mod++; e->size=e->gsize=e->fsize=st.st_size;
+        for(int i=0;i<t->n;i++){
+            HdEnt *e=&t->e[i];
+            snprintf(key,sizeof key,"remastered/%s/%s",rel,e->name);
+            if(i!=slot && !kh_player_voice(key)) continue;
+            kh_look_path(NULL,key,path,sizeof path);
+            if(stat(path,&st)){ snprintf(err,cap,"player-look-hd-stat: %s",path); goto fail; }
+            if(e->src==SRC_MOD) t->n_mod--; else if(e->src==SRC_VANILLA) t->n_van--; else t->n_null--;
+            free(e->host); e->host=strdup(path);
+            if(!e->host){ snprintf(err,cap,"out of memory"); goto fail; }
+            e->src=SRC_MOD; t->n_mod++; e->size=e->gsize=e->fsize=st.st_size;
+        }
     }
     rc=0;
 fail:
@@ -556,9 +561,9 @@ HdTable *kh_hd_begin(KCtx *g,const char *root,const char *rel_in,const unsigned 
     char err[1500]; HdTable *prev=cur_table; st_begin++;
     char rel[2300]; if(!canon_rel(rel_in,rel,sizeof rel)||!*rel) kh_fatal(g,"hd assets: no usable tree path in \"%s\"",rel_in);
     pthread_mutex_lock(&hd_lock);
-    unsigned b=ci_hash(rel)&1023; HdTable *t;
-    int look=hd_look(rel);
-    for(t=buckets[b];t;t=t->next) if(t->look==look&&t->fsize==n&&key_eq(t->key,rel)) break;
+    int look=hd_look(rel),hooded=look>0 && kh_look_enabled()==2;
+    unsigned b=(ci_hash(rel)+hooded)&1023; HdTable *t;
+    for(t=buckets[b];t;t=t->next) if(t->hooded==hooded&&t->look==look&&t->fsize==n&&key_eq(t->key,rel)) break;
     if(t&&t->gent){ st_cache_hit++; pthread_mutex_unlock(&hd_lock); cur_table=t; return prev; }
     if(!t){
         cfg_load(g,root);
@@ -1125,20 +1130,20 @@ void kh_rewind_hd(KhRecords *r){
     KH_RECORD(r,count);
     if(r->loading){
         while(count--){
-            size_t n=0; int look; int64_t size; char key[2300];
+            size_t n=0; int look,hooded; int64_t size; char key[2300];
             KH_RECORD(r,n);
             if(!n||n>sizeof key) kh_fatal(NULL,"savestate-hd-key-length");
-            kh_record(r,key,n); KH_RECORD(r,look); KH_RECORD(r,size);
+            kh_record(r,key,n); KH_RECORD(r,look); KH_RECORD(r,hooded); KH_RECORD(r,size);
             if(key[n-1]) kh_fatal(NULL,"savestate-hd-key");
-            HdTable *t=buckets[ci_hash(key)&1023];
-            while(t && (t->look!=look||t->fsize!=size||!key_eq(t->key,key))) t=t->next;
+            HdTable *t=buckets[(ci_hash(key)+hooded)&1023];
+            while(t && (t->hooded!=hooded||t->look!=look||t->fsize!=size||!key_eq(t->key,key))) t=t->next;
             if(!t) kh_fatal(NULL,"savestate-hd-binding: %s",key);
             KH_RECORD(r,t->gent);
         }
     }else{
         for(unsigned i=0;i<1024;i++) for(HdTable *t=buckets[i];t;t=t->next) if(t->gent){
             size_t n=strlen(t->key)+1;
-            KH_RECORD(r,n); kh_record(r,t->key,n); KH_RECORD(r,t->look); KH_RECORD(r,t->fsize); KH_RECORD(r,t->gent);
+            KH_RECORD(r,n); kh_record(r,t->key,n); KH_RECORD(r,t->look); KH_RECORD(r,t->hooded); KH_RECORD(r,t->fsize); KH_RECORD(r,t->gent);
         }
     }
 }

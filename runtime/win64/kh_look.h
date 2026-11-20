@@ -15,11 +15,16 @@ const char *kh_look_root(void);
 int kh_scene_path(const char *rel,char *host,size_t cap);
 enum { KH_FILE_LOOK = 2 }; /* A selected overlay file must open successfully. */
 int kh_look_enabled(void);
-int kh_look_pack_ready(void);
+int kh_look_asset(int look,const char *rel,char *host,size_t cap);
+int kh_look_pack_ready(int look);
 int kh_scene_pack_ready(void);
 int kh_player_asset_key(const char *canonical);
+int kh_player_voice(const char *rel);
+void kh_look_voice_request(KCtx *g);
+void kh_look_voice_bind(KCtx *g);
 int kh_look_key(const char *rel);
 int kh_look_available(const char *rel,char *host,size_t cap);
 void kh_look_path(KCtx *g,const char *rel,char *host,size_t cap);
 
+int kh_look_message_id(KCtx *g,u64 text);
 u64 kh_look_name(KCtx *g,int id,u64 original);

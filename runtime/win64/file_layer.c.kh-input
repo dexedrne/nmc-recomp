@@ -98,10 +98,15 @@ const char *kh_scene_root(void){
     const char *root=getenv("KHNMC_SCENE_ROXAS_DIR");
     return root?root:"private/scene-roxas";
 }
-const char *kh_look_root(void){
+static const char *look_root(int look){
+    if(look==2){
+        const char *root=getenv("KHNMC_LOOK_HOODED_DIR");
+        return root?root:"private/looks/xion-hooded";
+    }
     const char *root=getenv("KHNMC_LOOK_DIR");
     return root?root:"private/looks/xion";
 }
+const char *kh_look_root(void){return look_root(kh_look_enabled());}
 int kh_scene_path(const char *rel,char *host,size_t cap){
     const char *root=kh_scene_root();
     struct stat st;
@@ -154,90 +159,103 @@ int kh_scene_key(const char *rel){
 static u64 name_overlays;
 static const char roxas[]="@KHINPUT(slash,data/msg/us/he.bar,15561,5,6371a57675507ca2b56b55306572693e0b838cda8d98eeecb9ec54a9dd62947b)@",xion[]="@KHINPUT(slash,data/msg/us/po.bar,13217,4,3841ba554755fe34fbbe96d4378902dcb824fa5bb69ca360c5ceb31d86e155f6)@";
 static pthread_mutex_t names_lock=PTHREAD_MUTEX_INITIALIZER;
+/* Each overlay keeps both the source bytes and a stable display buffer. */
+static int menu_name(int id,const u8 *src,size_t at){
+    id&=0x7fff;
+    switch(id){
+    case 0x51f: case 0x52d: case 0x534a: case 0x2ce8: case 0x2d0c: case 0x2e9a:
+        return !at && !src[5];
+    case 0x453a: case 0x50e5: case 0x511d: case 0x533f:
+        return at==(id==0x453a?5:0) && (src[at+5]==0xec || src[at+5]==0xee);
+    default: return 0;
+    }
+}
+static size_t render_name(KCtx *g,int id,const u8 *src,u8 *dst,int menus,int selected,int *matched){
+    size_t i=0,n=0;
+    while(src[i]){
+        if(i>=65536) kh_fatal(g,"look-name-message-length: %#x",id);
+        size_t step=1+(src[i]<32?kh_route_message_ctl_args(src[i]):0);
+        if(!strncmp((const char *)src+i,roxas,5) && (!menus || menu_name(id,src,i))){
+            *matched=1;
+            if(dst) memcpy(dst+n,selected?xion:roxas,selected?4:5);
+            i+=5; n+=selected?4:5;
+        }else{
+            if(dst) memcpy(dst+n,src+i,step);
+            i+=step; n+=step;
+        }
+    }
+    if(dst) dst[n]=0;
+    return i+1;
+}
+static void update_name(KCtx *g,u64 e){
+    unsigned size=rd32(g,e+8); int matched=0;
+    render_name(g,rd16(g,e+12),hp(g,e+16+size),hp(g,e+16),rd8(g,e+14),kh_look_enabled(),&matched);
+}
 void kh_look_set(KCtx *g,int selected){
     pthread_mutex_lock(&files_lock);
     pthread_mutex_lock(&names_lock);
     player_look=selected;
-    selected=kh_look_enabled();
-    for(u64 e=name_overlays;e;e=rd64(g,e)){
-        char *text=hp(g,e+16+rd32(g,e+12));
-        int old=*text==*xion?4:5, len=selected?4:5;
-        if(old!=len){
-            memmove(text+len,text+old,rd32(g,e+8));
-            memcpy(text,selected?xion:roxas,len);
-        }
-    }
+    for(u64 e=name_overlays;e;e=rd64(g,e)) update_name(g,e);
     pthread_mutex_unlock(&names_lock);
     pthread_mutex_unlock(&files_lock);
 }
-
 u64 kh_look_name(KCtx *g,int id,u64 original){
-    if(!original) return original;
+    if(!original) return 0;
+    /* These native mission and rematch messages name the opposing Roxas. */
+    switch(id&0x7fff){
+    case 0x377a: case 0x48bc: case 0x491a: case 0x4ed9: case 0x4f43: return original;
+    }
+    const char *policy=getenv("KHNMC_LOOK_NAMES");
+    int menus=policy && !strcmp(policy,"menus"),matched=0;
+    if(policy && *policy && !menus && strcmp(policy,"all")) kh_fatal(g,"look-name-policy: expected all or menus");
+    const u8 *src=hp(g,original);
+    size_t size=render_name(g,id,src,NULL,menus,0,&matched);
+    if(!matched) return original;
     id&=0x7fff;
-    /* 0x453a is the camp Journal help string; its name follows a verb and a space. */
-    size_t prefix=id==0x453a?5:0;
-    if(prefix && strlen(gstr(g,original))<prefix) return original;
-    u64 name=original+prefix;
-    int len=!strncmp(gstr(g,name),roxas,5)?5:!strncmp(gstr(g,name),xion,4)?4:0;
-    if(!len) return original;
-    int suffix=rd8(g,name+len);
-    if(suffix!=0x52 || len==4){ /* A leading name and colon is the speaker label in 240 NMC system lines. */
-        switch(id){
-        case 0x51f: case 0x52d: case 0x534a:
-        case 0x2ce8: case 0x2d0c: case 0x2e9a:
-            if(suffix) return original;
-            break;
-        case 0x453a: case 0x50e5: case 0x511d: case 0x533f: /* possessive save summary titles */
-            if(suffix!=0xee && suffix!=0xec) return original;
-            break;
-        default: return original;
-        }
-    }
-    if(!kh_look_enabled() && player_look<0 && !getenv("KHNMC_PLAYER_LOOK")) return original;
-    size_t end=prefix+len;
-    while(end<4096){
-        u8 c=rd8(g,original+end++);
-        if(!c) break;
-        if(c<32) end+=kh_route_message_ctl_args(c);
-    }
-    if(end>=4096) kh_fatal(g,"look-name-message-length: %#x",id);
-    size_t tail=end-prefix-len;
     pthread_mutex_lock(&names_lock);
-    int selected=kh_look_enabled(), n=selected?4:5;
     u64 e=name_overlays;
     while(e){
-        char *text=hp(g,e+16);
-        if(rd32(g,e+12)==prefix && rd32(g,e+8)==tail && !memcmp(text,hp(g,original),prefix) &&
-           !memcmp(text+prefix+n,hp(g,name+len),tail)) break;
+        if(rd32(g,e+8)==size && rd16(g,e+12)==id && rd8(g,e+14)==menus &&
+           !memcmp(hp(g,e+16+size),src,size)) break;
         e=rd64(g,e);
     }
     if(!e){
-        e=ga_alloc(21+prefix+tail,16);
+        e=ga_alloc(16+2*size,16);
         if(!e) kh_fatal(g,"look-name-allocation");
-        wr64(g,e,name_overlays); wr32(g,e+8,tail); wr32(g,e+12,prefix);
-        memcpy(hp(g,e+16),hp(g,original),prefix);
-        memcpy(hp(g,e+16+prefix),selected?xion:roxas,n);
-        memcpy(hp(g,e+16+prefix+n),hp(g,name+len),tail);
-        name_overlays=e;
+        wr64(g,e,name_overlays); wr32(g,e+8,size); wr16(g,e+12,id); wr8(g,e+14,menus);
+        memcpy(hp(g,e+16+size),src,size);
+        update_name(g,e); name_overlays=e;
     }
     pthread_mutex_unlock(&names_lock);
     return e+16;
 }
-
-int kh_look_available(const char *rel,char *host,size_t cap){
-    const char *root=kh_look_root();
+/* Route readers reverse a displayed pointer to its current message table. */
+int kh_look_message_id(KCtx *g,u64 text){
+    pthread_mutex_lock(&names_lock);
+    int id=-1;
+    for(u64 e=name_overlays;e;e=rd64(g,e)){
+        if(text>=e+16 && text<e+16+rd32(g,e+8)){id=rd16(g,e+12); break;}
+    }
+    pthread_mutex_unlock(&names_lock);
+    return id;
+}
+int kh_look_asset(int look,const char *rel,char *host,size_t cap){
+    const char *root=look_root(look);
     struct stat st;
     return *root && strlen(root)+strlen(rel)+2<=cap && kh_resolve_ci(root,rel,host,cap) &&
            !stat(host,&st) && S_ISREG(st.st_mode) && st.st_size>0 && st.st_size<=INT_MAX && !access(host,R_OK);
 }
+int kh_look_available(const char *rel,char *host,size_t cap){return kh_look_asset(kh_look_enabled(),rel,host,cap);}
 void kh_look_path(KCtx *g,const char *rel,char *host,size_t cap){
     if(!kh_look_available(rel,host,cap)) kh_fatal(g,"player-look-asset: missing or invalid %s",rel);
 }
 
 void kh_xkb_set_mode(KCtx *g,int enabled){
     if(kh_xion_enabled==enabled) return;
+    int previous=kh_look_enabled();
     kh_xion_enabled=enabled;
     kh_look_set(g,player_look);
+    if((previous!=0)!=(kh_look_enabled()!=0)){ KCtx ctx=*g; kh_look_voice_bind(&ctx); }
 }
 
 int kh_look_enabled(void){
@@ -245,7 +263,54 @@ int kh_look_enabled(void){
     int selected=player_look;
     if(selected>=0) return selected;
     const char *env=getenv("KHNMC_PLAYER_LOOK");
-    return env && !strcmp(env,"xion");
+    return env && !strcmp(env,"xion-hooded")?2:env && !strcmp(env,"xion");
+}
+
+static const char *const banks[]={
+#include "look_voice.inc"
+};
+int kh_player_voice(const char *path){
+    if(strncasecmp(path,"voice/",6) && strncasecmp(path,"remastered/obj/P_EX1",20)) return 0;
+    for(size_t i=0;i<sizeof banks/sizeof *banks;i++) if(!strcasecmp(path,banks[i])) return (int)i+1;
+    return 0;
+}
+
+/* f_3cde50 keys these slots by character and costume, even across worlds. */
+static int voice_slot[4];
+static struct { u64 bytes; int size; } voice_data[2][sizeof banks/sizeof *banks];
+void kh_look_voice_request(KCtx *g){
+    if(A2(g)!=GS_BASE+0x3cddf0) return;
+    unsigned slot=(unsigned)A3(g);
+    if(slot>=4) kh_fatal(g,"look-voice-slot: %u",slot);
+    voice_slot[slot]=kh_player_voice(gstr(g,A0(g)));
+}
+void kh_look_voice_bind(KCtx *g){
+    for(unsigned slot=0;slot<4;slot++){
+        int id=voice_slot[slot];
+        if(!id || !(rd32(g,GS_BASE+0x2a244a8+12*slot)&1)) continue;
+        const char *key=banks[id-1];
+        int selected=!!kh_look_enabled();
+        u64 bytes=voice_data[selected][id-1].bytes;
+        int size=voice_data[selected][id-1].size;
+        if(!bytes){
+            u64 path=ga_strdup(key);
+            size=(int)kh_call(g,GS_BASE+0x3a09b0,path,0,0,0);
+            if(size<80 || !(bytes=ga_alloc(size,16)) ||
+               (int)kh_call(g,GS_BASE+0x3f9850,path,bytes,0,0)!=size ||
+               memcmp(hp(g,bytes),"SEDBSSCF",8) || rd32(g,bytes+16)!=(u32)size)
+                kh_fatal(g,"look-voice-load: %s",key);
+            ga_free(path);
+            voice_data[selected][id-1].bytes=bytes;
+            voice_data[selected][id-1].size=size;
+        }
+        /* f_1dcae0 stops slot voices, then f_1df560 retires the bank.
+         * f_13b2e0 argument five selects the synchronous, borrowed-buffer path. */
+        kh_call(g,GS_BASE+0x1de4a0,slot,0,0,0);
+        kh_call(g,GS_BASE+0x1363b0,slot,0xffffffffu,0,0);
+        int handle=(int)kh_call5(g,GS_BASE+0x13b2e0,slot,bytes,size,0xffffffffu,1);
+        if(handle<=0) kh_fatal(g,"look-voice-register: slot %u %s handle %d",slot,key,handle);
+        kh_warn("look-voice: slot %u %s size %d handle %d",slot,key,size,handle);
+    }
 }
 
 /* Restaged PC fights have their own ARD and mission but omit the arena files. */
@@ -427,14 +492,21 @@ int kh_file_selftest(KCtx *g){
     setenv("KHNMC_DATA",dir,1); char lp[KH_TMP_MAX+256]; snprintf(lp,sizeof lp,"%s/log",dir); setenv("KHNMC_FILELOG",lp,1);
     u64 name=ga_strdup("mixed.bin"),missing=ga_strdup("missing"),dst=ga_alloc(16,16),sz=ga_alloc(16,16);
 #define TEST(c) do { checks++; if(!(c)){ fprintf(stderr,"file selftest FAIL: %s\n",#c); bad++; } } while(0)
+    const char *policy=getenv("KHNMC_LOOK_NAMES");
+    char *saved_policy=policy?strdup(policy):NULL;
+    setenv("KHNMC_LOOK_NAMES","all",1);
     int initial_look=player_look;
     kh_look_set(g,1);
     TEST(kh_look_key("./OBJ//p_ex100.MDLX")==-1 && kh_look_key("obj/P_EX100_WI_KH1F.a.us")==40);
     TEST(kh_look_key("remastered/obj/P_EX100.a.us/-36.dds")==37 && !kh_look_key("remastered/obj/P_EX100.a.us/-37.dds"));
+    TEST(kh_look_key("voice/us/battle/TT0_ROXAS.win32.scd")==-1);
+    TEST(kh_look_key("remastered/obj/P_EX100_ULTF.a.us/voice/battle/us/awakened")==-1);
+    TEST(!kh_look_key("remastered/obj/P_EX220.a.us/voice/battle/us/xion"));
     TEST(!kh_look_key("obj/P_EX100.mset") && !kh_look_key("obj/P_EX1000.mdlx"));
     u64 label=ga_strdup("@KHINPUT(slash,data/msg/us/he.bar,15561,5,6371a57675507ca2b56b55306572693e0b838cda8d98eeecb9ec54a9dd62947b)@");
     TEST(label && !memcmp(hp(g,kh_look_name(g,0x851f,label)),"@KHINPUT(slash,data/msg/us/po.bar,13217,4,3841ba554755fe34fbbe96d4378902dcb824fa5bb69ca360c5ceb31d86e155f6)@",5));
-    TEST(kh_look_name(g,0x4023,label)==label);
+    TEST(!memcmp(hp(g,kh_look_name(g,0x4023,label)),xion,5));
+    TEST(kh_look_name(g,0xc91a,label)==label && kh_look_name(g,0x4f43,label)==label);
     u64 speaker=ga_alloc(16,16);
     memcpy(hp(g,speaker),"@KHINPUT(slash,data/msg/us/he.bar,15561,5,6371a57675507ca2b56b55306572693e0b838cda8d98eeecb9ec54a9dd62947b)@\x52\x01\x07\x00\x44\x00\x00\x48",14);
     u64 line=kh_look_name(g,0x27a,speaker);
@@ -449,7 +521,21 @@ int kh_file_selftest(KCtx *g){
         TEST(!strcmp(gstr(g,cached),(i&1)?xion:roxas));
         TEST(kh_look_name(g,0x51f,label)==cached);
     }
+    setenv("KHNMC_LOOK_NAMES","menus",1);
+    TEST(kh_look_name(g,0x4023,label)==label);
+    setenv("KHNMC_LOOK_NAMES","all",1);
+    u64 repeated=ga_alloc(32,16);
+    u8 *r=hp(g,repeated);
+    memcpy(r,roxas,5); r[5]=7; memcpy(r+6,roxas,5);
+    memcpy(r+11,roxas,5); r[16]=0xec; r[17]=0xac; r[18]=0x4f; r[19]=0;
+    u64 display=kh_look_name(g,104,repeated);
+    TEST(!memcmp(hp(g,display),xion,4) && !memcmp(hp(g,display+4),r+5,6) &&
+         !memcmp(hp(g,display+10),xion,4) && !memcmp(hp(g,display+14),r+16,4));
     kh_look_set(g,0);
+    TEST(!memcmp(hp(g,display),r,20));
+    ga_free(repeated);
+    if(saved_policy){setenv("KHNMC_LOOK_NAMES",saved_policy,1); free(saved_policy);}
+    else unsetenv("KHNMC_LOOK_NAMES");
     kh_xkb_set_mode(g,1);
     TEST(!strcmp(gstr(g,cached),xion) && kh_look_key("obj/H_EX510_PAJAMAS.mdlx")==-1);
     kh_xkb_set_mode(g,0);
@@ -574,6 +660,7 @@ int kh_file_selftest(KCtx *g){
 
 #include "rewind.h"
 void kh_rewind_files(KhRecords *r){
+    KH_RECORD(r,voice_slot); KH_RECORD(r,voice_data);
     KH_RECORD(r,real_packages);
     KH_RECORD(r,scene_pack);
     KH_RECORD(r,name_overlays);

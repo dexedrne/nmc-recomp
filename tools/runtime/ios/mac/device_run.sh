@@ -107,13 +107,14 @@ CUTSCENES=${CUTSCENES:-}; CUTSCENES_PACK=${CUTSCENES_PACK:-}                 # T
 # LOOK_PACK=DIR (11/19, task 56): every file under DIR on this Mac goes to the app's Documents/looks/xion/<same relative path>
 #   (the default KHNMC_LOOK_DIR on iOS), one devicectl copy per file; nothing on the phone is removed.
 # SCENE_ROXAS_PACK is the directory containing obj/ and remastered/ (task 64).
-EXTRA_ENV=${EXTRA_ENV:-}; LOOK_PACK=${LOOK_PACK:-}; SCENE_ROXAS_PACK=${SCENE_ROXAS_PACK:-}
+EXTRA_ENV=${EXTRA_ENV:-}; LOOK_PACK=${LOOK_PACK:-}; HOODED_LOOK_PACK=${HOODED_LOOK_PACK:-}; SCENE_ROXAS_PACK=${SCENE_ROXAS_PACK:-}
 if [ -n "$SCENE_ROXAS_PACK" ]; then
   for rel in obj/H_EX500.mdlx remastered/obj/H_EX500.mdlx/-{0,1,2}.dds; do
     [ -s "$SCENE_ROXAS_PACK/$rel" ] || bad "SCENE_ROXAS_PACK: missing $rel"
   done
 fi
 for kv in $EXTRA_ENV; do case "$kv" in KHNMC_*=*) k=${kv%%=*}; case "$k" in *[!A-Z0-9_]*) bad "EXTRA_ENV: bad name '$k'";; esac;; *) bad "EXTRA_ENV: '$kv' is not KHNMC_NAME=value";; esac; done
+[ -z "$HOODED_LOOK_PACK" ] || [ -d "$HOODED_LOOK_PACK" ] || bad "HOODED_LOOK_PACK: missing directory"
 [ -z "$LOOK_PACK" ] || [ -d "$LOOK_PACK" ] || bad "LOOK_PACK: no directory '$LOOK_PACK' on this Mac"
 case "$CUTSCENES" in ''|nmc|story|theater) ;; *) bad "CUTSCENES is nmc, story or theater (got '$CUTSCENES')";; esac
 uses_pack(){ [ "$CUTSCENES" = story ] || [ "$CUTSCENES" = theater ]; }
@@ -183,11 +184,14 @@ if [ -n "$SCENE_ROXAS_PACK" ]; then
   done
   say "scene Roxas model and three textures copied to Documents/scene-roxas"
 fi
-if [ -n "$LOOK_PACK" ]; then
-  n=0; ( cd "$LOOK_PACK" && find . -type f | sed 's#^\./##' ) > "$OUT/look-pack.list"
-  while IFS= read -r rel; do cp_to "$LOOK_PACK/$rel" "looks/xion/$rel" || { say "copy of the look pack FAILED at $rel"; exit 1; }; n=$((n+1)); done < "$OUT/look-pack.list"
-  say "look pack: $n files copied to Documents/looks/xion"
-fi
+for costume in xion xion-hooded; do
+  pack=$LOOK_PACK
+  [ "$costume" != xion-hooded ] || pack=$HOODED_LOOK_PACK
+  [ -n "$pack" ] || continue
+  n=0; ( cd "$pack" && find . -type f | sed 's#^\./##' ) > "$OUT/$costume.list"
+  while IFS= read -r rel; do cp_to "$pack/$rel" "looks/$costume/$rel" || { say "copy of $costume FAILED at $rel"; exit 1; }; n=$((n+1)); done < "$OUT/$costume.list"
+  say "look pack: $n files copied to Documents/looks/$costume"
+done
 if uses_pack; then
   cp_to "$CUTSCENES_PACK" "data/$pack_name" || { say "copy of the cutscene pack FAILED"; exit 1; }
 fi

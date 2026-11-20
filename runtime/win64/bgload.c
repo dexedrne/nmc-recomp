@@ -1,3 +1,4 @@
+#include "kh_look.h"
 #include "savestate.h"
 /* bgload.c : the engine's background file-load request list: serialisation (port hardening), stress knob, fault diagnostics, selftest.
  *
@@ -128,7 +129,7 @@ void f_3f99e0(KCtx *g){ released(g,o_read_a,RA_READ_A); }
 void f_3f9850(KCtx *g){ released(g,o_read_b,RA_READ_B); }
 void f_3a64f0(KCtx *g){ released(g,o_post,RA_POST); }
 void f_3a0aa0(KCtx *g){ check_node_allocator(g); atomic_fetch_add(&c_enq,1); locked(g,orig_f_3a0aa0); }
-void f_3a0b30(KCtx *g){ check_node_allocator(g); atomic_fetch_add(&c_enq,1); locked(g,orig_f_3a0b30); }
+void f_3a0b30(KCtx *g){ kh_look_voice_request(g); check_node_allocator(g); atomic_fetch_add(&c_enq,1); locked(g,orig_f_3a0b30); }
 void f_3a0bd0(KCtx *g){ check_node_allocator(g); atomic_fetch_add(&c_enq,1); locked(g,orig_f_3a0bd0); }
 void f_19c470(KCtx *g){ atomic_fetch_add(&c_free,1); locked(g,orig_f_19c470); }   /* kn::MemoryAllocator::free (any instance, any thread) */
 

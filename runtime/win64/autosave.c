@@ -113,8 +113,10 @@ static int publish(int dir,int n,const u8 *data){
     if(fd<0) return 0;
     FILE *f=fdopen(fd,"wb");
     if(!f){ close(fd); return 0; }
+    u8 trailer[sizeof mode_trailer]; memcpy(trailer,mode_trailer,sizeof trailer);
+    trailer[4]=data[0x2498];
     int ok=fwrite(data,1,SAVE_SIZE,f)==SAVE_SIZE &&
-        (!kh_xion_enabled || fwrite(mode_trailer,sizeof mode_trailer,1,f)==1) && !fflush(f) && !fsync(fd);
+        (!kh_xion_enabled || fwrite(trailer,sizeof trailer,1,f)==1) && !fflush(f) && !fsync(fd);
     if(fclose(f)) ok=0;
     if(ok) ok=renameat(dir,".slot.tmp",dir,name)==0;
     if(ok){
@@ -172,7 +174,8 @@ void kh_autosave_load(KCtx *g){
                rd64(g,GS_BASE+0xbef898) && native_valid(g,candidate);
             int tagged=st.st_size!=SAVE_SIZE;
             u8 trailer[sizeof mode_trailer];
-            if(ok && tagged) ok=fread(trailer,sizeof trailer,1,f)==1 && !memcmp(trailer,mode_trailer,sizeof trailer) && rd32(g,candidate+0x2498)==1;
+            if(ok && tagged) ok=fread(trailer,sizeof trailer,1,f)==1 && !memcmp(trailer,mode_trailer,4) &&
+                trailer[4]>=1 && trailer[4]<=3 && rd32(g,candidate+0x2498)==trailer[4];
             if(ok){
                 kh_xkb_set_mode(g,kh_xkb_menu && tagged);
                 memcpy(GUEST_PTR(SAVE),data,SAVE_SIZE);

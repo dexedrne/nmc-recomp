@@ -77,6 +77,7 @@ u64 kh_route_message(KCtx *g,int id,int *table){
  * such id: a table may give several ids one text (msg/us/eh.bar 0x3f56 = 0x3f59, msg/us/tt.bar 0x375b = 0x375c), and then this is not
  * necessarily the id the game named (kh_route_message_ids lists them all) */
 int kh_route_message_id(KCtx *g,u64 p){
+    int overlay=kh_look_message_id(g,p); if(overlay>=0) return overlay;
     for(int i=0;i<3;i++){
         u64 t=rd64(g,MSG_TABLES+0x10ull*(u64)i); if(!readable(t,8) || p<=t) continue;
         s32 n=(s32)rd32(g,t+4); if(n<=0 || n>1000000 || !readable(t+8,8ull*(u64)n)) continue;
@@ -86,6 +87,7 @@ int kh_route_message_id(KCtx *g,u64 p){
 }
 /* every id whose text starts at `p` (up to `max` of them; the count of all is returned) */
 int kh_route_message_ids(KCtx *g,u64 p,int *ids,int max){
+    int overlay=kh_look_message_id(g,p); if(overlay>=0) p=kh_route_message(g,overlay,NULL);
     int c=0;
     for(int i=0;i<3;i++){
         u64 t=rd64(g,MSG_TABLES+0x10ull*(u64)i); if(!readable(t,8) || p<=t) continue;
@@ -148,6 +150,7 @@ size_t kh_route_message_text(KCtx *g,u64 p,char *out,size_t cap){ return message
 size_t kh_route_message_page(KCtx *g,u64 p,char *out,size_t cap){ return message_decode(g,p,out,cap,1); }
 /* the id of the message that CONTAINS the byte at `p` (a page pointer lies inside its message), -1 = in none of the tables */
 int kh_route_message_id_of(KCtx *g,u64 p){
+    int overlay=kh_look_message_id(g,p); if(overlay>=0) return overlay;
     for(int i=0;i<3;i++){
         u64 t=rd64(g,MSG_TABLES+0x10ull*(u64)i); if(!readable(t,8) || p<=t) continue;
         s32 n=(s32)rd32(g,t+4); if(n<=0 || n>1000000 || !readable(t+8,8ull*(u64)n)) continue;

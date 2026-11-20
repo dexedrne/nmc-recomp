@@ -73,7 +73,7 @@ static BOOL suppress_buttons;
 static NSString *pending_character;
 static NSString *option_value(int index){
     const struct kh_option *o=&kh_options[index];
-    if(!strcmp(o->name,"KHNMC_PLAYER_LOOK")) return pending_character ?: (kh_settings_look()?@"xion":@"roxas");
+    if(!strcmp(o->name,"KHNMC_PLAYER_LOOK")) return pending_character ?: (@[@"roxas",@"xion",@"xion-hooded"][kh_settings_look()]);
     NSString *chosen=chosen_options[@(o->name)];
     const char *configured=getenv(o->name);
     return chosen ?: @(configured ?: o->initial);
@@ -83,21 +83,22 @@ static void show_options(NSString *error){
     int first=MAX(0,MIN(selected_option-2,kh_setting_menu_count()-5));
     for(int i=first;i<MIN(first+5,kh_setting_menu_count());i++){
         const char *reason=kh_setting_unavailable(i);
-        [text appendFormat:@"%@%@: %@\n",i==selected_option?@"▶  ":@"     ",@(kh_options[i].label),reason?[NSString stringWithFormat:@"Unavailable (%s)",reason]:i==0?option_value(i).capitalizedString:option_value(i)];
+        [text appendFormat:@"%@%@: %@\n",i==selected_option?@"▶  ":@"     ",@(kh_options[i].label),i==0 && kh_settings_look_locked()?@"Xion (Xion Knows Best)":reason?[NSString stringWithFormat:@"Unavailable (%s)",reason]:i==0 && [option_value(i) isEqualToString:@"xion-hooded"]?@"Xion (hooded)":i==0?option_value(i).capitalizedString:option_value(i)];
     }
     [text appendFormat:@"\n%@\nD-pad to select and change   •   Circle to close",
-     error ?: (selected_option==0?@"Applies when you close Options":kh_setting_action(selected_option)?@"Cross to execute when play resumes":kh_setting_live(selected_option)?@"Applies immediately":@"Applies on the next launch")];
+     error ?: (selected_option==0 && kh_settings_look_locked()?@"Character is locked":selected_option==0?@"Applies when you close Options":kh_setting_action(selected_option)?@"Cross to execute when play resumes":kh_setting_live(selected_option)?@"Applies immediately":@"Applies on the next launch")];
     if(strchr(kh_options[selected_option].initial,',')){
         [text appendFormat:@"\nL1/R1 to select value %d",selected_component+1];
     }
     options_label.text=text;
 }
 static void adjust_option(int direction){
-    if(kh_setting_unavailable(selected_option)) return;
+    if(kh_setting_unavailable(selected_option) || (selected_option==0 && kh_settings_look_locked())) return;
     const struct kh_option *o=&kh_options[selected_option];
     NSString *current=option_value(selected_option),*value;
     if(o->choices){
         NSArray<NSString *> *choices=[@(o->choices) componentsSeparatedByString:@"|"];
+        if(selected_option==0 && !kh_settings_hooded()) choices=@[@"roxas",@"xion"];
         NSInteger index=[choices indexOfObject:current];
         if(index==NSNotFound) index=0;
         index=(index+direction+(NSInteger)choices.count)%(NSInteger)choices.count;

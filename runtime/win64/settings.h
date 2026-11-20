@@ -21,6 +21,8 @@ int kh_setting_live(int index);
 double kh_live_setting_value(int index);
 
 int kh_settings_look(void);
+int kh_settings_look_locked(void);
+int kh_settings_hooded(void);
 const uint8_t *kh_look_notice(void);
 void kh_look_font_loaded(const char *path,const uint8_t *bar,size_t size);
 extern uint8_t kh_look_font[65536];

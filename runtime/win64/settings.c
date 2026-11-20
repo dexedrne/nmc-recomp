@@ -16,7 +16,7 @@ enum { LOOK, HP, MP, EXP, DROP, HUD_COMBO, COUNT };
 #define TWEAK_OPT(name,label,initial) {"KHNMC_TWEAK_" name,label,initial,"off|on",0,1,1}
 #define NUMBER(name,label,initial,min,max,step) {"KHNMC_" name,label,initial,NULL,min,max,step}
 const struct kh_option kh_options[]={
-    {"KHNMC_PLAYER_LOOK","Character","roxas","roxas|xion",0,0,0},
+    {"KHNMC_PLAYER_LOOK","Character","roxas","roxas|xion|xion-hooded",0,0,0},
     BOOL_OPT("CHEAT_INF_HP","Infinite HP","0"), BOOL_OPT("CHEAT_INF_MP","Infinite MP","0"),
     NUMBER("EXP_MULT","EXP multiplier","1",0.5,10,0.5), NUMBER("DROP_MULT","Item drop multiplier","1",0.5,10,0.5),
     BOOL_OPT("HUD_HIDE_COMBO","Hold L3 + R3 to hide HUD","0"),
@@ -122,7 +122,7 @@ static int validate(const char *name,const char *value,double *number){
             const char *p=o->choices;
             while(*p){
                 size_t n=strcspn(p,"|");
-                if(strlen(value)==n && !strncmp(p,value,n)){*number=i==LOOK?!strcmp(value,"xion"):!strcmp(value,"1");return i;}
+                if(strlen(value)==n && !strncmp(p,value,n)){*number=i==LOOK?(!strcmp(value,"xion-hooded")?2:!strcmp(value,"xion")):!strcmp(value,"1");return i;}
                 p+=n; if(*p) p++;
             }
             return -1;
@@ -202,6 +202,8 @@ static void load_saved_options(void){
 }
 #endif
 static _Atomic int look_request=-1;
+int kh_settings_look_locked(void){return kh_xion_enabled!=0;}
+int kh_settings_hooded(void){return kh_look_pack_ready(2);}
 int kh_settings_look(void){
     int request=atomic_load(&look_request);
     return request>=0?request:kh_look_enabled();
@@ -327,7 +329,7 @@ void kh_settings_init(void){
                strcasecmp(v,"off") && strcasecmp(v,"false") && strcmp(v,"0"))
                 reason="Expected on or off";
         }else if(validate(key,v,&n)<0) reason="Invalid configured value";
-        else if(i==LOOK && n && !kh_look_pack_ready()) reason="Xion asset pack incomplete";
+        else if(i==LOOK && n && !kh_look_pack_ready((int)n)) reason="Xion asset pack incomplete";
         else if(!strcmp(key,"KHNMC_SCENE_ROXAS") && n && !kh_scene_pack_ready()) reason="Scene asset pack incomplete";
         if(!reason && (!strcmp(key,"KHNMC_FOV_ZOOM") || !strncmp(key,"KHNMC_HUD_SCALE_",16))){
             const char *aspect=getenv("KHNMC_ASPECT");
@@ -470,7 +472,7 @@ static void show_look_notice(int index,u64 frame){
 /* A Drive change destroys the actor and its weapons. Use its model and material
  * binding operations on the live render instance, retaining the pose and sheet. */
 struct look_art { char stem[40]; int mode; u64 body,face; };
-static struct look_art art[32];
+static struct look_art art[48];
 static u64 face_actor,face_instance,face_model,face_bar;
 static u64 last_switch;
 /* A frame already submitted may still reference the old instance. Retire it
@@ -523,8 +525,8 @@ static u64 look_bar(KCtx *g,const char *stem,const char *ext,u64 native){
 }
 static struct look_art *look_art(KCtx *g,const char *stem,int target,u64 body,u64 face){
     struct look_art *a=art;
-    while(a<art+32 && a->stem[0] && (a->mode!=target || strcmp(a->stem,stem))) ++a;
-    if(a==art+32) kh_fatal(g,"look-art-cache-full: %s",stem);
+    while(a<art+48 && a->stem[0] && (a->mode!=target || strcmp(a->stem,stem))) ++a;
+    if(a==art+48) kh_fatal(g,"look-art-cache-full: %s",stem);
     snprintf(a->stem,sizeof a->stem,"%s",stem); a->mode=target;
     if(!a->body) a->body=look_bar(g,stem,"mdlx",body);
     if(face && !a->face) a->face=look_bar(g,stem,"a.us",face);
@@ -584,10 +586,9 @@ static int bind_look(KCtx *g,KhPlayerSheet p,const char *stem,int target){
     u64 original=kh_call(g,GS_BASE+0x3a6420,native,4,0,0);
     u64 wanted=kh_call(g,GS_BASE+0x3a6420,a->body,4,0,0);
     if(!original || !wanted) return 0;
-    /* All 15 X5 model members differ in length from their Roxas recipient.
-     * Keep the native instance on a room/form load that already selected it. */
+    /* Hooded and unhooded rigs can have the same byte length. */
     u64 selected_body=native;
-    if(rd32(g,original+12)==rd32(g,wanted+12)) face=rd64(g,obj+0x928);
+    if(original==wanted) face=rd64(g,obj+0x928);
     else { selected_body=a->body; wr64(g,obj+0x920,selected_body); }
     u64 model=kh_call(g,GS_BASE+0x3e62e0,obj+0x910,0,0,0);
     u64 tex=kh_call(g,GS_BASE+0x3e6310,obj+0x910,0,0,0);
@@ -626,6 +627,7 @@ static int bind_look(KCtx *g,KhPlayerSheet p,const char *stem,int target){
     return 1;
 }
 static void look_frame(KCtx *g,int target,u64 frame){
+    int previous=kh_look_enabled();
     int refresh=target<0;
     if(refresh){
         KhPlayerSheet active;
@@ -642,7 +644,7 @@ static void look_frame(KCtx *g,int target,u64 frame){
     if(kh_xion_enabled && !refresh){notice_index=NOTICE_XKB; goto feedback;}
     if(!cmds) goto feedback;
     notice_index=NOTICE_BUSY;
-    if(windows || rd8(g,GS_BASE+0x9ba8d1) || rd8(g,GS_BASE+0x2a11428) || rd8(g,GS_BASE+0x9006b0) || rd64(g,GS_BASE+0x2a11478) ||
+    if(windows || rd64(g,GS_BASE+0x2a244d8) || rd8(g,GS_BASE+0x9ba8d1) || rd8(g,GS_BASE+0x2a11428) || rd8(g,GS_BASE+0x9006b0) || rd64(g,GS_BASE+0x2a11478) ||
        rd64(g,GS_BASE+0x2ae9fa8) || rd64(g,GS_BASE+0x2a11268) || /* Roxas parked during XKB ownership */
        rd32(g,GS_BASE+0x2a10504) || rd64(g,GS_BASE+0x9ba928) ||
        (!refresh && last_switch && frame>=last_switch && frame-last_switch<60)) goto feedback;
@@ -653,23 +655,24 @@ static void look_frame(KCtx *g,int target,u64 frame){
     if(kh_player_asset_key(path)!=-1) goto feedback;
     if(target){
         char face[96],host[4096];
-        if(!kh_look_available(path,host,sizeof host)) {notice_index=NOTICE_PACK; goto feedback;}
+        if(!kh_look_asset(target,path,host,sizeof host)) {notice_index=NOTICE_PACK; goto feedback;}
         snprintf(path,sizeof path,"obj/%s.a.us",stem);
         snprintf(face,sizeof face,"remastered/%s/-%d.dds",path,kh_player_asset_key(path)-1);
-        if(!kh_look_available(path,host,sizeof host) || !kh_look_available(face,host,sizeof host)){
+        if(!kh_look_asset(target,path,host,sizeof host) || !kh_look_asset(target,face,host,sizeof host)){
             notice_index=NOTICE_PACK; goto feedback;
         }
     }
     KCtx ctx=*g;
     if(!refresh) kh_look_set(&ctx,target);
     if(!bind_look(&ctx,player,stem,target)){
-        if(!refresh) kh_look_set(&ctx,!target);
+        if(!refresh) kh_look_set(&ctx,previous);
         notice_index=NOTICE_PACK;
         goto feedback;
     }
     if(refresh) return;
+    if((previous!=0)!=(target!=0)) kh_look_voice_bind(&ctx);
     notice_index=target?0:1;
-    if(kh_save_live_option("KHNMC_PLAYER_LOOK",target?"xion":"roxas",LOOK,target))
+    if(kh_save_live_option("KHNMC_PLAYER_LOOK",target==2?"xion-hooded":target?"xion":"roxas",LOOK,target))
         kh_warn("appearance changed for this session: unable to save setting");
     last_switch=frame;
 feedback:
