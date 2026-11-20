@@ -297,6 +297,7 @@ void f_2f9440(KCtx *g){
 }
 
 static int notice_selftest(KCtx *g);
+static int next_multiplier(double,int);
 int kh_settings_selftest(KCtx *g){
     char dir[KH_TMP_MAX],path[KH_TMP_MAX+16],data[200];
     kh_tmp_path(dir,sizeof dir,"khnmc-settings-XXXXXX");
@@ -343,6 +344,11 @@ int kh_settings_selftest(KCtx *g){
     fail|=kh_stick_step(&state,&start,0,1500000001)!=CHORD_IDLE;
     fail|=LOOK!=0;
     fail|=validate("KHNMC_PLAYER_LOOK","xion",&v)!=LOOK || v!=1;
+    const int presets[]={1,2,3,5,10};
+    for(int i=0;i<5;i++)
+        fail|=next_multiplier(presets[i],1)!=presets[(i+1)%5] ||
+              next_multiplier(presets[i],0)!=presets[(i+4)%5];
+    fail|=next_multiplier(2.5,1)!=3 || next_multiplier(2.5,0)!=2;
     fail|=notice_selftest(g);
     unlink(path);rmdir(dir);
     fprintf(stderr,"kh: settings persistence and vector validation: %d failures\n",fail);
@@ -503,13 +509,30 @@ static const char *const notice_lines[]={"Xion","Roxas","Can't switch now: outsi
 static u8 look_text[NOTICE_COUNT][40];
 static _Atomic u64 notice;
 u8 kh_look_font[65536];
-static void init_notice_text(void){
-    for(int i=0;i<NOTICE_COUNT;i++){
-        for(size_t j=0;notice_lines[i][j];j++){
-            char c=notice_lines[i][j];
-            look_text[i][j]=c=='('?0x5a:c==')'?0x5b:c==' '?1:c=='\''?0x57:c==':'?0x52:c>='a'?0x9a+c-'a':0x2e + c-'A';
+static void encode_system_text(u8 *out,const char *text){
+    while(*text){
+        char c=*text++;
+        if(c>='a' && c<='z') *out++=0x9a+c-'a';
+        else if(c>='A' && c<='Z') *out++=0x2e + c-'A';
+        else if(c>='0' && c<='9') *out++=0x21+c-'0';
+        else switch(c){
+            case ' ': *out++=1; break;
+            case '\n': *out++=2; break;
+            case '\'': *out++=0x57; break;
+            case ':': *out++=0x52; break;
+            case '(': *out++=0x5a; break;
+            case ')': *out++=0x5b; break;
+            case '/': *out++=0x4b; break;
+            case '>': *out++=0x65; break;
+            case '-': *out++=0x2c; break;
+            case '.': *out++=0x4e; break;
+            default: kh_fatal(NULL,"settings-font-character: 0x%x",(unsigned char)c);
         }
     }
+    *out=0;
+}
+static void init_notice_text(void){
+    for(int i=0;i<NOTICE_COUNT;i++) encode_system_text(look_text[i],notice_lines[i]);
 }
 static _Atomic int font_ready; /* zero while loading, negative for an unsupported atlas */
 void kh_look_font_loaded(const char *path,const u8 *bar,size_t n){
@@ -528,6 +551,65 @@ void kh_look_font_loaded(const char *path,const u8 *bar,size_t n){
     return;
 invalid:
     atomic_store(&font_ready,-1);
+}
+/* Pad polling owns the cursor. The render thread reads it and the live options. */
+static _Atomic int cheats_available, cheat_row;
+void kh_title_cheats_available(int screen){
+    int previous=atomic_exchange(&cheats_available,screen);
+    if(test_log && screen==KH_TITLE_SETTINGS && screen!=previous)
+        fprintf(stderr,"kh: title GAME SETTINGS entered\n");
+    if(!screen) atomic_store(&cheat_row,0);
+}
+int kh_title_settings_key(void){
+    return atomic_load(&cheats_available) && !atomic_load(&cheat_row);
+}
+static int next_multiplier(double current,int right){
+    static const int steps[]={1,2,3,5,10};
+    if(right){
+        for(int i=0;i<5;i++) if(steps[i]>current) return steps[i];
+        return 1;
+    }
+    for(int i=4;i>=0;i--) if(steps[i]<current) return steps[i];
+    return 10;
+}
+int kh_title_cheats_pad(unsigned buttons){
+    static unsigned previous;
+    static int releasing;
+    unsigned down=buttons & ~previous;
+    previous=buttons;
+    if(releasing){releasing=buttons!=0;return releasing;}
+    if(!atomic_load(&cheats_available)) return 0;
+    int row=atomic_load(&cheat_row);
+    if(!row){
+        if(!(down&0x200)) return 0;
+        atomic_store(&cheat_row,HP);
+    }else if(down&(0x2000|0x200)){
+        atomic_store(&cheat_row,0); releasing=1;
+    }else if(down&3){
+        atomic_store(&cheat_row,HP+(row-HP+((down&1)?3:1))%4);
+    }else if(down&12){
+        double current=kh_live_setting_value(row);
+        int next=row<=MP?!current:next_multiplier(current,down&8);
+        char value[8];
+        snprintf(value,sizeof value,"%d",next);
+        if(kh_setting_set(kh_options[row].name,value)) kh_fatal(NULL,"title-cheats-save: %s",kh_options[row].name);
+        if(test_log) fprintf(stderr,"kh: title cheats %s=%s\n",kh_options[row].name,value);
+    }
+    return 1;
+}
+int kh_title_cheats_text(uint8_t text[KH_CHEAT_TEXT_SIZE]){
+    if(!atomic_load(&cheats_available)) return 0;
+    int ready=atomic_load(&font_ready);
+    if(ready<0) kh_fatal(NULL,"title-cheats-font: unsupported system font");
+    if(!ready) return 0;
+    int row=atomic_load(&cheat_row);
+    char buf[KH_CHEAT_TEXT_SIZE];
+    if(!row) strcpy(buf,"R1/RB  CHEATS");
+    else snprintf(buf,sizeof buf,"CHEATS\n%c Infinite HP: %s\n%c Infinite MP: %s\n%c EXP: x%g\n%c Drop rate: x%g\nD-pad to change   R1/RB to close",
+        row==HP?'>':' ',values[HP]?"On":"Off",row==MP?'>':' ',values[MP]?"On":"Off",
+        row==EXP?'>':' ',(double)values[EXP],row==DROP?'>':' ',(double)values[DROP]);
+    encode_system_text(text,buf);
+    return 1;
 }
 static const u8 *visible_notice(u64 state,u64 now){
     return now<(state & ~7ull)?look_text[state & 7]:NULL;

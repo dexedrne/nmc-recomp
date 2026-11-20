@@ -89,6 +89,7 @@ static BOOL controller_option(int index){
 static NSString *option_value(int index){
     const struct kh_option *o=&kh_options[index];
     if(!strcmp(o->name,"KHNMC_PLAYER_LOOK")) return (@[@"roxas",@"xion",@"xion-hooded"][kh_settings_look()]);
+    if(kh_setting_live(index)) return [NSString stringWithFormat:@"%g",kh_live_setting_value(index)];
     NSString *chosen=chosen_options[@(o->name)];
     const char *configured=getenv(o->name);
     return chosen ?: @(configured ?: o->initial);

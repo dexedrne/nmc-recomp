@@ -10,6 +10,12 @@ const char *kh_setting_unavailable(int index);
 int kh_cut_menu_request(int load,int slot);
 const char *kh_cut_menu_unavailable(void);
 const char *kh_cut_menu_status(void);
+enum { KH_TITLE_CLOSED, KH_TITLE_LIST, KH_TITLE_SETTINGS };
+void kh_title_cheats_available(int screen);
+int kh_title_settings_key(void);
+int kh_title_cheats_pad(unsigned buttons);
+enum { KH_CHEAT_TEXT_SIZE=192 };
+int kh_title_cheats_text(uint8_t text[KH_CHEAT_TEXT_SIZE]);
 float kh_drop_chance(float chance);
 struct kh_option {
     const char *name,*label,*initial,*choices;
