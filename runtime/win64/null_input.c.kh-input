@@ -38,6 +38,8 @@ static pthread_mutex_t input_lock=PTHREAD_MUTEX_INITIALIZER;
 /* host pad (2026-11-18, the iPhone): the platform shell's game controller as XInput pad 0.  KHNMC_INPUT=host turns it on when no input
  * script is loaded and the run is not a selftest; the shell (runtime/ios/ios_main.m: GameController framework) writes the whole state
  * with kh_input_host_pad_set from its own thread.  Unlike a script, it drives the right stick (the camera) too. */
+static _Atomic int host_nintendo;
+void kh_input_host_nintendo(int on){host_nintendo=on;}
 static int host_pad_on; static ScriptPad host_pad; static u64 host_pad_changes, host_pad_logged;
 static u16 host_latched;   /* review r9: buttons pressed since the last poll stay pressed for that poll (a tap shorter than a frame) */
 static int host_chord,host_click,script_chord,consume_sticks;
@@ -127,7 +129,7 @@ void kh_game_frame_step(KCtx *g){
         if(guest_return_addr(g)==GS_BASE+0x4edefe) title=KH_TITLE_SETTINGS;
         else if(kh_route_cond_eval(g,KR_TITLE_MENU,0,n,NULL)) title=KH_TITLE_LIST;
     }
-    kh_title_cheats_available(title);
+    kh_menu_title(title);
     kh_frame_time(g,n);
     extern void kh_settings_frame(KCtx *,uint64_t); kh_settings_frame(g,n);
     extern void kh_retry_frame(KCtx *); kh_retry_frame(g);
@@ -840,9 +842,9 @@ u32 kh_input_state(KCtx *g,u32 slot,u64 out,u64 frame){
     pthread_mutex_lock(&input_lock);
     if(nsteps) pad=route_pad;                               /* a route: the pad route_tick computed for this game frame */
     else if(scripted){ for(size_t i=0;i<nranges;i++) if(frame>=ranges[i].start && frame<=ranges[i].end) pad=ranges[i].pad; }
-    else { pad=host_pad; pad.buttons|=host_latched; host_latched=0; }   /* the shell's controller (KHNMC_INPUT=host); a tap shorter than a frame is seen once */
+    else { pad=host_pad; pad.buttons|=host_latched; host_latched=0; pad.buttons=kh_menu_map_buttons(pad.buttons,host_nintendo); }   /* the shell's controller (KHNMC_INPUT=host); a tap shorter than a frame is seen once */
     if(kh_cut_enabled) cut_pad_sample(&pad);
-    if(kh_title_cheats_pad(pad.buttons)) memset(&pad,0,sizeof pad);
+    if(kh_menu_pad(g,pad.buttons,pad.lt,pad.rt,pad.lx,pad.ly,pad.rx,pad.ry)) memset(&pad,0,sizeof pad);
     if(!packet || memcmp(&last_pad,&pad,sizeof pad)){ packet++; last_pad=pad; }
     /* R3 recenters the native camera. Consume the appearance gesture through
      * the release of both sticks, keeping single-stick presses available. */

@@ -17,13 +17,14 @@ for directory, enabled in ((args.control, False), (args.live, True)):
     assert run["result"] == "ok", directory
     root = root / run["run"]
     log = (root / "run.out").read_text()
-    edits = re.findall(r"kh: title cheats (\w+)=(\d+)", log)
+    prefix = "kh: RMC" if "kh: RMC KHNMC_" in log else "kh: title cheats"
+    edits = re.findall(prefix + r" (\w+)=(\d+)", log)
     assert dict(edits) == (options if enabled else {}), edits
     if enabled:
-        assert log.index("kh: title GAME SETTINGS entered") < log.index("kh: title cheats")
+        assert log.index("kh: title GAME SETTINGS entered") < log.index(prefix + " KHNMC_")
         conf = (root / "docs/khnmc.conf").read_text().splitlines()
         assert all(f"env {k}={v}" in conf for k,v in options.items())
-        assert log.index("kh: title cheats") < log.index("kh: phase: first FIELD_COMMAND")
+        assert log.index(prefix + " KHNMC_") < log.index("kh: phase: first FIELD_COMMAND")
     hits = re.findall(r"cheat HP before=(\d+) delta=(-\d+) protected=(\d)", log)
     assert hits and all(int(flag) == enabled for _, _, flag in hits), hits
     if enabled:

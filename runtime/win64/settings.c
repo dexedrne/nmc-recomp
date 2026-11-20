@@ -1,5 +1,7 @@
 #include "khnmc_rt.h"
 #include "settings.h"
+#include "frame_time.h"
+#include "autosave.h"
 #include "pad_layout.h"
 #include "xion_swap.h"
 #include "kh_look.h"
@@ -13,7 +15,8 @@
 #include <pthread.h>
 
 extern int kh_run_is_selftest;
-enum { LOOK, HP, MP, EXP, DROP, HUD_COMBO, COUNT };
+extern u64 kh_game_frames(void);
+enum { LOOK, HP, MP, EXP, DROP, HUD_COMBO, COUNT, PAD=COUNT, SWAP_AB, STYLE, RAISE, ENEMY, SUB, LOWER, MENU_LAYOUT, LOGO, CREDIT, TUTORIAL, AUTO_SAVE, NAMES, DIFF_LABEL, FRAME_WORK, FRAME_LOG };
 #define BOOL_OPT(name,label,initial) {"KHNMC_" name,label,initial,"0|1",0,1,1}
 #define TWEAK_OPT(name,label,initial) {"KHNMC_TWEAK_" name,label,initial,"off|on",0,1,1}
 #define NUMBER(name,label,initial,min,max,step) {"KHNMC_" name,label,initial,NULL,min,max,step}
@@ -24,6 +27,20 @@ const struct kh_option kh_options[]={
     BOOL_OPT("HUD_HIDE_COMBO","Hold L3 + R3 to hide HUD","0"),
     {"KHNMC_PAD_LAYOUT","Face buttons","auto","auto|positions|letters",0,0,0},
     BOOL_OPT("PAD_SWAP_AB","Swap confirm / back (A-B)","0"),
+    NUMBER("HUD_SCALE_STYLE","Style rank size","2",0.5,3,0.05),
+    NUMBER("HUD_STYLE_RAISE","Style rank raise","0.25",0,0.5,0.01),
+    NUMBER("HUD_SCALE_ENEMY","Enemy bars","1.5",0.5,3,0.05),
+    NUMBER("SUB_SCALE","Subtitle size","1.5",0.5,3,0.05),
+    NUMBER("SUB_LOWER","Subtitle lower","0.06",0,0.5,0.01),
+    {"KHNMC_MENU_LAYOUT","Portrait menu layout","portrait","portrait|band"},
+    {"KHNMC_TITLE_LOGO","Title logo","auto","auto|cycle|mod|roxas|xion|xkb"},
+    {"KHNMC_TITLE_CREDIT","Title credit","show","show|hide"},
+    {"KHNMC_TUTORIAL_FIGHT","Tutorial fight","real","real|mod"},
+    BOOL_OPT("AUTOSAVE","Autosave","0"),
+    {"KHNMC_LOOK_NAMES","Names in text","all","all|menus"},
+    BOOL_OPT("SAVE_DIFFICULTY","Save difficulty labels","1"),
+    BOOL_OPT("FRAME_WORK","Frame workload log","0"),
+    BOOL_OPT("FRAME_TIME","Frame time log","1"),
     TWEAK_OPT("DEBUG_DEBUG_ON","Enable debug commands","off"),
     TWEAK_OPT("DEBUG_SOFT_RESET","Allow debug reset to title","off"),
     NUMBER("TWEAK_DEBUG_TURBO_SPEED","Debug turbo speed","7.5",0.1,100,0.1),
@@ -181,11 +198,16 @@ static int save_option(const char *dir,const char *name,const char *value){
     if(fclose(out) || failed || rename(tmp,path)){unlink(tmp);return -1;}
     return 0;
 }
-/* Linux routes can reuse a Documents directory across launches. The shell environment wins there. */
-#if !KH_IOS_PATHS
+static const char *option_dir(void){
+#if KH_IOS_PATHS
+    extern const char *kh_autosave_documents(void);
+    return kh_autosave_documents();
+#else
+    return kh_docs;
+#endif
+}
 static void load_saved_options(void){
-    const char *dir=getenv("KH_DOCS");
-    if(!dir || !*dir) return;
+    const char *dir=option_dir();
     char path[4096];
     if(snprintf(path,sizeof path,"%s/khnmc.conf",dir)>=(int)sizeof path) kh_fatal(NULL,"settings-config-path");
     FILE *in=fopen(path,"r");
@@ -198,13 +220,15 @@ static void load_saved_options(void){
         char *v=strchr(p,'=');
         if(!v) continue;
         *v++=0;v[strcspn(v,"\r\n")]=0;
-        for(int i=0;i<kh_option_count-DEBUG_COUNT-STATE_ACTIONS;i++)
-            if(!strcmp(p,kh_options[i].name) && !getenv(p) && setenv(p,v,0)) kh_fatal(NULL,"settings-config-env: %s",p);
+        for(int i=0;i<kh_option_count-DEBUG_COUNT-STATE_ACTIONS;i++) if(!strcmp(p,kh_options[i].name)){
+            if(setenv(p,v,1)) kh_fatal(NULL,"settings-config-env: %s",p);
+            if(test_log) fprintf(stderr,"kh: RMC restored %s=%s\n",p,v);
+            break;
+        }
     }
     if(ferror(in)) kh_fatal(NULL,"settings-config-read: %s",path);
     free(line);fclose(in);
 }
-#endif
 static _Atomic int look_request=-1;
 int kh_settings_look_locked(void){return kh_xion_enabled!=0;}
 int kh_settings_hooded(void){return kh_look_pack_ready(2);}
@@ -215,6 +239,7 @@ int kh_settings_look(void){
 /* f_321e40 creates a four-row list. f_2eb490 builds two or three
  * stock rows, ending with Title Screen even when World Map is hidden. */
 static int character_row=-1, picking_character;
+static _Atomic int enter_character;
 static u16 choice_place;
 static u64 character_labels[6], root_labels[4];
 enum { CHANGE_LABEL=3, LOCK_LABEL, BACK_LABEL, CHARACTER_MSG=30016 };
@@ -275,15 +300,7 @@ void f_2f9440(KCtx *g){
     int row=(s32)KH_RAX(g);
     if(!picking_character && row==character_row){
         KH_RAX(g)=(u32)-1;
-        if(kh_settings_look_locked()) return;
-        picking_character=1;
-        KCtx ctx=*g;
-        for(int i=0;i<=character_row;i++){
-            u64 field=save_widget(g,menu,i)+0x1f8;
-            root_labels[i]=rd64(g,field);
-            wr64(g,field,kh_call(&ctx,GS_BASE+0x3ad9a0,0x8000|(CHARACTER_MSG+(i==3?BACK_LABEL:i)),0,0,0));
-        }
-        kh_call5(&ctx,GS_BASE+0x2f8c90,menu,kh_settings_look(),1,0,2);
+        if(!kh_settings_look_locked()) atomic_store(&enter_character,1);
     }else if(picking_character && (row>=0 || row==-2 || row==-4)){
         if(row>=0 && row<3 && !kh_settings_look_locked()){
             choice_place=rd16(g,GS_BASE+0x717008);
@@ -296,6 +313,7 @@ void f_2f9440(KCtx *g){
     }
 }
 
+static int menu_catalog_test(void);
 static int notice_selftest(KCtx *g);
 static int next_multiplier(double,int);
 int kh_settings_selftest(KCtx *g){
@@ -349,6 +367,7 @@ int kh_settings_selftest(KCtx *g){
         fail|=next_multiplier(presets[i],1)!=presets[(i+1)%5] ||
               next_multiplier(presets[i],0)!=presets[(i+4)%5];
     fail|=next_multiplier(2.5,1)!=3 || next_multiplier(2.5,0)!=2;
+    fail|=menu_catalog_test();
     fail|=notice_selftest(g);
     unlink(path);rmdir(dir);
     fprintf(stderr,"kh: settings persistence and vector validation: %d failures\n",fail);
@@ -356,6 +375,16 @@ int kh_settings_selftest(KCtx *g){
 }
 static pthread_mutex_t config_lock=PTHREAD_MUTEX_INITIALIZER;
 static int kh_save_live_option(const char *,const char *,int,double);
+static _Atomic(const char *) live_choices[FRAME_LOG+1];
+const char *kh_menu_choice(const char *name){
+    for(int i=PAD;i<=FRAME_LOG;i++) if(!strcmp(name,kh_options[i].name)){
+        const char *v=atomic_load(&live_choices[i]);
+        if(v) return v;
+        break;
+    }
+    return getenv(name);
+}
+
 int kh_setting_set(const char *name,const char *value){
     double v; int i=validate(name,value,&v);
     if(i<0) return -1;
@@ -378,17 +407,24 @@ int kh_setting_set(const char *name,const char *value){
     return kh_save_live_option(name,value,i,v);
 }
 static int kh_save_live_option(const char *name,const char *value,int i,double v){
-    const char *dir=getenv("KH_DOCS"); char docs[4096];
-#if KH_IOS_PATHS
-    const char *app=getenv("KH_APP_HOME");
-    if(app){
-        if(snprintf(docs,sizeof docs,"%s/Documents",app)>=(int)sizeof docs) return -1;
-        dir=docs;
-    }
-#endif
+    const char *dir=option_dir();
     pthread_mutex_lock(&config_lock);
-    int result=kh_run_is_selftest?0:dir?save_option(dir,name,value):(kh_setting_live(i)?0:-1);
+    int result=kh_run_is_selftest?0:save_option(dir,name,value);
     if(!result && kh_setting_live(i)) atomic_store(&values[i],v);
+    if(!result && ((i>=PAD && i<=FRAME_LOG) || strstr(name,"HUD_SCALE_") || !strcmp(name,"KHNMC_FOV_ZOOM"))){
+        /* The render and controller threads can keep reading these immutable strings. */
+        if(i==PAD || i==SWAP_AB || i==LOGO || i==NAMES || i==AUTO_SAVE){
+            static const char *const choices[]={"auto","positions","letters","0","1","cycle","mod","roxas","xion","xkb","all","menus"};
+            for(size_t j=0;j<sizeof choices/sizeof *choices;j++) if(!strcmp(value,choices[j])) live_choices[i]=choices[j];
+        }
+        extern void kh_menu_display_apply(const char *,const char *),kh_menu_tutorial(int),kh_menu_difficulty_labels(int);
+        if((i>=STYLE && i<=MENU_LAYOUT) || i==CREDIT || strstr(name,"HUD_SCALE_") || !strcmp(name,"KHNMC_FOV_ZOOM")) kh_menu_display_apply(name,value);
+        if(i==AUTO_SAVE) kh_autosave_init();
+        if(i==TUTORIAL) kh_menu_tutorial(!strcmp(value,"real"));
+        if(i==DIFF_LABEL) kh_menu_difficulty_labels((int)v);
+        if(i==FRAME_WORK) kh_frame_work=(int)v;
+        if(i==FRAME_LOG) kh_frame_log=(int)v;
+    }
     pthread_mutex_unlock(&config_lock);
     return result;
 }
@@ -399,9 +435,8 @@ static char *schedule_storage;
 static void init_notice_text(void);
 void kh_settings_init(void){
     init_notice_text();
-#if !KH_IOS_PATHS
+    test_log=getenv("KHNMC_TEST_CHEAT_LOG") && !strcmp(getenv("KHNMC_TEST_CHEAT_LOG"),"1");
     load_saved_options();
-#endif
     /* Older phone configs use the shorter spelling. */
     const char *present=getenv("KHNMC_PRESENT");
     if(present && *present && !getenv("KHNMC_GFX_PRESENT"))
@@ -440,7 +475,7 @@ void kh_settings_init(void){
         }else if(validate(key,v,&n)<0) reason="Invalid configured value";
         else if(i==LOOK && n && !kh_look_pack_ready((int)n)) reason="Xion asset pack incomplete";
         else if(!strcmp(key,"KHNMC_SCENE_ROXAS") && n && !kh_scene_pack_ready()) reason="Scene asset pack incomplete";
-        if(!reason && (!strcmp(key,"KHNMC_FOV_ZOOM") || !strncmp(key,"KHNMC_HUD_SCALE_",16))){
+        if(!reason && (!strcmp(key,"KHNMC_FOV_ZOOM") || !strcmp(key,"KHNMC_HUD_SCALE_CMD") || !strcmp(key,"KHNMC_HUD_SCALE_HP"))){
             const char *aspect=getenv("KHNMC_ASPECT");
             if(!aspect || strcmp(aspect,"fill")) reason="Requires fill aspect";
         }
@@ -460,7 +495,6 @@ void kh_settings_init(void){
         char *end;errno=0;mp_probe=strtoull(probe,&end,10);
         if(*probe<'0'||*probe>'9'||errno||*end||!mp_probe) kh_fatal(NULL,"settings-mp-probe-frame: %s",probe);
     }
-    test_log=getenv("KHNMC_TEST_CHEAT_LOG") && !strcmp(getenv("KHNMC_TEST_CHEAT_LOG"),"1");
     for(int i=0;i<COUNT;i++){
         const char *name=kh_options[i].name,*v=getenv(name);
         if(v){double n; if(validate(name,v,&n)<0) kh_fatal(NULL,"setting-value: %s=%s",name,v); values[i]=n;}
@@ -525,8 +559,12 @@ static void encode_system_text(u8 *out,const char *text){
             case '/': *out++=0x4b; break;
             case '>': *out++=0x65; break;
             case '-': *out++=0x2c; break;
+            case '+': *out++=0x2b; break;
+            case '_': *out++=0x2c; break;
+            case ',': *out++=0x4d; break;
+            case '&': *out++=0x86; break;
             case '.': *out++=0x4e; break;
-            default: kh_fatal(NULL,"settings-font-character: 0x%x",(unsigned char)c);
+            default: *out++=0x49; break; /* localized controller element or vendor name */
         }
     }
     *out=0;
@@ -553,16 +591,6 @@ invalid:
     atomic_store(&font_ready,-1);
 }
 /* Pad polling owns the cursor. The render thread reads it and the live options. */
-static _Atomic int cheats_available, cheat_row;
-void kh_title_cheats_available(int screen){
-    int previous=atomic_exchange(&cheats_available,screen);
-    if(test_log && screen==KH_TITLE_SETTINGS && screen!=previous)
-        fprintf(stderr,"kh: title GAME SETTINGS entered\n");
-    if(!screen) atomic_store(&cheat_row,0);
-}
-int kh_title_settings_key(void){
-    return atomic_load(&cheats_available) && !atomic_load(&cheat_row);
-}
 static int next_multiplier(double current,int right){
     static const int steps[]={1,2,3,5,10};
     if(right){
@@ -572,44 +600,268 @@ static int next_multiplier(double current,int right){
     for(int i=4;i>=0;i--) if(steps[i]<current) return steps[i];
     return 10;
 }
-int kh_title_cheats_pad(unsigned buttons){
-    static unsigned previous;
-    static int releasing;
-    unsigned down=buttons & ~previous;
-    previous=buttons;
-    if(releasing){releasing=buttons!=0;return releasing;}
-    if(!atomic_load(&cheats_available)) return 0;
-    int row=atomic_load(&cheat_row);
-    if(!row){
-        if(!(down&0x200)) return 0;
-        atomic_store(&cheat_row,HP);
-    }else if(down&(0x2000|0x200)){
-        atomic_store(&cheat_row,0); releasing=1;
-    }else if(down&3){
-        atomic_store(&cheat_row,HP+(row-HP+((down&1)?3:1))%4);
-    }else if(down&12){
-        double current=kh_live_setting_value(row);
-        int next=row<=MP?!current:next_multiplier(current,down&8);
-        char value[8];
-        snprintf(value,sizeof value,"%d",next);
-        if(kh_setting_set(kh_options[row].name,value)) kh_fatal(NULL,"title-cheats-save: %s",kh_options[row].name);
-        if(test_log) fprintf(stderr,"kh: title cheats %s=%s\n",kh_options[row].name,value);
+/* camp.2ld's first IMGZ picture contains the stock framed window and pointing hand. */
+static u8 camp_indices[65536],camp_clut[64];
+static _Atomic int camp_ready;
+static void load_camp_art(KCtx *g){
+    if(camp_ready) return;
+    KCtx ctx=*g;g=&ctx;
+    u64 key=ga_strdup("menu/us/camp.2ld");
+    int size=(int)kh_call(g,GS_BASE+0x3a09b0,key,0,0,0);
+    if(size<32 || size>16*1024*1024) kh_fatal(g,"settings-camp-layout-size: %d",size);
+    u64 bar=ga_alloc(size,16);
+    if(!bar || (int)kh_call(g,GS_BASE+0x3f9850,key,bar,0,0)!=size || rd32(g,bar)!=0x01524142)
+        kh_fatal(g,"settings-camp-layout-read");
+    u32 count=rd32(g,bar+4);
+    for(unsigned j=0;j<count && j<((unsigned)size-16)/16;j++){
+        u64 entry=bar+16+16*j;
+        if(rd32(g,entry)!=29) continue;
+        u32 off=rd32(g,entry+8),len=rd32(g,entry+12);
+        if(off>(unsigned)size || len>(unsigned)size-off || len<24) break;
+        u64 imgz=bar+off;
+        u32 index=rd32(g,imgz+8);
+        if(rd32(g,imgz)!=0x5a474d49 || !rd32(g,imgz+12) || index>len-8) break;
+        u32 pic=rd32(g,imgz+index),bytes=rd32(g,imgz+index+4);
+        if(pic>len || bytes>len-pic || bytes<64) break;
+        u64 im=imgz+pic;
+        u32 pixels=rd32(g,im+8),pal=rd32(g,im+16);
+        if(rd32(g,im)!=0x44474d49 || rd32(g,im+28)!=0x01000200 || rd32(g,im+12)!=65536 ||
+           rd32(g,im+20)!=64 || bytes<65536 || pixels>bytes-65536 || pal>bytes-64 || (rd32(g,im+60)&4)) break;
+        memcpy(camp_indices,hp(g,im+pixels),sizeof camp_indices);
+        memcpy(camp_clut,hp(g,im+pal),sizeof camp_clut);
+        camp_ready=1;break;
     }
+    ga_free(key);ga_free(bar);
+    if(!camp_ready) kh_fatal(g,"settings-camp-atlas-format");
+}
+uint32_t kh_menu_texel(unsigned x,unsigned y,uint32_t bg){
+    unsigned ix=(camp_indices[y*256+x/2]>>(4*(x&1)))&15;
+    const u8 *c=camp_clut+4*ix;
+    unsigned alpha=c[3]>128?128:c[3],color=0xff000000;
+    for(unsigned i=0;i<3;i++) color|=((c[2-i]*alpha+((bg>>(8*i))&255)*(128-alpha))/128)<<(8*i);
+    return color;
+}
+enum { ROOT, CHARACTER, CHEATS, CONTROLLER, DISPLAY, GAMEPLAY, ABOUT, ADVANCED, INPUT_TEST };
+static const char *const pages[]={"Roxas May Cry","Character","Cheats","Controller","Display","Gameplay","About","Advanced","Input test"};
+static _Atomic int title_screen,menu_open;
+static int page,row,component,advanced_row,direct_character,preview_look;
+enum { VALUE_CAP=1001 }; /* validate() caps persisted strings at 1000 bytes. */
+static char chosen[sizeof kh_options/sizeof *kh_options][VALUE_CAP];
+static const char *feedback;
+static pthread_mutex_t panel_lock=PTHREAD_MUTEX_INITIALIZER;
+static char input_device[48],input_element[48];
+void kh_menu_input_device(const char *device,const char *element){
+    pthread_mutex_lock(&panel_lock);
+    snprintf(input_device,sizeof input_device,"%.45s",device?:"");
+    snprintf(input_element,sizeof input_element,"%.45s",element?:"");
+    pthread_mutex_unlock(&panel_lock);
+}
+unsigned short kh_menu_map_buttons(unsigned short buttons,int nintendo){
+    const char *layout=kh_menu_choice("KHNMC_PAD_LAYOUT")?:"auto";
+    const char *ab=kh_menu_choice("KHNMC_PAD_SWAP_AB");
+    int xy=kh_pad_swap_xy(layout,nintendo,getenv("KHNMC_PAD_SWAP_XY"));
+    int swap=(!strcmp(layout,"letters")) ^ (ab && *ab=='1');
+    return (buttons&0xfff) | kh_pad_faces(buttons&0x1000,buttons&0x2000,buttons&0x4000,buttons&0x8000,xy,swap);
+}
+static u8 panel_text[KH_MENU_TEXT_SIZE];
+
+void kh_menu_title(int screen){
+    int previous=atomic_exchange(&title_screen,screen);
+    if(test_log && screen==KH_TITLE_SETTINGS && screen!=previous) fprintf(stderr,"kh: title GAME SETTINGS entered\n");
+}
+int kh_menu_active(void){return menu_open;}
+int kh_title_settings_key(void){return title_screen && !menu_open;}
+enum { INPUT_ROW=-1, ADVANCED_ROW=-2 };
+static int section_rows(int section,int *ids){
+    int n=0;
+    for(int i=0;i<kh_setting_menu_count();i++){
+        int group=ADVANCED;
+        if(i==LOOK) group=CHARACTER;
+        else if(i>=HP && i<=DROP) group=CHEATS;
+        else if(i==PAD || i==SWAP_AB) group=CONTROLLER;
+        else if(i==HUD_COMBO || (i>=STYLE && i<=CREDIT) || (i==FRAME_WORK || i==FRAME_LOG) ||
+                strstr(kh_options[i].name,"HUD_SCALE_") || !strcmp(kh_options[i].name,"KHNMC_FOV_ZOOM")) group=DISPLAY;
+        else if(i>=TUTORIAL && i<=DIFF_LABEL) group=GAMEPLAY;
+        if(group==section) ids[n++]=i;
+    }
+    if(section==CONTROLLER) ids[n++]=INPUT_ROW;
+    if(section==GAMEPLAY) ids[n++]=ADVANCED_ROW;
+    return n;
+}
+static int menu_catalog_test(void){
+    int ids[sizeof kh_options/sizeof *kh_options+1],seen[sizeof kh_options/sizeof *kh_options]={0};
+    for(int section=CHARACTER;section<=ADVANCED;section++){
+        int n=section_rows(section,ids);
+        if(!n && section!=ABOUT) return 1;
+        for(int j=0;j<n;j++) if(ids[j]>=0) seen[ids[j]]++;
+    }
+    for(int i=0;i<kh_setting_menu_count();i++){
+        u8 encoded[128];
+        encode_system_text(encoded,kh_options[i].label);
+        double value;
+        if(seen[i]!=1 || validate(kh_options[i].name,kh_options[i].initial,&value)!=i) return 1;
+    }
+    return 0;
+}
+static void option_text(int i,char *out,size_t cap){
+    if(i==LOOK){
+        static const char *const names[]={"roxas","xion","xion-hooded"};
+        snprintf(out,cap,"%s",kh_settings_look_locked()?"Xion (locked)":names[direct_character?preview_look:kh_settings_look()]);
+    }else if(kh_setting_live(i)) snprintf(out,cap,"%g",kh_live_setting_value(i));
+    else snprintf(out,cap,"%s",chosen[i][0]?chosen[i]:getenv(kh_options[i].name)?:kh_options[i].initial);
+}
+static const char *timing(int i,int point){
+    if(i<0) return "A to open";
+    if(i==LOOK) return kh_settings_look_locked()?"Character locked":point?(direct_character?"A to confirm   B to cancel":"Applies when menu closes"):"Change at a save point";
+    const char *reason=kh_setting_unavailable(i);
+    if(reason) return reason;
+    if(kh_setting_action(i)) return "A to queue on close";
+    if(i==LOGO) return "Next title load";
+    if(i==NAMES) return "Next text lookup";
+    if(i==TUTORIAL) return "Next tutorial fight";
+    if(i==DIFF_LABEL) return "Next save list";
+    if(i==HUD_COMBO || i<=FRAME_LOG || strstr(kh_options[i].name,"HUD_SCALE_") || !strcmp(kh_options[i].name,"KHNMC_FOV_ZOOM")) return "Applies immediately";
+    return "Applies on next launch";
+}
+static void edit_row(KCtx *g,int i,int direction,int point){
+    const struct kh_option *o=&kh_options[i];
+    if(kh_setting_unavailable(i) || (i==LOOK && (!point || kh_settings_look_locked()))) return;
+    char old[VALUE_CAP],value[VALUE_CAP];option_text(i,old,sizeof old);
+    if(o->choices){
+        char list[128];snprintf(list,sizeof list,"%s",o->choices);
+        char *rest=list,*v,*choices[16];int count=0,index=0;
+        while((v=strsep(&rest,"|"))){if(!strcmp(old,v)) index=count;choices[count++]=v;}
+        snprintf(value,sizeof value,"%s",choices[(index+direction+count)%count]);
+    }else if(i==EXP || i==DROP) snprintf(value,sizeof value,"%d",next_multiplier(atof(old),direction>0));
+    else{
+        char *field=old;
+        for(int j=0;j<component;j++){field=strchr(field,',');if(!field) return;field++;}
+        char *end;double number=strtod(field,&end);
+        snprintf(value,sizeof value,"%.*s%.8f",(int)(field-old),old,fmin(o->maximum,fmax(o->minimum,number+direction*o->step)));
+        char *tail=value+strlen(value);while(tail>value && tail[-1]=='0') tail--;
+        if(tail>value && tail[-1]=='.') tail--;
+        if(strlen(end)>=sizeof value-(size_t)(tail-value)){feedback="Value too long";return;}
+        strcpy(tail,end);
+    }
+    if(i==LOOK){
+        int target=!strcmp(value,"roxas")?0:!strcmp(value,"xion")?1:2;
+        if(target && !kh_look_pack_ready(target)){feedback="Missing character pack";return;}
+        choice_place=rd16(g,GS_BASE+0x717008);
+        atomic_store(&look_request,3+target);
+    }else if(!strcmp(o->name,"KHNMC_SCENE_ROXAS") && !strcmp(value,"1") && !kh_scene_pack_ready()){
+        feedback="Scene asset pack incomplete"; return;
+    }else if(!kh_setting_action(i) && kh_setting_set(o->name,value)){
+        kh_warn("settings-save: %s",o->name); feedback="Could not save option";return;
+    }
+    snprintf(chosen[i],sizeof chosen[i],"%s",value);
+    if(test_log) fprintf(stderr,"kh: RMC %s=%s\n",o->name,value);
+}
+int kh_menu_pad(struct KCtx *g,unsigned buttons,int lt,int rt,int lx,int ly,int rx,int ry){
+    static unsigned previous;static int releasing;
+    unsigned down=buttons & ~previous;previous=buttons;
+    if(releasing){releasing=buttons!=0;return releasing;}
+    int chord=(buttons&0x50)==0x50 && (down&0x50);
+    if(!menu_open){
+        direct_character=atomic_exchange(&enter_character,0);
+        if(!direct_character && !chord && !(title_screen && (down&0x200))) return 0;
+        if(!direct_character && !title_screen && !rd8(g,GS_BASE+0x9006b0)){
+            if(!kh_route_cond_eval(g,KR_FIELD,0,kh_game_frames(),NULL)) return 0;
+            if(rd64(g,GS_BASE+0x9ba928) || rd8(g,GS_BASE+0x9ba8d1)) return 0;
+        }
+        preview_look=kh_settings_look();
+        load_camp_art(g);
+        page=direct_character?CHARACTER:ROOT;row=component=0;feedback=NULL;menu_open=1;down=0;chord=0;
+    }
+    int ids[sizeof kh_options/sizeof *kh_options+1];
+    int n=page==ROOT?ABOUT:section_rows(page,ids);
+    int i=n && page!=ROOT?ids[row]:-1;
+    int point=!title_screen && g && page==CHARACTER && kh_route_at_save_point(g);
+    if(down && page!=INPUT_TEST){
+        KCtx ctx=*g;
+        kh_call(&ctx,GS_BASE+0x2eb740,(down&0x2000)?3:(down&0x1000)?2:1,1,0,0);
+    }
+    int before=page;
+    if(down) feedback=NULL;
+    if(page==INPUT_TEST){
+        if(chord){page=CONTROLLER;row=2;}
+    }else if(title_screen && page==CHEATS && (down&0x200)){
+        menu_open=0;releasing=1;return 1;
+    }else if(chord || (down&0x2000)){
+        if(page==ROOT || chord || direct_character){menu_open=0;releasing=1;return 1;}
+        if(page==ADVANCED){page=GAMEPLAY;row=advanced_row;}
+        else {row=page-1;page=ROOT;}
+        component=0;
+    }else if(direct_character && (down&15) && point && !kh_settings_look_locked()){
+        preview_look=(preview_look+((down&5)?2:1))%3;
+    }else if(n && (down&3)){row=(row+n+((down&1)?-1:1))%n;component=0;}
+    else if(down&0x1000){
+        if(direct_character){
+            if(point && !kh_settings_look_locked() && preview_look!=kh_settings_look()){
+                if(preview_look && !kh_look_pack_ready(preview_look)){feedback="Missing character pack";}
+                else{
+                    choice_place=rd16(g,GS_BASE+0x717008);
+                    atomic_store(&look_request,3+preview_look);
+                    if(getenv("KHNMC_TEST_LOOK_DIGEST")) kh_warn("save-character chose %d",preview_look);
+                }
+            }
+            if(!feedback){menu_open=0;releasing=1;return 1;}
+        }
+        if(page==ROOT){page=row+1;row=0;}
+        else if(i==ADVANCED_ROW){advanced_row=row;page=ADVANCED;row=0;}
+        else if(i==INPUT_ROW && page==CONTROLLER) page=INPUT_TEST;
+        else if(i>=0 && kh_setting_action(i)){
+            char value[VALUE_CAP];option_text(i,value,sizeof value);
+            feedback=kh_setting_set(kh_options[i].name,value)?"Command unavailable":"Command queued";
+        }
+    }else if(page!=ROOT && i>=0 && (down&12)) edit_row(g,i,(down&8)?1:-1,point);
+    else if(page==ADVANCED && i>=0 && (down&0x300)){
+        int fields=1;for(const char *p=kh_options[i].initial;*p;p++) fields+=*p==',';
+        component=(component+fields+((down&0x200)?1:-1))%fields;
+    }
+    if(test_log && before!=page) fprintf(stderr,"kh: RMC section %s frame=%llu\n",pages[page],(unsigned long long)kh_game_frames());
+    char buf[KH_MENU_TEXT_SIZE];int used=snprintf(buf,sizeof buf,"%s\n",pages[page]);
+    if(page==ABOUT) snprintf(buf+used,sizeof buf-used,"Version 0.1.0\nBuild T87  %s\nB to return",__DATE__);
+    else if(page==INPUT_TEST){
+        pthread_mutex_lock(&panel_lock);
+        if(input_device[0]) used+=snprintf(buf+used,sizeof buf-used,"%s\n",input_device);
+        if(input_element[0]) used+=snprintf(buf+used,sizeof buf-used,"Raw: %s\n",input_element);
+        pthread_mutex_unlock(&panel_lock);
+        static const char *const names[]={"Up","Down","Left","Right","Options","Create","L3","R3","L1","R1","","","Cross","Circle","Square","Triangle"};
+        for(int bit=0;bit<16;bit++) if(buttons&(1u<<bit))
+            used+=snprintf(buf+used,sizeof buf-used,"%s ",names[bit]);
+        snprintf(buf+used,sizeof buf-used,"\nLT %d  RT %d\nLeft %d / %d\nRight %d / %d\nL3 and Options to return",lt,rt,lx,ly,rx,ry);
+    }
+    else{
+        n=page==ROOT?ABOUT:section_rows(page,ids);
+        int first=row<5?0:row-4;
+        for(int j=first;j<n && j<first+6;j++){
+            int opt=page==ROOT?-1:ids[j];
+            const char *label=page==ROOT?pages[j+1]:opt==INPUT_ROW?"Input test":opt==ADVANCED_ROW?"Advanced":kh_options[opt].label;
+            char value[VALUE_CAP]="";
+            if(opt>=0) option_text(opt,value,sizeof value);
+            used+=snprintf(buf+used,sizeof buf-used,"%c %.42s%s%.32s\n",j==row?'>':' ',label,opt>=0?": ":"",value);
+        }
+        const char *hint=page==ROOT?"A to open   B to close":timing(ids[row],point);
+        if(page==ADVANCED && strchr(kh_options[ids[row]].initial,',')){
+            char value[VALUE_CAP];option_text(ids[row],value,sizeof value);
+            char *part=value;
+            for(int k=0;k<component && part;k++) {part=strchr(part,',');if(part) part++;}
+            if(part) used+=snprintf(buf+used,sizeof buf-used,"L1/R1 value %d: %.*s\n",component+1,(int)fmin(32,strcspn(part,",")),part);
+        }
+        if(page==ADVANCED && before!=page) feedback=kh_cut_menu_status();
+        snprintf(buf+used,sizeof buf-used,"%s",feedback?:hint);
+    }
+    pthread_mutex_lock(&panel_lock);encode_system_text(panel_text,buf);pthread_mutex_unlock(&panel_lock);
     return 1;
 }
-int kh_title_cheats_text(uint8_t text[KH_CHEAT_TEXT_SIZE]){
-    if(!atomic_load(&cheats_available)) return 0;
+int kh_menu_text(uint8_t text[KH_MENU_TEXT_SIZE]){
+    if(!menu_open && !title_screen) return 0;
     int ready=atomic_load(&font_ready);
-    if(ready<0) kh_fatal(NULL,"title-cheats-font: unsupported system font");
+    if(ready<0) kh_fatal(NULL,"settings-menu-font: unsupported system font");
     if(!ready) return 0;
-    int row=atomic_load(&cheat_row);
-    char buf[KH_CHEAT_TEXT_SIZE];
-    if(!row) strcpy(buf,"R1/RB  CHEATS");
-    else snprintf(buf,sizeof buf,"CHEATS\n%c Infinite HP: %s\n%c Infinite MP: %s\n%c EXP: x%g\n%c Drop rate: x%g\nD-pad to change   R1/RB to close",
-        row==HP?'>':' ',values[HP]?"On":"Off",row==MP?'>':' ',values[MP]?"On":"Off",
-        row==EXP?'>':' ',(double)values[EXP],row==DROP?'>':' ',(double)values[DROP]);
-    encode_system_text(text,buf);
-    return 1;
+    if(!menu_open){encode_system_text(text,"R1/RB  Roxas May Cry");return 1;}
+    pthread_mutex_lock(&panel_lock);memcpy(text,panel_text,sizeof panel_text);pthread_mutex_unlock(&panel_lock);
+    return text[0]?2:0;
 }
 static const u8 *visible_notice(u64 state,u64 now){
     return now<(state & ~7ull)?look_text[state & 7]:NULL;
@@ -953,11 +1205,11 @@ void kh_settings_frame(KCtx *g,uint64_t frame){
     if(g && !voice_busy && !gauge_pending && !deferred_resources){
         int request=atomic_load(&look_request);
         if(request>=3){
-            if(rd8(g,GS_BASE+0x9006b0) || kh_route_cond_eval(g,KR_BATTLE,0,frame,NULL)) request=-1;
+            if(menu_open || rd8(g,GS_BASE+0x9006b0) || kh_route_cond_eval(g,KR_BATTLE,0,frame,NULL)) request=-1;
             else if(rd16(g,GS_BASE+0x717008)!=choice_place || !kh_route_at_save_point(g) || kh_settings_look_locked()){
                 atomic_compare_exchange_strong(&look_request,&request,-1);
                 request=-1;
-            }
+            }else if(!kh_route_cond_eval(g,KR_FIELD,0,frame,NULL)) request=-1;
         }
         if(request>=0 && !atomic_compare_exchange_strong(&look_request,&request,-1)) request=-1;
         if(request>=0 || last_switch) look_frame(g,request,frame);
@@ -968,7 +1220,7 @@ void kh_settings_frame(KCtx *g,uint64_t frame){
         kh_call(g,GS_BASE+0x3d3cf0,p.obj,(u32)-1,0,0);
         fprintf(stderr,"kh: test MP cost frame=%llu before=%d after=%d\n",(unsigned long long)frame,p.mp,(s32)rd32(g,p.sheet+0x180));
     }
-    if(!debug_enabled) return;
+    if(!debug_enabled || kh_menu_active()) return;
     pthread_mutex_lock(&config_lock);
     int cmd=debug_pending,arg[6];memcpy(arg,debug_arg,sizeof arg);debug_pending=-1;
     pthread_mutex_unlock(&config_lock);
@@ -1057,7 +1309,7 @@ void f_3dc170(KCtx *g){
 void kh_rewind_look(KhRecords *r){
     u64 legacy_notice=0; /* former guest message buffer slot */
     KH_RECORD(r,legacy_notice);
-    if(r->loading) atomic_store(&notice,0);
+    if(r->loading){notice=0;menu_open=0;enter_character=0;}
     KH_RECORD(r,art);
     KH_RECORD(r,held_resources);
     KH_RECORD(r,deferred_resources);

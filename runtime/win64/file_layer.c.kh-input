@@ -216,7 +216,7 @@ u64 kh_look_name(KCtx *g,int id,u64 original){
     switch(id&0x7fff){
     case 0x377a: case 0x48bc: case 0x491a: case 0x4ed9: case 0x4f43: return original;
     }
-    const char *policy=getenv("KHNMC_LOOK_NAMES");
+    const char *policy=kh_menu_choice("KHNMC_LOOK_NAMES");
     int menus=policy && !strcmp(policy,"menus"),matched=0;
     if(policy && *policy && !menus && strcmp(policy,"all")) kh_fatal(g,"look-name-policy: expected all or menus");
     const u8 *src=hp(g,original);
@@ -429,7 +429,7 @@ static int title_logo(void){
     static int selected[2];
     static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&lock);
-    int id=choose_title_logo(getenv("KHNMC_TITLE_LOGO"),kh_look_enabled(),kh_autosave_documents(),selected);
+    int id=choose_title_logo(kh_menu_choice("KHNMC_TITLE_LOGO"),kh_look_enabled(),kh_autosave_documents(),selected);
     pthread_mutex_unlock(&lock);
     if(id){   /* the logo pack is a local, optional add-on: without its files the title keeps the mod's own logo (never a stop) */
         static _Atomic int warned;

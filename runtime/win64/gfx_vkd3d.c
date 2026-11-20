@@ -1329,7 +1329,7 @@ void kh_vkd3d_serialize_rootsig(KCtx *g){
  * check, the gate, a fence signalled on the queue and waited for (in slices), and the presenter's own submissions. */
 typedef struct Swap { struct KhSwapGeneration *generation; u64 obj; ID3D12CommandQueue *queue; ID3D12Device *dev; ID3D12Resource *buf[NBUF]; u32 w,h;
     ID3D12CommandAllocator *alloc; ID3D12GraphicsCommandList *list; ID3D12Fence *fence; u64 fence_val;
-    ID3D12Resource *notice_upload; u8 notice_text[KH_CHEAT_TEXT_SIZE]; unsigned notice_scale, notice_width, notice_height;
+    ID3D12Resource *notice_upload; u8 notice_text[KH_MENU_TEXT_SIZE]; unsigned notice_scale, notice_width, notice_height;
     ID3D12Resource *rb; u64 rb_size; D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp; u8 *seen;
     int bbmode; const KhVk *vk; VkImage img[NBUF]; VkDeviceMemory mem[NBUF]; KhPresenter *pres; } Swap;
 static Swap *swap_of(KCtx *g,u64 o,const char *what){ Swap *s=(Swap*)(uintptr_t)rd64(g,o+SW_PTR); if(!s||s->obj!=o) kh_fatal(g,"gfx-swapchain-state: %s on swap chain 0x%llx that has no vkd3d back buffers",what,P(o)); return s; }
@@ -1586,18 +1586,21 @@ static void draw_look_notice(KCtx *g,Swap *s,u32 idx,u64 n,const u8 *text,int ti
     unsigned scale=(s->w<s->h?s->w:s->h)/600;
     if(!scale) scale=1;
     if(scale>4) scale=4;
-    unsigned h=s->notice_height;
+    if(title==2 && scale<3 && 440*(scale+1)<=s->w) scale++;
+    unsigned requested_scale=scale,h=s->notice_height;
     if(strcmp((const char*)text,(const char*)s->notice_text) || scale!=s->notice_scale){
-        unsigned w=16,line=16,lines=1,advance[KH_CHEAT_TEXT_SIZE];
+        unsigned inset=title==2?42:8;
+        unsigned w=title==2?440:16,line=inset*2,lines=1,advance[KH_MENU_TEXT_SIZE];
         for(unsigned i=0;text[i];i++){
-            if(text[i]==2){line=16;lines++;advance[i]=0;continue;}
+            if(text[i]==2){line=inset*2;lines++;advance[i]=0;continue;}
             unsigned ink=0;
             if(text[i]!=1) for(unsigned x=0;x<18;x++) for(unsigned y=0;y<24;y++)
                 if(glyph_ink(text[i],x,y)) ink=x+1;
             advance[i]=text[i]==1?6:ink+1;
             line+=advance[i]; if(line>w) w=line;
         }
-        h=(8+24*lines)*scale; w*=scale;
+        if(title==2 && w*scale>s->w) scale=s->w/w?s->w/w:1;
+        h=((title==2?40:8)+24*lines)*scale; w*=scale;
         unsigned pitch=(w*4+255)&~255u;
         D3D12_HEAP_PROPERTIES heap={.Type=D3D12_HEAP_TYPE_UPLOAD};
         D3D12_RESOURCE_DESC desc={.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER,.Width=pitch*h,.Height=1,
@@ -1610,14 +1613,32 @@ static void draw_look_notice(KCtx *g,Swap *s,u32 idx,u64 n,const u8 *text,int ti
         const u32 colors[]={0xff203040,0xff647383,0xffaab5c0,0xffffffff};
         for(unsigned y=0;y<h;y++) for(unsigned x=0;x<w;x++)
             pixels[y*(pitch/4)+x]=y<scale||y>=h-scale?colors[1]:colors[0];
-        for(unsigned i=0,left=8,top=4;text[i];left+=advance[i++]){
-            if(text[i]==2){left=8;top+=24;continue;}
+        if(title==2){
+            unsigned width=w/scale,height=h/scale;
+            for(unsigned y=0;y<h;y++) for(unsigned x=0;x<w;x++){
+                unsigned px=x/scale,py=y/scale;
+                unsigned u=px<16?px:px>=width-16?79-(width-px):38;
+                unsigned v=py<16?py:py>=height-16?64-(height-py):32;
+                pixels[y*(pitch/4)+x]=kh_menu_texel(114+u,v,0xff101421);
+            }
+        }
+        for(unsigned i=0,left=inset,top=title==2?18:4;text[i];left+=advance[i++]){
+            if(text[i]==2){left=inset;top+=24;continue;}
             if(text[i]==1) continue;
-            for(unsigned y=0;y<24*scale;y++) for(unsigned x=0;x<(advance[i]-1)*scale;x++)
-                pixels[(top*scale+y)*(pitch/4)+left*scale+x]=colors[glyph_ink(text[i],x/scale,y/scale)];
+            if(title==2 && text[i]==0x65){
+                for(unsigned y=0;y<24*scale;y++) for(unsigned x=0;x<36*scale;x++){
+                    u32 *p=pixels+(top*scale+y)*(pitch/4)+(inset-34)*scale+x;
+                    *p=kh_menu_texel(108+x/scale,111+y/scale,*p);
+                }
+                continue;
+            }
+            for(unsigned y=0;y<24*scale;y++) for(unsigned x=0;x<(advance[i]-1)*scale;x++){
+                unsigned ink=glyph_ink(text[i],x/scale,y/scale);
+                if(ink || title!=2) pixels[(top*scale+y)*(pitch/4)+left*scale+x]=colors[ink];
+            }
         }
         ID3D12Resource_Unmap(s->notice_upload,0,NULL);
-        s->notice_width=w; s->notice_scale=scale; s->notice_height=h; strcpy((char*)s->notice_text,(const char*)text);
+        s->notice_width=w; s->notice_scale=requested_scale; s->notice_height=h; strcpy((char*)s->notice_text,(const char*)text);
     }
     unsigned w=s->notice_width;
     if(w>s->w || h>s->h) return;
@@ -1626,7 +1647,7 @@ static void draw_look_notice(KCtx *g,Swap *s,u32 idx,u64 n,const u8 *text,int ti
     D3D12_TEXTURE_COPY_LOCATION dst={.pResource=s->buf[idx],.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
     begin_frame_copy(g,s);
     barrier(s->list,s->buf[idx],D3D12_RESOURCE_STATE_PRESENT,D3D12_RESOURCE_STATE_COPY_DEST);
-    ID3D12GraphicsCommandList_CopyTextureRegion(s->list,&dst,title?s->w/40:(s->w-w)/2,title?s->h/20:(s->h-h)/5,0,&src,NULL);
+    ID3D12GraphicsCommandList_CopyTextureRegion(s->list,&dst,title==1?s->w/40:(s->w-w)/2,title==2?(s->h-h)/2:title?s->h/20:(s->h-h)/5,0,&src,NULL);
     barrier(s->list,s->buf[idx],D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_PRESENT);
     finish_frame_copy(g,s,n,"Present (appearance notice)");
 }
@@ -1798,9 +1819,9 @@ void kh_vkd3d_present(KCtx *g,u64 o,u64 n){
     memlow_check(n);                                                    /* review X38 n=2: the gfx-memory-low soft stop, before a dump allocates */
     u32 idx=rd32(g,o+40)%NBUF;
     int want_dump=dump_dir[0]&&n>=dump_from&&n<=dump_to&&n%dump_every==0, want_video=video_wanted(), want_hash=hash_f!=NULL, want_band=band_f!=NULL;
-    u8 cheats[KH_CHEAT_TEXT_SIZE];
-    int title=kh_title_cheats_text(cheats);
-    const u8 *notice=title?cheats:kh_look_notice();
+    u8 panel[KH_MENU_TEXT_SIZE];
+    int title=kh_menu_text(panel);
+    const u8 *notice=title?panel:kh_look_notice();
     if(notice) draw_look_notice(g,s,idx,n,notice,title);
     if(cut_dumps){ want_dump=1; cut_dumps--; }
     if(want_dump||want_video||want_hash||want_band){
