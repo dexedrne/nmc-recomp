@@ -11,20 +11,23 @@
 #   tools/publish/export.sh --push     the same, then push branch main to $KHNMC_PUBLISH_URL as $KHNMC_PUBLISH_USER
 #
 # env: KHNMC_PUBLISH_RULES (default ~/.config/khnmc/publish-rules.tsv; private, never committed)
+#      KHNMC_PUBLISH_SOURCE optionally selects a clean input clone for this copy of the publishing tools
+#      KHNMC_PUBLISH_EXPECTED_MAIN permits replacement only if the remote still has that full commit ID
 #      KHNMC_PUBLISH_URL   https URL of the remote (required for --push)
 #      KHNMC_PUBLISH_USER  account whose token `gh auth token --user` gives (required for --push); the active gh account is
 #                          never switched and no credential helper stores the token
 # Exit status: 0 done, 1 the scan found something or a step failed (nothing is pushed), 2 usage.
 set -u
 HERE=$(cd "$(dirname "$0")/../.." && pwd)
+SOURCE=${KHNMC_PUBLISH_SOURCE:-$HERE}
 RULES=${KHNMC_PUBLISH_RULES:-$HOME/.config/khnmc/publish-rules.tsv}
 OUT=${KHNMC_PUBLISH_DIR:-$HOME/work/khnmc-publish}
 PUSH=0; [ "${1:-}" = "--push" ] && PUSH=1
 [ $# -le 1 ] && { [ $# -eq 0 ] || [ $PUSH = 1 ]; } || { sed -n 2,18p "$0"; exit 2; }
 [ -f "$RULES" ] || { echo "export: no rules file $RULES" >&2; exit 2; }
-[ -z "$(git -C "$HERE" status --porcelain)" ] || { echo "export: the working repository has uncommitted changes: commit first" >&2; exit 1; }
+[ -z "$(git -C "$SOURCE" status --porcelain)" ] || { echo "export: the working repository has uncommitted changes: commit first" >&2; exit 1; }
 SCRUB="$HERE/tools/publish/scrub.py"
-rm -rf "$OUT.new" && git clone -q --no-local --single-branch --branch main "$HERE" "$OUT.new" || exit 1
+rm -rf "$OUT.new" && git clone -q --no-local --single-branch --branch main "$SOURCE" "$OUT.new" || exit 1
 cd "$OUT.new" || exit 1
 git remote remove origin
 FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch -f \
@@ -38,7 +41,12 @@ rm -rf "$OUT" && mv "$OUT.new" "$OUT" && cd "$OUT" || exit 1
 [ $PUSH = 1 ] || { echo "export: built in $OUT (not pushed)"; exit 0; }
 : "${KHNMC_PUBLISH_URL:?set KHNMC_PUBLISH_URL}" "${KHNMC_PUBLISH_USER:?set KHNMC_PUBLISH_USER}"
 gh auth token --user "$KHNMC_PUBLISH_USER" > /dev/null 2>&1 || { echo "export: no gh token for $KHNMC_PUBLISH_USER" >&2; exit 1; }
+lease=()
+if [ -n "${KHNMC_PUBLISH_EXPECTED_MAIN:-}" ]; then
+    [[ "$KHNMC_PUBLISH_EXPECTED_MAIN" =~ ^[0-9a-f]{40}$ ]] || { echo "export: expected main must be a full object ID" >&2; exit 2; }
+    lease=("--force-with-lease=refs/heads/main:$KHNMC_PUBLISH_EXPECTED_MAIN")
+fi
 git -c credential.https://github.com.helper= \
     -c "credential.https://github.com.helper=!f() { test \"\$1\" = get || exit 0; echo username=$KHNMC_PUBLISH_USER; echo \"password=\$(gh auth token --user $KHNMC_PUBLISH_USER)\"; }; f" \
-    push "$KHNMC_PUBLISH_URL" main:main || { echo "export: push refused (a non-fast-forward means the rules or the history changed: look before forcing)" >&2; exit 1; }
+    push "${lease[@]}" "$KHNMC_PUBLISH_URL" main:main || { echo "export: push refused (a non-fast-forward means the rules or the history changed: look before forcing)" >&2; exit 1; }
 echo "export: pushed main to $KHNMC_PUBLISH_URL as $KHNMC_PUBLISH_USER"
