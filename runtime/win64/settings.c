@@ -712,7 +712,8 @@ static void option_text(int i,char *out,size_t cap){
 }
 static const char *timing(int i,int point){
     if(i<0) return "A to open";
-    if(i==LOOK) return kh_settings_look_locked()?"Character locked":point?(direct_character?"A to confirm   B to cancel":"Applies when menu closes"):"Change at a save point";
+    if(i==LOOK) return kh_settings_look_locked()?"Character locked":point?(direct_character?"A to confirm   B to cancel":"Applies when menu closes"):
+                       title_screen?"Left / Right to change (next game)":"Change at a save point";
     const char *reason=kh_setting_unavailable(i);
     if(reason) return reason;
     if(kh_setting_action(i)) return "A to queue on close";
@@ -725,7 +726,9 @@ static const char *timing(int i,int point){
 }
 static void edit_row(KCtx *g,int i,int direction,int point){
     const struct kh_option *o=&kh_options[i];
-    if(kh_setting_unavailable(i) || (i==LOOK && (!point || kh_settings_look_locked()))) return;
+    /* Owner 2026-11-20 ("its only on xion hooded i cant change it", on the title): no game is loaded at the title, so Character can
+     * change there too (stored for the next New Game / Load); in a game it still needs a save point. */
+    if(kh_setting_unavailable(i) || (i==LOOK && ((!point && !title_screen) || kh_settings_look_locked()))) return;
     char old[VALUE_CAP],value[VALUE_CAP];option_text(i,old,sizeof old);
     if(o->choices){
         char list[128];snprintf(list,sizeof list,"%s",o->choices);
@@ -746,8 +749,14 @@ static void edit_row(KCtx *g,int i,int direction,int point){
     if(i==LOOK){
         int target=!strcmp(value,"roxas")?0:!strcmp(value,"xion")?1:2;
         if(target && !kh_look_pack_ready(target)){feedback="Missing character pack";return;}
-        choice_place=rd16(g,GS_BASE+0x717008);
-        atomic_store(&look_request,3+target);
+        if(title_screen && !point){
+            kh_look_set(g,target);
+            if(kh_save_live_option(o->name,value,i,target)){kh_warn("settings-save: %s",o->name); feedback="Could not save option";return;}
+            feedback="Set for the next game you start or load";
+        }else{
+            choice_place=rd16(g,GS_BASE+0x717008);
+            atomic_store(&look_request,3+target);
+        }
     }else if(!strcmp(o->name,"KHNMC_SCENE_ROXAS") && !strcmp(value,"1") && !kh_scene_pack_ready()){
         feedback="Scene asset pack incomplete"; return;
     }else if(!kh_setting_action(i) && kh_setting_set(o->name,value)){
