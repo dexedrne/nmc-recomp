@@ -1,3 +1,4 @@
+#include "rmc.h"
 #include "savestate.h"
 #include "settings.h"
 #include "khnmc_rt.h"
@@ -121,7 +122,25 @@ void f_105e10(KCtx *g){
     if(kh_cut_enabled) kh_cut_frame(g,atomic_load(&game_frames)+1);
     kh_game_frame_step(g);
 }
+/* NMC V0.20 lines 7505–7516. Check the low halfword exactly as the EE joker does.
+   The upper bytes can contain an independent pause lock. */
+static void ending_pause_frame(KCtx *g){
+    static int enabled = -1;
+    if(enabled < 0){
+        extern int kh_tweak_boolean(KCtx *,const char *,int);
+        enabled = kh_tweak_boolean(g,"KHNMC_RMC_ENDING_PAUSE",kh_rmc_find("rmc-package-1") != NULL);
+    }
+    if(!enabled || rd16(g,GS_BASE+0xabb878) != 2) return;
+    u16 room = rd16(g,GS_BASE+0x717008);
+    u16 event = rd16(g,GS_BASE+0x717010);
+    if(room == 0x1412 && event == 74)
+        wr8(g,GS_BASE+0x9ab540+0x24f,0); /* TWTNW progress 0x4878 through 0x487f */
+    else if(room != 1 || event <= 50 || event >= 62)
+        return;
+    wr8(g,GS_BASE+0xabb878,0);
+}
 void kh_game_frame_step(KCtx *g){
+    ending_pause_frame(g);
     u64 n=atomic_fetch_add(&game_frames,1)+1;
     extern int kh_phase_title_alive(void);
     int title=KH_TITLE_CLOSED;
@@ -132,6 +151,7 @@ void kh_game_frame_step(KCtx *g){
     kh_menu_title(title);
     kh_frame_time(g,n);
     extern void kh_settings_frame(KCtx *,uint64_t); kh_settings_frame(g,n);
+    extern void kh_ps2_castle_frame(KCtx *); kh_ps2_castle_frame(g);
     extern void kh_retry_frame(KCtx *); kh_retry_frame(g);
     extern void kh_shortcut_frame(KCtx *); kh_shortcut_frame(g);
     extern void kh_test_resize_frame(u64); kh_test_resize_frame(n);
