@@ -95,7 +95,7 @@ esac
 grep -a "guest space\|host dirs\|NOT RUN:\|selftest: [0-9]* checks\|SKIPPED\|FAIL\|process exit\|kh: gfx: draws" "$OUT/run.out" 2>/dev/null | cut -c1-240 | tail -80
 if [ "$MODE" = selftest ]; then
   if cp "$DOCS/touch-controller.txt" "$OUT/touch-controller.txt" && grep -qx PASS "$OUT/touch-controller.txt"; then
-    say "virtual extended profile and simultaneous touch button masks passed"
+    say "touch shortcut, overlapping pad-0 chord and independent stick releases passed"
   else
     say "simulator-touch-controller: missing or failed result"; [ "$rc" != 0 ] || rc=1
   fi

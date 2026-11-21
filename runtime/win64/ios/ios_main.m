@@ -70,9 +70,6 @@ static short pad_axis(float v){ if(!(v>=-1.0f)) v=-1.0f; if(v>1.0f) v=1.0f; retu
 static unsigned char pad_trigger(float v){ if(!(v>=0.0f)) v=0.0f; if(v>1.0f) v=1.0f; return (unsigned char)lrintf(v*255.0f); }
 static UILabel *test_label;
 static GCController *pad_active;
-static GCVirtualController *virtual_pad;
-static __weak GCController *touch_controller;
-static unsigned short touch_held(void);
 static BOOL pad_nintendo;
 void kh_input_host_nintendo(int on);
 static GCControllerButtonInput *capture_button;
@@ -104,7 +101,7 @@ static void pad_extras(GCExtendedGamepad *p){
     }
 }
 static unsigned short pad_buttons(GCExtendedGamepad *p){
-    unsigned short b=(pad_active && pad_active==virtual_pad.controller)?touch_held():0;
+    unsigned short b=0;
     if(p.dpad.up.pressed) b|=0x0001; if(p.dpad.down.pressed) b|=0x0002; if(p.dpad.left.pressed) b|=0x0004; if(p.dpad.right.pressed) b|=0x0008;
     if(p.buttonMenu.pressed) b|=0x0010; if(p.buttonOptions.pressed || touchpad_click(p).pressed || capture_button.pressed) b|=0x0020;
     if(p.leftThumbstickButton.pressed) b|=0x0040; if(p.rightThumbstickButton.pressed) b|=0x0080;
@@ -128,21 +125,14 @@ static int pad_attach(GCController *c){
     pad_active=c;
     pad_layout(c);
     kh_title_pad_family(pad_nintendo,[p isKindOfClass:GCDualShockGamepad.class] || [p isKindOfClass:GCDualSenseGamepad.class]);
-    BOOL touch=(c==virtual_pad.controller);
     /* A negative layout family keeps GC positions and the separate confirm/back preference. */
-    kh_input_host_nintendo(!touch && pad_nintendo?1:-1);
-    NSString *device=touch?@"Touch controls":(c.vendorName ?: c.productCategory);
+    kh_input_host_nintendo(pad_nintendo?1:-1);
+    NSString *device=c.vendorName ?: c.productCategory;
     kh_menu_input_device(device.UTF8String,NULL);
     pad_extras(p);
     c.handlerQueue=dispatch_get_main_queue();
-    __block unsigned shoulder_state=0;
     p.valueChangedHandler=^(GCExtendedGamepad *gp,GCControllerElement *el){
         if(gp!=pad_active.extendedGamepad) return;
-        if(touch){
-            unsigned held=gp.leftShoulder.pressed | (gp.rightShoulder.pressed<<1) | (gp.leftTrigger.pressed<<2) | (gp.rightTrigger.pressed<<3);
-            if(held & ~shoulder_state) [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight] impactOccurred];
-            shoulder_state=held;
-        }
         NSString *element=el.unmappedLocalizedName ?: el.localizedName ?: el.aliases.anyObject;
         if(el) kh_menu_input_device(device.UTF8String,element.UTF8String);
         const char *log=getenv("KHNMC_PAD_LOG");
@@ -170,79 +160,161 @@ static void sim_controller_pages(void){
     pad_active=nil;
 }
 #endif
-/* Only buttons in this window intercept touches. Both native sticks and the shoulders
- * underneath keep receiving independent fingers while a button is held. */
-@interface KHTouchWindow : UIWindow
+/* Buttons win UIKit hit testing. Each remaining finger owns one stick until lift
+ * or cancellation, even if it crosses the centre of the screen. */
+@interface KHTouchSurface : UIView
+- (void)reset;
+- (void)publish;
 @end
-@implementation KHTouchWindow
-- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    UIView *hit=[super hitTest:point withEvent:event];
-    return [hit isKindOfClass:UIButton.class] ? hit : nil;
-}
-@end
-
-@interface KHTouchButtons : UIViewController
-@property(nonatomic,copy) NSArray<UIButton *> *buttons;
-@end
-static KHTouchWindow *touch_window;
+static KHTouchSurface *touch_surface;
 static __weak UIWindow *game_window;
-static int touch_mode=0,touch_size=1,touch_opacity=65;
-static BOOL touch_ready, touch_connecting;
-static NSHashTable<GCController *> *retired;
+static KHTouchSettings touch_options;
+static BOOL touch_ready,touch_flipped;
 static id pad_connect_observer,pad_disconnect_observer;
-static unsigned short touch_held(void){
-    unsigned short mask=0;
-    for(UIButton *button in ((KHTouchButtons *)touch_window.rootViewController).buttons)
-        if(button.selected) mask|=button.tag;
-    return mask;
+
+@implementation KHTouchSurface {
+    NSArray<UIButton *> *_buttons;
+    UIView *_rings[2], *_knobs[2];
+    id _finger[2];
+    KHStick _sticks[2];
+    CGSize _layoutSize;
 }
-@implementation KHTouchButtons
-- (void)button:(UIButton *)b pressed:(BOOL)pressed {
-    if(!pad_active || pad_active!=virtual_pad.controller || b.selected==pressed) return;
-    b.selected=pressed;
-    if(pressed) [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight] impactOccurred];
-    kh_menu_input_device("Touch controls",b.accessibilityLabel.UTF8String);
-    pad_send(pad_active.extendedGamepad);
-}
-- (void)down:(UIButton *)b { [self button:b pressed:YES]; }
-- (void)up:(UIButton *)b { [self button:b pressed:NO]; }
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.view.backgroundColor=UIColor.clearColor;
-    NSArray *labels=@[@"↑",@"↓",@"←",@"→",@"A",@"B",@"X",@"Y",@"Menu",@"RMC",@"R3"];
-    NSArray *names=@[@"Up",@"Down",@"Left",@"Right",@"Cross",@"Circle",@"Square",@"Triangle",@"Options",@"Roxas May Cry menu",@"Right stick click"];
-    const unsigned short bits[]={1,2,4,8,0x1000,0x2000,0x4000,0x8000,0x10,0x50,0x80};
-    NSMutableArray *buttons=[NSMutableArray arrayWithCapacity:labels.count];
-    for(NSUInteger i=0;i<labels.count;i++){
+- (instancetype)initWithFrame:(CGRect)frame {
+    if(!(self=[super initWithFrame:frame])) return nil;
+    self.multipleTouchEnabled=YES;
+    for(int i=0;i<2;i++){
+        _rings[i]=[UIView new]; _knobs[i]=[UIView new];
+        for(UIView *part in @[_rings[i],_knobs[i]]){
+            part.userInteractionEnabled=NO;
+            part.backgroundColor=[UIColor.blackColor colorWithAlphaComponent:part==_rings[i]?.12:.6];
+            part.layer.borderColor=UIColor.whiteColor.CGColor;
+            part.layer.borderWidth=1.5;
+            [self addSubview:part];
+        }
+    }
+    NSArray *labels=@[@"↑",@"↓",@"←",@"→",@"A",@"B",@"X",@"Y",@"L2",@"L1",@"L3",@"Menu",@"RMC",@"R3",@"R1",@"R2",@"L1+A",@"L1+B",@"L1+X",@"L1+Y"];
+    NSArray *names=@[@"Up",@"Down",@"Left",@"Right",@"Cross",@"Circle",@"Square",@"Triangle",
+        @"Left trigger",@"Left shoulder",@"Left stick click",@"Options",@"Roxas May Cry menu",@"Right stick click",@"Right shoulder",@"Right trigger",
+        @"Shortcut L1 + Cross",@"Shortcut L1 + Circle",@"Shortcut L1 + Square",@"Shortcut L1 + Triangle"];
+    NSMutableArray *buttons=[NSMutableArray array];
+    for(int i=0;i<KH_TOUCH_COUNT;i++){
         UIButton *b=[UIButton buttonWithType:UIButtonTypeCustom];
-        b.tag=bits[i]; b.accessibilityLabel=names[i];
+        b.tag=i; b.accessibilityLabel=names[i];
         [b setTitle:labels[i] forState:UIControlStateNormal];
-        [b setTitleColor:UIColor.systemYellowColor forState:UIControlStateSelected];
-        b.backgroundColor=UIColor.darkGrayColor;
+        b.titleLabel.shadowOffset=CGSizeMake(0,1);
+        b.layer.borderWidth=1;
+        b.titleLabel.font=[UIFont boldSystemFontOfSize:14];
+        b.titleLabel.adjustsFontSizeToFitWidth=YES;
         [b addTarget:self action:@selector(down:) forControlEvents:UIControlEventTouchDown|UIControlEventTouchDragEnter];
         [b addTarget:self action:@selector(up:) forControlEvents:UIControlEventTouchUpInside|UIControlEventTouchUpOutside|UIControlEventTouchCancel|UIControlEventTouchDragExit];
-        [self.view addSubview:b];
-        [buttons addObject:b];
+        [self addSubview:b]; [buttons addObject:b];
     }
-    self.buttons=buttons;
+    _buttons=buttons;
+    return self;
 }
-- (void)viewDidLayoutSubviews {
-    [super viewDidLayoutSubviews];
-    CGRect area=self.view.safeAreaLayoutGuide.layoutFrame;
-    if(area.size.width<=12 || area.size.height<=0) return;
-    int i=0;
-    for(UIButton *b in self.buttons){
+- (CGFloat)radius {
+    return kh_touch_diameter(touch_options.size,self.bounds.size.width,self.bounds.size.height)*.85;
+}
+- (CGFloat)alphaForPress:(BOOL)pressed {
+    double idle=touch_options.opacity/100.;
+    return pressed?idle+.7*(1-idle):idle;
+}
+- (void)drawSticks {
+    CGFloat r=self.radius;
+    for(int i=0;i<2;i++){
+        KHStick s=_sticks[i];
+        BOOL active=_finger[i]!=nil;
+        double x,y;
+        kh_touch_stick_home(i,kh_touch_diameter(touch_options.size,self.bounds.size.width,self.bounds.size.height),
+                           self.bounds.size.width,self.bounds.size.height,&x,&y);
+        CGPoint center=active?CGPointMake(s.x,s.y):CGPointMake(x,y);
+        for(UIView *v in @[_rings[i],_knobs[i]]){
+            CGFloat d=v==_rings[i]?2*r:r*.7;
+            v.bounds=CGRectMake(0,0,d,d);
+            v.center=v==_rings[i]?center:CGPointMake(center.x+s.dx*r,center.y-s.dy*r);
+            v.layer.cornerRadius=d/2;
+            v.hidden=!active && !touch_options.fixed;
+            v.alpha=[self alphaForPress:active];
+        }
+    }
+}
+- (void)publish {
+    if(self!=touch_surface || UIApplication.sharedApplication.applicationState!=UIApplicationStateActive) return;
+    unsigned mask=0;
+    for(UIButton *b in _buttons) if(b.selected) mask|=kh_touch_mask((int)b.tag);
+    kh_input_host_pad_set((unsigned short)mask,(mask&0x10000)?255:0,(mask&0x20000)?255:0,
+        pad_axis(_sticks[0].dx),pad_axis(_sticks[0].dy),pad_axis(_sticks[1].dx),pad_axis(_sticks[1].dy));
+}
+- (void)styleButton:(UIButton *)b {
+    CGFloat alpha=[self alphaForPress:b.selected];
+    b.backgroundColor=[UIColor.blackColor colorWithAlphaComponent:.7*alpha];
+    b.layer.borderColor=[UIColor.whiteColor colorWithAlphaComponent:alpha].CGColor;
+    UIColor *ink=b.selected?UIColor.systemYellowColor:UIColor.whiteColor;
+    [b setTitleColor:[ink colorWithAlphaComponent:.3+.7*alpha] forState:UIControlStateNormal];
+    [b setTitleShadowColor:[UIColor.blackColor colorWithAlphaComponent:.7] forState:UIControlStateNormal];
+}
+- (void)setButton:(UIButton *)b pressed:(BOOL)pressed {
+    if(self!=touch_surface || b.selected==pressed) return;
+    b.selected=pressed;
+    [self styleButton:b];
+    if(pressed){
+        [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight] impactOccurred];
+        kh_menu_input_device("Touch controls",b.accessibilityLabel.UTF8String);
+    }
+    [self publish];
+}
+- (void)down:(UIButton *)b { [self setButton:b pressed:YES]; }
+- (void)up:(UIButton *)b { [self setButton:b pressed:NO]; }
+- (void)reset {
+    for(int i=0;i<2;i++){ _finger[i]=nil; _sticks[i]=(KHStick){0}; }
+    for(UIButton *b in _buttons){ b.selected=NO; [self styleButton:b]; }
+    [self drawSticks];
+    if(self==touch_surface) kh_input_host_pad_neutral();
+}
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGSize size=self.bounds.size;
+    if(!CGSizeEqualToSize(size,_layoutSize)){ [self reset]; _layoutSize=size; }
+    for(UIButton *b in _buttons){
+        int i=(int)b.tag;
         double x,y,d;
-        kh_touch_button_frame(i,touch_size,area.size.width,area.size.height,&x,&y,&d);
-        b.bounds=CGRectMake(0,0,d,d);
-        b.center=CGPointMake(CGRectGetMinX(area)+x,CGRectGetMinY(area)+y);
-        b.layer.cornerRadius=d/2;
-        b.alpha=touch_opacity/100.0;
-        i++;
+        kh_touch_button_frame(i,touch_options.size,size.width,size.height,&x,&y,&d);
+        b.bounds=CGRectMake(0,0,d,d); b.center=CGPointMake(x,y); b.layer.cornerRadius=d/2;
+        b.hidden=(i<KH_A && !touch_options.dpad) || (i>=KH_SLOT_A && !touch_options.shortcuts);
+        [self styleButton:b];
     }
+    [self drawSticks];
 }
-- (BOOL)prefersStatusBarHidden { return YES; }
-- (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
+- (void)track:(id)finger point:(CGPoint)p begin:(BOOL)begin {
+    int i;
+    if(begin){
+        i=p.x<self.bounds.size.width/2?0:1;
+        if(_finger[i] || self.radius<=0) return;
+        CGPoint origin=touch_options.fixed?_rings[i].center:p;
+        if(touch_options.fixed && hypot(p.x-origin.x,p.y-origin.y)>self.radius) return;
+        _finger[i]=finger; _sticks[i]=(KHStick){origin.x,origin.y,0,0};
+        kh_menu_input_device("Touch controls",i?"Look stick":"Move stick");
+    }else{
+        i=finger==_finger[0]?0:finger==_finger[1]?1:-1;
+        if(i<0) return;
+    }
+    kh_touch_drag(&_sticks[i],p.x,p.y,self.radius,touch_options.fixed,i?touch_options.sensitivity:100);
+}
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    for(UITouch *t in touches) [self track:t point:[t locationInView:self] begin:YES];
+    [self drawSticks]; [self publish];
+}
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    for(UITouch *t in touches) [self track:t point:[t locationInView:self] begin:NO];
+    [self drawSticks]; [self publish];
+}
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    for(int i=0;i<2;i++) if(_finger[i] && [touches containsObject:_finger[i]]){
+        _finger[i]=nil; _sticks[i]=(KHStick){0};
+    }
+    [self drawSticks]; [self publish];
+}
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event { [self touchesEnded:touches withEvent:event]; }
 @end
 
 static void pad_release(void){
@@ -259,106 +331,96 @@ static void pad_select(GCController *controller){
 static void reconcile_pads(GCController *excluded){
     if(!game_window) return;
     if(excluded && excluded==pad_active) pad_release();
-    GCController *vc=virtual_pad.controller;
     GCController *physical=nil;
     for(GCController *c in GCController.controllers){
-        if(c==excluded || c==vc || [retired containsObject:c] || !c.extendedGamepad) continue;
+        if(c==excluded || !c.extendedGamepad) continue;
         if(!physical || c==pad_active) physical=c;
     }
-    BOOL visible=touch_ready && kh_touch_visible(touch_mode,physical!=nil);
-    if(!visible){
-        touch_window.hidden=YES; touch_window=nil;
-        pad_select(physical);
-        if(!touch_connecting && virtual_pad){
-            if(vc) [retired addObject:vc];
-            GCVirtualController *old=virtual_pad;
-            virtual_pad=nil; touch_controller=nil;
-            [old disconnect];
+    if(!touch_ready || !kh_touch_visible(touch_options.mode,physical!=nil)){
+        if(touch_surface){
+            [touch_surface reset]; [touch_surface removeFromSuperview]; touch_surface=nil;
+            kh_menu_input_device(NULL,NULL);
         }
+        pad_select(physical);
         return;
     }
-    if(touch_connecting) return;
-    if(!virtual_pad){
-        GCVirtualControllerConfiguration *config=[GCVirtualControllerConfiguration new];
-        config.elements=[NSSet setWithArray:@[GCInputLeftThumbstick,GCInputRightThumbstick,
-            GCInputLeftShoulder,GCInputRightShoulder,GCInputLeftTrigger,GCInputRightTrigger]];
-        virtual_pad=[[GCVirtualController alloc] initWithConfiguration:config];
-        touch_connecting=YES;
-        GCVirtualController *request=virtual_pad;
-        [request connectWithReplyHandler:^(NSError *error){
-            dispatch_async(dispatch_get_main_queue(),^{
-                if(request!=virtual_pad){
-                    if(request.controller) [retired addObject:request.controller];
-                    [request disconnect];
-                    return;
-                }
-                touch_connecting=NO;
-                if(error || !virtual_pad.controller.extendedGamepad){
-                    fprintf(stderr,"kh: ios: virtual-pad-connect: %s\n",error.localizedDescription.UTF8String?:"missing extended gamepad");
-                    GCVirtualController *failed=virtual_pad;
-                    virtual_pad=nil;
-                    if(failed.controller) [retired addObject:failed.controller];
-                    [failed disconnect];
-                    return;
-                }
-                reconcile_pads(nil);
-            });
-        }];
-        return;
+    pad_select(nil);
+    if(!touch_surface){
+        kh_input_host_nintendo(-1);
+        kh_title_pad_family(0,0);
+        kh_menu_input_device("Touch controls",NULL);
+        UIView *view=game_window.rootViewController.view;
+        touch_surface=[KHTouchSurface new];
+        touch_surface.translatesAutoresizingMaskIntoConstraints=NO;
+        [view addSubview:touch_surface];
+        UILayoutGuide *guide=view.safeAreaLayoutGuide;
+        [NSLayoutConstraint activateConstraints:@[
+            [touch_surface.leadingAnchor constraintEqualToAnchor:guide.leadingAnchor],
+            [touch_surface.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor],
+            [touch_surface.topAnchor constraintEqualToAnchor:guide.topAnchor],
+            [touch_surface.bottomAnchor constraintEqualToAnchor:guide.bottomAnchor]]];
+        touch_surface.transform=touch_flipped?CGAffineTransformMakeRotation(M_PI):CGAffineTransformIdentity;
     }
-    touch_controller=vc;
-    pad_select(vc);
-    if(!touch_window){
-        touch_window=[[KHTouchWindow alloc] initWithWindowScene:game_window.windowScene];
-        touch_window.windowLevel=UIWindowLevelAlert;
-        touch_window.rootViewController=[KHTouchButtons new];
-        touch_window.backgroundColor=UIColor.clearColor;
-        touch_window.hidden=NO;
-    }
-    [touch_window.rootViewController.view setNeedsLayout];
+    [touch_surface setNeedsLayout];
 #if TARGET_OS_SIMULATOR
     static BOOL tested;
-    if(!tested && [NSProcessInfo.processInfo.arguments containsObject:@"--test-controller-pages"]){
+    if(!tested && [NSProcessInfo.processInfo.arguments containsObject:@"--test-controller-pages"] &&
+       UIApplication.sharedApplication.applicationState==UIApplicationStateActive){
         tested=YES;
-        UIView *controls=touch_window.rootViewController.view;
-        UIButton *rmc=(UIButton *)[controls viewWithTag:0x50], *r3=(UIButton *)[controls viewWithTag:0x80];
-        GCExtendedGamepad *p=vc.extendedGamepad;
-        BOOL ok=p && vc==pad_active && p.leftThumbstick && p.rightThumbstick && p.leftShoulder && p.rightShoulder && p.leftTrigger && p.rightTrigger;
-        rmc.selected=YES; r3.selected=YES;
-        ok &= (pad_buttons(p)&0xd0)==0xd0;
-        rmc.selected=NO;
-        ok &= (pad_buttons(p)&0xd0)==0x80;
-        r3.selected=NO;
-        ok &= !(pad_buttons(p)&0xd0);
+        [game_window.rootViewController.view layoutIfNeeded];
+        UIButton *slot=(UIButton *)[touch_surface viewWithTag:KH_SLOT_X];
+        UIButton *lb=(UIButton *)[touch_surface viewWithTag:KH_LB];
+        BOOL ok=[touch_surface hitTest:slot.center withEvent:nil]==slot;
+        extern void kh_input_host_pad_get(unsigned short *,unsigned short *,short *);
+        unsigned short held=0;
+        [lb sendActionsForControlEvents:UIControlEventTouchDown]; [slot sendActionsForControlEvents:UIControlEventTouchDown]; kh_input_host_pad_get(&held,NULL,NULL);
+        ok &= held==0x4100;
+        [slot sendActionsForControlEvents:UIControlEventTouchUpInside]; kh_input_host_pad_get(&held,NULL,NULL);
+        ok &= held==0x100;
+        [lb sendActionsForControlEvents:UIControlEventTouchCancel]; kh_input_host_pad_get(&held,NULL,NULL);
+        ok &= held==0;
+        // track: uses finger identity only. UIKit supplies the locations in the real event handlers.
+        NSObject *left=[NSObject new], *right=[NSObject new];
+        CGFloat w=touch_surface.bounds.size.width, h=touch_surface.bounds.size.height;
+        [touch_surface track:left point:CGPointMake(w*.2,h*.65) begin:YES];
+        [touch_surface track:right point:CGPointMake(w*.8,h*.65) begin:YES];
+        [touch_surface track:left point:CGPointMake(w*.8,h*.65) begin:NO];
+        [touch_surface track:right point:CGPointMake(w*.8,h*.3) begin:NO];
+        [touch_surface publish];
+        short lx=0;
+        kh_input_host_pad_get(NULL,NULL,&lx);
+        ok &= lx==32767;
+        [touch_surface touchesEnded:(NSSet *)[NSSet setWithObject:left] withEvent:nil];
+        kh_input_host_pad_get(NULL,NULL,&lx);
+        ok &= lx==0 && (kh_input_host_pad_neutral()&0x10000)!=0;
+        [touch_surface touchesCancelled:(NSSet *)[NSSet setWithObject:right] withEvent:nil];
+        ok &= kh_input_host_pad_neutral()==0;
+        [touch_surface reset];
         NSString *path=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/touch-controller.txt"];
-        if(![(ok?@"PASS":@"FAIL: virtual profile or touch buttons") writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL])
+        if(![(ok?@"PASS":@"FAIL: shortcut hit target, overlapping chord or independent stick release") writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL])
             fprintf(stderr,"kh: simulator-touch-controller: could not write result\n");
     }
 #endif
 }
-static void touch_settings_changed(int mode,int size,int opacity){
+static void touch_settings_changed(KHTouchSettings options){
     dispatch_async(dispatch_get_main_queue(),^{
-        touch_mode=mode; touch_size=size; touch_opacity=opacity; touch_ready=YES;
+        [touch_surface reset];
+        touch_options=options; touch_ready=YES;
         reconcile_pads(nil);
     });
 }
 static void setup_controllers(UIWindow *window){
     game_window=window;
-    if(!retired) retired=[NSHashTable weakObjectsHashTable];
     reconcile_pads(nil);
     pad_connect_observer=[NSNotificationCenter.defaultCenter addObserverForName:GCControllerDidConnectNotification object:nil queue:NSOperationQueue.mainQueue
-        usingBlock:^(NSNotification *n){ if(!touch_connecting && n.object!=virtual_pad.controller) reconcile_pads(nil); }];
+        usingBlock:^(NSNotification *n){ reconcile_pads(nil); }];
     pad_disconnect_observer=[NSNotificationCenter.defaultCenter addObserverForName:GCControllerDidDisconnectNotification object:nil queue:NSOperationQueue.mainQueue
-        usingBlock:^(NSNotification *n){
-            if(n.object==pad_active && n.object==touch_controller){
-                touch_window.hidden=YES; touch_window=nil; virtual_pad=nil; touch_controller=nil;
-            }
-            reconcile_pads(n.object);
-        }];
+        usingBlock:^(NSNotification *n){ reconcile_pads(n.object); }];
 }
-/* TASK41: after a suspension the CURRENT state of pad 0 (a button that came up meanwhile sent no event), or neutral without one */
 static void pad_resync(void){
-    if(pad_active && pad_active.extendedGamepad) pad_send(pad_active.extendedGamepad); else kh_input_host_pad_set(0,0,0,0,0,0,0);
+    if(touch_surface) [touch_surface publish];
+    else if(pad_active) pad_send(pad_active.extendedGamepad);
+    else kh_input_host_pad_neutral();
 }
 
 /* Sound: the mixer runs in pull mode (KHNMC_AUDIO=pull unless khnmc.conf says otherwise) and the RemoteIO unit pulls from it.  The
@@ -547,6 +609,9 @@ static void start_display_link(void){
     _lastDevice=d;
     BOOL flip=kh_portrait_flip(io==UIInterfaceOrientationPortrait,&_upsideDown,device,sample!=nil,gravity.x,gravity.y);
     CGAffineTransform t=flip ? CGAffineTransformMakeRotation((CGFloat)M_PI) : CGAffineTransformIdentity;
+    if(touch_flipped!=flip){
+        [touch_surface reset]; touch_flipped=flip; touch_surface.transform=t;
+    }
     if(!CGAffineTransformEqualToTransform(t,_picture.transform)) _picture.transform=t;
     if(_started && io!=UIInterfaceOrientationUnknown && _lastInterface!=io && kh_present_built()){
         uint32_t w,h;
@@ -584,12 +649,8 @@ static void start_display_link(void){
     [NSNotificationCenter.defaultCenter removeObserver:pad_connect_observer];
     [NSNotificationCenter.defaultCenter removeObserver:pad_disconnect_observer];
     pad_connect_observer=nil; pad_disconnect_observer=nil;
-    game_window=nil; touch_window.hidden=YES; touch_window=nil;
-    pad_release();
-    GCVirtualController *old=virtual_pad;
-    if(old.controller) [retired addObject:old.controller];
-    virtual_pad=nil; touch_controller=nil; touch_connecting=NO;
-    [old disconnect];
+    [touch_surface reset]; [touch_surface removeFromSuperview]; touch_surface=nil;
+    game_window=nil; pad_release();
 }
 - (void)windowScene:(UIWindowScene *)scene didUpdateCoordinateSpace:(id<UICoordinateSpace>)oldSpace interfaceOrientation:(UIInterfaceOrientation)oldOrientation traitCollection:(UITraitCollection *)oldTraits {
     (void)scene; (void)oldSpace; (void)oldOrientation; (void)oldTraits;
@@ -597,7 +658,7 @@ static void start_display_link(void){
 }
 - (void)sceneWillResignActive:(UIScene *)scene {
     (void)scene; _left=YES;
-    for(UIButton *button in ((KHTouchButtons *)touch_window.rootViewController).buttons) button.selected=NO;
+    [touch_surface reset];
     kh_app_will_resign_active();                               /* the gate is set and the focus lost; returns at once */
 }
 - (void)sceneDidEnterBackground:(UIScene *)scene {
@@ -653,7 +714,6 @@ static void exclude_game_data_from_backup(void){
 
 int main(int argc,char *argv[]){
     @autoreleasepool {
-        extern void (*kh_ios_touch_changed)(int,int,int);
         kh_ios_touch_changed=touch_settings_changed;
         exclude_game_data_from_backup();
         setenv("KHNMC_INPUT","host",0);       /* the controller is pad 0 (a route script, when set, wins; never in a selftest) */

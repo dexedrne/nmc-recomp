@@ -1,5 +1,8 @@
 #include "khnmc_rt.h"
 #include "settings.h"
+#if KH_IOS_PATHS
+#include "ios/touch_layout.h"
+#endif
 #include "frame_time.h"
 #include "autosave.h"
 #include "pad_layout.h"
@@ -17,7 +20,7 @@
 
 extern int kh_run_is_selftest;
 extern u64 kh_game_frames(void);
-enum { LOOK, HP, MP, EXP, DROP, DRIVE, HUD_COMBO, COUNT, PAD=COUNT, SWAP_AB, STYLE, RAISE, ENEMY, SUB, LOWER, MENU_LAYOUT, LOGO, CREDIT, TITLE_STYLE, TUTORIAL, AUTO_SAVE, NAMES, DIFF_LABEL, FRAME_WORK, FRAME_LOG, TOUCH_MODE, TOUCH_SIZE, TOUCH_OPACITY };
+enum { LOOK, HP, MP, EXP, DROP, DRIVE, HUD_COMBO, COUNT, PAD=COUNT, SWAP_AB, STYLE, RAISE, ENEMY, SUB, LOWER, MENU_LAYOUT, LOGO, CREDIT, TITLE_STYLE, TUTORIAL, AUTO_SAVE, NAMES, DIFF_LABEL, FRAME_WORK, FRAME_LOG, TOUCH_MODE, TOUCH_SIZE, TOUCH_OPACITY, TOUCH_STYLE, TOUCH_LOOK, TOUCH_SLOTS, TOUCH_DPAD };
 #define BOOL_OPT(name,label,initial) {"KHNMC_" name,label,initial,"0|1",0,1,1}
 #define TWEAK_OPT(name,label,initial) {"KHNMC_TWEAK_" name,label,initial,"off|on",0,1,1}
 #define NUMBER(name,label,initial,min,max,step) {"KHNMC_" name,label,initial,NULL,min,max,step}
@@ -47,7 +50,11 @@ const struct kh_option kh_options[]={
 #if KH_IOS_PATHS
     {"KHNMC_TOUCH_MODE","Touch controls","Auto","Auto|Always|Off"},
     {"KHNMC_TOUCH_SIZE","Touch button size","M","S|M|L"},
-    {"KHNMC_TOUCH_OPACITY","Touch button opacity","65","35|65|100"},
+    {"KHNMC_TOUCH_OPACITY","Touch button opacity","25","15|25|35|65|100"},
+    {"KHNMC_TOUCH_STYLE","Touch style","Dynamic","Dynamic|Fixed"},
+    {"KHNMC_TOUCH_LOOK","Look sensitivity (%)","100","50|75|100|125|150|200"},
+    BOOL_OPT("TOUCH_SHORTCUTS","Shortcut buttons","1"),
+    BOOL_OPT("TOUCH_DPAD","Show D-pad","0"),
 #endif
     TWEAK_OPT("DEBUG_DEBUG_ON","Enable debug commands","off"),
     TWEAK_OPT("DEBUG_SOFT_RESET","Allow debug reset to title","off"),
@@ -401,14 +408,21 @@ static pthread_mutex_t config_lock=PTHREAD_MUTEX_INITIALIZER;
 static int kh_save_live_option(const char *,const char *,int,double);
 #if KH_IOS_PATHS
 /* The app shell installs this before the game thread starts. Values come from validated catalog entries. */
-void (*kh_ios_touch_changed)(int mode,int size,int opacity);
-static int touch_settings[3]={0,1,65};
+void (*kh_ios_touch_changed)(KHTouchSettings);
+static KHTouchSettings touch_settings;
 static void touch_setting(int i,const char *v){
-    touch_settings[i-TOUCH_MODE]=i==TOUCH_MODE?(!strcmp(v,"Off")?2:!strcmp(v,"Always")):
-        i==TOUCH_SIZE?(!strcmp(v,"L")?2:!strcmp(v,"M")):atoi(v);
+    switch(i){
+    case TOUCH_MODE: touch_settings.mode=!strcmp(v,"Off")?2:!strcmp(v,"Always"); break;
+    case TOUCH_SIZE: touch_settings.size=!strcmp(v,"L")?2:!strcmp(v,"M"); break;
+    case TOUCH_OPACITY: touch_settings.opacity=atoi(v); break;
+    case TOUCH_STYLE: touch_settings.fixed=!strcmp(v,"Fixed"); break;
+    case TOUCH_LOOK: touch_settings.sensitivity=atoi(v); break;
+    case TOUCH_SLOTS: touch_settings.shortcuts=atoi(v); break;
+    case TOUCH_DPAD: touch_settings.dpad=atoi(v); break;
+    }
 }
 static void publish_touch(void){
-    if(kh_ios_touch_changed) kh_ios_touch_changed(touch_settings[0],touch_settings[1],touch_settings[2]);
+    if(kh_ios_touch_changed) kh_ios_touch_changed(touch_settings);
 }
 #endif
 static _Atomic(const char *) live_choices[FRAME_LOG+1];
@@ -451,7 +465,7 @@ static int kh_save_live_option(const char *name,const char *value,int i,double v
     pthread_mutex_lock(&config_lock);
     int result=kh_run_is_selftest?0:save_option(dir,name,value);
 #if KH_IOS_PATHS
-    if(!result && i>=TOUCH_MODE && i<=TOUCH_OPACITY){touch_setting(i,value);publish_touch();}
+    if(!result && i>=TOUCH_MODE && i<=TOUCH_DPAD){touch_setting(i,value);publish_touch();}
 #endif
     if(!result && kh_setting_live(i)) atomic_store(&values[i],v);
     if(!result && ((i>=PAD && i<=FRAME_LOG) || strstr(name,"HUD_SCALE_") || !strcmp(name,"KHNMC_FOV_ZOOM"))){
@@ -531,7 +545,7 @@ void kh_settings_init(void){
         }
     }
 #if KH_IOS_PATHS
-    for(int i=TOUCH_MODE;i<=TOUCH_OPACITY;i++) touch_setting(i,getenv(kh_options[i].name)?:kh_options[i].initial);
+    for(int i=TOUCH_MODE;i<=TOUCH_DPAD;i++) touch_setting(i,getenv(kh_options[i].name)?:kh_options[i].initial);
     publish_touch();
 #endif
     extern int kh_tweak_boolean(KCtx *,const char *,int);
@@ -698,9 +712,15 @@ enum { VALUE_CAP=1001 }; /* validate() caps persisted strings at 1000 bytes. */
 static char chosen[sizeof kh_options/sizeof *kh_options][VALUE_CAP];
 static const char *feedback;
 static pthread_mutex_t panel_lock=PTHREAD_MUTEX_INITIALIZER;
+#if KH_IOS_PATHS
+static _Atomic int touch_device;
+#endif
 static char input_device[48],input_element[48];
 void kh_menu_input_device(const char *device,const char *element){
     pthread_mutex_lock(&panel_lock);
+#if KH_IOS_PATHS
+    touch_device=device && !strcmp(device,"Touch controls");
+#endif
     snprintf(input_device,sizeof input_device,"%.45s",device?:"");
     snprintf(input_element,sizeof input_element,"%.45s",element?:"");
     pthread_mutex_unlock(&panel_lock);
@@ -728,7 +748,7 @@ static int section_rows(int section,int *ids){
         if(i==LOOK) group=CHARACTER;
         else if(i>=HP && i<=DRIVE) group=CHEATS;
 #if KH_IOS_PATHS
-        else if(i>=TOUCH_MODE && i<=TOUCH_OPACITY) group=CONTROLLER;
+        else if(i>=TOUCH_MODE && i<=TOUCH_DPAD) group=CONTROLLER;
 #endif
         else if(i==PAD || i==SWAP_AB) group=CONTROLLER;
         else if(i==HUD_COMBO || (i>=STYLE && i<=TITLE_STYLE) || (i==FRAME_WORK || i==FRAME_LOG) ||
@@ -756,14 +776,22 @@ static int menu_catalog_test(void){
     }
 #if KH_IOS_PATHS
     int n=section_rows(CONTROLLER,ids);
-    if(n!=6 || ids[2]!=TOUCH_MODE || ids[3]!=TOUCH_SIZE || ids[4]!=TOUCH_OPACITY || ids[5]!=INPUT_ROW) return 1;
-    int saved[3];
-    memcpy(saved,touch_settings,sizeof saved);
+    if(n!=10 || ids[9]!=INPUT_ROW) return 1;
+    KHTouchSettings saved=touch_settings;
+    for(int i=TOUCH_MODE;i<=TOUCH_DPAD;i++){
+        if(ids[2+i-TOUCH_MODE]!=i) return 1;
+        touch_setting(i,kh_options[i].initial);
+    }
+    int defaults=touch_settings.opacity==25 && !touch_settings.fixed && touch_settings.sensitivity==100 &&
+                 touch_settings.shortcuts && !touch_settings.dpad;
+    touch_setting(TOUCH_STYLE,"Fixed"); touch_setting(TOUCH_LOOK,"150");
+    touch_setting(TOUCH_SLOTS,"0"); touch_setting(TOUCH_DPAD,"1");
     touch_setting(TOUCH_MODE,"Always"); touch_setting(TOUCH_SIZE,"L"); touch_setting(TOUCH_OPACITY,"35");
-    int ok=touch_settings[0]==1 && touch_settings[1]==2 && touch_settings[2]==35;
+    int ok=defaults && touch_settings.mode==1 && touch_settings.size==2 && touch_settings.opacity==35 &&
+           touch_settings.fixed && touch_settings.sensitivity==150 && !touch_settings.shortcuts && touch_settings.dpad;
     touch_setting(TOUCH_MODE,"Off"); touch_setting(TOUCH_SIZE,"S");
-    ok=ok && touch_settings[0]==2 && touch_settings[1]==0;
-    memcpy(touch_settings,saved,sizeof saved);
+    ok=ok && touch_settings.mode==2 && touch_settings.size==0;
+    touch_settings=saved;
     const char *layout=atomic_exchange(&live_choices[PAD],"letters");
     const char *ab=atomic_exchange(&live_choices[SWAP_AB],"0");
     ok=ok && kh_menu_map_buttons(0x5050,-1)==0x5050 && kh_menu_map_buttons(0x5050,1)==0xa050;
@@ -854,7 +882,7 @@ static const char *timing(int i,const char *blocked){
     if(reason) return reason;
     if(kh_setting_action(i)) return "A to queue on close";
 #if KH_IOS_PATHS
-    if(i>=TOUCH_MODE && i<=TOUCH_OPACITY) return "Applies immediately";
+    if(i>=TOUCH_MODE && i<=TOUCH_DPAD) return "Applies immediately";
 #endif
     if(i==TITLE_STYLE) return "Auto follows Character";
     if(i==LOGO) return "Next title load";
@@ -897,6 +925,12 @@ static void edit_row(KCtx *g,int i,int direction,const char *blocked){
     if(test_log) fprintf(stderr,"kh: RMC %s=%s\n",o->name,value);
 }
 int kh_menu_pad(struct KCtx *g,unsigned buttons,int lt,int rt,int lx,int ly,int rx,int ry){
+#if KH_IOS_PATHS
+    if(menu_open && page!=INPUT_TEST && touch_device){
+        if(abs(lx)>abs(ly)) buttons|=lx>16000?8:lx< -16000?4:0;
+        else buttons|=ly>16000?1:ly< -16000?2:0;
+    }
+#endif
     static unsigned previous;static int releasing;
     unsigned down=buttons & ~previous;previous=buttons;
     if(releasing){releasing=buttons!=0;return releasing;}
