@@ -187,7 +187,7 @@ INPUT_HOOKS += $(PLACE_HOOKS)
 # and 0x3ad9a0 (message id -> text) is noted while a system menu runs: the camp menu's labels (`kh: menu text:`)
 INFO_HOOKS = 2f8e20 2f9440 2eb620 17b710 3ad9a0
 INPUT_HOOKS += $(INFO_HOOKS)
-FILE_HOOKS = 3afd90 3e6120 3e61e0 3b43c0 3b4ec0 3b57b0 1f9a80 3a9cf0 131ef0 106000 1063d0 106700 106790 106870 $(HD_HOOKS) $(PHASE_HOOKS) $(DIFFICULTY_HOOKS) $(MOD_A_HOOKS) $(MOD_B_HOOKS) $(MOD_PARAMS_HOOKS) $(STREAM_HOOKS) $(BGLOAD_HOOKS) $(INPUT_HOOKS)
+FILE_HOOKS = 166640 19c3a0 3afd90 3e6120 3e61e0 3b43c0 3b4ec0 3b57b0 1f9a80 3a9cf0 131ef0 106000 1063d0 106700 106790 106870 $(HD_HOOKS) $(PHASE_HOOKS) $(DIFFICULTY_HOOKS) $(MOD_A_HOOKS) $(MOD_B_HOOKS) $(MOD_PARAMS_HOOKS) $(STREAM_HOOKS) $(BGLOAD_HOOKS) $(INPUT_HOOKS)
 # object-id table guard (runtime/idtable.c): 0x4ad390 registers a 32 MiB window in the game's 64-slot id table and encodes the pointer
 IDTABLE_HOOKS = 4ad390
 FILE_HOOKS += $(IDTABLE_HOOKS)
@@ -201,10 +201,7 @@ FILE_HOOKS += $(EVENT_HOOKS)
 # the largest-16:9 fit keeps the full height, so 0x14e050 / 0x4ed940 draw no bars; 186920 = the map pass, a pass-through that records
 # the frame of the 3D view for H1's condition (H2b's m11 edit joined it in task 40, below).  The plan listed 2bd190 126500 156940
 # 1569b0 156a70 156e20 126fd0 4b7530.  With KHNMC_ASPECT unset both are exact pass-throughs.
-ASPECT_HOOKS = 11c1e0 186920
-ifneq ($(shell grep -l '^void f_1948c0' $(ROOT)/runtime/aspect.c),)
-ASPECT_HOOKS += 1948c0
-endif
+ASPECT_HOOKS = 1948c0 11c1e0 186920
 # Task 40 (runtime/aspect.c; plan steps 4, 5 and the H4/H5 part of 7): 186920 also = H2b (cam+0x98 / r around the map pass), 2bd190 =
 # H2c (the same around the effect pass), 156f10 = H4a (the three full-screen fades, f_156940 / f_1569b0 / f_156a70, draw inside through
 # it), 156e20 = H4b (the event letterbox bars, after it), 126fd0 = H5 (full-height scissor rects); 126500 and 19d040 are pass-throughs
@@ -571,7 +568,10 @@ $(GEN)/mod_static_lifted.c: tools/mod_static_lift.py $(MOD_EDITS) $(MOD_NEVERLAN
 	    --funcs "$(MOD_LIFT_FUNCS)" --chained "$(MOD_LIFT_CHAINED)" --vanilla-shards $(LIFTED)/shards --out $@ --report $(GEN)/mod_static_lift.json
 endif
 $(addprefix $(O)/,frame_time.o null_input.o null_d3d12.o gfx_present.o gfx_vkd3d.o gfx_wrap.o loader.o loader_app.o bgload.o file_layer.o): $(ROOT)/runtime/frame_time.h
-$(O)/file_layer.o $(O)/hd_assets.o: $(ROOT)/runtime/title_logo.h
+$(O)/file_layer.o $(O)/hd_assets.o $(O)/aspect.o $(O)/settings.o: $(ROOT)/runtime/title_logo.h
+ifeq ($(IOS_PATHS),1)
+$(O)/settings.o: $(ROOT)/runtime/ios/touch_layout.h
+endif
 $(O)/file_layer.o: $(ROOT)/runtime/look_voice.inc
 $(O)/xion_swap.o: $(ROOT)/runtime/xion_fields.inc
 $(O)/mod_neverland.o $(O)/mod_neverland_test.o: $(GEN)/mod_neverland_table.h

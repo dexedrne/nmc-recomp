@@ -1193,6 +1193,18 @@ void f_3e61e0(KCtx *g){
     }
     orig_f_3e61e0(g);
 }
+/* The camp model allocator needs room for Xion's extra mesh groups. */
+static u64 camp_preview_pool;
+void orig_f_19c3a0(KCtx *);
+void f_19c3a0(KCtx *g){
+    if(A0(g)==GS_BASE+0x938730 && A1(g)==0x68000 && kh_look_enabled()){
+        if(!camp_preview_pool) camp_preview_pool=ga_alloc(2*1024*1024,128);
+        if(!camp_preview_pool) kh_fatal(g,"camp-preview-heap");
+        A0(g)=camp_preview_pool;
+        A1(g)=2*1024*1024;
+    }
+    orig_f_19c3a0(g);
+}
 void orig_f_3e6120(KCtx *);
 static int bind_resource(KCtx *g,u64 resource){
     if(!last_switch && !kh_scene_pack_active()) return 1;
@@ -1494,8 +1506,10 @@ void f_3dc170(KCtx *g){
 
 #include "rewind.h"
 void kh_rewind_look(KhRecords *r){
-    u64 legacy_notice=0; /* former guest message buffer slot */
+    /* Older snapshots stored an untagged guest message pointer here. */
+    u64 legacy_notice=camp_preview_pool?camp_preview_pool|(1ull<<63):0;
     KH_RECORD(r,legacy_notice);
+    if(r->loading) camp_preview_pool=(legacy_notice>>63)?legacy_notice & ~(1ull<<63):0;
     if(r->loading){notice=0;menu_open=0;enter_character=0;}
     KH_RECORD(r,art);
     KH_RECORD(r,held_resources);

@@ -4,6 +4,7 @@
 #include "kh_look.h"
 #include "rewind.h"
 #include "route_state.h"
+#include "rmc.h"
 
 #define VA(rva) (GS_BASE+(rva))
 #define ACTIVE VA(0x2a105d0)
@@ -326,7 +327,37 @@ void f_2ed0e0(KCtx *g){
     }
     if(kh_xion_enabled) kh_warn("xion-swap: loaded Roxas, save EXP %u munny %u",rd32(g,VA(0x9acf90)),rd32(g,VA(0x9abcf0)));
 }
-BOUNDARY(2e4950,"system menu",0)
+/* Camp freezes the last completed field image. Let the START task yield one
+ * field frame with its command widgets excluded from the transient draw list. */
+static int clean_camp_frame;
+void orig_f_166640(KCtx *);
+void f_166640(KCtx *g){
+    if(clean_camp_frame){
+        u64 manager=rd64(g,A0(g)+0x18),prev=0;
+        KCtx ctx=*g;
+        for(u64 obj=rd64(g,manager+0x18);obj;){
+            u32 next=rd32(g,obj+0xc),group=rd32(g,obj+0x14);
+            u64 following=kh_call(&ctx,VA(0x4ad270),next,0,0,0);
+            if(group==1 || group==2){
+                if(prev) wr32(g,prev+0xc,next);
+                else wr64(g,manager+0x18,following);
+            }else prev=obj;
+            obj=following;
+        }
+    }
+    orig_f_166640(g);
+}
+void orig_f_2e4950(KCtx *);
+void f_2e4950(KCtx *g){
+    if(rd64(g,KH_RSP(g))==VA(0x15731e) && kh_rmc_find("menu/us/camp.2ld")){
+        clean_camp_frame=1;
+        KCtx ctx=*g;
+        kh_call(&ctx,VA(0x150060),KH_RBX(g),0,0,0);
+        clean_camp_frame=0;
+    }
+    if(kh_xion_enabled){KCtx ctx=*g; handback(&ctx,"system menu");}
+    orig_f_2e4950(g);
+}
 void orig_f_3ad540(KCtx *);
 void f_3ad540(KCtx *g){
     if(xion&&rd64(g,KH_RSP(g))==VA(0x157304)){ KCtx ctx=*g; handback(&ctx,"START"); }
