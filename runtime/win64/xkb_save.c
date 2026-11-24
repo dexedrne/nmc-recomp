@@ -34,11 +34,16 @@ static Record change,source;
 static int tagged,source_tag;
 static u64 change_card;
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
+static void forget_lazy_label(void);   /* defined with difficulty_text below */
 
 void kh_rewind_xkb_save(KhRecords *r){
     pthread_mutex_lock(&lock);
     KH_RECORD(r,change_card);
     KH_VALUE(r,change); KH_VALUE(r,source); KH_VALUE(r,tagged); KH_VALUE(r,source_tag);
+    /* The seventh difficulty label is allocated in the guest arena on first use.  A snapshot taken before that allocation restores
+     * an allocator state without it, so the host pointer would be kept over a block the snapshot freed (review round 9, item 4):
+     * drop it on load and let difficulty_label encode it again in the restored arena. */
+    if(r->loading) forget_lazy_label();
     pthread_mutex_unlock(&lock);
 }
 
@@ -232,7 +237,9 @@ static const char *const difficulties[]={
 };
 enum { LABELS=sizeof difficulties/sizeof *difficulties, STOCK_LABELS=6 };
 static u64 difficulty_text[LABELS],autosave_title[2];
-/* The seventh label is encoded when a slot first shows it: without such a slot nothing more is allocated than before. */
+/* The seventh label is encoded when a slot first shows it: without such a slot nothing more is allocated than before.  A savestate
+ * load drops that one pointer (kh_rewind_xkb_save): the snapshot may predate its allocation. */
+static void forget_lazy_label(void){ difficulty_text[LABELS-1]=0; }
 static u64 difficulty_label(unsigned label){
     if(!label || label>LABELS) kh_fatal(NULL,"save-difficulty-label: %u",label);
     if(!difficulty_text[label-1]) difficulty_text[label-1]=kh_encode_menu_text(difficulties[label-1],label>3);

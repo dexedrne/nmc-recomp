@@ -312,6 +312,7 @@ static int selftest_all(KCtx *g){
     fails+=kh_mod_hooks_a_selftest(g);
     { extern int kh_transform_selftest(KCtx *); fails+=kh_transform_selftest(g); }
     { extern int kh_mod_hooks_b_selftest(KCtx *); fails+=kh_mod_hooks_b_selftest(g); }   /* Task 23: the remaining DLL detours */
+    { extern int kh_form_rewards_selftest(KCtx *); fails+=kh_form_rewards_selftest(g); } /* T101: PS2 growth rewards of forms 2 and 3 */
     extern int kh_mod_params_selftest(KCtx *);
     fails+=kh_mod_params_selftest(g);
     extern int kh_bgload_selftest(KCtx *);

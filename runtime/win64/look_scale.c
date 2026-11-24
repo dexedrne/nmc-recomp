@@ -109,7 +109,7 @@ static void ls_readback(KCtx *g,u64 inst,u64 pl,int look,float s,const float *m,
         float cy=q[0]*P[1]+q[1]*P[5]+q[2]*P[9]+P[13], cw=q[0]*P[3]+q[1]*P[7]+q[2]*P[11]+P[15];
         if(cw>0){ float up=(2048.f-cy/cw)/208.f; if(t==0 && up>ls_top) ls_top=up; if(t==1 && up>ls_top1) ls_top1=up; }
     }
-    if(n%(unsigned long long)ls_log!=1) return;
+    if(n%(unsigned long long)ls_log) return;   /* every n-th body draw; n starts at 1, so ls_log 1 prints every draw (review round 9, item 8) */
     float dsx=sc, dsy=sqrtf(d[4]*d[4]+d[5]*d[5]+d[6]*d[6]), dsz=sqrtf(d[8]*d[8]+d[9]*d[9]+d[10]*d[10]);
     float gsx=sqrtf(m[0]*m[0]+m[1]*m[1]+m[2]*m[2]);
     /* the head (bone 140 of the 229-bone rig): its distance from the feet as the game places it and as drawn */
@@ -160,3 +160,21 @@ static void ls_draw(KCtx *g,void (*orig)(KCtx *)){
 void orig_f_1a5180(KCtx *); void f_1a5180(KCtx *g){ ls_draw(g,orig_f_1a5180); }
 void orig_f_1a5580(KCtx *); void f_1a5580(KCtx *g){ ls_draw(g,orig_f_1a5580); }
 void orig_f_1af000(KCtx *); void f_1af000(KCtx *g){ ls_draw(g,orig_f_1af000); }
+
+/* ---- camp-menu model view scale (owner 2026-11-23: "in the pause menu axel looks short") ----
+ * The pause (camp) menu draws the player as a menu 3D model (Tz::MenuObj): its draw f_3001b0 builds each model's matrix from the
+ * per-slot scale at slot+0x860, and the slot reader f_2ff210 copies that 4-float scale to its second argument (rdx).  The field hooks
+ * above do not see this separate menu instance, so the camp menu keeps drawing Axel at Roxas's size.  Here f_2ff210's result is
+ * scaled by ls_scale(look) while the camp menu shell runs ([0x9006b0] system menu on, [0x900724] running id 8): Axel 1.34, every
+ * other look 1.0 (one flag test and the lifted body).  Nothing in guest state changes; the slot value and the caller's matrix build
+ * stay exactly PC NMC. */
+static void ls_menu_scale(KCtx *g,void (*orig)(KCtx *)){
+    orig(g);
+    if(!rd8(g,GS_BASE+0x9006b0) || rd32(g,GS_BASE+0x900724)!=8) return;   /* not the camp menu shell */
+    float s=ls_scale(kh_look_enabled());
+    if(s==1.0f) return;
+    u64 out=A1(g);                                                        /* the 4-float scale f_2ff210 wrote for its caller */
+    if(!ls_ok(out,16)) return;
+    for(int i=0;i<4;i++){ u32 v=rd32(g,out+4ull*(u64)i); float f; memcpy(&f,&v,4); f*=s; memcpy(&v,&f,4); wr32(g,out+4ull*(u64)i,v); }
+}
+void orig_f_2ff210(KCtx *); void f_2ff210(KCtx *g){ ls_menu_scale(g,orig_f_2ff210); }

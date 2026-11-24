@@ -31,6 +31,7 @@ IOS_SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30 -o 
 IOS_RSH="ssh -o BatchMode=yes -o ConnectTimeout=20"
 IOS_ENV='export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer; export LC_ALL=C;'
 [ -n "${KHNMC_IOS_RDIR:-}" ] && IOS_ENV="$IOS_ENV export KHNMC_KROOT=\$HOME/$KHNMC_IOS_RDIR;"        # mac/lib.sh KROOT follows the remote root
+[ -n "${KHNMC_IOS_RDIR:-}" ] && IOS_ENV="$IOS_ENV export KHNMC_MACLOCK_FILE=\$HOME/$KHNMC_IOS_RDIR/.mac-build.lock;"   # the build lock lives in the same root
 [ -n "${KHNMC_IOS_GFXDIR:-}" ] && IOS_ENV="$IOS_ENV export GFX_APPLE_DIR=$KHNMC_IOS_GFXDIR;"       # the Makefile's iOS deps (vkd3d + MoltenVK)
 # TASK38: GFX=1 (the app with the graphics backend: tools/ios/mac/lib.sh) reaches the Mac's scripts through every remote command;
 # without it the remote commands are as before
@@ -57,14 +58,40 @@ ios_guard(){
 # mac CMD            : one remote shell command (not a build or simulator step: no lock)
 mac(){ "${IOS_SSH[@]}" "$IOS_MAC" "$IOS_ENV $1"; }
 
+# IOS_LOCKFILE: the Mac's build lock file (maclock.py; relative to the remote home), so the driver can see when the Mac released it
+IOS_LOCKFILE=Developer/.mac-build.lock; [ -n "${KHNMC_IOS_RDIR:-}" ] && IOS_LOCKFILE=$IOS_RDIR/.mac-build.lock
+
+# mac_wait_released : after this driver sent its step a hangup, wait (up to 150 s; maclock gives the step 120 s to clean up) until the
+# Mac's lock file no longer carries OUR line, so the driver lock (fd 9, held here) is never given up while the step still runs there.
+mac_wait_released(){ local i r      # remote: 0 = our line is gone or the file is (released), 1 = still there; 255 = ssh itself failed: look again
+  for i in $(seq 30); do
+    "${IOS_SSH[@]}" "$IOS_MAC" "! grep -q '^khnmc iOS build' ~/$IOS_LOCKFILE 2>/dev/null"; r=$?
+    [ $r = 0 ] && return 0
+    sleep 5
+  done
+  echo "tools/ios: the Mac's step still holds ~/$IOS_LOCKFILE after 150 s: keeping nothing running here, but LOOK at the Mac" >&2; return 1; }
+
 # mac_step WHAT SCRIPT [ARGS...] : run tools/ios/mac/SCRIPT (synced copy) on the Mac under the shared lock.  Exit status of the
 # script; 75 = the Mac is busy (xcodebuild running, lock held, or a foreign description in the lock file): nothing was started.
+# Review fix #6: the step dies WITH this side.  ssh runs with a forced tty (-tt): when this driver is killed or the connection drops, the
+# step's pty is hung up, sshd sends SIGHUP, maclock.py (which holds the Mac lock) passes SIGTERM to the step's process group, runs its
+# cleanup and releases the lock (see maclock.py).  Output arrives with CRLF line ends (pty).  A signal to the driver is turned into a
+# hangup of the ssh and the driver then WAITS until the Mac's lock is released (mac_wait_released) before it ends: the driver lock
+# (fd 9, inherited by the ssh, released when both are gone) and the Mac lock are therefore always held over the same span.
 mac_step(){
   local what=$1 script=$2; shift 2
   local args=""; local a
   for a in "$@"; do case "$a" in *[!A-Za-z0-9_./:=,+@%-]*) echo "tools/ios: argument '$a' has characters the remote command line does not carry" >&2; return 2;; esac; args="$args $a"; done
   case "$what" in *[!A-Za-z0-9_.,:\ -]*) echo "tools/ios: bad step description" >&2; return 2;; esac
-  "${IOS_SSH[@]}" "$IOS_MAC" "$IOS_ENV cd ~/$IOS_RDIR/src && exec python3 tools/ios/maclock.py --what '$what' -- /bin/bash tools/ios/mac/$script$args"
+  local sp rc sig=0
+  "${IOS_SSH[@]}" -tt "$IOS_MAC" "$IOS_ENV cd ~/$IOS_RDIR/src && exec python3 tools/ios/maclock.py --what '$what' -- /bin/bash tools/ios/mac/$script$args" < /dev/null &
+  sp=$!
+  trap 'sig=1; kill -HUP $sp 2>/dev/null' INT TERM HUP
+  wait $sp; rc=$?
+  while kill -0 $sp 2>/dev/null; do wait $sp; rc=$?; done      # a trapped signal ends `wait` early: the ssh is still going down
+  trap - INT TERM HUP
+  if [ $sig = 1 ]; then echo "tools/ios: interrupted: the Mac step was hung up; waiting for the Mac to release its lock" >&2; mac_wait_released; return 130; fi
+  return $rc
 }
 
 # busy_note RC : explain exit status 75 once, the same way everywhere

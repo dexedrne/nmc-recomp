@@ -4,16 +4,21 @@
 #   plan : write the chunk lists only (run-J26/ios/push/chunk-NNN.list, about CHUNK_MB each, default 2048)
 #   verify: list Documents/data and Documents/pkgdir ON THE PHONE (devicectl info files, JSON) and compare every name and byte size
 #          with manifest.tsv: missing, wrong size and extra files are listed (verify.txt); exit 0 only when all match
-#   run  : for every chunk without a .done mark: rsync it to ~/Developer/KHNMC/stage/cNNN on the Mac (the NEXT chunk is staged while
+#   run  : for every chunk without a .done mark: rsync it to ~/Developer/KHNMC/stage/cNNN on the Mac (KHNMC_IOS_RDIR changes the root) (the NEXT chunk is staged while
 #          the current one goes to the phone, so at most two chunks, about 4 GB, sit on the Mac: the project folder stays under its
 #          6 GB limit), check file count and bytes there, `devicectl device copy to` into the app's container (devicectl merges
 #          into the folder and skips files that did not change), delete the staged chunk, mark it done.  Resumable: run again.
-# The phone's id is read from the Mac's ~/Developer/KHNMC/state/device.env.  The app must be installed (it marks data/ and
+# The phone's id is read from the Mac's ~/Developer/KHNMC/state/device.env (under KHNMC_IOS_RDIR).  The app must be installed (it marks data/ and
 # pkgdir/ as excluded from iCloud backup at every start; device_run.sh installs it).  Wired or over the network: devicectl
 # uses the cable when the phone is plugged into the Mac.
-set -u
-HERE=$(cd "$(dirname "$0")/../.." && pwd); P=$HERE/run-J26/ios/push; mkdir -p "$P"
-MAC=${IOS_MAC:-user@macbook}; RSH="ssh -o BatchMode=yes -o ServerAliveInterval=30"
+# Review fixes: common.sh is sourced (KHNMC_IOS_MACBOOK_OK guard, the Linux driver lock, KHNMC_IOS_MAC / KHNMC_IOS_RDIR honoured);
+# pipelines are judged by the status of the step before `tee` (pipefail), not by tee's; a chunk that fails to send is removed from
+# the Mac (trap), so a re-plan starts clean.
+set -u -o pipefail
+. "$(dirname "$0")/common.sh"
+case "${1:-run}" in plan) ;; *) ios_guard;; esac     # plan only reads this machine; verify and run talk to the Mac
+HERE=$IOS_HERE; P=$HERE/run-J26/ios/push; mkdir -p "$P"
+MAC=$IOS_MAC; RDIR=$IOS_RDIR; RSH=$IOS_RSH" -o ServerAliveInterval=30"
 DATA=$HERE/data-full; PKG=$HERE/pkgdir; PRUNE=$HERE/prune-A.list; CHUNK_MB=${CHUNK_MB:-2048}
 log(){ echo "push: $(date +%H:%M:%S) $*" | tee -a "$P/push.log"; }
 plan(){
@@ -49,19 +54,27 @@ for i,(k,c) in enumerate(chunks):
 print('push: plan: %d files, %.2f GB, %d chunks of up to %s MiB (manifest %s/manifest.tsv)'%(len(files),sum(s for _,_,s in files)/1e9,len(chunks),cmb,out))
 PY
 }
+STAGED=()   # the chunks staged on the Mac by this run (recorded by the parent before a background stage starts)
+unstage(){ $RSH "$MAC" "rm -rf ~/$RDIR/stage/$1"; }
+# review fix #8: whatever this run staged and did not finish is removed from the Mac when the run ends or is interrupted
+cleanup_stage(){ local n j; trap - EXIT; for j in $(jobs -p); do kill "$j" 2>/dev/null; done; wait 2>/dev/null   # our own background staging first
+  for n in ${STAGED[@]+"${STAGED[@]}"}; do
+    [ -f "$P/$n.done" ] || unstage "$n" > /dev/null 2>&1 || echo "push: could not remove the staged $n on the Mac (~/$RDIR/stage/$n): remove it by hand" >&2; done; }
+trap cleanup_stage EXIT; trap 'exit 130' INT TERM HUP
 stage(){ local c=$1 n=$(basename "$1" .list) k src; k=$(head -1 "$c" | cut -d' ' -f2); [ "$k" = data ] && src=$DATA || src=$PKG
   grep -v '^#' "$c" > "$P/$n.files"
-  $RSH "$MAC" "mkdir -p ~/Developer/KHNMC/stage/$n/$k" || return 1
-  rsync -rlpt --files-from="$P/$n.files" -e "$RSH" "$src/" "$MAC:Developer/KHNMC/stage/$n/$k/" >> "$P/rsync.log" 2>&1 || return 1
+  unstage "$n" || return 1     # a copy left by an earlier or re-planned run must not add files to this chunk
+  $RSH "$MAC" "mkdir -p ~/$RDIR/stage/$n/$k" || return 1
+  rsync -rlpt --files-from="$P/$n.files" -e "$RSH" "$src/" "$MAC:$RDIR/stage/$n/$k/" >> "$P/rsync.log" 2>&1 || return 1
   local want got; want=$(head -1 "$c" | awk '{print $3" "$5}')
-  got=$($RSH "$MAC" "cd ~/Developer/KHNMC/stage/$n/$k && echo \$(find . -type f | wc -l) \$(find . -type f -exec stat -f %z {} + | awk '{s+=\$1} END{print s+0}')") || return 1
+  got=$($RSH "$MAC" "cd ~/$RDIR/stage/$n/$k && echo \$(find . -type f | wc -l) \$(find . -type f -exec stat -f %z {} + | awk '{s+=\$1} END{print s+0}')") || return 1
   [ "$(echo $got)" = "$want" ] || { log "$n: staged copy differs: want '$want' got '$got'"; return 1; }; }
 send(){ local c=$1 n=$(basename "$1" .list) k; k=$(head -1 "$c" | cut -d' ' -f2)
-  $RSH "$MAC" "export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer; . ~/Developer/KHNMC/state/device.env; xcrun devicectl device copy to --device \$DEVICE --timeout 7200 --domain-type appDataContainer --domain-identifier beer.vyvanse.khnmc --source ~/Developer/KHNMC/stage/$n/$k --destination Documents/$k" >> "$P/devicectl.log" 2>&1 || return 1
-  $RSH "$MAC" "rm -rf ~/Developer/KHNMC/stage/$n"; }
+  $RSH "$MAC" "export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer; . ~/$RDIR/state/device.env; xcrun devicectl device copy to --device \$DEVICE --timeout 7200 --domain-type appDataContainer --domain-identifier beer.vyvanse.khnmc --source ~/$RDIR/stage/$n/$k --destination Documents/$k" >> "$P/devicectl.log" 2>&1 || return 1
+  unstage "$n"; }
 verify(){
   local k; for k in data pkgdir; do
-    $RSH "$MAC" "export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer; . ~/Developer/KHNMC/state/device.env; xcrun devicectl device info files --device \$DEVICE --timeout 600 --domain-type appDataContainer --domain-identifier beer.vyvanse.khnmc --subdirectory Documents/$k --json-output ~/Developer/KHNMC/run/phone-$k.json > /dev/null 2>&1; cat ~/Developer/KHNMC/run/phone-$k.json; rm -f ~/Developer/KHNMC/run/phone-$k.json" > "$P/phone-$k.json" || return 1
+    $RSH "$MAC" "export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer; . ~/$RDIR/state/device.env; xcrun devicectl device info files --device \$DEVICE --timeout 600 --domain-type appDataContainer --domain-identifier beer.vyvanse.khnmc --subdirectory Documents/$k --json-output ~/$RDIR/run/phone-$k.json > /dev/null 2>&1; cat ~/$RDIR/run/phone-$k.json; rm -f ~/$RDIR/run/phone-$k.json" > "$P/phone-$k.json" || return 1
   done
   python3 - "$P" <<'PY'
 import json,os,sys
@@ -110,10 +123,11 @@ PY
 fi
 log "run: ${#todo[@]} chunks to send"
 [ ${#todo[@]} = 0 ] && exit 0
+STAGED+=("$(basename "${todo[0]}" .list)")
 stage "${todo[0]}" || { log "$(basename "${todo[0]}" .list): staging FAILED (see rsync.log)"; exit 1; }
 for ((i=0;i<${#todo[@]};i++)); do
   c=${todo[$i]}; n=$(basename "$c" .list); nx=""; pid=""
-  if [ $((i+1)) -lt ${#todo[@]} ]; then nx=${todo[$((i+1))]}; stage "$nx" & pid=$!; fi
+  if [ $((i+1)) -lt ${#todo[@]} ]; then nx=${todo[$((i+1))]}; STAGED+=("$(basename "$nx" .list)"); stage "$nx" & pid=$!; fi
   t0=$SECONDS; b=$(head -1 "$c" | awk '{print $5}')
   if send "$c"; then touch "${c%.list}.done"; dt=$((SECONDS-t0)); log "$n: on the phone ($(head -1 "$c" | cut -c3-)) in ${dt} s, $(( b / (dt>0?dt:1) / 1048576 )) MiB/s"
   else log "$n: devicectl copy FAILED (see devicectl.log)"; [ -n "$pid" ] && wait $pid; exit 1; fi

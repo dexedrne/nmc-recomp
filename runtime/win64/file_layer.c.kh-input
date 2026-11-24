@@ -20,6 +20,15 @@
 #include <unistd.h>
 
 static pthread_mutex_t files_lock=PTHREAD_MUTEX_INITIALIZER;
+/* Per-frame readers must not walk packs (review round 9, item 10: the title draw and the Character page asked the file layer for
+ * the same answer every frame, and on iOS every lookup walks directories case-insensitively).  These two answers are cached and
+ * dropped by kh_look_set, which every look / pack change runs through. */
+static _Atomic int title_available_cache[KH_TITLE_SCREENS]={-1,-1,-1};
+static _Atomic int axel_weapon_ready_cache=-1;
+static void look_cache_clear(void){
+    for(int i=0;i<KH_TITLE_SCREENS;i++) atomic_store(&title_available_cache[i],-1);
+    atomic_store(&axel_weapon_ready_cache,-1);
+}
 static unsigned real_packages;
 void orig_f_106000(KCtx *g);
 void orig_f_1063d0(KCtx *g);
@@ -136,6 +145,9 @@ static const char *look_root(int look){
     return root?root:"private/looks/xion";
 }
 const char *kh_look_root(void){return look_root(kh_look_enabled());}
+/* The root of any look's pack (the savestate identity hashes the packs that serve files under every look: the N_PO010 companion
+ * from the Xion pack, the title pictures and sketches from the Xion / hooded / Axel packs). */
+const char *kh_look_root_for(int look){return look_root(look);}
 int kh_scene_path(const char *rel,char *host,size_t cap){
     const char *root=kh_scene_root();
     struct stat st;
@@ -229,6 +241,7 @@ void kh_look_set(KCtx *g,int selected){
     pthread_mutex_lock(&files_lock);
     pthread_mutex_lock(&names_lock);
     player_look=selected;
+    look_cache_clear();
     for(u64 e=name_overlays;e;e=rd64(g,e)) update_name(g,e);
     pthread_mutex_unlock(&names_lock);
     pthread_mutex_unlock(&files_lock);
@@ -327,9 +340,13 @@ int kh_axel_weapon_asset(const char *rel,char *host,size_t cap){
     return kh_look_asset(KH_LOOK_AXEL,sub,host,cap);
 }
 int kh_axel_weapon_ready(void){
+    int cached=atomic_load(&axel_weapon_ready_cache);
+    if(cached>=0) return cached;
     char host[4096];
-    return kh_look_pack_ready(KH_LOOK_AXEL) && kh_axel_weapon_asset("obj/W_EX010.mdlx",host,sizeof host) &&
-           kh_look_asset(KH_LOOK_AXEL,"weapons/chakram/hd/-0.dds",host,sizeof host);
+    int ready=kh_look_pack_ready(KH_LOOK_AXEL) && kh_axel_weapon_asset("obj/W_EX010.mdlx",host,sizeof host) &&
+              kh_look_asset(KH_LOOK_AXEL,"weapons/chakram/hd/-0.dds",host,sizeof host);
+    atomic_store(&axel_weapon_ready_cache,ready?1:0);
+    return ready;
 }
 void kh_look_path(KCtx *g,const char *rel,char *host,size_t cap){
     if(!kh_look_available(rel,host,cap)) kh_fatal(g,"player-look-asset: missing or invalid %s",rel);
@@ -535,21 +552,48 @@ int kh_title_screen_picture(int screen,char *host,size_t cap){
     if(screen==KH_TITLE_AXEL) return kh_look_asset(KH_LOOK_AXEL,image,host,cap);
     return 0;
 }
-int kh_title_screen_available(int screen){
-    char host[4096];
-    return screen==KH_TITLE_ROXAS || (screen>KH_TITLE_ROXAS && screen<KH_TITLE_SCREENS && kh_title_screen_picture(screen,host,sizeof host));
+/* a boot-intro sketch slot (3, 5 or 6) of a screen: like the picture, the same path -N.png in the screen's pack; Roxas = the
+ * tree's own (the rmc overlay's when installed; 0 here, and the caller falls back to the tree scan's slot) */
+int kh_title_screen_sketch(int screen,int slot,char *host,size_t cap){
+    char image[48];
+    snprintf(image,sizeof image,"remastered/" KH_TITLE_LAYOUT "/-%d.png",slot);
+    if(screen==KH_TITLE_XION) return kh_look_asset(KH_LOOK_XION,image,host,cap) || kh_look_asset(KH_LOOK_HOODED,image,host,cap);
+    if(screen==KH_TITLE_AXEL) return kh_look_asset(KH_LOOK_AXEL,image,host,cap);
+    return 0;
 }
-int kh_title_screen_next(int screen){
-    for(int i=1;i<=KH_TITLE_SCREENS;i++){ int s=(screen+i)%KH_TITLE_SCREENS; if(kh_title_screen_available(s)) return s; }
+int kh_title_screen_available(int screen){
+    if(screen==KH_TITLE_ROXAS) return 1;
+    if(screen<0 || screen>=KH_TITLE_SCREENS) return 0;
+    int cached=atomic_load(&title_available_cache[screen]);
+    if(cached<0){
+        char host[4096];
+        cached=kh_title_screen_picture(screen,host,sizeof host)?1:0;
+        atomic_store(&title_available_cache[screen],cached);
+    }
+    return cached;
+}
+int kh_title_screen_step(int screen,int forward){
+    if(screen<0 || screen>=KH_TITLE_SCREENS) screen=KH_TITLE_ROXAS;
+    for(int i=1;i<=KH_TITLE_SCREENS;i++){
+        int s=forward?(screen+i)%KH_TITLE_SCREENS:(screen-i+2*KH_TITLE_SCREENS)%KH_TITLE_SCREENS;
+        if(kh_title_screen_available(s)) return s;
+    }
     return KH_TITLE_ROXAS;
 }
-int kh_title_screen(void){
+int kh_title_screen_next(int screen){ return kh_title_screen_step(screen,1); }
+/* The setting as stored, without the "whose picture is missing" fallback: the settings row moves from this value through the
+ * available screens, so a screen whose pack is missing does not pin the cycle to Roxas (review round 9, item 7). */
+int kh_title_screen_stored(void){
     const char *v=kh_menu_choice("KHNMC_TITLE_SCREEN");
     int s=KH_TITLE_ROXAS;
     if(v && *v){
         while(s<KH_TITLE_SCREENS && strcmp(v,screen_names[s])) s++;
-        if(s==KH_TITLE_SCREENS) kh_fatal(NULL,"title-screen-value: KHNMC_TITLE_SCREEN=%s (known: roxas, xion, axel)",v);
+        if(s==KH_TITLE_SCREENS) s=KH_TITLE_ROXAS;   /* a bad value reads as Roxas, never a fatal (review round 9, item 2) */
     }
+    return s;
+}
+int kh_title_screen(void){
+    int s=kh_title_screen_stored();
     if(!kh_title_screen_available(s)){
         static _Atomic int warned;
         if(!warned++) kh_warn("title-screen-pack-missing: KHNMC_TITLE_SCREEN=%s but its picture remastered/%s/-4.png is not in the %s pack: showing ROXAS MAY CRY",
@@ -582,7 +626,7 @@ int kh_title_screens_check(const char *host,char *why,size_t cap){
     u8 bar[48],z[16]; int ok=0; u32 imgz=0;
     if(pread(fd,bar,48,0)!=48 || memcmp(bar,"BAR\1",4)) snprintf(why,cap,"not a BAR file");
     else if(memcpy(&imgz,bar+40,4), pread(fd,z,16,imgz)!=16 || memcmp(z,"IMGZ",4)) snprintf(why,cap,"no IMGZ in its second entry");
-    else if(z[12]!=17 || z[13]||z[14]||z[15]) snprintf(why,cap,"IMGZ holds %u textures, not 17",(unsigned)z[12]|(unsigned)z[13]<<8);
+    else if(z[12]!=KH_TITLE_TEXTURES || z[13]||z[14]||z[15]) snprintf(why,cap,"IMGZ holds %u textures, not %d",(unsigned)z[12]|(unsigned)z[13]<<8,KH_TITLE_TEXTURES);
     else{
         ok=1;
         for(int slot=12;ok && slot<17;slot++){
@@ -907,14 +951,15 @@ int kh_file_selftest(KCtx *g){
         TEST(!strcmp(kh_title_screen_name(0),"roxas") && !strcmp(kh_title_screen_name(1),"xion") && !strcmp(kh_title_screen_name(2),"axel"));
         TEST(screen_logo[KH_TITLE_ROXAS]==1 && screen_logo[KH_TITLE_XION]==2 && screen_logo[KH_TITLE_AXEL]==4 && !strcmp(logo_names[4],"axel"));
         TEST(kh_title_screen_available(KH_TITLE_ROXAS) && !kh_title_screen_available(KH_TITLE_SCREENS) && !kh_title_screen_available(-1));
-        /* Round 5: the screens layout check (17 IMGD textures; 12/13 must match slot 4, 14..16 slot 7, by byte count and header) */
-        static u8 sl[16+48+16+8*17+17*320+4];
+        /* Round 5: the screens layout check (KH_TITLE_TEXTURES IMGD textures; 12/13 must match slot 4, 14..16 slot 7, by byte count
+         * and header).  Round TI: 26 textures now (9 boot-sketch slots follow 17). */
+        static u8 sl[16+48+16+8*KH_TITLE_TEXTURES+KH_TITLE_TEXTURES*320+4];
         size_t total=0;
         for(int pass=0;pass<4;pass++){
             memset(sl,0,sizeof sl); memcpy(sl,"BAR\1",4); u32 imgz=64; memcpy(sl+40,&imgz,4);
-            u8 *z=sl+imgz; memcpy(z,"IMGZ",4); z[12]=17;
-            u32 at=16+8*17;
-            for(int t=0;t<17;t++){
+            u8 *z=sl+imgz; memcpy(z,"IMGZ",4); z[12]=KH_TITLE_TEXTURES;
+            u32 at=16+8*KH_TITLE_TEXTURES;
+            for(int t=0;t<KH_TITLE_TEXTURES;t++){
                 u32 len=256+((t==4||t==12||t==13)?32:0)+((pass==1 && t==12)?64:0);   /* pass 1: a bigger picture in 12 */
                 memcpy(z+16+8*t,&at,4); memcpy(z+20+8*t,&len,4);
                 memcpy(z+at,"IMGD",4); u32 pix=len-64; memcpy(z+at+12,&pix,4);

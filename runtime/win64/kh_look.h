@@ -52,6 +52,8 @@ int kh_scene_look(void);
 int kh_scene_wear(void);
 const char *kh_scene_root(void);
 const char *kh_look_root(void);
+/* The root of a named look's pack (0 Roxas, 1 Xion, 2 hooded, 3 Axel, 4 Roxas HD), whatever the current look. */
+const char *kh_look_root_for(int look);
 int kh_scene_path(const char *rel,char *host,size_t cap);
 enum { KH_FILE_LOOK = 2, KH_FILE_RMC = 3 }; /* A selected overlay file must open successfully. */
 int kh_look_enabled(void);

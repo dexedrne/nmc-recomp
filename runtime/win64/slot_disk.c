@@ -61,18 +61,28 @@ static int tree_hash(SlotHash *hash,const char *path){
 }
 static int appearance_hash(SlotHash *hash){
     const char *scene=getenv("KHNMC_SCENE_ROXAS");
+    /* The N_PO010 companion (kh_companion_asset) is served from the Xion pack and the title pictures / boot sketches
+     * (kh_title_screen_picture / kh_title_screen_sketch) from the Xion, hooded or Axel pack, whatever the player's look: those
+     * packs are read in every look, so their bytes belong to the slot's identity (review round 9, item 5). */
     const char *roots[]={kh_look_enabled()?kh_look_root():NULL,
-                         scene&&!strcmp(scene,"1")?kh_scene_root():NULL};
-    for(unsigned i=0;i<2;i++){
+                         scene&&!strcmp(scene,"1")?kh_scene_root():NULL,
+                         kh_look_root_for(KH_LOOK_XION),kh_look_root_for(KH_LOOK_HOODED),kh_look_root_for(KH_LOOK_AXEL)};
+    const char *unique[sizeof roots/sizeof *roots]; size_t n=0; int absent=0;
+    for(size_t i=0;i<sizeof roots/sizeof *roots;i++){
         const char *root=roots[i];
         struct stat st;
         if(root && stat(root,&st)){
             if(errno!=ENOENT && errno!=ENOTDIR) return 0;
             root=NULL;
         }
-        if(!tree_hash(hash,root)) return 0;
+        if(!root){ absent=1; continue; }
+        size_t j;
+        for(j=0;j<n;j++) if(!strcmp(unique[j],root)) break;
+        if(j==n) unique[n++]=root;
     }
-    return 1;
+    if(!n) return tree_hash(hash,NULL);
+    for(size_t i=0;i<n;i++) if(!tree_hash(hash,unique[i])) return 0;
+    return absent?tree_hash(hash,NULL):1;
 }
 static int string_order(const void *a,const void *b){
     return strcmp(*(const char *const *)a,*(const char *const *)b);

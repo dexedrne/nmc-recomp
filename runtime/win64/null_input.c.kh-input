@@ -152,6 +152,7 @@ void kh_game_frame_step(KCtx *g){
     kh_frame_time(g,n);
     extern void kh_settings_frame(KCtx *,uint64_t); kh_settings_frame(g,n);
     extern void kh_ps2_castle_frame(KCtx *); kh_ps2_castle_frame(g);
+    extern void kh_form_rewards_frame(KCtx *); kh_form_rewards_frame(g);   /* T101: PS2 growth rewards of Bladeless / Light & Dark */
     extern void kh_retry_frame(KCtx *); kh_retry_frame(g);
     extern void kh_shortcut_frame(KCtx *); kh_shortcut_frame(g);
     extern void kh_test_resize_frame(u64); kh_test_resize_frame(n);
@@ -781,10 +782,20 @@ invalid: kh_fatal(g,"scripted XInput: invalid %s line %u%s%s",path,lineno,*why?"
         if(e&&*e){ if(e[0]<'0'||e[0]>'3'||e[1]) kh_fatal(g,"KHNMC_ROUTE_DIFFICULTY must be one of 0,1,2,3 (0 Beginner, 1 Standard, 2 Critical, 3 Less Than Nothing)"); route_difficulty=e[0]-'0'; route_difficulty_from=" (KHNMC_ROUTE_DIFFICULTY)"; }
         { int cond=0; for(size_t i=0;i<nsteps;i++) if(steps[i].only>=0) cond=1; if(cond) uses_difficulty=1; }
         if(uses_difficulty && route_difficulty<0) kh_fatal(g,"scripted XInput: %s uses `difficulty` in a condition but sets none: add `@difficulty N` or set KHNMC_ROUTE_DIFFICULTY",path);
-        for(size_t i=0;i<nsteps;i++) if(steps[i].c.arg==ARG_DIFFICULTY)
-            steps[i].c.arg=steps[i].c.kind==KR_NEWGAME_CHOICE?(route_difficulty&1):route_difficulty;
         { size_t k=0, dropped=0; for(size_t i=0;i<nsteps;i++){ if(steps[i].only>=0 && steps[i].only!=route_difficulty){ free(steps[i].rel); dropped++; continue; } steps[k++]=steps[i]; }   /* @if-difficulty */
           nsteps=k; if(dropped) kh_warn("scripted XInput: %zu step(s) of another difficulty (@if-difficulty) left out",dropped); }
+        /* The New Game difficulty page offers two rows now (xion_swap.c prepare_menu / f_2b88c0): row 0 = Critical (level 2),
+         * row 1 = Less Than Nothing (level 3).  `difficulty` in a newgame-choice is that page's row, so only levels 2 and 3 have
+         * one; the old `route_difficulty & 1` map sent Standard (1) to row 1 (level 3) and left `@expect game-level 1` waiting for
+         * a level the run never reaches.  A level without a row is a named fatal (review round 9, item 1).  Only the steps this
+         * run keeps are remapped: an @if-difficulty step of another level has already been dropped. */
+        for(size_t i=0;i<nsteps;i++) if(steps[i].c.arg==ARG_DIFFICULTY){
+            if(steps[i].c.kind==KR_NEWGAME_CHOICE){
+                if(route_difficulty<2) kh_fatal(g,"scripted XInput: %s line %u: `difficulty` in a newgame-choice is a New Game row, and the New Game menu offers only Critical (2) and Less Than Nothing (3): run with @difficulty 2 or 3",
+                                                path,steps[i].line);
+                steps[i].c.arg=route_difficulty-2;
+            }else steps[i].c.arg=route_difficulty;
+        }
         { const char *x=getenv("KHNMC_ROUTE_END"); route_exit_at_end=0;
           if(x&&*x){ if(!strcmp(x,"exit")) route_exit_at_end=1; else if(strcmp(x,"idle")) kh_fatal(g,"KHNMC_ROUTE_END=%s: known values are idle (the default: after the last step the pad stays released) and exit (the run ends, exit 0)",x); } }
         kh_warn("scripted XInput pad 0: route of %zu steps from %s (difficulty %d%s; game-frame clock; after the last step: %s)",nsteps,path,route_difficulty,route_difficulty_from,route_exit_at_end?"exit":"idle");
@@ -1087,7 +1098,7 @@ int kh_input_route_selftest(KCtx *g){
     t_cursor_step=0; t_cursor[KR_NEWGAME_CHOICE]=-1;
     /* 7. `difficulty`: @difficulty, overridden by KHNMC_ROUTE_DIFFICULTY; frames N counts from the step's start */
     RCHECK(t_load(g,"@difficulty 2\n@wait newgame-choice difficulty\n@expect game-level difficulty\n") && route_difficulty==2 && steps[0].c.arg==0 && steps[1].c.arg==2);
-    setenv("KHNMC_ROUTE_DIFFICULTY","0",1); RCHECK(t_load(g,"@difficulty 2\n@select newgame-choice difficulty\n") && route_difficulty==0 && steps[0].c.arg==0); unsetenv("KHNMC_ROUTE_DIFFICULTY");
+    setenv("KHNMC_ROUTE_DIFFICULTY","3",1); RCHECK(t_load(g,"@difficulty 2\n@select newgame-choice difficulty\n") && route_difficulty==3 && steps[0].c.arg==1); unsetenv("KHNMC_ROUTE_DIFFICULTY");
     memset(t_val,0,sizeof t_val); RCHECK(t_load(g,"@wait frames 5\n+1 +1 A\n")); t_run(g,10,16,b);
     RCHECK(steps[0].met==15 && b[5]==0x1000 && b[4]==0 && b[6]==0);
     RCHECK(t_load(g,"@wait not field\n") && steps[0].c.neg==1); t_val[KR_FIELD]=1; t_run(g,1,3,NULL); RCHECK(!steps[0].met); t_val[KR_FIELD]=0; t_run(g,4,4,NULL); RCHECK(steps[0].met==4);
@@ -1116,6 +1127,7 @@ int kh_input_route_selftest(KCtx *g){
             {"@press A until field every 2 hold 2\n","line 1: @press: hold must be shorter than every"},
             {"@expect field timeout 5\n","line 1: unknown option"},
             {"@select newgame-choice difficulty\n","uses `difficulty` in a condition but sets none"},
+            {"@difficulty 1\n@select newgame-choice difficulty\n","`difficulty` in a newgame-choice is a New Game row"},
             {"@frobnicate\n","line 1: unknown directive"},
         };
         for(size_t i=0;i<sizeof bad/sizeof *bad;i++){ t_fatal_txt=bad[i].txt; t_fatal_ticks=1;

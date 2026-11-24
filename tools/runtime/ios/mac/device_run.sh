@@ -117,12 +117,9 @@ RMC_PACK=${RMC_PACK:-}
 LOGO_PACK=${LOGO_PACK:-}
 if [ -z "$LOGO_PACK" ] && [ -d "$SRC/private/logos" ]; then LOGO_PACK=$SRC/private/logos; fi
 if [ -n "$LOGO_PACK" ]; then
-  if [ -e "$LOGO_PACK/styles.2ld" ]; then
-    for file in styles.2ld painting.png prompt-{LB,L1,L}.png; do
-      [ -s "$LOGO_PACK/$file" ] || bad "LOGO_PACK: missing $file"
-    done
-  fi
-  for file in {roxas,xion,xkb}.{2ld,png}; do
+  # The style artwork (styles.2ld, painting.png, prompt-*.png) and the retired xkb logo are what older builds drew; the runtime reads
+  # each screen's own logo and the screens layout now.  They are uploaded below when present, never required (review round 9, item 9).
+  for file in {roxas,xion}.{2ld,png}; do
     [ -s "$LOGO_PACK/$file" ] || bad "LOGO_PACK: missing $file"
   done
 fi
@@ -167,6 +164,7 @@ cp_to(){ xcrun devicectl device copy to --device "$DEVICE" --timeout 300 --domai
            --source "$1" --destination "Documents/$2" >> "$OUT/devicectl.log" 2>&1; }
 cp_from(){ rm -f "$OUT/$1"; xcrun devicectl device copy from --device "$DEVICE" --timeout 120 --domain-type appDataContainer \
            --domain-identifier "$BUNDLE_ID" --source "Documents/$1" --destination "$OUT/$1" >> "$OUT/devicectl.log" 2>&1; }
+[ ! -f "$RUNS/app-signed/sign.failed" ] || { say "the last signing FAILED ($RUNS/app-signed/sign.failed, see sign.log there): nothing is installed from an older app"; exit 2; }
 [ -x "$APP/KHNMC" ] || { say "no signed app at $APP (mac/sign_app.sh first)"; exit 2; }
 if [ -n "$GFX_APP" ]; then gfx_has "$APP/KHNMC"; hb=$?
   [ $hb = 2 ] && { say "nm could not read the signed app $APP/KHNMC: whether it has the graphics backend is unknown (GFX_APP=$GFX_APP): not run"; exit 2; }
@@ -205,12 +203,13 @@ if [ -n "$SCENE_ROXAS_PACK" ]; then
   say "scene Roxas model and three textures copied to Documents/scene-roxas"
 fi
 if [ -n "${LOGO_PACK:-}" ]; then
-  if [ -s "$LOGO_PACK/styles.2ld" ]; then
-    for file in painting.png prompt-{LB,L1,L}.png styles.2ld; do
-      cp_to "$LOGO_PACK/$file" "logos/$file" || { say "title style copy failed at $file"; exit 1; }
-    done
-  fi
-  for logo in roxas xion xkb; do
+  # Optional artwork: upload each of these only when the pack has it (styles.2ld, painting.png, prompt-*.png and xkb.* are no longer
+  # read; roxas/xion logos and the optional axel/screens layouts below are).  A missing optional file never stops the install.
+  for file in styles.2ld painting.png prompt-LB.png prompt-L1.png prompt-L.png xkb.2ld xkb.png; do
+    [ -s "$LOGO_PACK/$file" ] || continue
+    cp_to "$LOGO_PACK/$file" "logos/$file" || { say "title style copy failed at $file"; exit 1; }
+  done
+  for logo in roxas xion; do
     for ext in 2ld png; do
       file=$logo.$ext
       cp_to "$LOGO_PACK/$file" "logos/$file" || { say "title logo copy failed at $file"; exit 1; }

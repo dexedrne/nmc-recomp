@@ -808,6 +808,11 @@ static int decimal_range(const char *s,double *v,double lo,double hi){
 }
 int kh_hud_scale_parse(const char *s,double *v){ return decimal_range(s,v,0.5,3.0); }
 static _Atomic double style_scale=2,style_raise=0.25,enemy_scale=1.5,sub_scale=1.5,sub_lower=0.06;
+/* owner 2026-11-23: "the pause menu looks really weird, doesnt fit right".  The portrait camp layout below spans the frame from edge
+ * to edge, i.e. under the iPhone's Dynamic Island at the top and its home indicator at the bottom.  The iOS shell passes the real
+ * safe-area insets as KHNMC_SAFE_TOP / KHNMC_SAFE_BOTTOM (per mille of the screen's height, runtime/ios/ios_main.m); the camp stack
+ * is then kept inside those rows (moved, and shrunk when they are shorter than it).  Unset or 0 on every other host: nothing moves. */
+static _Atomic double safe_top_pm,safe_bottom_pm;
 static _Atomic int menu_band;
 static void portrait_number(const char *key,_Atomic double *value,double lo,double hi){
     const char *s=getenv(key);
@@ -817,12 +822,23 @@ static void portrait_number(const char *key,_Atomic double *value,double lo,doub
     if(e) kh_fatal(NULL,"portrait-value-%s: %s=%s (plain decimal %g..%g)",e==1?"malformed":"range",key,s,lo,hi);
     *value=number;
 }
+/* review fix #10: the iOS shell re-reads the REAL safe-area insets whenever the window's size, orientation or insets change and hands them
+ * over here (per mille of the screen's height, clamped like the environment values); the camp stack reads them on every frame, so a
+ * rotation or a fold change moves it at once.  No margin is assumed anywhere: a screen without insets (the unfolded Duo) reports 0. */
+void kh_safe_area_set(double top_pm,double bottom_pm);
+void kh_safe_area_set(double top_pm,double bottom_pm){
+    if(!(top_pm>=0.0)) top_pm=0.0; else if(top_pm>200.0) top_pm=200.0;
+    if(!(bottom_pm>=0.0)) bottom_pm=0.0; else if(bottom_pm>200.0) bottom_pm=200.0;
+    safe_top_pm=top_pm; safe_bottom_pm=bottom_pm;
+}
 static void portrait_config(void){
     portrait_number("KHNMC_HUD_SCALE_STYLE",&style_scale,0.5,3);
     portrait_number("KHNMC_HUD_STYLE_RAISE",&style_raise,0,0.5);
     portrait_number("KHNMC_HUD_SCALE_ENEMY",&enemy_scale,0.5,3);
     portrait_number("KHNMC_SUB_SCALE",&sub_scale,0.5,3);
     portrait_number("KHNMC_SUB_LOWER",&sub_lower,0,0.5);
+    portrait_number("KHNMC_SAFE_TOP",&safe_top_pm,0,200);
+    portrait_number("KHNMC_SAFE_BOTTOM",&safe_bottom_pm,0,200);
     const char *s=getenv("KHNMC_MENU_LAYOUT");
     menu_band=s && !strcmp(s,"band");
     if(s && *s && !menu_band && strcmp(s,"portrait")) kh_fatal(NULL,"menu-layout-value: KHNMC_MENU_LAYOUT=%s (known: portrait, band)",s);
@@ -911,14 +927,15 @@ void kh_aspect_title_config(const char *v){
 static _Atomic int title_pad_family;
 void kh_title_pad_family(int nintendo,int playstation){title_pad_family=nintendo?2:playstation?1:0;}
 
-/* The screens layout (tools/pack_title_screens.py, 17 textures): f_194550 binds each property to one 0x1a0-byte sequence.  Rebind
- * the picture (slot 4 -> 4 / 12 / 13) and the logo (slot 7 -> 14 / 15 / 16) of the screen chosen now (KHNMC_TITLE_SCREEN, R3) before
- * f_1948c0 draws it, retaining the current animation time, and copy that logo's sprite UV and part rectangles. */
+/* The screens layout (tools/pack_title_screens.py, KH_TITLE_TEXTURES textures): f_194550 binds each property to one 0x1a0-byte
+ * sequence.  Rebind the picture (slot 4 -> 4 / 12 / 13), the logo (slot 7 -> 14 / 15 / 16) and the boot sketch layers (slot 3 / 5 / 6
+ * -> 17+3*screen + {0,1,2}) of the screen chosen now (KHNMC_TITLE_SCREEN, R3) before f_1948c0 draws it, retaining the current
+ * animation time, and copy that logo's sprite UV and part rectangles. */
 void orig_f_1948c0(KCtx *);
 void f_1948c0(KCtx *g){
     u64 layout=A0(g),obj=layout-0x50;
     if((obj==rd64(g,T_LAYOUT_PTR) || obj==rd64(g,T_MENU_PTR)) && kh_phase_title_alive() &&
-       rd32(g,obj+0x40)==17 && rd32(g,layout+0x38)==105){   /* 17 textures, the native 105 properties */
+       rd32(g,obj+0x40)==KH_TITLE_TEXTURES && rd32(g,layout+0x38)==105){   /* 26 textures, the native 105 properties */
         u64 lay=rd64(g,layout+0x10),geometry=lay+KH_TITLE_SCREENS_GEOMETRY;
         if(rd32(g,geometry)!=0x47303954) kh_fatal(g,"title-screens-geometry: no T90G at byte %d of the screens layout",KH_TITLE_SCREENS_GEOMETRY);
         int picture,logo=kh_title_variant(&picture);
@@ -937,6 +954,9 @@ void f_1948c0(KCtx *g){
                 int slot=rd32(g,prop+24*i);
                 if(slot==4) slot=picture?11+picture:4;
                 else if(slot==7) slot=13+logo;
+                else if(slot==3) slot=KH_TITLE_SKETCH_BASE+3*picture;
+                else if(slot==5) slot=KH_TITLE_SKETCH_BASE+3*picture+1;
+                else if(slot==6) slot=KH_TITLE_SKETCH_BASE+3*picture+2;
                 else continue;
                 wr64(g,active+i*0x1a0+0x60,textures+256*slot);
             }
@@ -1586,6 +1606,21 @@ static void camp_matrix(u32 ms[4],double b,const float box[4],u64 vt,int page){
             ty=60-b+(left?0:280*scale+14);
         }
     }
+    /* The phone's safe area (KHNMC_SAFE_TOP / _BOTTOM, per mille of the screen's height; both 0 on every other host, where k = 1,
+     * lo = -b and nothing below moves): the camp stack's own extent is the header's top (20-b) to the footer's bottom
+     * (416+b-3.5), and that whole extent is moved inside the safe rows - and shrunk about its top, and about the band's centre in
+     * x so text keeps its shape, when the safe rows are shorter than it.  The same k, lo and stack top go into every batch of a
+     * page, so the menu keeps its internal geometry (the Config row's two halves still receive one transform) and nothing is cut.
+     * The frame's columns are the GS frame of a screen taller than wide: xl = 256 - 256*(16/9)/(4/3) = -85.33, xr = 512 - xl. */
+    { double span=416.0+2.0*b, stack_top=-b+20.0, stack_bottom=416.0+b-3.5, stack_h=stack_bottom-stack_top;
+      double lo=stack_top+span*(double)safe_top_pm/1000.0, hi=stack_bottom-span*(double)safe_bottom_pm/1000.0;
+      if(lo>hi){ double mid=(lo+hi)/2; lo=hi=mid; }
+      double k=(stack_h>0.0 && hi-lo<stack_h)?(hi-lo)/stack_h:1.0;
+      scale*=k; ty=k*ty+lo-k*stack_top; tx=256.0+k*(tx-256.0);
+      double xl=-85.33333333333333, xr=512.0-xl, bw=(double)box[1]-(double)box[0];
+      if(bw>1e-6 && scale*bw>xr-xl-2.0) scale=(xr-xl-2.0)/bw;
+      double x0p=tx+scale*((double)box[0]-px), x1p=tx+scale*((double)box[1]-px);
+      if(x0p<xl+1.0) tx+=xl+1.0-x0p; else if(x1p>xr-1.0) tx-=x1p-(xr-1.0); }
     double xs=bf(ms[0]),ys=bf(ms[1]);
     hud_ms(ms,scale,px,py);
     ms[2]=fbits((float)(bf(ms[2])+(tx-px)*xs));
@@ -2550,6 +2585,25 @@ static void h3_selftest(KCtx *g){
         camp_matrix(left,300,(float[]){40,138,80,106},GS_BASE+0x5bab18,36);
         camp_matrix(right,300,(float[]){178,493,80,106},0,36);
         ACHECK(!memcmp(left,right,sizeof left) && bf(left[0])>1);
+        /* owner 2026-11-23 ("the pause menu ... doesnt fit right"): the phone's safe area.  The whole camp stack (the header's top
+         * to the footer's bottom) is moved into the safe rows, and shrunk when they are shorter; the Config row's two halves still
+         * receive one transform; with no margins nothing moves. */
+        { double st0=safe_top_pm, sb0=safe_bottom_pm, span=416.0+600.0;                      /* b = 300 in these calls */
+          double lo=-280.0+span*45.0/1000.0, hi=(716.0-3.5)-span*30.0/1000.0;
+          u32 hd[4]={fbits(1),fbits(1),0,0}, ft[4]={fbits(1),fbits(1),0,0}, ft0[4]={fbits(1),fbits(1),0,0};
+          safe_top_pm=45; safe_bottom_pm=30;
+          camp_matrix(hd,300,(float[]){0,512,0,34},0,0);                                    /* the header: the stack's top */
+          camp_matrix(ft,300,(float[]){0,512,312,416},0,0);                                 /* the footer: the stack's bottom */
+          ACHECK(near(bf(hd[3]),lo,0.05) && near(416.0*bf(ft[1])+bf(ft[3]),hi,0.05));        /* inside the safe rows, exactly */
+          ACHECK(bf(ft[1])<1.05 && bf(ft[1])>0.5);                                          /* shrunk, not cut */
+          u32 l3[4]={fbits(1),fbits(1),0,0}, r3[4]; memcpy(r3,l3,sizeof r3);
+          camp_matrix(l3,300,(float[]){40,138,80,106},GS_BASE+0x5bab18,36);
+          camp_matrix(r3,300,(float[]){178,493,80,106},0,36);
+          ACHECK(!memcmp(l3,r3,sizeof l3) && bf(l3[0])>1);                                  /* Config: still one transform */
+          safe_top_pm=0; safe_bottom_pm=0;
+          camp_matrix(ft0,300,(float[]){0,512,312,416},0,0);
+          ACHECK(near(416.0*bf(ft0[1])+bf(ft0[3]),716.0-3.45,0.05));                        /* no margins: where it always was */
+          safe_top_pm=st0; safe_bottom_pm=sb0; }
         ACHECK(kh_hud_scale_parse("0.49",&v)==2&&kh_hud_scale_parse("3.01",&v)==2&&kh_hud_scale_parse("0",&v)==2);
         ACHECK(kh_hud_scale_parse("1,25",&v)==1&&kh_hud_scale_parse("1.25x",&v)==1&&kh_hud_scale_parse("",&v)==1&&kh_hud_scale_parse(".5",&v)==1&&kh_hud_scale_parse("1.",&v)==1&&kh_hud_scale_parse("-1",&v)==1&&kh_hud_scale_parse("1e0",&v)==1&&kh_hud_scale_parse(NULL,&v)==1);
         hud_s[0]=1.25; hud_s[1]=1.5; asp_mode=1;

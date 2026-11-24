@@ -616,7 +616,7 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
             for(int i=0;i<noffs;i++) offs[i]=(int32_t)pt->e[i].orig;
             t->unknown_ext=1;
         }
-        if(styles && noffs!=17){snprintf(err,cap,"title-screens-texture-count: %d (expected 17)",noffs);goto fail;}
+        if(styles && noffs!=KH_TITLE_TEXTURES){snprintf(err,cap,"title-screens-texture-count: %d (expected %d)",noffs,KH_TITLE_TEXTURES);goto fail;}
         if(styles) noffs=9;
         t->offsets=noffs;
         for(int i=0;i<nf;i++) if(strlen(files[i].name)>31){ snprintf(err,cap,"mod file name longer than 31 characters in a scanned folder: %s (folder of %s); Panacea keeps names in 32 bytes",files[i].name,rel); goto fail; }
@@ -652,12 +652,13 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
     }
     if(styles){
         /* the screens layout: 9 textures of the title's folder, 3 controller aliases of 8, then the Xion and Axel pictures (their
-         * packs' plain slots) and the roxas / xion / axel logo atlases of the logo folder.  A screen whose pack is missing gets the
-         * Roxas picture in its slot (it is never shown: kh_title_screen skips it). */
+         * packs' plain slots), the roxas / xion / axel logo atlases of the logo folder, and the nine boot-intro sketch layers
+         * (slots 3/5/6 of each screen, from that screen's pack).  A screen whose pack is missing gets the Roxas picture / sketch in
+         * its slot (it is never shown: kh_title_screen skips it). */
         int count=0,bad=0;
         free(offs);offs=NULL;
-        if(t->n!=9 || !kh_rm_offsets(rel,bytes,n,&offs,&count,&bad) || bad || count!=17){
-            snprintf(err,cap,"title-screens-hd-layout: expected 9 original, 3 controller, 2 picture and 3 logo slots");goto fail;
+        if(t->n!=9 || !kh_rm_offsets(rel,bytes,n,&offs,&count,&bad) || bad || count!=KH_TITLE_TEXTURES){
+            snprintf(err,cap,"title-screens-hd-layout: expected 9 original, 3 controller, 2 picture, 3 logo and 9 boot-sketch slots");goto fail;
         }
         HdEnt *entries=realloc(t->e,count*sizeof *entries);
         if(!entries){snprintf(err,cap,"title-screens-hd-memory");goto fail;}
@@ -665,10 +666,13 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
         for(int i=0;i<count;i++){
             if(i>=9){
                 static const int logos[]={1,2,4};
+                static const int sketches[]={3,5,6};
                 char path[4096];
                 if(i<12) snprintf(path,sizeof path,"%s",entries[8].host);
                 else if(i<14){ if(!kh_title_screen_picture(i-11,path,sizeof path)) snprintf(path,sizeof path,"%s",entries[4].host); }
-                else kh_title_logo_path(logos[i-14],"png",path,sizeof path);
+                else if(i<KH_TITLE_SKETCH_BASE) kh_title_logo_path(logos[i-14],"png",path,sizeof path);
+                else{ int screen=(i-KH_TITLE_SKETCH_BASE)/3, slot=sketches[(i-KH_TITLE_SKETCH_BASE)%3];
+                      if(!kh_title_screen_sketch(screen,slot,path,sizeof path)) snprintf(path,sizeof path,"%s",entries[slot].host); }
                 if(stat(path,&st) || st.st_size<=0 || st.st_size>INT_MAX){snprintf(err,cap,"title-screens-hd-file: %s",path);goto fail;}
                 HdEnt *e=&entries[t->n++];memset(e,0,sizeof *e);
                 snprintf(e->name,sizeof e->name,"-%d.png",i);e->gsize=st.st_size;
@@ -677,8 +681,9 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
             }
             entries[i].orig=(uint32_t)offs[i];
         }
-        fprintf(stderr,"kh: title screens HD: Roxas picture %s, Xion picture %s, Axel picture %s, logos %s %s %s\n",
-                entries[4].host,entries[12].host,entries[13].host,entries[14].host,entries[15].host,entries[16].host);
+        fprintf(stderr,"kh: title screens HD: Roxas picture %s, Xion picture %s, Axel picture %s, logos %s %s %s, sketches roxas %s %s %s, xion %s %s %s, axel %s %s %s\n",
+                entries[4].host,entries[12].host,entries[13].host,entries[14].host,entries[15].host,entries[16].host,
+                entries[17].host,entries[18].host,entries[19].host,entries[20].host,entries[21].host,entries[22].host,entries[23].host,entries[24].host,entries[25].host);
     }
     if(t->look>0){
         int slot=t->look-1;
@@ -1131,8 +1136,9 @@ int kh_hd_selftest(KCtx *g){
         kh_hd_begin(g,dir,TITLE_LAYOUT,bar,sizeof bar); TEST(cur_table==stock);
         kh_look_set(g,0);
         TEST(kh_title_screen_next(KH_TITLE_ROXAS)==KH_TITLE_XION && kh_title_screen_next(KH_TITLE_XION)==KH_TITLE_ROXAS);   /* no Axel pack: skipped */
-        TEST(put_file(axelpack,TITLE_IMAGE,"axel-pic!",9) && kh_title_screen_next(KH_TITLE_XION)==KH_TITLE_AXEL &&
-             kh_title_screen_next(KH_TITLE_AXEL)==KH_TITLE_ROXAS);
+        TEST(put_file(axelpack,TITLE_IMAGE,"axel-pic!",9));
+        kh_look_set(g,kh_look_enabled());   /* the pack changed: drop the cached screen availability */
+        TEST(kh_title_screen_next(KH_TITLE_XION)==KH_TITLE_AXEL && kh_title_screen_next(KH_TITLE_AXEL)==KH_TITLE_ROXAS);   /* the Axel pack now counts */
         TEST(put_file(pack,"xkb.png","logo-xkb",8));
         memcpy(bar+sizeof bar-6,"T80L",4); bar[sizeof bar-2]=3;
         kh_hd_begin(g,dir,TITLE_LAYOUT,bar,sizeof bar-1);
@@ -1146,20 +1152,22 @@ int kh_hd_selftest(KCtx *g){
         memcpy(bar+sizeof bar-7,"T80L",4); bar[sizeof bar-3]=4;
         kh_hd_begin(g,dir,TITLE_LAYOUT,bar,sizeof bar-2);
         TEST(cur_table!=stock && cur_table->n==8 && cur_table->e[7].size==10 && cur_table->e[4].size==9);
-        /* the screens layout (T90L): 17 slots, live switching; pictures from the packs, logos from the logo folder */
+        /* the screens layout (T90L): KH_TITLE_TEXTURES slots, live switching; pictures/sketches from the packs, logos from the logo folder */
         {
             static unsigned char big[0x1000];
             char key[128]; snprintf(key,sizeof key,"remastered/" TITLE_LAYOUT "/-8.png");
             TEST(prov_add(key) && put_file(dir,key,"stock",5));
             TEST(put_file(pack,"roxas.png","logo-r",6) && put_file(pack,"xion.png","logo-xi",7));
-            make_bar_at(big,17,0,0x200); memcpy(big+sizeof big-20,"T90L",4);   /* its own length: the cache key holds the byte count */
+            make_bar_at(big,KH_TITLE_TEXTURES,0,0x200); memcpy(big+sizeof big-20,"T90L",4);   /* its own length: the cache key holds the byte count */
             kh_hd_begin(g,dir,TITLE_LAYOUT,big,sizeof big-16);
             HdTable *sc=cur_table;
-            TEST(sc && sc->n==17 && sc->look==0 && sc->hooded==0);
-            if(sc && sc->n==17){
+            TEST(sc && sc->n==KH_TITLE_TEXTURES && sc->look==0 && sc->hooded==0);
+            if(sc && sc->n==KH_TITLE_TEXTURES){
                 TEST(sc->e[12].size==7 && sc->e[13].size==9 && sc->e[14].size==6 && sc->e[15].size==7 && sc->e[16].size==10);
                 for(int i=9;i<12;i++) TEST(!strcmp(sc->e[i].host,sc->e[8].host));
                 TEST(sc->e[4].size==5);
+                /* the nine boot sketches fall back to the tree's sketch slots (3/5/6) when their pack has none */
+                for(int i=KH_TITLE_SKETCH_BASE;i<KH_TITLE_TEXTURES;i++) TEST(sc->e[i].size==5 && !strcmp(sc->e[i].host,sc->e[(i-KH_TITLE_SKETCH_BASE)%3==0?3:(i-KH_TITLE_SKETCH_BASE)%3==1?5:6].host));
             }
             setenv("KHNMC_TITLE_SCREEN","roxas",1);
             kh_hd_begin(g,dir,TITLE_LAYOUT,big,sizeof big-16); TEST(cur_table==sc);   /* one table for every screen */

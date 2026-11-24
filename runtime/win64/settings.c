@@ -574,7 +574,16 @@ void kh_settings_init(void){
             if(strcasecmp(v,"on") && strcasecmp(v,"true") && strcmp(v,"1") &&
                strcasecmp(v,"off") && strcasecmp(v,"false") && strcmp(v,"0"))
                 reason="Expected on or off";
-        }else if(validate(key,v,&n)<0) reason="Invalid configured value";
+        }else if(validate(key,v,&n)<0){
+            /* The title screen has a defined default: a bad value (wrong case, empty, unknown) reads as ROXAS and never disables the
+             * row for the rest of the session (review round 9, item 2: it used to stay "unavailable", so R3 died on the next save). */
+            if(i==TITLE_SCREEN){
+                kh_warn("title-screen-value: %s=%s (known: roxas, xion, axel): showing ROXAS MAY CRY",key,v);
+                unsetenv(key);
+                continue;
+            }
+            reason="Invalid configured value";
+        }
         else if(!strcmp(key,"KHNMC_SCENE_ROXAS") && n && !kh_scene_pack_ready()) reason="Scene asset pack incomplete";
         if(!reason && (!strcmp(key,"KHNMC_FOV_ZOOM") || !strcmp(key,"KHNMC_HUD_SCALE_CMD") || !strcmp(key,"KHNMC_HUD_SCALE_HP"))){
             const char *aspect=getenv("KHNMC_ASPECT");
@@ -754,6 +763,10 @@ uint32_t kh_menu_texel(unsigned x,unsigned y,uint32_t bg){
 enum { ROOT, CHARACTER, CHEATS, CONTROLLER, DISPLAY, GAMEPLAY, ABOUT, ADVANCED, INPUT_TEST };
 static const char *const pages[]={"Roxas May Cry","Character","Cheats","Controller","Display","Gameplay","About","Advanced","Input test"};
 static _Atomic int title_screen,menu_open;
+/* The title menu (NEW GAME / LOAD / BACK) gains a fourth row, CHEATS, that opens this menu.  The native menu has no artwork for a
+ * fourth row, so the row is a cursor position: kh_menu_pad raises the native row count to 4 (the game's own up/down then wraps
+ * 0..3) and answers a confirm on row 3 by opening this menu; kh_menu_text draws the row label while it is selected. */
+static _Atomic int title_cheats_row;
 static int page,row,component,advanced_row,direct_character,preview_look,first_section;
 enum { VALUE_CAP=1001 }; /* validate() caps persisted strings at 1000 bytes. */
 static char chosen[sizeof kh_options/sizeof *kh_options][VALUE_CAP];
@@ -946,6 +959,11 @@ static void edit_row(KCtx *g,int i,int direction,const char *blocked){
     if(kh_setting_unavailable(i) || ((i==LOOK || i==WEAPON) && blocked)) return;
     char old[VALUE_CAP],value[VALUE_CAP];option_text(i,old,sizeof old);
     if(i==LOOK) snprintf(value,sizeof value,"%s",look_names[next_available_look(look_number(old),direction>0)]);
+    else if(i==TITLE_SCREEN){
+        /* Move from the STORED screen, not the displayed one: with the Xion pack missing the row showed Roxas and Right always
+         * wrote xion, so Axel could never be reached (review round 9, item 7).  Only available screens are visited. */
+        snprintf(value,sizeof value,"%s",kh_title_screen_name(kh_title_screen_step(kh_title_screen_stored(),direction>0)));
+    }
     else if(o->choices){
         char list[128];snprintf(list,sizeof list,"%s",o->choices);
         char *rest=list,*v,*choices[16];int count=0,index=0;
@@ -991,15 +1009,39 @@ int kh_menu_pad(struct KCtx *g,unsigned buttons,int lt,int rt,int lx,int ly,int 
         if(title_screen==KH_TITLE_LIST && (buttons&0x80) && !(buttons&~0x80)){
             if(down&0x80){
                 int from=kh_title_screen(),to=kh_title_screen_next(from);
-                int rc=kh_setting_set("KHNMC_TITLE_SCREEN",kh_title_screen_name(to));
-                if(rc) kh_fatal(g,"title-screen-save: %d",rc);
-                fprintf(stderr,"kh: title screen R3: %s -> %s frame=%llu\n",kh_title_screen_name(from),kh_title_screen_name(to),
-                        (unsigned long long)kh_game_frames());
+                const char *name=kh_title_screen_name(to);
+                double checked;
+                /* Validate the value and normalise a bad startup setting away instead of dying on it (review round 9, item 2):
+                 * an invalid KHNMC_TITLE_SCREEN (e.g. "Xion" or "") leaves the option marked unavailable from the config load, so
+                 * kh_setting_set returned -2 and this handler called kh_fatal("title-screen-save").  A save of a valid screen clears
+                 * that stale reason; any remaining refusal is a warning, never a stop. */
+                int rc=-1;
+                if(validate("KHNMC_TITLE_SCREEN",name,&checked)==TITLE_SCREEN){
+                    if(unavailable[TITLE_SCREEN]) unavailable[TITLE_SCREEN]=NULL;
+                    rc=kh_setting_set("KHNMC_TITLE_SCREEN",name);
+                }
+                if(rc) kh_warn("title-screen-save: %s not saved (%d)",name,rc);
+                else fprintf(stderr,"kh: title screen R3: %s -> %s frame=%llu\n",kh_title_screen_name(from),name,
+                             (unsigned long long)kh_game_frames());
             }
             return 1;
         }
+        int cheats_open=0;
+        if(title_screen==KH_TITLE_LIST){
+            /* lane T-title-cheats: NEW GAME / LOAD / BACK / CHEATS.  Raise the native row count so the game's own up/down wraps
+             * 0..3; a confirm (Cross/A) on row 3 opens this menu exactly as the (now hidden) R1/RB shortcut did.  The native menu
+             * has no artwork for a fourth row, so keep the last row's highlight frame for the new cursor position. */
+            int cursor=kh_route_cursor(g,KR_TITLE_CHOICE);
+            if(cursor>=0 && rd32(g,GS_BASE+0xb1d5f0ull)==3){
+                wr32(g,GS_BASE+0xb1d5f0ull,4);
+                wr8(g,GS_BASE+0x5b8623ull,0x12);   /* theatre-variant row index -> THEATER's frame */
+                wr8(g,GS_BASE+0x5b8627ull,0x04);   /* no-theatre row index -> BACK's frame */
+            }
+            atomic_store(&title_cheats_row,cursor==3);
+            cheats_open=cursor==3 && (down&0x1000);
+        }else atomic_store(&title_cheats_row,0);
         direct_character=atomic_exchange(&enter_character,0);
-        if(!direct_character && !chord && !(title_screen && (down&0x200))) return 0;
+        if(!direct_character && !chord && !cheats_open && !(title_screen && (down&0x200))) return 0;
         if(!direct_character && !title_screen && !rd8(g,GS_BASE+0x9006b0)){
             if(!kh_route_cond_eval(g,KR_FIELD,0,kh_game_frames(),NULL)) return 0;
             if(rd64(g,GS_BASE+0x9ba928) || rd8(g,GS_BASE+0x9ba8d1)) return 0;
@@ -1095,7 +1137,8 @@ int kh_menu_text(uint8_t text[KH_MENU_TEXT_SIZE]){
     int ready=atomic_load(&font_ready);
     if(ready<0) kh_fatal(NULL,"settings-menu-font: unsupported system font");
     if(!ready) return 0;
-    if(!menu_open){encode_system_text(text,"R1/RB  Roxas May Cry");return 1;}
+    /* The title's R1/RB prompt is gone; R1/RB still opens this menu.  While the fourth title row is selected its label is shown. */
+    if(!menu_open){if(atomic_load(&title_cheats_row)){encode_system_text(text,"CHEATS");return 1;} return 0;}
     pthread_mutex_lock(&panel_lock);memcpy(text,panel_text,sizeof panel_text);pthread_mutex_unlock(&panel_lock);
     return text[0]?2:0;
 }
@@ -2043,8 +2086,10 @@ int kh_axel_round2_selftest(KCtx *g){
     R2(!kh_axel_weapon_ready() && !weapon_offered(KH_LOOK_AXEL) && kh_setting_set("KHNMC_AXEL_WEAPON","chakrams")==-2);
     R2(load_marks_weapons()==0);                                                 /* a load without the chakram set: nothing to rebind */
     made&=axel_test_file(roots[2],"weapons/chakram/obj/W_EX010.mdlx") && axel_test_file(roots[2],"weapons/chakram/obj/W_EX010_10.mdlx");
+    kh_look_set(g,kh_look_enabled());                                              /* the pack changed: drop the cached answer */
     R2(made && !kh_axel_weapon_ready());                                           /* no HD texture yet */
     made&=axel_test_file(roots[2],"weapons/chakram/hd/-0.dds");
+    kh_look_set(g,kh_look_enabled());                                              /* the pack changed: drop the cached answer */
     R2(made && kh_axel_weapon_ready() && weapon_offered(KH_LOOK_AXEL) && !weapon_offered(KH_LOOK_XION) && !weapon_offered(KH_LOOK_ROXAS));
     char host[4096];
     R2(kh_axel_weapon_asset("obj/W_EX010_10.mdlx",host,sizeof host) && !kh_axel_weapon_asset("obj/W_EX010_20.mdlx",host,sizeof host));

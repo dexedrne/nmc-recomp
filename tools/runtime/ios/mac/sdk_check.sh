@@ -6,13 +6,14 @@
 #   port in one pass.  Nothing is linked, no shard is compiled (they hold no system call; the full build is build.sh).
 #   Result: $RUNS/sdk-check-<sdk>.log and one summary line per SDK; exit 1 when anything failed to compile.
 . "$(dirname "$0")/lib.sh"
-mem_gate "the compile check"
 rc=0
 for sdk in iphoneos iphonesimulator; do
+  mem_gate "the $sdk compile pass (make)"      # review fix #5: a fresh memory reading before EVERY compile pass
   T=$(sdk_triple "$sdk"); LOG="$RUNS/sdk-check-$sdk.log"
   echo "ios/mac: sdk_check: $sdk $(xcrun --sdk "$sdk" --show-sdk-version), $(xcrun --sdk "$sdk" clang --version | head -1), target $T" | tee "$LOG"
   nice -n $NICE make -k -j$JOBS IOS_SDK="$sdk" rtobjs >> "$LOG" 2>&1; mrc=$?
   mkdir -p "obj-$sdk/objc"
+  mem_gate "the $sdk Objective-C / probe compile pass"
   for f in runtime/ios/ios_main.m tools/ios/probe/probe_main.m tools/ios/probe/probe_core.c; do
     nice -n $NICE xcrun --sdk "$sdk" clang -target "$T" -fobjc-arc -std=gnu11 -O1 -Wall -Wextra -Wno-unused-parameter -Iruntime -c "$f" -o "obj-$sdk/objc/$(basename "$f").o" >> "$LOG" 2>&1 || { echo "ios/mac: sdk_check: $f FAILED for $sdk" | tee -a "$LOG"; mrc=1; }
   done

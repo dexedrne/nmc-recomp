@@ -1,15 +1,18 @@
 """Build the three-screen title layout (screens.2ld): ROXAS MAY CRY, XION ALWAYS CRIES, AXEL WON'T CRY.
 
 One resident layout holds every picture and logo, so R3 on the title screen switches screens live (aspect.c f_1948c0, DLL logo.c
-draw_layout rebind texture slots 4 and 7 and copy the chosen logo's geometry).  Texture slots:
-   0-8   the game's title textures (4 = the Roxas picture, 7 = the mod's own logo atlas)
+draw_layout rebind texture slots 3 / 4 / 5 / 6 / 7 and copy the chosen logo's geometry).  Texture slots:
+   0-8   the game's title textures (3 / 5 / 6 = the boot-intro hooded-figure line-art sketches, 4 = the Roxas picture, 7 = the mod's
+         own logo atlas)
    9-11  the controller sheets (aliases of 8, as f_2b4c60 expects)
    12    the Xion picture         13  the Axel picture
    14    the roxas logo atlas     15  the xion logo atlas     16  the axel logo atlas
-The HD pictures are NOT read from this file: the port serves slot 4 from remastered/menu/us/title.2ld/-4.png (the rmc pack),
-12 / 13 from each look pack's remastered/menu/us/title.2ld/-4.png and 14-16 from <logo dir>/{roxas,xion,axel}.png; the DLL serves
-remastered/menu/us/rmcsc.2ld/-<slot>.png.  The SD copies here (pictures downscaled to 512x512, each logo .2ld's own texture 7) only
-fill the slots.  After the layout: b"T90G" + 4 x (16-byte sprite UV + 120-byte part rectangles) for the native, roxas, xion and
+   17-19 the Roxas boot sketches (-3 / -5 / -6), 20-22 the Xion sketches, 23-25 the Axel sketches (17 + 3*screen + k)
+The HD pictures and sketches are NOT read from this file: the port serves slot 4 from remastered/menu/us/title.2ld/-4.png (the rmc
+pack), 12 / 13 from each look pack's remastered/menu/us/title.2ld/-4.png, 14-16 from <logo dir>/{roxas,xion,axel}.png and 17-25 from
+each screen's pack remastered/menu/us/title.2ld/-{3,5,6}.png; the DLL serves remastered/menu/us/rmcsc.2ld/-<slot>.png.  The SD copies
+here (pictures downscaled to 512x512, each logo .2ld's own texture 7, the sketches the native slot 3 / 5 / 6 texture) only fill the
+slots.  After the layout: b"T90G" + 4 x (16-byte sprite UV + 120-byte part rectangles) for the native, roxas, xion and
 axel logos (taken from the logo .2ld files, pack_title_logo.py), at byte 79092 of the layout; the file ends in b"T90L"."""
 import argparse
 import hashlib
@@ -73,6 +76,11 @@ def build(data, logos, xion, axel, out, roxas=None):
     for name, blob in zip(LOGOS, blobs):
         assert blob[-5:-1] == b"T80L", f"{name}.2ld is not a pack_title_logo.py layout"
         textures.append(texture(blob, 7))
+    # Boot-intro sketches (17..25): the SD copy is the native sketch texture the slot stands in for (3 / 5 / 6) per screen; the HD
+    # is served from each screen's pack remastered/menu/us/title.2ld/-{3,5,6}.png by runtime/hd_assets.c (never read here).
+    for screen in range(3):
+        for native in (3, 5, 6):
+            textures.append(texture(original, native))
     lay += b"T90G" + geometry(original) + b"".join(geometry(blob) for blob in blobs)
     # Round 5: the runtime draws 12/13 in place of slot 4 and 14..16 in place of slot 7; anything but the native allocation (byte
     # count + IMGD header) makes the Load menu's save check fail with that texture on screen (runtime/file_layer.c

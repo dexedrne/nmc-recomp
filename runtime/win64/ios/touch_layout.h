@@ -19,13 +19,18 @@ static inline unsigned kh_touch_mask(int i){
 static inline double kh_touch_diameter(int size,double w,double h){
     return fmin(44+size*6,fmin((w-8)/(h>w?10:8),h/(h>w?16:9)));
 }
-/* All persistent controls fit above the lower HUD corners, in safe-area points. */
+/* All persistent controls fit above the lower HUD corners, in safe-area points.  In portrait (h > w) the movement cluster and
+ * the sticks sit LOWER, near the bottom edge of the safe area (owner 2026-11-23: "on portrait mode the touch controls can be
+ * kinda lower on the screen since thats where you are holding them"): the cluster's centre is 2.4 button diameters above the
+ * safe area's bottom edge, so the lowest button keeps 0.9 d of clearance (the safe area already excludes the home indicator).
+ * Landscape is unchanged.  Upside down is the same portrait layout, turned with the whole view (runtime/ios/ios_main.m), so the
+ * same places face the thumbs. */
 static inline void kh_touch_button_frame(int i,int size,double w,double h,double *x,double *y,double *diameter){
     double d=kh_touch_diameter(size,w,h);
     if(i<KH_LT){
         static const int dx[]={0,0,-1,1,0,1,-1,0},dy[]={-1,1,0,0,1,0,0,-1};
         *x=(i<KH_A?1.5*d+2:w-1.5*d-2)+dx[i]*d;
-        *y=(h>w?h*.655:h*.44)+dy[i]*d;
+        *y=(h>w?h-2.4*d:h*.44)+dy[i]*d;
     }else if(h>w){
         /* The animated rank fills the upper right. Stack these rows on the left. */
         int n=i-KH_LT;
@@ -42,7 +47,7 @@ static inline void kh_touch_button_frame(int i,int size,double w,double h,double
 }
 static inline void kh_touch_stick_home(int side,double d,double w,double h,double *x,double *y){
     double inset=h>w?2+3.95*d:w*.23;
-    *x=side?w-inset:inset; *y=h*(h>w?.655:.75);
+    *x=side?w-inset:inset; *y=h>w?h-2.4*d:h*.75;   /* portrait: as low as the button cluster (owner 2026-11-23) */
 }
 typedef struct { double x,y,dx,dy; } KHStick;
 static inline void kh_touch_drag(KHStick *s,double x,double y,double radius,int fixed,int sensitivity){

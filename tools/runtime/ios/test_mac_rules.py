@@ -64,21 +64,59 @@ check(bool(macs), 'no tools/ios/mac/*.sh found in %s' % D)
 # 1. piped memory gates
 for f in macs:
     for no, t in lines('mac/' + f):
-        if re.search(r'(^|[;&|{(]\s*)mem_gate\s+"', t) and re.search(r'mem_gate\s+"[^"]*"[^;]*\|', t):
+        if re.search(r'(^|[;&|{(]\s*)mem_gate\s+"', t) and re.search(r'mem_gate\s+"[^"]*"[^;|]*\|(?!\|)', t):
             check('PIPESTATUS[0]' in t and re.search(r'\|\|\s*\{?.*?\bexit\s+[1-9]', t) is not None,
                   'mac/%s:%d: mem_gate is piped and its exit status is not checked (exit 3 ends only the subshell): %s'
                   % (f, no, t.strip()[:120]))
 
-# 2. a gate before every heavy step of build.sh
-heavy_seen, gate_since = 0, False
-for no, t in lines('mac/build.sh'):
-    if re.search(r'(^|[;&|{(]\s*)mem_gate\s+"', t):
-        gate_since = True
-    if re.search(r'-j\$JOBS|\bxcodebuild\b', t) and not t.lstrip().startswith('mem_gate'):
-        heavy_seen += 1
-        check(gate_since, 'mac/build.sh:%d: heavy step without a fresh memory reading before it: %s' % (no, t.strip()[:100]))
-        gate_since = False
-check(heavy_seen >= 3, 'mac/build.sh: expected at least 3 heavy steps (shards, applib, xcodebuild), found %d' % heavy_seen)
+# 2. a fresh memory reading before EVERY compiling step of EVERY mac script (review fix #5: build.sh, sdk_check.sh, sign_app.sh)
+HEAVY = r'-j\$JOBS|\bxcodebuild\b|\bclang\s+-target\b'
+heavy_by = {}
+for f in macs:
+    heavy_seen, gate_since = 0, False
+    for no, t in lines('mac/' + f):
+        ts = t.lstrip()
+        if re.search(r'(^|[;&|{(]\s*)mem_gate\s+"', ts) or re.search(r'\(\s*mem_gate\s+"', ts):
+            gate_since = True
+        if re.search(HEAVY, ts) and not re.match(r'(echo|\[|else|fail|#|case|for|if|mem_gate)\b|\[', ts) and not ts.startswith('('):
+            heavy_seen += 1
+            check(gate_since, 'mac/%s:%d: heavy step without a fresh memory reading before it: %s' % (f, no, t.strip()[:100]))
+            gate_since = False
+    heavy_by[f] = heavy_seen
+check(heavy_by.get('build.sh', 0) >= 3, 'mac/build.sh: expected at least 3 heavy steps (shards, applib, xcodebuild), found %d' % heavy_by.get('build.sh', 0))
+check(heavy_by.get('sdk_check.sh', 0) >= 2, 'mac/sdk_check.sh: expected a make pass and an Objective-C pass, found %d heavy step(s)' % heavy_by.get('sdk_check.sh', 0))
+check(heavy_by.get('sign_app.sh', 0) >= 1, 'mac/sign_app.sh: no xcodebuild found')
+# every script that compiles runs under the shared Mac lock: build / sdk_check go through mac_step (maclock.py); sign_app.sh is started by
+# launchctl, so it takes the lock itself and maclock.py tells its child so
+sg = ' '.join(t for _, t in lines('mac/sign_app.sh'))
+check('maclock.py' in sg and 'KHNMC_MACLOCK_HELD' in sg, 'mac/sign_app.sh: does not take the shared Mac lock (maclock.py / KHNMC_MACLOCK_HELD)')
+check("KHNMC_MACLOCK_HELD" in ' '.join(t for _, t in lines('maclock.py')) if os.path.exists(os.path.join(D, 'maclock.py')) else False, 'maclock.py: does not export KHNMC_MACLOCK_HELD to its step')
+for f in macs:
+    if heavy_by.get(f):
+        body = ' '.join(t for _, t in lines('mac/' + f))
+        check(f in ('build.sh', 'sdk_check.sh') or 'maclock.py' in body, 'mac/%s compiles but is not run under the shared lock (add it to the mac_step scripts or take the lock)' % f)
+# review fix #3: a failed signing is never reported as success
+sg_lines = lines('mac/sign_app.sh')
+check(any('sign.failed' in t for _, t in sg_lines) and any('xrc=$?' in t for _, t in sg_lines) and any('xcodebuild exited' in t for _, t in sg_lines),
+      'mac/sign_app.sh: the xcodebuild exit status is not checked / no sign.failed marker')
+done_lines = [t for _, t in sg_lines if 'touch "$OUT/sign.done"' in t]
+check(len(done_lines) == 1 and re.search(r'\[ \$rc = 0 \] && touch "\$OUT/sign\.done"', done_lines[0]) is not None, 'mac/sign_app.sh: sign.done must be written only when the whole signing succeeded ($rc = 0)')
+check(any('rm -rf "$APP"' in t for _, t in sg_lines), 'mac/sign_app.sh: the previous signed app is not removed before xcodebuild (a failed run would leave an old app to install)')
+check(any('sign.failed' in t for _, t in lines('mac/device_run.sh')), 'mac/device_run.sh: does not refuse to install while sign.failed exists')
+# review fix #7: cleanup removes the ORDERED_MEM objects and the signing job's derived data
+cl7 = ' '.join(t for _, t in lines('mac/cleanup.sh'))
+for p7 in ('src/obj-iphoneos-om', 'src/obj-iphonesimulator-om', 'build/app-signed/dd'):
+    check(re.search(r'objects\)[^;]*rm -rf[^;]*"\$KROOT/%s"' % re.escape(p7), cl7) is not None, 'mac/cleanup.sh: `objects` does not remove $KROOT/%s' % p7)
+# review fix #6: mac_step dies with the driver (forced tty, hangup on a signal, waits for the Mac's lock to be released)
+cm6 = ' '.join(t for _, t in lines('common.sh'))
+check(re.search(r'IOS_SSH\[@\]\}" -tt "\$IOS_MAC"', cm6) is not None and 'maclock.py' in cm6, 'common.sh: mac_step does not run the step over ssh -tt (the step would survive the driver)')
+check(re.search(r"trap 'sig=1; kill -HUP \$sp", cm6) is not None and 'mac_wait_released' in cm6, 'common.sh: mac_step does not hang the step up on a signal and wait for the Mac lock to be released')
+# review fix #2/#4/#8: push_data.sh
+pd = lines('push_data.sh'); pdt = ' '.join(t for _, t in pd)
+check(re.search(r'^set -u -o pipefail', pdt) is not None or 'set -u -o pipefail' in pdt, 'push_data.sh: no pipefail (`if verify | tee` would test tee)')
+check('. "$(dirname "$0")/common.sh"' in pdt and re.search(r'\bios_guard\b', pdt) is not None, 'push_data.sh: does not source common.sh / call ios_guard')
+check('IOS_MAC' in pdt and 'IOS_RDIR' in pdt and 'Developer/KHNMC' not in ' '.join(t for _, t in pd if not t.lstrip().startswith('#')), 'push_data.sh: hard-coded Mac or folder (use IOS_MAC / IOS_RDIR)')
+check(re.search(r'trap cleanup_stage EXIT', pdt) is not None and 'unstage' in pdt, 'push_data.sh: no trap that removes the staged chunks when a send fails')
 
 # 3. mute first, fail closed, read back
 sim = lines('mac/sim_run.sh')

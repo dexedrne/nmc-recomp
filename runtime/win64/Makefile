@@ -226,7 +226,8 @@ FILE_HOOKS += $(ASPECT_HOOKS)
 MOVIE_HOOKS = 5375d0 2cbd80 13d690
 FILE_HOOKS += $(MOVIE_HOOKS)
 # lane R8-SCALE (runtime/look_scale.c): the three model-instance draws (rcx instance, r8 world matrix): the per-look render scale of the player
-SCALE_HOOKS = 1a5180 1a5580 1af000
+# 2ff210 (the menu model's per-slot scale reader, rcx object / rdx 4-float scale out): the camp menu's model view scale per look (owner 2026-11-23)
+SCALE_HOOKS = 1a5180 1a5580 1af000 2ff210
 FILE_HOOKS += $(SCALE_HOOKS)
 # ---- Task 12: mod static edits ---------------------------------------------------------------------------------------------------
 # The mod DLL patches code bytes in 28 exe functions and attaches two INLINE detours (inside 3c3fe0 and 360920).  Those 30 functions

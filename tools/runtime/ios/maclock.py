@@ -131,7 +131,8 @@ def main():
         signal.signal(s, on_signal)
     rc = 1
     try:
-        child = subprocess.Popen(cmd, start_new_session=True)
+        env = dict(os.environ, KHNMC_MACLOCK_HELD='1')       # review fix #5: the step knows it runs under the lock (mac/sign_app.sh)
+        child = subprocess.Popen(cmd, start_new_session=True, env=env)
         while True:
             try:
                 rc = child.wait(timeout=1)

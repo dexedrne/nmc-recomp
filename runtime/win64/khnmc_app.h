@@ -116,6 +116,10 @@ unsigned kh_input_host_pad_neutral(void);       /* every button up, sticks and t
  * (TASK43: a Present that parked after its acquire no longer fails the test; its own counters are checked instead).  A failed
  * check is the named fatal app-test-gate-failed / app-test-suspend-failed. */
 
+/* review fix #10 (runtime/aspect.c): the iOS shell's current safe-area insets, per mille of the screen's height (clamped 0..200), re-read
+ * at every size / orientation / inset change; the portrait camp stack follows on the next frame. */
+void kh_safe_area_set(double top_pm,double bottom_pm);
+
 #ifdef __cplusplus
 }
 #endif

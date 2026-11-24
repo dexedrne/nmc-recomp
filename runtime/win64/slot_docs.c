@@ -30,12 +30,17 @@ const char *kh_slot_autosave_documents(void){
     const char *private=private_documents();
     return private?private:kh_autosave_documents();
 }
-static int rotation_slot(const char *name){
+/* A rotation number is two files: the checkpoint KH2autosave-<n>.dat and, for Axel Won't Cry, its side file KH2autosave-<n>.axel
+ * (autosave.c).  Both belong to the snapshot: dropping the .axel made a reloaded Theater/savestate lose the mode (review round 9,
+ * item 3).  The `newest` marker still names a checkpoint only. */
+static int rotation_name(const char *name,const char *ext){
     if(strncmp(name,"KH2autosave-",12)||name[12]<'1'||name[12]>'9') return 0;
     const char *p=name+13;
     while(isdigit((unsigned char)*p)) p++;
-    return !strcmp(p,".dat");
+    return !strcmp(p,ext);
 }
+static int rotation_slot(const char *name){ return rotation_name(name,".dat") || rotation_name(name,".axel"); }
+static int rotation_marker(const char *name){ return rotation_name(name,".dat"); }
 static int entry_order(const FTSENT **a,const FTSENT **b){ return strcmp((*a)->fts_name,(*b)->fts_name); }
 
 static int append(KhBootDocs *d,const void *p,size_t n){
@@ -83,7 +88,7 @@ static const char *capture_tree(KhBootDocs *d,const char *root,const char *sub,i
             if(k<=0 || k>=sizeof target){ error="savestate-autosave-marker"; break; }
             target[k]=0;
             u32 n=strlen(name),length=k; u64 type=NEWEST;
-            if(!rotation_slot(target)){ error="savestate-autosave-marker"; break; }
+            if(!rotation_marker(target)){ error="savestate-autosave-marker"; break; }
             if(!append(d,&n,sizeof n)||!append(d,&type,sizeof type)||!append(d,name,n)||
                !append(d,&length,sizeof length)||!append(d,target,k)) error="savestate-documents-size";
             continue;
@@ -165,7 +170,7 @@ static const char *extract(const KhBootDocs *d,const char *root){
             memcpy(&length,d->data+pos,sizeof length); pos+=sizeof length;
             if(length>=sizeof target||length>d->size-pos||memchr(d->data+pos,0,length)) goto failed;
             memcpy(target,d->data+pos,length); pos+=length; target[length]=0;
-            if(!rotation_slot(target)||symlink(target,path)) goto failed;
+            if(!rotation_marker(target)||symlink(target,path)) goto failed;
             continue;
         }
         if(slot && bytes==DIRECTORY) goto failed;

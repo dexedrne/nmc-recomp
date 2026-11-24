@@ -9,8 +9,12 @@
  *   - main(): passes the app container (NSHomeDirectory) and its scratch directory (NSTemporaryDirectory) to the runtime as
  *     KH_APP_HOME and KH_TMPDIR, registers the audio start / stop the life cycle uses, then UIApplicationMain.
  *   - THE GAME VIEW (IOS-GRAPHICS-PLAN step 10): KHGameView, whose +layerClass is CAMetalLayer, so the view is the layer's delegate
- *     (MoltenVK's guide).  contentScaleFactor = the screen's nativeScale (the drawable is the panel's pixels), opaque, black.  Landscape
- *     only (Info.plist and the view controller), status bar hidden, home indicator auto-hidden.
+ *     (MoltenVK's guide).  contentScaleFactor = the screen's nativeScale (the drawable is the panel's pixels), opaque, black.  Every
+ *     position works: both landscapes and upright portrait are the system's own rotation; upside-down portrait is the app's own
+ *     180-degree turn (flipForDevice, runtime/ios/portrait.h), because an iPhone does not turn its interface upside down.  The turn is
+ *     applied to the view controller's ROOT view (self.view): the Metal picture and the touch overlay are its subviews, so both turn
+ *     together and UIKit maps every touch through the same turn onto the overlay's own coordinates (the Days port's picture is turned
+ *     by the system on that phone; this one is turned here).  Status bar hidden, home indicator auto-hidden.
  *   - THE ORDER OF START: after the first layout with a size, kh_present_note_drawable(w_px, h_px) (every app) and
  *     kh_present_set_layer(layer, w_px, h_px) (only in an app built with the graphics backend: kh_present_built()), then the game
  *     thread.  So the drawable size is in the runtime BEFORE the game reads its screen size: khnmc.conf `env KHNMC_SCREEN=layer`
@@ -65,7 +69,9 @@ void kh_input_host_pad_set(unsigned short buttons,unsigned char lt,unsigned char
 /* The controller (GameController framework) is XInput pad 0 (KHNMC_INPUT=host, set below unless khnmc.conf says otherwise): every
  * change of any element sends the whole state.  Buttons by position, as the PC game sees an Xbox pad: A (bottom; cross on a
  * DualSense) = 0x1000, B (right) = 0x2000, X (left) = 0x4000, Y (top) = 0x8000, LB/RB 0x100/0x200, the menu button START 0x10, the
- * options button BACK 0x20, the stick clicks 0x40/0x80, the d-pad 0x1/0x2/0x4/0x8; triggers 0..255; sticks -32767..32767 (up = +). */
+ * options button BACK 0x20, the stick clicks 0x40/0x80, the d-pad 0x1/0x2/0x4/0x8; triggers 0..255; sticks -32767..32767 (up = +).
+ * On a Nintendo pad (Switch Pro, Joy-Con) A and B arrive by their printed letters, A on the right; pad_buttons exchanges them so
+ * the faces stay by position too (owner 2026-11-22). */
 static short pad_axis(float v){ if(!(v>=-1.0f)) v=-1.0f; if(v>1.0f) v=1.0f; return (short)lrintf(v*32767.0f); }
 static unsigned char pad_trigger(float v){ if(!(v>=0.0f)) v=0.0f; if(v>1.0f) v=1.0f; return (unsigned char)lrintf(v*255.0f); }
 static UILabel *test_label;
@@ -100,13 +106,21 @@ static void pad_extras(GCExtendedGamepad *p){
                                [key.lowercaseString containsString:@"capture"])) capture_button=v;
     }
 }
+/* Face buttons by POSITION, as on a PlayStation pad (owner 2026-11-22: "A on switch pro is playstation Cross and B is playstation
+ * Circle, should be the opposite"): bottom = Cross 0x1000, right = Circle 0x2000, top = Triangle 0x8000, left = Square 0x4000.  A
+ * DualSense / Xbox pad already reports A at the bottom, B at the right, X left, Y top.  A Nintendo pad (Switch Pro, Joy-Con) reports
+ * A and B by their PRINTED letters instead - A on the right (the phone's log, 2026-11-22: 'A Button' -> host mask 0x1000) - so A/B
+ * are exchanged here.  X/Y needs the same exchange for it and already gets it in kh_menu_map_buttons (KHNMC_PAD_LAYOUT=auto with
+ * host_nintendo=1); exchanging it here too would cancel it.  Other pads are unchanged. */
 static unsigned short pad_buttons(GCExtendedGamepad *p){
     unsigned short b=0;
     if(p.dpad.up.pressed) b|=0x0001; if(p.dpad.down.pressed) b|=0x0002; if(p.dpad.left.pressed) b|=0x0004; if(p.dpad.right.pressed) b|=0x0008;
     if(p.buttonMenu.pressed) b|=0x0010; if(p.buttonOptions.pressed || touchpad_click(p).pressed || capture_button.pressed) b|=0x0020;
     if(p.leftThumbstickButton.pressed) b|=0x0040; if(p.rightThumbstickButton.pressed) b|=0x0080;
     if(p.leftShoulder.pressed) b|=0x0100; if(p.rightShoulder.pressed) b|=0x0200;
-    return b | kh_pad_faces(p.buttonA.pressed,p.buttonB.pressed,p.buttonX.pressed,p.buttonY.pressed,0,0);
+    int fa=p.buttonA.pressed,fb=p.buttonB.pressed;
+    if(pad_nintendo){ int t=fa; fa=fb; fb=t; }
+    return b | kh_pad_faces(fa,fb,p.buttonX.pressed,p.buttonY.pressed,0,0);
 }
 static void pad_send(GCExtendedGamepad *p){
     unsigned short b=pad_buttons(p);
@@ -124,6 +138,7 @@ static int pad_attach(GCController *c){
     if(pad_active && pad_active!=c){ fprintf(stderr,"kh: ios: controller '%s' connected: not used (another controller is pad 0)\n",c.vendorName.UTF8String?:"?"); return 0; }
     pad_active=c;
     pad_layout(c);
+    if(pad_nintendo) fprintf(stderr,"kh: ios: Nintendo pad: A/B exchanged so the face buttons stay by position (bottom Cross, right Circle, top Triangle, left Square)\n");
     kh_title_pad_family(pad_nintendo,[p isKindOfClass:GCDualShockGamepad.class] || [p isKindOfClass:GCDualSenseGamepad.class]);
     /* A negative layout family keeps GC positions and the separate confirm/back preference. */
     kh_input_host_nintendo(pad_nintendo?1:-1);
@@ -359,7 +374,7 @@ static void reconcile_pads(GCController *excluded){
             [touch_surface.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor],
             [touch_surface.topAnchor constraintEqualToAnchor:guide.topAnchor],
             [touch_surface.bottomAnchor constraintEqualToAnchor:guide.bottomAnchor]]];
-        touch_surface.transform=touch_flipped?CGAffineTransformMakeRotation(M_PI):CGAffineTransformIdentity;
+        /* no transform of its own: the upside-down turn is the root view's (flipForDevice), and this is its subview */
     }
     [touch_surface setNeedsLayout];
 #if TARGET_OS_SIMULATOR
@@ -527,12 +542,14 @@ static void start_display_link(void){
     BOOL _started;
     int _upsideDown;
     CMDeviceMotion *_sample;
+    CMAccelerometerData *_accel;
     CMMotionManager *_motion;
     KHGameView *_picture;
     id _orientationObserver;
+    NSTimer *_poll;
     UIInterfaceOrientation _lastInterface;
-    UIDeviceOrientation _lastDevice;
     NSString *_orientationLog;
+    NSString *_safeLog;
 }
 - (void)loadView {
     KHGameView *v=[[KHGameView alloc] initWithFrame:CGRectZero];
@@ -550,7 +567,13 @@ static void start_display_link(void){
 - (BOOL)prefersStatusBarHidden { return YES; }
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
 #define KH_IOS_PORTRAIT 1
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return KH_IOS_PORTRAIT ? UIInterfaceOrientationMaskAll : UIInterfaceOrientationMaskLandscape;   /* owner 11/18: upside-down portrait too */ }
+/* owner 2026-11-23: "kh2 portrait doesnt work upside down, only right side up portrait".  An iPhone does not turn its interface
+ * upside down (owner 2026-11-18), so the app itself turns the picture while the phone is held that way (flipForDevice below).  The
+ * upside-down interface orientation is therefore deliberately NOT in this mask: if UIKit turned the window as well, the two turns
+ * would cancel and the picture would stay upright to the phone (upside down to the owner).  Portrait and both landscapes stay, so
+ * landscape keeps following the system.  The Info.plist still lists all four (tools/ios/Info.plist): UIKit uses the intersection, so
+ * it changes nothing - it is there to say which positions the app plays. */
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return KH_IOS_PORTRAIT ? UIInterfaceOrientationMaskAllButUpsideDown : UIInterfaceOrientationMaskLandscape; }
 /* the drawable's size in pixels (bounds x nativeScale), 0 x 0 before the view has a screen */
 - (BOOL)pixelsW:(uint32_t *)w h:(uint32_t *)h {
     UIScreen *scr=self.view.window.windowScene.screen; if(!scr) return NO;
@@ -562,6 +585,10 @@ static void start_display_link(void){
     [super viewDidLayoutSubviews];
     _picture.bounds=self.view.bounds;
     _picture.center=CGPointMake(CGRectGetMidX(self.view.bounds),CGRectGetMidY(self.view.bounds));
+    if(_lastInterface==UIInterfaceOrientationUnknown){               /* before the window scene reports one, the first shape decides */
+        CGSize shape=self.view.bounds.size;
+        _lastInterface=shape.height>=shape.width?UIInterfaceOrientationPortrait:UIInterfaceOrientationLandscapeRight;
+    }
     [self flipForDevice];
     test_label.frame=CGRectInset(self.view.bounds,24,24);
     uint32_t w=0,h=0; if(![self pixelsW:&w h:&h]) return;          /* wait for a layout with a screen and a size */
@@ -571,11 +598,39 @@ static void start_display_link(void){
         kh_present_note_drawable(w,h);                                 /* every app (review A41, verification): KHNMC_SCREEN=layer needs only the size */
         if(kh_present_built()) kh_present_set_layer((__bridge void *)_picture.layer,w,h);   /* before the game reads its screen size */
         fprintf(stderr,"kh: ios: game view %ux%u px (scale %.3f), layer %s; starting the game\n",w,h,_picture.contentScaleFactor,kh_present_built()?"handed to the runtime":"not used (no graphics backend in this app)");
+        [self exportSafeArea];      /* before the game reads it (runtime/aspect.c: KHNMC_SAFE_TOP / _BOTTOM) */
         start_display_link();
         start_game_once();
-    } else kh_present_set_size(w,h);
+    } else { kh_present_set_size(w,h); [self exportSafeArea]; }   /* every later layout re-reads the insets (rotation, fold, split view) */
 }
 - (void)reportSize { uint32_t w=0,h=0; if(_started && [self pixelsW:&w h:&h]) kh_present_set_size(w,h); }
+/* The portrait camp menu keeps inside the visible safe area (owner 2026-11-23: "the pause menu looks really weird, doesnt fit
+ * right"): the insets, in per mille of the screen's height, are handed to runtime/aspect.c before the game starts.  Called from
+ * both viewSafeAreaInsetsDidChange and the first layout, so a pass without insets cannot lose them. */
+- (void)exportSafeArea {
+    CGSize shape=self.view.bounds.size; if(shape.height<=0) return;
+    /* review fix #10: the REAL insets of the window this view is in, read again at every call (first layout, every layout, every
+     * inset change, every rotation / size change, every flip): no island or home-indicator margin is assumed, so a screen that reports
+     * none (the unfolded Duo) gets its full area.  The window's insets are in screen terms; when the view is turned 180 degrees
+     * (upside-down portrait) the game's top is the phone's bottom, so the two swap. */
+    UIWindow *win=self.view.window;
+    UIEdgeInsets safe=win?win.safeAreaInsets:self.view.safeAreaInsets;
+    BOOL turned=fabs(self.view.transform.b)<0.5 && self.view.transform.a<0;
+    CGFloat gt=turned?safe.bottom:safe.top, gb=turned?safe.top:safe.bottom;
+    double tpm=gt/shape.height*1000.0, bpm=gb/shape.height*1000.0;
+    char top[16],bottom[16];
+    snprintf(top,sizeof top,"%d",(int)lround(tpm));
+    snprintf(bottom,sizeof bottom,"%d",(int)lround(bpm));
+    NSString *state=[NSString stringWithFormat:@"%.1f/%.1f of %.0f points, turned=%d",gt,gb,shape.height,turned];
+    if(![state isEqualToString:_safeLog]){      /* only a CHANGE is applied: the 0.5 s orientation poll calls this too, and setenv must not race the game thread */
+        _safeLog=state;
+        setenv("KHNMC_SAFE_TOP",top,1); setenv("KHNMC_SAFE_BOTTOM",bottom,1);   /* the game's start-up reads these */
+        kh_safe_area_set(tpm,bpm);                                              /* a running game takes the current ones live (atomic stores) */
+        fprintf(stderr,"kh: ios: safe area %.1f above / %.1f below of %.0f points (turned %d): KHNMC_SAFE_TOP=%s, KHNMC_SAFE_BOTTOM=%s (per mille)\n",
+                gt,gb,shape.height,turned,top,bottom);
+    }
+}
+- (void)viewSafeAreaInsetsDidChange { [super viewSafeAreaInsetsDidChange]; [self exportSafeArea]; }
 - (void)viewDidLoad {
     [super viewDidLoad];
     [[UIDevice currentDevice] beginGeneratingDeviceOrientationNotifications];
@@ -589,41 +644,79 @@ static void start_display_link(void){
             if(error){ fprintf(stderr,"kh: ios: orientation motion stopped: %s\n",error.localizedDescription.UTF8String); [ws stopMotion]; }
             else if(sample){ KHGameViewController *vc=ws; if(vc){ vc->_sample=sample; [vc flipForDevice]; } }
         }];
+    } else if(_motion.accelerometerAvailable){
+        /* no gyro: the raw accelerometer carries gravity just as well for a still phone (its x/y are the same signs as
+         * CMDeviceMotion.gravity's), so the turn does not depend on the fused device-motion service */
+        fprintf(stderr,"kh: ios: orientation: device motion unavailable, the accelerometer alone\n");
+        _motion.accelerometerUpdateInterval=0.15;
+        [_motion startAccelerometerUpdatesToQueue:NSOperationQueue.mainQueue withHandler:^(CMAccelerometerData *data,NSError *error){
+            if(error) fprintf(stderr,"kh: ios: orientation accelerometer stopped: %s\n",error.localizedDescription.UTF8String);
+            else if(data){ KHGameViewController *vc=ws; if(vc){ vc->_accel=data; [vc flipForDevice]; } }
+        }];
     } else fprintf(stderr,"kh: ios: orientation motion unavailable\n");
+    /* a slow poll: the turn must also follow a hold in which neither a notification nor a motion sample arrives (a reclined hold
+     * resting still).  Nothing is written unless the answer changed, so this costs a comparison twice a second.  The weak self
+     * keeps the timer from owning the controller. */
+    __weak KHGameViewController *resting=self;
+    _poll=[NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *timer){
+        (void)timer; [resting flipForDevice]; }];
 }
-- (void)stopMotion { [_motion stopDeviceMotionUpdates]; _sample=nil; [self flipForDevice]; }
+- (void)stopMotion { [_motion stopDeviceMotionUpdates]; [_motion stopAccelerometerUpdates]; _sample=nil; _accel=nil; [self flipForDevice]; }
 - (void)dealloc {
+    [_poll invalidate];
     [_motion stopDeviceMotionUpdates];
+    [_motion stopAccelerometerUpdates];
     if(_orientationObserver) [[NSNotificationCenter defaultCenter] removeObserver:_orientationObserver];
     [[UIDevice currentDevice] endGeneratingDeviceOrientationNotifications];
 }
+- (void)applyFlip:(BOOL)flip {
+    CGAffineTransform t=flip?CGAffineTransformMakeRotation((CGFloat)M_PI):CGAffineTransformIdentity;
+    if(CGAffineTransformEqualToTransform(t,self.view.transform)) return;
+    if(_started) [UIView animateWithDuration:0.25 animations:^{ self.view.transform=t; }];
+    else self.view.transform=t;
+}
 - (void)flipForDevice {
     UIDeviceOrientation d=UIDevice.currentDevice.orientation;
-    UIInterfaceOrientation io=self.view.window.windowScene.interfaceOrientation;
+    UIWindowScene *scene=self.view.window.windowScene;
+    UIInterfaceOrientation io=scene?scene.interfaceOrientation:UIInterfaceOrientationUnknown;
+    if(io==UIInterfaceOrientationUnknown) io=_lastInterface;          /* the window scene has not reported one yet: the last shape */
     CMDeviceMotion *sample=_sample;
-    CMAcceleration gravity=sample ? sample.gravity : (CMAcceleration){0};
-    // Latch between thresholds so a flat device or a diagonal turn cannot oscillate.
+    CMAccelerometerData *raw=_accel;
+    double gx=sample?sample.gravity.x:raw?raw.acceleration.x:0.0;
+    double gy=sample?sample.gravity.y:raw?raw.acceleration.y:0.0;
+    BOOL motion=sample!=nil||raw!=nil;
+    // The phone's own report: +1 upside down in portrait, -1 upright in portrait, 0 in landscape / face up / face down / unknown.
+    // It is not thrown away when it has not changed (the 2026-11-20 code did that): kh_portrait_flip uses it only where gravity is
+    // not decisive, and a repeated upside-down report is exactly what a reclined hold leaves to go on.
     int device=d==UIDeviceOrientationPortraitUpsideDown ? 1 : d==UIDeviceOrientationPortrait ? -1 : 0;
-    // An unchanged upright report is common on this device, even while gravity is inverted.
-    if(sample && d==_lastDevice) device=0;
-    _lastDevice=d;
-    BOOL flip=kh_portrait_flip(io==UIInterfaceOrientationPortrait,&_upsideDown,device,sample!=nil,gravity.x,gravity.y);
-    CGAffineTransform t=flip ? CGAffineTransformMakeRotation((CGFloat)M_PI) : CGAffineTransformIdentity;
-    if(touch_flipped!=flip){
-        [touch_surface reset]; touch_flipped=flip; touch_surface.transform=t;
-    }
-    if(!CGAffineTransformEqualToTransform(t,_picture.transform)) _picture.transform=t;
+    BOOL flip=kh_portrait_flip(io==UIInterfaceOrientationPortrait,&_upsideDown,device,motion,gx,gy);
+    /* owner 2026-11-23, round 2: "upside down portrait mode isnt working its still right side up".  Round 1 turned the Metal child
+     * (_picture); the phone kept the picture right side up.  Turn the view controller's ROOT view instead - the 2026-11-18 shape of
+     * this fix - so the picture and the touch overlay (both its subviews) turn together with one transform, and UIKit maps every
+     * touch through that same transform onto the overlay's own coordinates (the button is drawn where the finger lands).  A system
+     * rotation still resets it (viewWillTransitionToSize) and re-asks afterwards. */
+    [self applyFlip:flip];
+    [self exportSafeArea];                   /* the turn swaps which end of the game's picture is the phone's top */
+    if(touch_flipped!=flip){ touch_flipped=flip; [touch_surface reset]; }   /* a finger held through the turn must not stick */
     if(_started && io!=UIInterfaceOrientationUnknown && _lastInterface!=io && kh_present_built()){
         uint32_t w,h;
         if([self pixelsW:&w h:&h]) kh_present_set_layer((__bridge void *)_picture.layer,w,h);
     }
     _lastInterface=io;
     NSString *state=[NSString stringWithFormat:@"device=%ld interface=%ld bounds=%@ transform=%@ motion=%d flip=%d",
-        (long)d,(long)io,NSStringFromCGRect(self.view.bounds),NSStringFromCGAffineTransform(_picture.transform),sample!=nil,flip];
+        (long)d,(long)io,NSStringFromCGRect(self.view.bounds),NSStringFromCGAffineTransform(self.view.transform),motion,flip];
     if(![state isEqualToString:_orientationLog]){
         _orientationLog=state;
-        fprintf(stderr,"kh: ios: orientation %s gravityY=%.3f\n",state.UTF8String,gravity.y);
+        fprintf(stderr,"kh: ios: orientation %s gravityY=%.3f\n",state.UTF8String,gy);
     }
+}
+/* a system rotation (landscape <-> portrait, left <-> right) starts from an upright view and re-checks the phone afterwards */
+- (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
+    self.view.transform=CGAffineTransformIdentity;
+    [super viewWillTransitionToSize:size withTransitionCoordinator:coordinator];
+    __weak KHGameViewController *ws=self;
+    [coordinator animateAlongsideTransition:nil completion:^(id<UIViewControllerTransitionCoordinatorContext> c){
+        (void)c; [ws reportSize]; [ws flipForDevice]; }];
 }
 @end
 
@@ -691,24 +784,39 @@ static void start_display_link(void){
 }
 @end
 
-/* The game data lives in Documents (data/, pkgdir/, kh2fm.exe: runtime/host_env.c).  iOS backs Documents up to iCloud by default, and
- * 42 GB of game data must never go there: the two folders are created if missing and marked excluded from backup, at every start
- * (a folder's mark covers what is copied into it later), the exe too when it is there.  What happened is written to
- * Documents/khnmc-backup.txt so it can be checked from the Mac (devicectl copy from). */
+/* The game data lives in Documents (data/, pkgdir/, kh2fm.exe: runtime/host_env.c) and the game-derived folders next to it (rmc/, looks/,
+ * scene-roxas/, logos/: the owner's own game files and what the app builds from them).  iOS backs Documents up to iCloud by default,
+ * and 42 GB of game data must never go there.  Review fix #9: ALL of them are created if missing (the folders) and marked excluded from
+ * backup at every start (a folder's mark covers what is copied into it later; looks/'s sub-folders and the *.pending manifests that
+ * exist are marked too, since a copy can replace a file and drop its mark).  NOT excluded, on purpose: Saves/ (the player's saves) and the
+ * settings / config text files (khnmc.conf, touch-controller.txt, controller-pages.txt): small, and the player's own.  What happened
+ * is written to Documents/khnmc-backup.txt (including the exact lists of what is excluded and what is kept) so it can be checked from
+ * the Mac (devicectl copy from). */
+static NSString *backup_mark(NSFileManager *fm,NSString *docs,NSString *rel,BOOL isFolder,NSMutableString *out){
+    NSString *path=[docs stringByAppendingPathComponent:rel]; BOOL dir=NO, ok=NO; NSError *err=nil;
+    if(isFolder && ![fm fileExistsAtPath:path]) [fm createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:&err];
+    if(![fm fileExistsAtPath:path isDirectory:&dir]){ [out appendFormat:@"%@ absent\n",rel]; return nil; }
+    NSURL *u=[NSURL fileURLWithPath:path isDirectory:dir];
+    ok=[u setResourceValue:@YES forKey:NSURLIsExcludedFromBackupKey error:&err];
+    NSNumber *v=nil; [u getResourceValue:&v forKey:NSURLIsExcludedFromBackupKey error:nil];
+    [out appendFormat:@"%@ excluded-from-backup=%@%@\n",rel,(ok&&v.boolValue)?@"yes":@"NO",err?[@" error: " stringByAppendingString:err.localizedDescription]:@""];
+    return path;
+}
 static void exclude_game_data_from_backup(void){
     NSFileManager *fm=[NSFileManager defaultManager];
     NSString *docs=[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
-    NSMutableString *out=[NSMutableString stringWithString:@"# written at every start by runtime/ios/ios_main.m\n"];
-    for(NSString *name in @[@"data",@"pkgdir",@"kh2fm.exe"]){
-        NSString *path=[docs stringByAppendingPathComponent:name]; BOOL dir=NO, ok=NO; NSError *err=nil;
-        if(![name hasSuffix:@".exe"] && ![fm fileExistsAtPath:path]) [fm createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:&err];
-        if([fm fileExistsAtPath:path isDirectory:&dir]){
-            NSURL *u=[NSURL fileURLWithPath:path isDirectory:dir];
-            ok=[u setResourceValue:@YES forKey:NSURLIsExcludedFromBackupKey error:&err];
-            NSNumber *v=nil; [u getResourceValue:&v forKey:NSURLIsExcludedFromBackupKey error:nil];
-            [out appendFormat:@"%@ excluded-from-backup=%@%@\n",name,(ok&&v.boolValue)?@"yes":@"NO",err?[@" error: " stringByAppendingString:err.localizedDescription]:@""];
-        } else [out appendFormat:@"%@ absent\n",name];
+    NSMutableString *out=[NSMutableString stringWithString:@"# written at every start by runtime/ios/ios_main.m\n"
+        "# EXCLUDED from iCloud backup (game data and what is built from it): data/ pkgdir/ rmc/ looks/ (and each folder in it) scene-roxas/ logos/\n"
+        "#   kh2fm.exe, looks-*.pending, rmc-pack.pending (each only while present)\n"
+        "# KEPT in the backup: Saves/ (the player's saves) and everything else in Documents (khnmc.conf, touch-controller.txt, controller-pages.txt, this file)\n"];
+    for(NSString *name in @[@"data",@"pkgdir",@"rmc",@"looks",@"scene-roxas",@"logos"]) backup_mark(fm,docs,name,YES,out);
+    backup_mark(fm,docs,@"kh2fm.exe",NO,out);
+    NSString *looks=[docs stringByAppendingPathComponent:@"looks"];
+    for(NSString *sub in [[fm contentsOfDirectoryAtPath:looks error:nil] sortedArrayUsingSelector:@selector(compare:)]){
+        BOOL dir=NO; if([fm fileExistsAtPath:[looks stringByAppendingPathComponent:sub] isDirectory:&dir] && dir) backup_mark(fm,docs,[@"looks" stringByAppendingPathComponent:sub],NO,out);
     }
+    for(NSString *f in [[fm contentsOfDirectoryAtPath:docs error:nil] sortedArrayUsingSelector:@selector(compare:)])
+        if([f hasSuffix:@".pending"] && ([f hasPrefix:@"looks-"] || [f isEqualToString:@"rmc-pack.pending"])) backup_mark(fm,docs,f,NO,out);
     [out writeToFile:[docs stringByAppendingPathComponent:@"khnmc-backup.txt"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
