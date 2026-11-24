@@ -149,6 +149,29 @@ static void fmt_info(u32 f,u32 *bw,u32 *bytes){
 #define R_FMT 60
 #define R_DESC 64
 #define R_UP 120
+/* A texture of DXGI_FORMAT_UNKNOWN: vkd3d (the phone and Linux GPU builds) and Windows D3D12 refuse its creation with E_INVALIDARG and
+ * the caller gets a null object (round 6: the phone died in the save menu that way, kh_settings_frame -> look_bar -> f_3a6840 ->
+ * f_10ad60).  This backend refuses it the same way, with the guest call sites, so a null-graphics run fails where a GPU run fails.
+ * KHNMC_GFX_NULL_FORMAT0=accept restores the old (permissive) behaviour. */
+static _Atomic u64 tx_fmt0_refused;
+static int refuse_fmt0(KCtx *g,u64 desc){
+    if(!desc) return 0;
+    u32 dim=rd32(g,desc),fmt=rd32(g,desc+32);
+    if(fmt || dim<2 || dim>4) return 0;
+    static int mode=-1; if(mode<0){ const char *e=getenv("KHNMC_GFX_NULL_FORMAT0"); mode=e&&!strcmp(e,"accept")?0:1; }
+    u64 n=atomic_fetch_add(&tx_fmt0_refused,1)+1;
+    if(n<=16 || !(n&(n-1))){
+        extern void kh_guest_bt(KCtx *,FILE *); extern u64 kh_game_frames(void);
+        char *bt=NULL; size_t btn=0; FILE *m=open_memstream(&bt,&btn); char sites[300]; sites[0]=0;
+        if(m){ kh_guest_bt(g,m); fclose(m); size_t o=0; int k=0;
+            for(char *p=bt;p&&(p=strstr(p,"return-site rva 0x"))&&k<8;k++){ p+=18; size_t l=strspn(p,"0123456789abcdef"); if(o+l+2<sizeof sites){ memcpy(sites+o,p,l); o+=l; sites[o++]=' '; sites[o]=0; } }
+            free(bt); }
+        fprintf(stderr,"kh: gfx null: texture #%llu with DXGI_FORMAT_UNKNOWN (dim %u %llux%u mips %u array %u flags 0x%x) at game frame %llu %s; sites: %s\n",
+                (unsigned long long)n,dim,(unsigned long long)rd64(g,desc+16),rd32(g,desc+24),rd16(g,desc+30),rd16(g,desc+28),rd32(g,desc+48),
+                (unsigned long long)kh_game_frames(),mode?"REFUSED (E_INVALIDARG, as vkd3d)":"accepted (KHNMC_GFX_NULL_FORMAT0=accept)",sites);
+    }
+    return mode;
+}
 static u64 new_resource(KCtx *g,u64 desc,int placed_dim_hint){
     u64 r=new_obj(C_res,128); u32 dim=desc?rd32(g,desc):placed_dim_hint; u64 w=desc?rd64(g,desc+16):0; u32 fmt=desc?rd32(g,desc+32):0;
     wr32(g,r+R_DIM,dim); wr32(g,r+R_FMT,fmt); if(desc) memcpy(hp(g,r+R_DESC),hp(g,desc),56);
@@ -519,9 +542,11 @@ static int h_dev(KCtx *g,u64 o,int s,const char *c){ if(common(g,s,c)) return 1;
         for(u32 i=0;i<n;i++){ u64 d=descs+56ull*i; u32 dim=rd32(g,d); u64 w=rd64(g,d+16); u32 h=rd32(g,d+24); u32 depth=rd16(g,d+28); u32 mips=rd16(g,d+30); u32 fmt=rd32(g,d+32); if(!mips) mips=1; if(!depth) depth=1;
             if(dim==1){ total+=(w+65535)&~65535ull; continue; } u32 bw,bpb; fmt_info(fmt,&bw,&bpb); u64 sz=0; for(u32 m=0;m<mips;m++){ u64 W=w>>m; if(!W) W=1; u32 H=h>>m; if(!H) H=1; sz+=((W+bw-1)/bw)*bpb*((H+bw-1)/bw); } total+=((sz*depth)+65535)&~65535ull; }
         wr64(g,out,total); wr64(g,out+8,65536); SET_RAX(g,out); return 1; }
-    case 27: { u64 r=new_resource(g,ARG(g,3),0); out_obj(g,ARG(g,7),r); SET_RAX(g,0); return 1; }          /* CreateCommittedResource(heapprops, flags, desc, state, clear, riid, **pp) */
+    case 27: { if(refuse_fmt0(g,ARG(g,3))){ out_obj(g,ARG(g,7),0); SET_RAX(g,0x80070057u); return 1; }
+               u64 r=new_resource(g,ARG(g,3),0); out_obj(g,ARG(g,7),r); SET_RAX(g,0); return 1; }          /* CreateCommittedResource(heapprops, flags, desc, state, clear, riid, **pp) */
     case 28: { u64 hh=new_obj(C_heap,16); out_obj(g,ARG(g,3),hh); SET_RAX(g,0); return 1; }                /* CreateHeap(desc, riid, **pp) */
-    case 29: { u64 r=new_resource(g,ARG(g,3),0); out_obj(g,ARG(g,7),r); SET_RAX(g,0); return 1; }          /* CreatePlacedResource(heap, offset, desc, state, clear, riid, **pp) */
+    case 29: { if(refuse_fmt0(g,ARG(g,3))){ out_obj(g,ARG(g,7),0); SET_RAX(g,0x80070057u); return 1; }
+               u64 r=new_resource(g,ARG(g,3),0); out_obj(g,ARG(g,7),r); SET_RAX(g,0); return 1; }          /* CreatePlacedResource(heap, offset, desc, state, clear, riid, **pp) */
     case 36: { u64 f=new_obj(C_fence,16); wr64(g,f+32,A1(g)); out_obj(g,ARG(g,4),f); SET_RAX(g,0); return 1; }   /* CreateFence(initial, flags, riid, **pp) */
     case 37: SET_RAX(g,0); return 1;                                                                        /* GetDeviceRemovedReason */
     case 38: { /* GetCopyableFootprints(desc, first, num, base, layouts, rows, rowsizes, total) */

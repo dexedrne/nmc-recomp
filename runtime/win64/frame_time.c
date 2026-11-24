@@ -27,7 +27,7 @@ static void emit(const char *kind,int world,int area,int look,const FrameStats *
     while(cumulative<rank && i<256) cumulative+=s->hist[++i];
     double ms=s->frames*1e6;
     fprintf(stderr,"kh: frame-time %s room=%02x:%02x look=%s frames=%llu wall_ms=%.3f p95_le_ms=%.3f worst_ms=%.3f cpu_ms=%.3f present_ms=%.3f acquire_ms=%.3f slot_wait_ms=%.3f missed=%llu source=%s draws_per_frame=%.2f\n",
-        kind,world&255,area&255,look==2?"xion-hooded":look?"xion":"roxas",(unsigned long long)s->frames,
+        kind,world&255,area&255,look==2?"xion-hooded":look==3?"axel":look==4?"roxas-hd":look?"xion":"roxas",(unsigned long long)s->frames,
         s->wall/ms,i==256?s->worst/1e6:(double)i,s->worst/1e6,s->cpu/ms,s->present/ms,s->acquire/ms,s->slot_wait/ms,
         (unsigned long long)s->missed,display?"display-link":"60Hz-estimate",(double)s->draws/s->frames);
 }

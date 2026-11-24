@@ -355,3 +355,13 @@ jump raises `route-save-menu-busy`. The command itself writes no slot.
 Package F2 can direct the scripted melee approach at a particular model using
 `@fight object NAME until COND`. It follows the nearest instance of NAME,
 waits for it to spawn, and presses Attack within the configured radius.
+
+## Title character, difficulty and save points
+
+R3 cycles Roxas, Xion and Axel on the title list and stores `KHNMC_TITLE_SCREEN` in khnmc.conf. The initial choice is KH2 Roxas. New Game takes the character from that screen. Difficulty row 0 selects Critical (level 2) and row 1 selects Less Than Nothing (level 3). The route token `newgame-choice difficulty` selects the corresponding visible row. Literal row numbers remain literal.
+
+At a save point, **Change Character** offers installed packs in this order: Roxas, Xion, hooded Xion, Axel and HD Roxas. The port uses `KHNMC_LOOK_DIR`, `KHNMC_LOOK_HOODED_DIR`, `KHNMC_LOOK_AXEL_DIR` and `KHNMC_LOOK_ROXAS_HD_DIR`. Phone folders are `Documents/looks/{xion,xion-hooded,axel,roxas-hd}`. The native slot stores the chosen look independently of difficulty. Existing tagged saves still load their historical campaigns. The Axel weapon setting `KHNMC_AXEL_WEAPON=keyblade|chakrams` defaults to Keyblade.
+
+Title pictures use `remastered/menu/us/title.2ld/-4.png` in the rmc, xion and axel packs. Xion can also use the hooded pack. Title logos use `Documents/logos/{roxas,xion,axel}.png` and classic .2ld files. Use `tools/pack_title_logo.py NAME SHEET --sheet-layout INSTALLED_LAYOUT --out LOGODIR` for a finished, pre-stretched HD sheet. Use `tools/pack_title_screens.py data-full LOGODIR XION AXEL LOGODIR --roxas ROXAS` for the combined layout.
+
+`route-title-screens.txt` cycles all three screens. `route-title-critical-save.txt` starts from Roxas, presses R3 to choose Xion and saves on Critical. `route-title-ltn-save.txt` uses the selected screen, wraps between the two menu rows and saves on Less Than Nothing. `route-axel-quick.txt` exercises 21 field changes plus six native save-point changes with KHNMC_TITLE_SCREEN=axel and the four original looks installed. `route-axel-weapon.txt` and `route-axel-weapon-load.txt` cover the optional weapon set.

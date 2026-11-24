@@ -107,7 +107,27 @@ const char *kh_scene_root(void){
     const char *root=getenv("KHNMC_SCENE_ROXAS_DIR");
     return root?root:"private/scene-roxas";
 }
+/* lane scene-off (KHNMC_SCENE_LOOK, default 0): 1 when the look may follow into the story scenes.
+ * Round 9 item 0: this is the ONLY gate, in every campaign mode -- ordinary, Xion Always Cries / Xion Knows Best, Axel Won't Cry
+ * (before: the Xion / Axel modes followed without it).  The scene-roxas overlay (Roxas in Sora's close-ups) is not a look and
+ * keeps its own gate (events_stub.c scene_roxas: the modes or KHNMC_SCENE_ROXAS=1). */
+int kh_scene_look(void){
+    const char *v=getenv("KHNMC_SCENE_LOOK");
+    if(!v || !*v || !strcmp(v,"0")) return 0;
+    if(!strcmp(v,"1")) return 1;
+    kh_fatal(NULL,"scene-look-mode: KHNMC_SCENE_LOOK=%s (expected 0 or 1)",v);
+}
+/* Round 9 item 0: the look the story scenes wear: the field look with KHNMC_SCENE_LOOK=1, else 0 (Roxas, as with look 0). */
+int kh_scene_wear(void){ return kh_scene_look()?kh_look_enabled():0; }
 static const char *look_root(int look){
+    if(look==KH_LOOK_ROXAS_HD){
+        const char *root=getenv("KHNMC_LOOK_ROXAS_HD_DIR");
+        return root?root:"private/looks/roxas-hd";
+    }
+    if(look==KH_LOOK_AXEL){
+        const char *root=getenv("KHNMC_LOOK_AXEL_DIR");
+        return root?root:"private/looks/axel";
+    }
     if(look==2){
         const char *root=getenv("KHNMC_LOOK_HOODED_DIR");
         return root?root:"private/looks/xion-hooded";
@@ -136,7 +156,7 @@ void kh_scene_pack_begin(void){
     if(!scene_pack){
         char host[4096];
         int ok=1;
-        if(kh_look_enabled()){
+        if(kh_scene_wear()){   /* round 9 item 0: the look's H_EX500 only when the scenes wear the look, else the overlay */
             if(!kh_look_available(KH_SCENE_MDLX,host,sizeof host)){
                 kh_warn("scene-xion-asset: %s unavailable for this event",KH_SCENE_MDLX);
                 ok=0;
@@ -168,7 +188,8 @@ int kh_scene_key(const char *rel){
 
 /* Menus may retain the returned guest address for the lifetime of a page. */
 static u64 name_overlays;
-static const char roxas[]="@KHINPUT(slash,data/msg/us/he.bar,15561,5,6371a57675507ca2b56b55306572693e0b838cda8d98eeecb9ec54a9dd62947b)@",xion[]="@KHINPUT(slash,data/msg/us/po.bar,13217,4,3841ba554755fe34fbbe96d4378902dcb824fa5bb69ca360c5ceb31d86e155f6)@";
+static const char roxas[]="@KHINPUT(slash,data/msg/us/he.bar,15561,5,6371a57675507ca2b56b55306572693e0b838cda8d98eeecb9ec54a9dd62947b)@",xion[]="@KHINPUT(slash,data/msg/us/po.bar,13217,4,3841ba554755fe34fbbe96d4378902dcb824fa5bb69ca360c5ceb31d86e155f6)@",axel[]="\x2e\xb1\x9e\xa5";
+static const char *look_name(int look){ return look==KH_LOOK_AXEL?axel:kh_look_is_xion(look)?xion:roxas; }
 static pthread_mutex_t names_lock=PTHREAD_MUTEX_INITIALIZER;
 /* Each overlay keeps both the source bytes and a stable display buffer. */
 static int menu_name(int id,const u8 *src,size_t at){
@@ -188,8 +209,10 @@ static size_t render_name(KCtx *g,int id,const u8 *src,u8 *dst,int menus,int sel
         size_t step=1+(src[i]<32?kh_route_message_ctl_args(src[i]):0);
         if(!strncmp((const char *)src+i,roxas,5) && (!menus || menu_name(id,src,i))){
             *matched=1;
-            if(dst) memcpy(dst+n,selected?xion:roxas,selected?4:5);
-            i+=5; n+=selected?4:5;
+            const char *name=look_name(selected);   /* never longer than the five bytes it replaces */
+            size_t len=strlen(name);
+            if(dst) memcpy(dst+n,name,len);
+            i+=5; n+=len;
         }else{
             if(dst) memcpy(dst+n,src+i,step);
             i+=step; n+=step;
@@ -250,31 +273,118 @@ int kh_look_message_id(KCtx *g,u64 text){
     pthread_mutex_unlock(&names_lock);
     return id;
 }
-int kh_look_asset(int look,const char *rel,char *host,size_t cap){
+static int look_file(int look,const char *rel,char *host,size_t cap){
     const char *root=look_root(look);
     struct stat st;
     return *root && strlen(root)+strlen(rel)+2<=cap && kh_resolve_ci(root,rel,host,cap) &&
            !stat(host,&st) && S_ISREG(st.st_mode) && st.st_size>0 && st.st_size<=INT_MAX && !access(host,R_OK);
 }
+int kh_scene_form_alias(const char *rel,char *out,size_t cap){
+    static const char *const forms[]={"_BTLF","_MAGF","_KH1F","_TRIF","_ULTF"};
+    size_t pre=!strncasecmp(rel,"remastered/",11)?11:0;
+    if(strncasecmp(rel+pre,"obj/H_EX500_",12)) return 0;
+    const char *f=rel+pre+11;
+    for(size_t i=0;i<sizeof forms/sizeof *forms;i++){
+        if(strncasecmp(f,forms[i],5) || strncasecmp(f+5,".mdlx",5)) continue;
+        const char *tail=f+10;
+        if(pre ? tail[0]!='/' || !tail[1] || strchr(tail+1,'/') : tail[0]!=0) return 0;
+        if(out && snprintf(out,cap,"%sobj/H_EX500.mdlx%s",pre?"remastered/":"",tail)>=(int)cap) return 0;
+        return 1;
+    }
+    return 0;
+}
+/* A file the pack does not hold under a Drive form's high-Sora name is its H_EX500 (kh_scene_form_alias). */
+int kh_look_asset(int look,const char *rel,char *host,size_t cap){
+    if(look_file(look,rel,host,cap)) return 1;
+    char alias[2300];
+    return kh_scene_form_alias(rel,alias,sizeof alias) && look_file(look,alias,host,cap);
+}
 int kh_look_available(const char *rel,char *host,size_t cap){return kh_look_asset(kh_look_enabled(),rel,host,cap);}
+/* lane HM (kh_look.h): the companion's model and its HD sheets come from the Xion pack; the model only together with sheet -0. */
+int kh_companion_asset(const char *rel,char *host,size_t cap){
+    static const char *const names[]={"obj/N_PO010_BTL.mdlx","obj/N_PO010_RTN.mdlx"};
+    size_t pre=!strncasecmp(rel,"remastered/",11)?11:0;
+    for(size_t i=0;i<sizeof names/sizeof *names;i++){
+        size_t n=strlen(names[i]);
+        if(strncasecmp(rel+pre,names[i],n)) continue;
+        const char *tail=rel+pre+n;
+        if(pre ? tail[0]!='/' || !tail[1] || strchr(tail+1,'/') : tail[0]!=0) return 0;
+        char leaf[64];
+        snprintf(leaf,sizeof leaf,"remastered/%s/-0.dds",names[i]);
+        return look_file(KH_LOOK_XION,leaf,host,cap) && look_file(KH_LOOK_XION,rel,host,cap);
+    }
+    return 0;
+}
+/* The Axel look's optional chakram set (lane WEAPON: 101 drop-in keyblade files cut from KH2's B_EX110): <axel pack>/weapons/
+ * chakram/obj/<name>.mdlx stands for the game's obj/<name>.mdlx of the same name (only W_EX010*.mdlx; the .a.us effects and the
+ * W_EX010*.mset motions stay the game's), weapons/chakram/hd/-<i>.dds is HD texture i of every one of them.  Offered when the
+ * Axel pack is complete and the set's base file and first HD texture are there; a missing variant keeps its keyblade. */
+_Thread_local int kh_loading_weapon;
+int kh_axel_weapon_asset(const char *rel,char *host,size_t cap){
+    char sub[2300];
+    if(strncasecmp(rel,"obj/W_EX010",11) || strlen(rel)<16 || strcasecmp(rel+strlen(rel)-5,".mdlx") ||
+       snprintf(sub,sizeof sub,"weapons/chakram/%s",rel)>=(int)sizeof sub) return 0;
+    return kh_look_asset(KH_LOOK_AXEL,sub,host,cap);
+}
+int kh_axel_weapon_ready(void){
+    char host[4096];
+    return kh_look_pack_ready(KH_LOOK_AXEL) && kh_axel_weapon_asset("obj/W_EX010.mdlx",host,sizeof host) &&
+           kh_look_asset(KH_LOOK_AXEL,"weapons/chakram/hd/-0.dds",host,sizeof host);
+}
 void kh_look_path(KCtx *g,const char *rel,char *host,size_t cap){
     if(!kh_look_available(rel,host,cap)) kh_fatal(g,"player-look-asset: missing or invalid %s",rel);
 }
 
-void kh_xkb_set_mode(KCtx *g,int enabled){
+/* mode: KH_MODE_NONE, KH_MODE_XION (any nonzero value older callers pass for "a Xion mode") or KH_MODE_AXEL.
+ * Each mode resets the appearance to its default, on every new game and load. */
+void kh_xkb_set_mode(KCtx *g,int mode){
     kh_settings_reset_look();
     int previous=kh_look_enabled();
-    kh_xion_enabled=enabled;
-    kh_look_set(g,enabled);
-    kh_warn("player appearance: mode default %s",enabled?"Xion":"Roxas");
-    if((previous!=0)!=(kh_look_enabled()!=0)){ KCtx ctx=*g; kh_look_voice_bind(&ctx); }
+    int axel=mode==KH_MODE_AXEL,look=axel?KH_LOOK_AXEL:mode?KH_LOOK_XION:KH_LOOK_ROXAS;
+    kh_xion_enabled=mode && !axel;
+    kh_axel_enabled=axel;
+    if(axel && !kh_look_switch_ready(KH_LOOK_AXEL)){
+        /* A save of this mode loaded without its pack: the campaign and its tag stay, the appearance is Roxas. */
+        kh_warn("axel-mode-pack-missing: %s is absent or incomplete, keeping Roxas",look_root(KH_LOOK_AXEL));
+        look=KH_LOOK_ROXAS;
+    }
+    kh_look_set(g,look);
+    kh_warn("player appearance: mode default %s",look==KH_LOOK_AXEL?"Axel":look?"Xion":"Roxas");
+    if(kh_look_voice_set(previous)!=kh_look_voice_set(kh_look_enabled())){ KCtx ctx=*g; kh_look_voice_bind(&ctx); }
+}
+
+/* The native serializer preserves the twenty-three bits above its portrait and world flag.
+ * Save the look independently of the legacy campaign tag (khXb). */
+void kh_select_saved_look(KCtx *g,int look){
+    u64 word=GS_BASE+0x9a98b0+0x419c;
+    u32 marker=0x4c4b0000u | (u32)look<<9;
+    wr32(g,word,(rd32(g,word)&511u)|marker);
+    int previous=kh_look_enabled();
+    kh_look_set(g,look);
+    if(kh_look_voice_set(previous)!=kh_look_voice_set(look)){ KCtx ctx=*g; kh_look_voice_bind(&ctx); }
+}
+void kh_restore_saved_look(KCtx *g){
+    u32 word=rd32(g,GS_BASE+0x9a98b0+0x419c);
+    if((word&0xfffff000u)!=0x4c4b0000u) return;
+    int look=(word>>9)&7;
+    if(look>=KH_LOOKS) return;
+    if(look && !kh_look_switch_ready(look)){
+        kh_warn("save-look: missing pack for %d, showing Roxas",look);
+        int previous=kh_look_enabled();
+        kh_look_set(g,KH_LOOK_ROXAS);
+        if(kh_look_voice_set(previous)){ KCtx ctx=*g; kh_look_voice_bind(&ctx); }
+        return;
+    }
+    kh_select_saved_look(g,look);
+    kh_warn("save-look: restored look %d",look);
 }
 
 int kh_look_enabled(void){
     if(kh_loading_look>=0) return kh_loading_look;
     int selected=player_look;
-    return selected<0?!!kh_xion_enabled:selected; /* older rewind snapshots used -1 */
+    return selected<0?(kh_axel_enabled?KH_LOOK_AXEL:!!kh_xion_enabled):selected; /* older rewind snapshots used -1 */
 }
+int kh_look_count(void){ return 3+!!kh_look_pack_ready(KH_LOOK_AXEL)+!!kh_look_switch_ready(KH_LOOK_ROXAS_HD); }
 
 static const char *const banks[]={
 #include "look_voice.inc"
@@ -282,6 +392,14 @@ static const char *const banks[]={
 int kh_look_switch_ready(int target){
     char host[4096];
     if(!kh_look_pack_ready(target) || !kh_look_asset(target,KH_SCENE_MDLX,host,sizeof host)) return 0;
+    if(target==KH_LOOK_ROXAS_HD){
+        static const char *const story[]={"P_EX110","P_EX110_NPC_PAJAMAS","H_EX510","H_EX510_PAJAMAS"};
+        for(size_t i=0;i<sizeof story/sizeof *story;i++){
+            char path[96]; snprintf(path,sizeof path,"obj/%s.mdlx",story[i]);
+            if(!kh_look_asset(target,path,host,sizeof host)) return 0;
+        }
+        return 1; /* native Roxas voice and shop portraits */
+    }
     for(size_t i=0;i<sizeof banks/sizeof *banks;i++)
         if(!kh_look_asset(target,banks[i],host,sizeof host)) return 0;
     return 1;
@@ -296,6 +414,8 @@ int kh_player_voice(const char *path){
 static int voice_slot[4];
 static unsigned voice_pending, voice_retired, voice_wait_reported;
 static struct { u64 bytes; int size; } voice_data[2][sizeof banks/sizeof *banks];
+/* Axel's banks. Kept out of voice_data: that array is a savestate record of a fixed size. */
+static struct { u64 bytes; int size; } voice_axel[sizeof banks/sizeof *banks];
 void kh_look_voice_request(KCtx *g){
     if(A2(g)!=GS_BASE+0x3cddf0) return;
     unsigned slot=(unsigned)A3(g);
@@ -312,9 +432,11 @@ int kh_look_voice_retry(KCtx *g){
         if(!(voice_pending & bit)) continue;
         if(!id || !(rd32(g,GS_BASE+0x2a244a8+12*slot)&1)){voice_pending &= ~bit;continue;}
         const char *key=banks[id-1];
-        int selected=!!kh_look_enabled();
-        u64 bytes=voice_data[selected][id-1].bytes;
-        int size=voice_data[selected][id-1].size;
+        int selected=kh_look_voice_set(kh_look_enabled());
+        u64 *cached_bytes=selected==2?&voice_axel[id-1].bytes:&voice_data[selected][id-1].bytes;
+        int *cached_size=selected==2?&voice_axel[id-1].size:&voice_data[selected][id-1].size;
+        u64 bytes=*cached_bytes;
+        int size=*cached_size;
         if(!bytes){
             u64 path=ga_strdup(key);
             char host[4096];
@@ -328,8 +450,8 @@ int kh_look_voice_retry(KCtx *g){
             if(memcmp(hp(g,bytes),"SEDBSSCF",8) || rd32(g,bytes+16)!=(u32)size)
                 kh_fatal(g,"look-voice-load: %s",key);
             ga_free(path);
-            voice_data[selected][id-1].bytes=bytes;
-            voice_data[selected][id-1].size=size;
+            *cached_bytes=bytes;
+            *cached_size=size;
         }
         /* f_1dcae0 stops slot voices, then f_1df560 retires the bank.
          * f_136060 frees mode 1 buffers at +0x58. Give each registration
@@ -389,70 +511,116 @@ static const char *arena_fallback(const char *rel){
         if(!strcasecmp(rel,arenas[i][0])) return arenas[i][1];
     return NULL;
 }
-static const char *const logo_names[]={"mod","roxas","xion","xkb","styles","painting","prompt-LB","prompt-L1","prompt-L"};
+/* Title logos and screens (lane TI).  ids: 1 roxas, 2 xion, 3 xkb, 4 axel (the T80L byte of pack_title_logo.py), 5 the screens
+ * layout (pack_title_screens.py). */
+static const char *const logo_names[]={"mod","roxas","xion","xkb","axel","screens"};
 void kh_title_logo_path(int id,const char *suffix,char *host,size_t cap){
     const char *root=getenv("KHNMC_TITLE_LOGO_DIR");
     const char *data=getenv("KHNMC_DATA");
     const char *slash=(!root && data && access("private/logos",F_OK))?strrchr(data,'/'):NULL;
     int prefix=slash?(int)(slash-data+1):0;
+    if(id<0 || id>=(int)(sizeof logo_names/sizeof *logo_names)) kh_fatal(NULL,"title-logo-id: %d",id);
     if(snprintf(host,cap,"%.*s%s/%s.%s",prefix,data?data:"",root?root:"private/logos",logo_names[id],suffix)>=(int)cap)
         kh_fatal(NULL,"title-logo-path: path too long");
 }
 
-static int next_logo(const char *docs,const char *mode,int count){
-    char path[4096];
-    if(snprintf(path,sizeof path,"%s/title-logo-%s",docs,mode)>=(int)sizeof path ||
-       (mkdir(docs,0700) && errno!=EEXIST)) kh_fatal(NULL,"title-logo-documents: %s",docs);
-    int fd=open(path,O_RDWR|O_CREAT,0600);
-    if(fd<0 || flock(fd,LOCK_EX)) kh_fatal(NULL,"title-logo-state-open: %s",path);
-    char c='0';
-    ssize_t n=pread(fd,&c,1,0);
-    if(n<0 || c<'0' || c>='0'+count) kh_fatal(NULL,"title-logo-state-read: %s",path);
-    int current=c-'0';
-    c='0'+(current+1)%count;
-    if(pwrite(fd,&c,1,0)!=1 || fsync(fd) || close(fd)) kh_fatal(NULL,"title-logo-state-write: %s",path);
-    return current;
+static const char *const screen_names[KH_TITLE_SCREENS]={"roxas","xion","axel"};
+static const int screen_logo[KH_TITLE_SCREENS]={1,2,4};
+const char *kh_title_screen_name(int screen){ return screen>=0 && screen<KH_TITLE_SCREENS?screen_names[screen]:"?"; }
+/* the picture slot of a screen: Roxas = the tree's own remastered/menu/us/title.2ld/-4.png (the rmc pack's when installed; 0 here),
+ * Xion = the Xion pack's (the hooded pack's when only that one is there), Axel = the Axel pack's, same path */
+int kh_title_screen_picture(int screen,char *host,size_t cap){
+    static const char image[]="remastered/" KH_TITLE_LAYOUT "/-4.png";
+    if(screen==KH_TITLE_XION) return kh_look_asset(KH_LOOK_XION,image,host,cap) || kh_look_asset(KH_LOOK_HOODED,image,host,cap);
+    if(screen==KH_TITLE_AXEL) return kh_look_asset(KH_LOOK_AXEL,image,host,cap);
+    return 0;
 }
-
-static int choose_title_logo(const char *mode,int look,const char *docs,int selected[2]){
-    for(int i=0;i<4;i++) if(mode && !strcmp(mode,logo_names[i])) return i;
-    int cycle=mode && !strcmp(mode,"cycle");
-    if(!cycle && mode && *mode && strcmp(mode,"auto")) kh_fatal(NULL,"title-logo-mode: %s",mode);
-    if(!cycle && !look) return 1;
-    if(!selected[cycle]) selected[cycle]=(cycle?1:2)+next_logo(docs,cycle?"cycle":"xion",cycle?3:2);
-    return selected[cycle];
+int kh_title_screen_available(int screen){
+    char host[4096];
+    return screen==KH_TITLE_ROXAS || (screen>KH_TITLE_ROXAS && screen<KH_TITLE_SCREENS && kh_title_screen_picture(screen,host,sizeof host));
 }
-
-static _Atomic(const char *) loaded_logo_mode;
-
-int kh_title_variant(int *picture){
-    static int selected[2];
-    const char *style=kh_menu_choice("KHNMC_TITLE_STYLE"),*mode=atomic_load(&loaded_logo_mode);
-    *picture=kh_look_enabled()!=0;
-    if(style && !strcmp(style,"roxas")){*picture=0;return 1;}
-    if(style && !strcmp(style,"xion")){
-        *picture=1;
-        if(mode && !strcmp(mode,"xkb")) return 3;
-        if(mode && strcmp(mode,"cycle") && strcmp(mode,"auto")) return 2;
-        mode="auto";
+int kh_title_screen_next(int screen){
+    for(int i=1;i<=KH_TITLE_SCREENS;i++){ int s=(screen+i)%KH_TITLE_SCREENS; if(kh_title_screen_available(s)) return s; }
+    return KH_TITLE_ROXAS;
+}
+int kh_title_screen(void){
+    const char *v=kh_menu_choice("KHNMC_TITLE_SCREEN");
+    int s=KH_TITLE_ROXAS;
+    if(v && *v){
+        while(s<KH_TITLE_SCREENS && strcmp(v,screen_names[s])) s++;
+        if(s==KH_TITLE_SCREENS) kh_fatal(NULL,"title-screen-value: KHNMC_TITLE_SCREEN=%s (known: roxas, xion, axel)",v);
     }
-    return choose_title_logo(mode,*picture,kh_autosave_documents(),selected);
+    if(!kh_title_screen_available(s)){
+        static _Atomic int warned;
+        if(!warned++) kh_warn("title-screen-pack-missing: KHNMC_TITLE_SCREEN=%s but its picture remastered/%s/-4.png is not in the %s pack: showing ROXAS MAY CRY",
+                              screen_names[s],KH_TITLE_LAYOUT,s==KH_TITLE_XION?"Xion":"Axel");
+        s=KH_TITLE_ROXAS;
+    }
+    return s;
+}
+/* aspect.c f_1948c0 (the screens layout): picture and logo of the screen shown now; 1 roxas, 2 xion, 3 axel logo */
+int kh_title_variant(int *picture){
+    int s=kh_title_screen();
+    *picture=s;
+    return 1+s;
 }
 
-static int title_logo(void){
-    static int selected[2];
-    static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
-    pthread_mutex_lock(&lock);
-    int id=choose_title_logo(kh_menu_choice("KHNMC_TITLE_LOGO"),kh_look_enabled(),kh_autosave_documents(),selected);
-    pthread_mutex_unlock(&lock);
-    if(id){   /* the logo pack is a local, optional add-on: without its files the title keeps the mod's own logo (never a stop) */
-        static _Atomic int warned;
-        char a[4096],b[4096]; struct stat st;
-        kh_title_logo_path(id,"2ld",a,sizeof a); kh_title_logo_path(id,"png",b,sizeof b);
-        if(stat(a,&st) || !S_ISREG(st.st_mode) || stat(b,&st) || !S_ISREG(st.st_mode)){
-            if(!warned++) fprintf(stderr,"kh: title logo: %s / %s not present: the mod's own logo is shown\n",a,b);
-            return 0;
+/* Round 5 (owner 2026-11-22, phone: Load after R3 "starts glitching trying to load the same data"): f_1948c0 above rebinds the drawn
+ * picture (slot 4) to slot 12 / 13 and the logo (slot 7) to 14..16.  The native title code needs those textures in the allocation of
+ * the slot they stand in for: with a 512x512 32-bit picture (1,048,640 bytes) on screen instead of the native 512x512 8-bit indexed
+ * one (263,232 bytes), the next save check of the Load menu reports "No system storage found" and never lists the card (null port,
+ * run-R5/p0: raw slot 12 fails on the Xion screen and passes on the Axel screen, raw slot 13 the other way round, the same file
+ * padded to 5.4 MB passes).  The 5,415,092-byte screens.2ld of 2026-11-22 00:49 carries such pictures in 12 and 13, so Load failed
+ * whenever R3 had left XION or AXEL on screen.  A layout whose slots 12..16 do not match their native slot (byte count and IMGD
+ * header) is therefore not used: a named warning, and the per-screen logo layouts below take over (R3 applies at the next load). */
+static int screens_entry(int fd,u32 imgz,int slot,u32 *off,u32 *len){
+    u8 e[8]; if(pread(fd,e,8,(off_t)imgz+16+8*slot)!=8) return 0;
+    memcpy(off,e,4); memcpy(len,e+4,4); return *len>=64;
+}
+int kh_title_screens_check(const char *host,char *why,size_t cap){
+    int fd=open(host,O_RDONLY); if(fd<0){ snprintf(why,cap,"cannot open it (%s)",strerror(errno)); return 0; }
+    u8 bar[48],z[16]; int ok=0; u32 imgz=0;
+    if(pread(fd,bar,48,0)!=48 || memcmp(bar,"BAR\1",4)) snprintf(why,cap,"not a BAR file");
+    else if(memcpy(&imgz,bar+40,4), pread(fd,z,16,imgz)!=16 || memcmp(z,"IMGZ",4)) snprintf(why,cap,"no IMGZ in its second entry");
+    else if(z[12]!=17 || z[13]||z[14]||z[15]) snprintf(why,cap,"IMGZ holds %u textures, not 17",(unsigned)z[12]|(unsigned)z[13]<<8);
+    else{
+        ok=1;
+        for(int slot=12;ok && slot<17;slot++){
+            int native=slot<14?4:7; u32 so,sl,no,nl; u8 sh[64],nh[64];
+            if(!screens_entry(fd,imgz,slot,&so,&sl) || !screens_entry(fd,imgz,native,&no,&nl) ||
+               pread(fd,sh,64,(off_t)imgz+so)!=64 || pread(fd,nh,64,(off_t)imgz+no)!=64){ snprintf(why,cap,"texture %d unreadable",slot); ok=0; break; }
+            if(sl!=nl || memcmp(sh+8,nh+8,56)){
+                u32 spix,npix; memcpy(&spix,sh+12,4); memcpy(&npix,nh+12,4);
+                snprintf(why,cap,"slot %d (the %s %s) is %u bytes with %u pixel bytes, its native slot %d is %u bytes with %u",slot,
+                         slot<14?"picture of":"logo of",kh_title_screen_name(slot<14?slot-11:slot-14),sl,spix,native,nl,npix);
+                ok=0;
+            }
         }
+    }
+    close(fd);
+    return ok;
+}
+static int screens_usable(const char *host){
+    static char last[4096]; static struct stat seen; static int verdict;
+    struct stat st; if(stat(host,&st)) return 0;
+    if(!strcmp(last,host) && st.st_size==seen.st_size && st.st_mtime==seen.st_mtime && st.st_ino==seen.st_ino) return verdict;
+    char why[256]; verdict=kh_title_screens_check(host,why,sizeof why);
+    if(!verdict) kh_warn("title-screens-layout-unsafe: %s: %s; with that texture on screen the Load menu's save check fails (\"No system storage "
+                         "found\"), so this layout is not used: the per-screen logo layouts are (R3 applies at the next title load). Rebuild it with "
+                         "tools/pack_title_screens.py (native 8-bit 512x512 pictures)",host,why);
+    snprintf(last,sizeof last,"%s",host); seen=st;
+    return verdict;
+}
+
+/* without the screens layout: the chosen screen's own logo layout, read once per title load */
+static int title_logo(int screen){
+    int id=screen_logo[screen];
+    /* the logo pack is a local, optional add-on: without its files the title keeps the mod's own logo (never a stop) */
+    char a[4096],b[4096]; struct stat st;
+    kh_title_logo_path(id,"2ld",a,sizeof a); kh_title_logo_path(id,"png",b,sizeof b);
+    if(stat(a,&st) || !S_ISREG(st.st_mode) || stat(b,&st) || !S_ISREG(st.st_mode)){
+        fprintf(stderr,"kh: title logo: %s / %s not present: the mod's own logo is shown\n",a,b);
+        return 0;
     }
     return id;
 }
@@ -461,20 +629,31 @@ static int loose_path(KCtx *g,const char *path,const char *what,char *host,size_
     char rel[2048];
     if(!relative(g,path,rel,sizeof rel)||kh_data_denied(g,rel,what)) return 0;
     if(!strcasecmp(rel,KH_TITLE_LAYOUT)){
-        kh_title_logo_path(4,"2ld",host,cap);
-        if(!access(host,R_OK)){
-            loaded_logo_mode=kh_menu_choice("KHNMC_TITLE_LOGO");
+        int screen=kh_title_screen();
+        char picture[4096];
+        if(!kh_title_screen_picture(screen,picture,sizeof picture)) snprintf(picture,sizeof picture,"remastered/%s/-4.png of the tree",KH_TITLE_LAYOUT);
+        kh_title_logo_path(5,"2ld",host,cap);
+        if(!access(host,R_OK) && screens_usable(host)){
+            fprintf(stderr,"kh: title screens: layout %s (all three resident), screen %s, picture %s\n",host,screen_names[screen],picture);
             return KH_FILE_LOOK;
         }
-        const char *style=kh_menu_choice("KHNMC_TITLE_STYLE");
-        if(style && strcmp(style,"auto")) kh_fatal(g,"title-style-pack-missing: %s",host);
-        int logo=title_logo();
+        int logo=title_logo(screen);
+        char png[4096]; kh_title_logo_path(logo,"png",png,sizeof png);
+        fprintf(stderr,"kh: title screen %s: picture %s, logo %s (next title load after R3)\n",screen_names[screen],picture,logo?png:"the mod's own");
         if(logo){ kh_title_logo_path(logo,"2ld",host,cap); return KH_FILE_LOOK; }
     }
     int profile=kh_look_key(rel);
     if(profile==KH_SCENE_MODEL){
         if(!kh_scene_path(rel,host,cap)) kh_fatal(g,"scene-roxas-asset: overlay disappeared: %s",rel);
         fprintf(stderr,"kh: scene Roxas: event overlay %s %s\n",what,rel);
+        return KH_FILE_LOOK;
+    }
+    if(profile==KH_LOOK_WEAPON){
+        if(!kh_axel_weapon_asset(rel,host,cap)) kh_fatal(g,"axel-weapon-asset: missing or invalid weapons/chakram/%s",rel);
+        return KH_FILE_LOOK;
+    }
+    if(profile==KH_LOOK_COMPANION){
+        if(!kh_companion_asset(rel,host,cap)) kh_fatal(g,"companion-asset: missing or invalid %s in %s",rel,look_root(KH_LOOK_XION));
         return KH_FILE_LOOK;
     }
     if(profile){ kh_look_path(g,rel,host,cap); return KH_FILE_LOOK; }
@@ -665,7 +844,9 @@ int kh_file_selftest(KCtx *g){
     voice_slot[0]=0; voice_data[1][0].bytes=0; voice_data[1][0].size=0;
     voice_retired=voice_wait_reported=0;
     ga_free(scd);
-    TEST(kh_look_key("./OBJ//p_ex100.MDLX")==-1 && kh_look_key("obj/P_EX100_WI_KH1F.a.us")==40);
+    /* face slot 45 (round 2; 39 before); a Xion pack of before round 2 with its sheet at -39 only: the stock HD table */
+    int wi_kh1f=kh_look_key("obj/P_EX100_WI_KH1F.a.us");
+    TEST(kh_look_key("./OBJ//p_ex100.MDLX")==-1 && (wi_kh1f==46 || wi_kh1f==KH_LOOK_STOCK_HD));
     TEST(kh_look_key("remastered/obj/P_EX100.a.us/-36.dds")==37 && !kh_look_key("remastered/obj/P_EX100.a.us/-37.dds"));
     TEST(kh_look_key("voice/us/battle/TT0_ROXAS.win32.scd")==-1);
     TEST(kh_look_key("remastered/obj/P_EX100_ULTF.a.us/voice/battle/us/awakened")==-1);
@@ -705,7 +886,8 @@ int kh_file_selftest(KCtx *g){
     if(saved_policy){setenv("KHNMC_LOOK_NAMES",saved_policy,1); free(saved_policy);}
     else unsetenv("KHNMC_LOOK_NAMES");
     kh_xkb_set_mode(g,1);
-    TEST(!strcmp(gstr(g,cached),xion) && kh_look_key("obj/H_EX510_PAJAMAS.mdlx")==-1);
+    /* round 9 item 0: a story rig follows the look in the Xion mode only with KHNMC_SCENE_LOOK=1 (before: always -1 here) */
+    TEST(!strcmp(gstr(g,cached),xion) && (kh_look_key("obj/H_EX510_PAJAMAS.mdlx")==-1)==kh_scene_look());
     kh_look_set(g,0);
     TEST(kh_xion_enabled && !kh_look_enabled() && !strcmp(gstr(g,cached),roxas));
     kh_xkb_set_mode(g,1); /* a second load of the same mode also resets its appearance */
@@ -716,21 +898,40 @@ int kh_file_selftest(KCtx *g){
     TEST(!kh_xion_enabled && !kh_look_enabled());
     TEST(!strcmp(gstr(g,cached),roxas) && !kh_look_key("obj/H_EX510_PAJAMAS.mdlx"));
     ga_free(label); ga_free(journal);
-    for(int count=2;count<=3;count++)
-        for(int j=0;j<count*2;j++) TEST(next_logo(dir,count==2?"xion":"cycle",count)==j%count);
-    for(int launch=0;launch<6;launch++){
-        int picks[2]={0};
-        TEST(choose_title_logo(NULL,0,dir,picks)==1);
-        TEST(choose_title_logo("auto",1,dir,picks)==2+launch%2);
-        TEST(choose_title_logo("",2,dir,picks)==2+launch%2);
-        TEST(choose_title_logo("cycle",0,dir,picks)==1+launch%3);
-        TEST(choose_title_logo("cycle",2,dir,picks)==1+launch%3);
-        for(int i=0;i<4;i++) TEST(choose_title_logo(logo_names[i],2,dir,picks)==i);
-    }
-    {   /* the logo counters live in the test directory: remove them so the directory can be removed (app-way scratch check) */
-        char counter[KH_TMP_MAX+64];
-        snprintf(counter,sizeof counter,"%s/title-logo-xion",dir); TEST(unlink(counter)==0);
-        snprintf(counter,sizeof counter,"%s/title-logo-cycle",dir); TEST(unlink(counter)==0);
+    {   /* lane TI: the title screens' names, logo ids and files (no counters any more: the choice is KHNMC_TITLE_SCREEN) */
+        char path[4096];
+        kh_title_logo_path(4,"2ld",path,sizeof path); size_t n=strlen(path);
+        TEST(n>9 && !strcmp(path+n-9,"/axel.2ld"));
+        kh_title_logo_path(5,"2ld",path,sizeof path); n=strlen(path);
+        TEST(n>12 && !strcmp(path+n-12,"/screens.2ld"));
+        TEST(!strcmp(kh_title_screen_name(0),"roxas") && !strcmp(kh_title_screen_name(1),"xion") && !strcmp(kh_title_screen_name(2),"axel"));
+        TEST(screen_logo[KH_TITLE_ROXAS]==1 && screen_logo[KH_TITLE_XION]==2 && screen_logo[KH_TITLE_AXEL]==4 && !strcmp(logo_names[4],"axel"));
+        TEST(kh_title_screen_available(KH_TITLE_ROXAS) && !kh_title_screen_available(KH_TITLE_SCREENS) && !kh_title_screen_available(-1));
+        /* Round 5: the screens layout check (17 IMGD textures; 12/13 must match slot 4, 14..16 slot 7, by byte count and header) */
+        static u8 sl[16+48+16+8*17+17*320+4];
+        size_t total=0;
+        for(int pass=0;pass<4;pass++){
+            memset(sl,0,sizeof sl); memcpy(sl,"BAR\1",4); u32 imgz=64; memcpy(sl+40,&imgz,4);
+            u8 *z=sl+imgz; memcpy(z,"IMGZ",4); z[12]=17;
+            u32 at=16+8*17;
+            for(int t=0;t<17;t++){
+                u32 len=256+((t==4||t==12||t==13)?32:0)+((pass==1 && t==12)?64:0);   /* pass 1: a bigger picture in 12 */
+                memcpy(z+16+8*t,&at,4); memcpy(z+20+8*t,&len,4);
+                memcpy(z+at,"IMGD",4); u32 pix=len-64; memcpy(z+at+12,&pix,4);
+                z[at+0x30]=(t==4||t==12||t==13)?5:3;
+                if(pass==2 && t==15) z[at+0x30]=4;                                    /* pass 2: a logo of another format */
+                at+=len;
+            }
+            memcpy(z+at,"T90L",4); total=imgz+at+4;
+            if(pass==3) z[12]=16;                                                      /* pass 3: 16 textures */
+            snprintf(path,sizeof path,"%s/screens.2ld",dir); f=fopen(path,"wb"); TEST(f && fwrite(sl,1,total,f)==total); if(f) fclose(f);
+            char why[256]; why[0]=0; int good=kh_title_screens_check(path,why,sizeof why);
+            if(pass==0) TEST(good);
+            if(pass==1) TEST(!good && strstr(why,"slot 12 (the picture of xion) is 352 bytes") && strstr(why,"native slot 4 is 288 bytes"));
+            if(pass==2) TEST(!good && strstr(why,"slot 15 (the logo of xion)"));
+            if(pass==3) TEST(!good && strstr(why,"16 textures"));
+        }
+        char why[256]; snprintf(path,sizeof path,"%s/no-such.2ld",dir); TEST(!kh_title_screens_check(path,why,sizeof why));
     }
     TEST(!kh_look_key("obj/P_EX100.mdlx"));
     const char *pack_env=getenv("KHNMC_SCENE_ROXAS_DIR");
@@ -767,11 +968,111 @@ int kh_file_selftest(KCtx *g){
     TEST(!kh_look_key(KH_SCENE_MDLX) && !kh_file_loose_path(g,KH_SCENE_MDLX,resolved,sizeof resolved));
     const char *look_env=getenv("KHNMC_LOOK_DIR");
     char *initial_dir=look_env?strdup(look_env):NULL;
+    const char *sl_env=getenv("KHNMC_SCENE_LOOK");
+    char *initial_sl=sl_env?strdup(sl_env):NULL;
     setenv("KHNMC_LOOK_DIR",pack,1);
-    kh_look_set(g,1); kh_scene_pack_begin();
-    TEST(kh_look_key(KH_SCENE_MDLX)==-1 && !kh_look_key(scene_files[3]));
-    TEST(kh_file_loose_path(g,KH_SCENE_MDLX,resolved,sizeof resolved)==KH_FILE_LOOK);
-    kh_scene_pack_end();
+    kh_look_set(g,1);
+    /* lane scene-off: an ordinary campaign (mode 0) with a look on.  KHNMC_SCENE_LOOK=0 (the default) keeps the story scenes on
+     * Roxas; =1 restores the CSI behaviour (the gates follow the look).  The campaign modes: the round-9 block below. */
+    for(int scene_look=0;scene_look<=1;scene_look++){
+        char sl[2]; snprintf(sl,sizeof sl,"%d",scene_look); setenv("KHNMC_SCENE_LOOK",sl,1);
+        TEST(!kh_xion_enabled && !kh_axel_enabled && kh_event_high_scene(g)==scene_look);
+        TEST((kh_look_key("obj/H_EX510.mdlx")==-1)==scene_look &&
+             (kh_look_key("obj/P_EX110.mdlx")==-1)==scene_look &&
+             (kh_look_key("obj/P_EX110_NPC_PAJAMAS.mdlx")==-1)==scene_look);
+        TEST(!kh_look_key("obj/H_EX500_BTLF.mdlx"));        /* outside an event a Drive form's high model stays stock */
+        kh_scene_pack_begin();
+        TEST(kh_look_key(KH_SCENE_MDLX)==(scene_look?-1:KH_SCENE_MODEL));
+        TEST(kh_look_key(scene_files[3])==(scene_look?0:KH_SCENE_MODEL));
+        TEST(kh_file_loose_path(g,KH_SCENE_MDLX,resolved,sizeof resolved)==KH_FILE_LOOK);
+        {   /* lane CSI: Drive forms of high Sora inside the event = the look's H_EX500 (model and HD leaves) with the setting */
+            char high[4096],leaf[4096];
+            TEST(kh_look_asset(1,KH_SCENE_MDLX,high,sizeof high) && kh_look_asset(1,scene_files[3],leaf,sizeof leaf));
+            TEST((kh_look_key("obj/H_EX500_BTLF.mdlx")==-1)==scene_look &&
+                 (kh_look_key("obj/H_EX500_MAGF.mdlx")==-1)==scene_look &&
+                 (kh_look_key("obj/H_EX500_KH1F.mdlx")==-1)==scene_look &&
+                 (kh_look_key("obj/H_EX500_TRIF.mdlx")==-1)==scene_look &&
+                 (kh_look_key("obj/H_EX500_ULTF.mdlx")==-1)==scene_look);
+            TEST(!kh_look_key("obj/H_EX500_NM.mdlx") && !kh_look_key("obj/H_EX500_NM_BTLF.mdlx") && !kh_look_key("obj/H_EX500_BTLF.mset") &&
+                 !kh_look_key("remastered/obj/H_EX500_BTLF.mdlx/-0.dds"));
+            if(scene_look) TEST(kh_file_loose_path(g,"obj/H_EX500_ULTF.mdlx",resolved,sizeof resolved)==KH_FILE_LOOK && !strcmp(resolved,high));
+            TEST(kh_look_asset(1,"remastered/obj/H_EX500_MAGF.mdlx/-2.dds",resolved,sizeof resolved) && !strcmp(resolved,leaf));
+            TEST(!kh_scene_form_alias("obj/H_EX500_BTLF.mdlx.bak",NULL,0) && !kh_scene_form_alias("remastered/obj/H_EX500_BTLF.mdlx/",NULL,0) &&
+                 !kh_scene_form_alias("remastered/obj/H_EX500_BTLF.mdlx/a/-0.dds",NULL,0) && !kh_scene_form_alias("obj/H_EX500.mdlx",NULL,0));
+        }
+        kh_scene_pack_end();
+        TEST(!kh_look_key("obj/H_EX500_BTLF.mdlx"));
+        kh_look_set(g,0);
+        TEST(!kh_look_key("obj/H_EX510.mdlx"));
+        if(!getenv("KHNMC_SCENE_ROXAS")) TEST(!kh_event_high_scene(g));
+        kh_look_set(g,1);
+    }
+    {   /* Round 9 item 0: the campaign modes (Xion Always Cries / Xion Knows Best = kh_xion_enabled, Axel Won't Cry = kh_axel_enabled)
+         * take the same gate as an ordinary campaign: KHNMC_SCENE_LOOK=0 keeps the story rigs on Roxas and high Sora on the scene-roxas
+         * overlay, =1 lets them wear the look (Xion here, and the Axel look for high Sora).  Unchanged: the overlay's own gate (the
+         * modes), the field look (P_EX100).  Before round 9 the modes followed with 0 as well: every "==scene_look" story / Drive-form
+         * check and the KH_SCENE_MODEL checks failed for 0, and with no overlay installed the event opened on the look's H_EX500 and
+         * served the overlay key (kh_file_loose_path: scene-roxas-asset fatal). */
+        int prior_xion=kh_xion_enabled,prior_axel=kh_axel_enabled;
+        const char *axel_env=getenv("KHNMC_LOOK_AXEL_DIR");
+        char *initial_axel=axel_env?strdup(axel_env):NULL;
+        static const char *const story[]={"obj/H_EX510.mdlx","obj/H_EX510_PAJAMAS.mdlx","obj/P_EX110.mdlx","obj/P_EX110_NPC_PAJAMAS.mdlx"};
+        char nopack[KH_TMP_MAX+64]; snprintf(nopack,sizeof nopack,"%s/no-scene-pack",dir);
+        setenv("KHNMC_LOOK_AXEL_DIR",pack,1);
+        for(int mode=1;mode<=2;mode++) for(int look=1;look<=KH_LOOK_AXEL;look+=KH_LOOK_AXEL-1){
+            kh_xion_enabled=mode==1; kh_axel_enabled=mode==2;
+            kh_look_set(g,look);
+            for(int scene_look=0;scene_look<=1;scene_look++){
+                char sl[2]; snprintf(sl,sizeof sl,"%d",scene_look); setenv("KHNMC_SCENE_LOOK",sl,1);
+                TEST(kh_scene_wear()==(scene_look?look:0));
+                TEST(kh_event_high_scene(g)==1);                                  /* the overlay's gate: the modes, unchanged */
+                TEST(kh_look_key("obj/P_EX100.mdlx")==-1);                        /* the field look, unchanged */
+                if(look==1) for(size_t i=0;i<sizeof story/sizeof *story;i++) TEST((kh_look_key(story[i])==-1)==scene_look);
+                kh_scene_pack_begin();
+                TEST(kh_scene_pack_active());
+                TEST(kh_look_key(KH_SCENE_MDLX)==(scene_look?-1:KH_SCENE_MODEL));
+                TEST(kh_look_key(scene_files[3])==(scene_look?0:KH_SCENE_MODEL));
+                TEST((kh_look_key("obj/H_EX500_BTLF.mdlx")==-1)==scene_look && (kh_look_key("obj/H_EX500_ULTF.mdlx")==-1)==scene_look);
+                if(!scene_look) TEST(kh_file_loose_path(g,KH_SCENE_MDLX,resolved,sizeof resolved)==KH_FILE_LOOK && !strcmp(resolved+strlen(pack),"/" KH_SCENE_MDLX));
+                kh_scene_pack_end();
+                setenv("KHNMC_SCENE_ROXAS_DIR",nopack,1);                         /* no overlay installed, the look's H_EX500 present */
+                kh_scene_pack_begin();
+                TEST(kh_scene_pack_active()==scene_look && kh_look_key(KH_SCENE_MDLX)==(scene_look?-1:0));
+                kh_scene_pack_end();
+                setenv("KHNMC_SCENE_ROXAS_DIR",pack,1);
+            }
+        }
+        kh_xion_enabled=prior_xion; kh_axel_enabled=prior_axel;
+        kh_look_set(g,1);
+        if(initial_axel) setenv("KHNMC_LOOK_AXEL_DIR",initial_axel,1); else unsetenv("KHNMC_LOOK_AXEL_DIR");
+        free(initial_axel);
+    }
+    if(initial_sl) setenv("KHNMC_SCENE_LOOK",initial_sl,1); else unsetenv("KHNMC_SCENE_LOOK");
+    free(initial_sl);
+    {   /* lane HM: the Holo-Mission companion takes the Xion pack's body with any look (here Roxas, then hooded), model + sheet -0 */
+        char body[KH_TMP_MAX+512],hdir[KH_TMP_MAX+512],sheet[KH_TMP_MAX+512]; int costume=-1;
+        snprintf(body,sizeof body,"%s/obj/N_PO010_BTL.mdlx",pack);
+        snprintf(hdir,sizeof hdir,"%s/remastered/obj/N_PO010_BTL.mdlx",pack);
+        snprintf(sheet,sizeof sheet,"%s/-0.dds",hdir);
+        FILE *part=fopen(body,"wb"); TEST(part!=NULL); if(part){ fputc('x',part); fclose(part); }
+        TEST(!kh_look_key("obj/N_PO010_BTL.mdlx"));                  /* no HD sheet: NMC's own companion */
+        TEST(mkdir(hdir,0700)==0);
+        part=fopen(sheet,"wb"); TEST(part!=NULL); if(part){ fputc('x',part); fclose(part); }
+        TEST(kh_look_key("obj/N_PO010_BTL.mdlx")==KH_LOOK_COMPANION && kh_look_key("./OBJ//n_po010_btl.MDLX")==KH_LOOK_COMPANION);
+        TEST(kh_file_loose_path(g,"obj/N_PO010_BTL.mdlx",resolved,sizeof resolved)==KH_FILE_LOOK && !strcmp(resolved,body));
+        TEST(kh_hd_look_probe("obj/N_PO010_BTL.mdlx",&costume)==KH_LOOK_COMPANION && costume==0);
+        TEST(kh_companion_asset("remastered/obj/N_PO010_BTL.mdlx/-0.dds",resolved,sizeof resolved) && !strcmp(resolved,sheet));
+        TEST(!kh_look_key("remastered/obj/N_PO010_BTL.mdlx/-0.dds") && !kh_look_key("obj/N_PO010_BTL.mset") &&
+             !kh_look_key("obj/N_PO010_BTL.a.us") && !kh_look_key("obj/N_PO010_SIT_RTN.mdlx") && !kh_look_key("obj/N_PO010_RTN.mdlx"));
+        TEST(!kh_companion_asset("remastered/obj/N_PO010_BTL.mdlx/a/-0.dds",NULL,0) && !kh_companion_asset("remastered/obj/N_PO010_BTL.mdlx/",NULL,0) &&
+             !kh_companion_asset("obj/N_PO010_BTL.mdlx.bak",NULL,0) && !kh_companion_asset("obj/P_EX220.mdlx",NULL,0));
+        kh_look_set(g,KH_LOOK_HOODED);
+        TEST(kh_look_key("obj/N_PO010_BTL.mdlx")==KH_LOOK_COMPANION);
+        kh_look_set(g,0);
+        unlink(sheet); rmdir(hdir);
+        TEST(!kh_look_key("obj/N_PO010_BTL.mdlx"));
+        unlink(body);
+    }
     if(initial_dir) setenv("KHNMC_LOOK_DIR",initial_dir,1); else unsetenv("KHNMC_LOOK_DIR");
     free(initial_dir);
     kh_look_set(g,initial_look);
@@ -874,6 +1175,8 @@ int kh_file_selftest(KCtx *g){
 void kh_rewind_files(KhRecords *r){
     KH_RECORD(r,voice_pending); KH_RECORD(r,voice_retired);
     KH_RECORD(r,voice_slot); KH_RECORD(r,voice_data);
+    /* Not a record (the stream's layout is fixed): a restored arena may not hold these copies, so they are read again. */
+    if(r->loading) memset(voice_axel,0,sizeof voice_axel);
     KH_RECORD(r,real_packages);
     KH_RECORD(r,scene_pack);
     KH_RECORD(r,name_overlays);

@@ -65,6 +65,7 @@
 #include "khnmc_remaster.h"
 #include "kh_look.h"
 #include "xion_swap.h"
+#include <stdatomic.h>
 #include <dirent.h>
 #include <string.h>
 #include <strings.h>
@@ -127,22 +128,73 @@ static int canon_rel(const char *in,char *out,size_t cap){
     if(!cap) return 0; out[o]=0; return 1;
 }
 
+/* face = the HD slot of the HUD face sheet: in the player's files always the LAST texture of the form's remastered folder (read
+ * from data-full/remastered/obj/<STEM>.a.us: the one 1024x510/512 sheet of each folder).  P_EX100_WI_KH1F's sheet is slot 45 (46
+ * textures); slot 39 there is a 128x128 effect texture.  Packs made before that was known carry their face at -39 only
+ * (`legacy`): such a pack is still complete, its -39 is no longer served (the effect texture stays stock) and that one form
+ * keeps the stock HUD face (KH_LOOK_STOCK_HD below; named warning look-face-legacy-slot). */
+static const struct { const char *stem; int face,legacy; } keys[]={
+        {"P_EX100",36,-1},{"P_EX100_BTLF",47,-1},{"P_EX100_MAGF",38,-1},{"P_EX100_KH1F",47,-1},
+        {"P_EX100_TRIF",5,-1},{"P_EX100_ULTF",41,-1},{"P_EX100_HTLF",3,-1},{"P_EX101",36,-1},
+        {"P_EX101_BTLF",47,-1},{"P_EX110_BTLF",0,-1},{"P_EX121",36,-1},{"P_EX100_WI",36,-1},
+        {"P_EX100_WI_MAGF",38,-1},{"P_EX100_WI_KH1F",45,39},{"P_EX100_WI_ULTF",41,-1}
+    };
+/* 1: the look's pack holds the form's face sheet at its slot; 2: only at the legacy slot; 0: neither. */
+static int face_sheet(int look,size_t i){
+    char rel[128],host[4096];
+    snprintf(rel,sizeof rel,"remastered/obj/%s.a.us/-%d.dds",keys[i].stem,keys[i].face);
+    if(kh_look_asset(look,rel,host,sizeof host)) return 1;
+    if(keys[i].legacy<0) return 0;
+    snprintf(rel,sizeof rel,"remastered/obj/%s.a.us/-%d.dds",keys[i].stem,keys[i].legacy);
+    return kh_look_asset(look,rel,host,sizeof host)?2:0;
+}
 int kh_look_key(const char *rel){
     int scene=kh_scene_pack_active(), xion=kh_look_enabled();
-    if(!scene && !xion) return 0;
     char key[2300];
     if(!canon_rel(rel,key,sizeof key)) return 0;
+    /* lane HM: the Holo-Mission companion follows the Xion pack, not the look (kh_look.h); only its .mdlx is served by key, its HD
+     * sheets through the table hd_look builds for it. */
+    if(!strncasecmp(key,"obj/N_PO010_",12)){
+        char host[4096];
+        if(kh_companion_asset(key,host,sizeof host)) return KH_LOOK_COMPANION;
+    }
+    if(!scene && !xion) return 0;
     if(scene && kh_scene_key(key)){
-        if(xion) return !strcasecmp(key,KH_SCENE_MDLX)?-1:0; /* X5 uses embedded textures. */
+        /* A look's H_EX500 gets its HD table from the look pack (KH_LOOK_HD_MODEL in hd_look); its leaves are never served by key.
+         * Round 9 item 0: only with KHNMC_SCENE_LOOK=1 does the look take H_EX500, in every campaign mode; otherwise the overlay. */
+        if(xion && kh_scene_look()) return !strcasecmp(key,KH_SCENE_MDLX)?-1:0;
         return KH_SCENE_MODEL;
     }
+    /* lane CSI: high Sora in a Drive form inside the event: the look's H_EX500 under the form's name (file_layer.c alias). */
+    if(scene && xion && kh_scene_look() && !strncasecmp(key,"obj/",4) && kh_scene_form_alias(key,NULL,0)) return -1;
     if(!xion) return 0;
-    if(kh_player_voice(key)) return -1;
-    if(kh_xion_enabled){
+    if(kh_loading_weapon && xion==KH_LOOK_AXEL){
+        char host[4096];
+        if(kh_axel_weapon_asset(key,host,sizeof host)) return KH_LOOK_WEAPON;
+    }
+    if(!strncasecmp(key,"obj/P_EX120",11)){
+        static const char *const theater[]={"obj/P_EX120.mdlx","obj/P_EX120_NPC_RED.mdlx",
+            "obj/P_EX120_NPC_GREEN.mdlx","obj/P_EX120_NPC_BLUE.mdlx"};
+        for(size_t i=0;i<sizeof theater/sizeof *theater;i++){
+            if(!strcasecmp(key,theater[i])){
+                char host[4096];
+                return kh_look_available(key,host,sizeof host)?-1:0;
+            }
+        }
+    }
+    if(kh_player_voice(key)) return xion==KH_LOOK_ROXAS_HD?0:-1;
+    /* lane CSI (gated by KHNMC_SCENE_LOOK, default 0): Roxas's own event rigs follow the look only with the setting, in every
+     * campaign mode (round 9 item 0: the Xion / Axel modes no longer follow without it; before CSI they were the only gate). */
+    if(kh_scene_look()){
         static const char *const story[]={"obj/P_EX110.mdlx","obj/P_EX110_NPC_PAJAMAS.mdlx",
                                            "obj/H_EX510.mdlx","obj/H_EX510_PAJAMAS.mdlx"};
         for(size_t i=0;i<sizeof story/sizeof *story;i++)
-            if(!strcasecmp(key,story[i])) return -1;
+            if(!strcasecmp(key,story[i])){
+                /* The Axel pack's story rigs are optional: without one the stock model plays that scene. */
+                char host[4096];
+                if(xion==KH_LOOK_AXEL) return kh_look_available(key,host,sizeof host)?-1:0;
+                return -1;
+            }
     }
     const char *base=!strncasecmp(key,"remastered/",11)?key+11:key;
     if(!strncasecmp(base,"menu/shopface/",14)){
@@ -155,15 +207,27 @@ int kh_look_key(const char *rel){
         }
         return 0;
     }
-    return kh_player_asset_key(key);
+    int face=kh_player_asset_key(key);
+    if(face>0){
+        /* A pack with the face at the legacy slot only: its motion file is served with the stock HD table, its HD face is not. */
+        for(size_t i=0;i<sizeof keys/sizeof *keys;i++) if(keys[i].face+1==face && keys[i].legacy>=0){
+            const char *stem=key+(!strncasecmp(key,"remastered/",11)?11:0)+4;
+            if(strncasecmp(stem,keys[i].stem,strlen(keys[i].stem)) || stem[strlen(keys[i].stem)]!='.') continue;
+            if(face_sheet(xion,i)!=2) break;
+            static _Atomic unsigned warned;
+            if(!(atomic_fetch_or(&warned,1u<<xion)&(1u<<xion)))
+                kh_warn("look-face-legacy-slot: %s has remastered/obj/%s.a.us/-%d.dds but not -%d.dds: that form keeps the stock HUD face",
+                        kh_look_root(),keys[i].stem,keys[i].legacy,keys[i].face);
+            return strncasecmp(key,"remastered/",11)?KH_LOOK_STOCK_HD:0;
+        }
+    }
+    return face;
 }
 
-static const struct { const char *stem; int face; } keys[]={
-        {"P_EX100",36},{"P_EX100_BTLF",47},{"P_EX100_MAGF",38},{"P_EX100_KH1F",47},
-        {"P_EX100_TRIF",5},{"P_EX100_ULTF",41},{"P_EX100_HTLF",3},{"P_EX101",36},
-        {"P_EX101_BTLF",47},{"P_EX110_BTLF",0},{"P_EX121",36},{"P_EX100_WI",36},
-        {"P_EX100_WI_MAGF",38},{"P_EX100_WI_KH1F",39},{"P_EX100_WI_ULTF",41}
-    };
+int kh_look_face_ready(int look,const char *stem){
+    for(size_t i=0;i<sizeof keys/sizeof *keys;i++) if(!strcasecmp(stem,keys[i].stem)) return face_sheet(look,i)!=0;
+    return 0;
+}
 int kh_look_pack_ready(int look){
     char rel[128],host[4096];
     for(size_t i=0;i<sizeof keys/sizeof *keys;i++){
@@ -171,8 +235,7 @@ int kh_look_pack_ready(int look){
         if(!kh_look_asset(look,rel,host,sizeof host)) return 0;
         snprintf(rel,sizeof rel,"obj/%s.a.us",keys[i].stem);
         if(!kh_look_asset(look,rel,host,sizeof host)) return 0;
-        snprintf(rel,sizeof rel,"remastered/obj/%s.a.us/-%d.dds",keys[i].stem,keys[i].face);
-        if(!kh_look_asset(look,rel,host,sizeof host)) return 0;
+        if(!face_sheet(look,i)) return 0;
     }
     return 1;
 }
@@ -424,18 +487,38 @@ static int mod_asset(const HdFile *f,HdEnt *e,HdTable *t,char *err,size_t cap){
 #include "title_logo.h"
 #define TITLE_LAYOUT KH_TITLE_LAYOUT
 #define TITLE_IMAGE "remastered/" TITLE_LAYOUT "/-4.png"
+/* A look body (obj/<STEM>.mdlx of the selected pack) whose pack also holds remastered/obj/<STEM>.mdlx/-0.dds .. -N.dds: its HD
+ * table is one sheet per texture offset of the model, read from the pack (the HD Xion job's hd-body binding, never merged). */
+#define KH_LOOK_HD_MODEL (-3)
+/* hd_look of the title layout while XION / AXEL is chosen: texture slot 4 (= look - 1) comes from that screen's pack */
+#define KH_TITLE_PICTURE_SLOT 5
 
+/* Tables of the same face slot differ by costume: 0 Xion (and every table that no look serves), 1 hooded Xion, 2 Axel.
+ * (HdTable.hooded keeps its name: it is part of the savestate's HD binding record.) */
+static int hd_costume(int look){
+    if(look<=0 && look!=KH_LOOK_HD_MODEL) return 0;
+    int selected=kh_look_enabled();
+    return selected==KH_LOOK_ROXAS_HD?3:selected==KH_LOOK_AXEL?2:selected==KH_LOOK_HOODED;
+}
 /* Only the HD table varies. The loose title layout and its other textures stay shared. */
 static int hd_look(const char *rel){
-    if(!strcasecmp(rel,TITLE_LAYOUT) && kh_look_enabled()){
-        char path[4096];
-        if(kh_look_available(TITLE_IMAGE,path,sizeof path)) return 5;
-        kh_warn("player-look-title: missing %s in the Xion pack; using original title",TITLE_IMAGE);
-        return 0;
+    /* The title picture follows the title screen (KHNMC_TITLE_SCREEN, R3), not the look: XION / AXEL take their pack's picture slot
+     * (kh_title_screen falls back to Roxas when that pack has none); ROXAS keeps the tree's own. */
+    if(!strcasecmp(rel,TITLE_LAYOUT)) return kh_title_screen()!=KH_TITLE_ROXAS?5:0;
+    int key=kh_look_key(rel);
+    if(key==KH_LOOK_STOCK_HD) return 0;
+    if(key==KH_LOOK_COMPANION) return KH_LOOK_COMPANION;          /* lane HM: its 12 sheets from the Xion pack (hd_build) */
+    size_t n=strlen(rel);
+    if(key==-1 && n>5 && !strcasecmp(rel+n-5,".mdlx")){
+        char leaf[2700],host[4096];
+        snprintf(leaf,sizeof leaf,"remastered/%s/-0.dds",rel);
+        if(kh_look_available(leaf,host,sizeof host)) return KH_LOOK_HD_MODEL;
     }
-    return kh_look_key(rel);
+    return key;
 }
 
+/* selftest probe (settings.c kh_axel_round2_selftest): the HD-table key and costume a file would get now */
+int kh_hd_look_probe(const char *rel,int *costume){ int look=hd_look(rel); if(costume) *costume=!strcasecmp(rel,TITLE_LAYOUT)?kh_title_screen():hd_costume(look); return look; }
 /* Builds the table for `rel` (canonical tree path of the game file). Returns 0, or -1 with a message in err.  `root` is the tree; the
  * folder is <root>/remastered/<rel> (case-insensitive).  `bytes` are only read when the folder is scanned. */
 static int hd_build(const char *root,const char *rel,const unsigned char *bytes,int64_t n,HdTable **out,char *err,size_t cap){
@@ -445,13 +528,16 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
     t->game_mod=gmod; t->mod_files=nmod; t->pkg_n=pt?pt->n:0; t->offsets=-1;
     HdFile *files=NULL; int nf=0; int32_t *offs=NULL; char *served=NULL; int rc=-1;
     char sub[2700],dir[4300],full[3000]; struct stat st;
-    int styles=!strcasecmp(rel,TITLE_LAYOUT) && bytes && n>=4 && !memcmp(bytes+n-4,"T89L",4);
+    int styles=!strcasecmp(rel,TITLE_LAYOUT) && bytes && n>=4 && !memcmp(bytes+n-4,"T90L",4);   /* the screens layout */
     t->look=styles?0:hd_look(rel);
-    t->hooded=t->look>0 && kh_look_enabled()==2;
-    if(t->look==KH_SCENE_MODEL && !strcasecmp(rel,KH_SCENE_MDLX)){
+    t->hooded=styles?0:!strcasecmp(rel,TITLE_LAYOUT)?kh_title_screen():hd_costume(t->look);   /* title: the screen */
+    if(t->look==KH_LOOK_HD_MODEL || t->look==KH_LOOK_WEAPON || t->look==KH_LOOK_COMPANION || (t->look==KH_SCENE_MODEL && !strcasecmp(rel,KH_SCENE_MDLX))){
+        int scene=t->look==KH_SCENE_MODEL,weapon=t->look==KH_LOOK_WEAPON,companion=t->look==KH_LOOK_COMPANION;
         int count=0,bad=0;
-        if(!kh_rm_offsets(rel,bytes,n,&offs,&count,&bad) || bad || count!=KH_SCENE_TEXTURES){
-            snprintf(err,cap,"scene-roxas-hd-offsets: expected %d texture offsets in %s, got %d",KH_SCENE_TEXTURES,rel,count); goto fail;
+        if(!kh_rm_offsets(rel,bytes,n,&offs,&count,&bad) || bad || count<=0 || (scene && count!=KH_SCENE_TEXTURES)){
+            if(scene) snprintf(err,cap,"scene-roxas-hd-offsets: expected %d texture offsets in %s, got %d",KH_SCENE_TEXTURES,rel,count);
+            else snprintf(err,cap,"%s: invalid texture offset table in %s, got %d",weapon?"look-weapon-hd-offsets":companion?"look-companion-hd-offsets":"look-model-hd-offsets",rel,count);
+            goto fail;
         }
         t->rule=R_SCAN; t->game_mod=1; t->mod_files=t->offsets=count; t->pkg_n=0;
         t->e=calloc(count,sizeof *t->e);
@@ -459,8 +545,12 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
         for(int i=0;i<count;i++){
             HdEnt *e=&t->e[t->n++];
             snprintf(e->name,sizeof e->name,"-%d.dds",i);
-            snprintf(full,sizeof full,"remastered/%s/%s",KH_SCENE_MDLX,e->name);
-            if(!kh_scene_path(full,dir,sizeof dir) || stat(dir,&st)){ snprintf(err,cap,"scene-roxas-hd-asset: %s",full); goto fail; }
+            /* the chakram set: one HD texture folder for all its files (weapons/chakram/hd/-<i>.dds) */
+            if(weapon) snprintf(full,sizeof full,"weapons/chakram/hd/%s",e->name);
+            else snprintf(full,sizeof full,"remastered/%s/%s",rel,e->name);
+            if(!(scene?kh_scene_path(full,dir,sizeof dir):weapon?kh_look_asset(KH_LOOK_AXEL,full,dir,sizeof dir):
+                 companion?kh_companion_asset(full,dir,sizeof dir):kh_look_available(full,dir,sizeof dir)) || stat(dir,&st)){
+                snprintf(err,cap,"%s: %s",scene?"scene-roxas-hd-asset":weapon?"look-weapon-hd-asset":companion?"look-companion-hd-asset":"look-model-hd-asset",full); goto fail; }
             HdFile file={.host=dir,.size=st.st_size};
             e->orig=(uint32_t)offs[i]; e->gsize=(int32_t)file.size;
             if(mod_asset(&file,e,t,err,cap)) goto fail;
@@ -526,7 +616,7 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
             for(int i=0;i<noffs;i++) offs[i]=(int32_t)pt->e[i].orig;
             t->unknown_ext=1;
         }
-        if(styles && noffs!=19){snprintf(err,cap,"title-style-texture-count: %d",noffs);goto fail;}
+        if(styles && noffs!=17){snprintf(err,cap,"title-screens-texture-count: %d (expected 17)",noffs);goto fail;}
         if(styles) noffs=9;
         t->offsets=noffs;
         for(int i=0;i<nf;i++) if(strlen(files[i].name)>31){ snprintf(err,cap,"mod file name longer than 31 characters in a scanned folder: %s (folder of %s); Panacea keeps names in 32 bytes",files[i].name,rel); goto fail; }
@@ -561,21 +651,25 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
         for(int k=0;k<nf;k++) if(!served[k]) t->unserved++;
     }
     if(styles){
+        /* the screens layout: 9 textures of the title's folder, 3 controller aliases of 8, then the Xion and Axel pictures (their
+         * packs' plain slots) and the roxas / xion / axel logo atlases of the logo folder.  A screen whose pack is missing gets the
+         * Roxas picture in its slot (it is never shown: kh_title_screen skips it). */
         int count=0,bad=0;
         free(offs);offs=NULL;
-        if(t->n!=9 || !kh_rm_offsets(rel,bytes,n,&offs,&count,&bad) || bad || count!=19){
-            snprintf(err,cap,"title-style-hd-layout: expected 9 original, 3 controller and 7 alternate slots");goto fail;
+        if(t->n!=9 || !kh_rm_offsets(rel,bytes,n,&offs,&count,&bad) || bad || count!=17){
+            snprintf(err,cap,"title-screens-hd-layout: expected 9 original, 3 controller, 2 picture and 3 logo slots");goto fail;
         }
         HdEnt *entries=realloc(t->e,count*sizeof *entries);
-        if(!entries){snprintf(err,cap,"title-style-hd-memory");goto fail;}
+        if(!entries){snprintf(err,cap,"title-screens-hd-memory");goto fail;}
         t->e=entries;t->offsets=count;
         for(int i=0;i<count;i++){
             if(i>=9){
-                static const int files[]={5,1,2,3,6,7,8};
+                static const int logos[]={1,2,4};
                 char path[4096];
                 if(i<12) snprintf(path,sizeof path,"%s",entries[8].host);
-                else kh_title_logo_path(files[i-12],"png",path,sizeof path);
-                if(stat(path,&st) || st.st_size<=0 || st.st_size>INT_MAX){snprintf(err,cap,"title-style-hd-file: %s",path);goto fail;}
+                else if(i<14){ if(!kh_title_screen_picture(i-11,path,sizeof path)) snprintf(path,sizeof path,"%s",entries[4].host); }
+                else kh_title_logo_path(logos[i-14],"png",path,sizeof path);
+                if(stat(path,&st) || st.st_size<=0 || st.st_size>INT_MAX){snprintf(err,cap,"title-screens-hd-file: %s",path);goto fail;}
                 HdEnt *e=&entries[t->n++];memset(e,0,sizeof *e);
                 snprintf(e->name,sizeof e->name,"-%d.png",i);e->gsize=st.st_size;
                 HdFile image={.host=path,.size=st.st_size};
@@ -583,19 +677,33 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
             }
             entries[i].orig=(uint32_t)offs[i];
         }
+        fprintf(stderr,"kh: title screens HD: Roxas picture %s, Xion picture %s, Axel picture %s, logos %s %s %s\n",
+                entries[4].host,entries[12].host,entries[13].host,entries[14].host,entries[15].host,entries[16].host);
     }
     if(t->look>0){
         int slot=t->look-1;
         char name[32],key[2600],path[4300];
         snprintf(name,sizeof name,"-%d.%s",slot,!strcasecmp(rel,TITLE_LAYOUT)?"png":"dds");
-        if(slot>=t->n || strcasecmp(t->e[slot].name,name)){
+        /* Round 9: NMC's obj/P_EX100_WI_KH1F.a.us holds only 41 texture offsets, so its face sheet -45.dds is never drawn, not even
+         * by the stock game (hd.log offsets=41 truncated=6); entering Limit in Timeless River with any look stopped here.  When the
+         * game file itself has fewer offsets than the face slot, the form keeps the stock table (voices still follow the look). */
+        if((slot>=t->n || strcasecmp(t->e[slot].name,name)) && t->offsets>=0 && slot>=t->offsets && strcasecmp(rel,TITLE_LAYOUT))
+            fprintf(stderr,"kh: warning look-face-slot-absent: %s has %d texture offsets; the look's face sheet %s is never drawn by this file, the form keeps the stock HUD face\n",rel,t->offsets,name);
+        else if(slot>=t->n || strcasecmp(t->e[slot].name,name)){
             snprintf(err,cap,"player-look-hd-slot: %s lacks texture entry %s",rel,name); goto fail;
         }
         for(int i=0;i<t->n;i++){
             HdEnt *e=&t->e[i];
             snprintf(key,sizeof key,"remastered/%s/%s",rel,e->name);
-            if(i!=slot && !kh_player_voice(key)) continue;
-            kh_look_path(NULL,key,path,sizeof path);
+            /* Round 5: voice banks in the form's HD folder come from the pack only for a look with its own voices (HD Roxas speaks
+             * with the native banks, as kh_look_key says; before, entering Awakened as HD Roxas stopped at player-look-asset). */
+            if(i!=slot && (!kh_player_voice(key) || !kh_look_voice_set(kh_look_enabled()))) continue;
+            if(t->look==KH_TITLE_PICTURE_SLOT && !strcasecmp(rel,TITLE_LAYOUT)){
+                if(i!=slot) continue;
+                int screen=kh_title_screen();
+                if(!kh_title_screen_picture(screen,path,sizeof path)){ snprintf(err,cap,"title-screen-picture: %s",kh_title_screen_name(screen)); goto fail; }
+                fprintf(stderr,"kh: title screen %s HD picture %s\n",kh_title_screen_name(screen),path);
+            }else kh_look_path(NULL,key,path,sizeof path);
             if(stat(path,&st)){ snprintf(err,cap,"player-look-hd-stat: %s",path); goto fail; }
             if(e->src==SRC_MOD) t->n_mod--; else if(e->src==SRC_VANILLA) t->n_van--; else t->n_null--;
             free(e->host); e->host=strdup(path);
@@ -607,7 +715,7 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
      * The existing cache and savestate key already include this byte length. */
     if(!strcasecmp(rel,TITLE_LAYOUT) && n>=5 && bytes && !memcmp(bytes+n-5,"T80L",4)){
         int id=bytes[n-1];
-        if(id<1 || id>3 || t->n<=7 || strcasecmp(t->e[7].name,"-7.png")){
+        if(id<1 || id>4 || t->n<=7 || strcasecmp(t->e[7].name,"-7.png")){
             snprintf(err,cap,"title-logo-slot: unexpected layout or HD table"); goto fail;
         }
         char path[4096]; kh_title_logo_path(id,"png",path,sizeof path);
@@ -615,6 +723,7 @@ static int hd_build(const char *root,const char *rel,const unsigned char *bytes,
             snprintf(err,cap,"title-logo-atlas: %s",path); goto fail;
         }
         HdEnt *e=&t->e[7];
+        fprintf(stderr,"kh: title logo HD atlas %s\n",path);
         free(e->host); e->host=strdup(path);
         if(!e->host){ snprintf(err,cap,"out of memory"); goto fail; }
         e->size=e->gsize=e->fsize=st.st_size;
@@ -642,8 +751,8 @@ HdTable *kh_hd_begin(KCtx *g,const char *root,const char *rel_in,const unsigned 
     char err[1500]; HdTable *prev=cur_table; st_begin++;
     char rel[2300]; if(!canon_rel(rel_in,rel,sizeof rel)||!*rel) kh_fatal(g,"hd assets: no usable tree path in \"%s\"",rel_in);
     pthread_mutex_lock(&hd_lock);
-    int styles=!strcasecmp(rel,TITLE_LAYOUT) && bytes && n>=4 && !memcmp(bytes+n-4,"T89L",4);
-    int look=styles?0:hd_look(rel),hooded=look>0 && kh_look_enabled()==2;
+    int styles=!strcasecmp(rel,TITLE_LAYOUT) && bytes && n>=4 && !memcmp(bytes+n-4,"T90L",4);
+    int look=styles?0:hd_look(rel),hooded=styles?0:!strcasecmp(rel,TITLE_LAYOUT)?kh_title_screen():hd_costume(look);
     unsigned b=(ci_hash(rel)+hooded)&1023; HdTable *t;
     for(t=buckets[b];t;t=t->next) if(t->hooded==hooded&&t->look==look&&t->fsize==n&&key_eq(t->key,rel)) break;
     if(t&&t->gent){ st_cache_hit++; pthread_mutex_unlock(&hd_lock); cur_table=t; return prev; }
@@ -702,6 +811,63 @@ static void note_asset(const unsigned char *b,u32 size){
         if(i==st_ndims&&st_ndims<48){ st_dims[i].w=w; st_dims[i].h=h; st_ndims++; } if(i<48) st_dims[i].n++; pthread_mutex_unlock(&hd_lock); }
 }
 
+/* Round 6: the game's own DDS reader, f_118a90 (0x140118b8e..0x140118e32), picks the texture format by EXACT header match (pixel
+ * format at +0x4c: size, flags, FourCC, RGBBitCount, R/G/B/A masks):
+ *   size 32, flags 0x41, FourCC 0, 32 bits, masks ff0000/ff00/ff/ff000000   -> 87 B8G8R8A8_UNORM
+ *   size 32, flags 0x4, FourCC DXT5 or DXT4, bit count 0, masks 0           -> 77 BC3_UNORM
+ *   size 32, flags 0x4, FourCC DXT3 or DXT2, bit count 0, masks 0           -> 74 BC2_UNORM
+ *   size 32, flags 0x4, FourCC DXT1, bit count 0, masks 0                   -> 71 BC1_UNORM
+ *   size 32, 16-bit 4444 / 1555 (flags 0x41) or 24-bit 888 / 16-bit 565 (flags 0x40): no HD texture (the reader returns, the SD
+ *   image is drawn): -1 here
+ *   anything else: the texture is created with DXGI_FORMAT_UNKNOWN (0).  vkd3d and Windows D3D12 refuse that creation and the
+ *   game then writes through the null resource in f_10ad60: the phone's save-menu (and New Game as Axel) crash.
+ * The KH3-derived look sheets (Xion, Axel, HD Roxas: Pillow's DDS writer) carry DXT5 with an RGBBitCount of 32, which no row
+ * matches.  The packs are rebuilt with a zero bit count; a sheet served with a nonzero bit count / masks on an otherwise valid
+ * DXT1..5 header is repaired in the served copy (the pixel data is untouched; named warning hd-dds-header-repaired, counted at
+ * exit).  A DDS header that still matches no row is a named fatal (hd-dds-unreadable), not a device crash later. */
+int kh_dds_game_format(const unsigned char *b,size_t n){
+    if(n<128 || memcmp(b,"DDS ",4)) return -2;
+    u32 v[8]; memcpy(v,b+0x4c,32);      /* size flags fourcc bits r g b a */
+    if(v[0]!=32) return 0;
+    if(v[1]==0x41 && !v[2] && v[3]==32 && v[4]==0xff0000 && v[5]==0xff00 && v[6]==0xff && v[7]==0xff000000u) return 87;
+    if(v[1]==4 && !v[3] && !v[4] && !v[5] && !v[6] && !v[7]){
+        if(!memcmp(b+0x54,"DXT5",4) || !memcmp(b+0x54,"DXT4",4)) return 77;
+        if(!memcmp(b+0x54,"DXT3",4) || !memcmp(b+0x54,"DXT2",4)) return 74;
+        if(!memcmp(b+0x54,"DXT1",4)) return 71;
+    }
+    if(v[1]==0x41 && !v[2] && v[3]==16 && ((v[4]==0xf00 && v[5]==0xf0 && v[6]==0xf && v[7]==0xf000) ||
+                                           (v[4]==0x7c00 && v[5]==0x3e0 && v[6]==0x1f && v[7]==0x8000))) return -1;
+    if(v[1]==0x40 && !v[2] && !v[7] && ((v[3]==24 && v[4]==0xff0000 && v[5]==0xff00 && v[6]==0xff) ||
+                                        (v[3]==16 && v[4]==0xf800 && v[5]==0x7e0 && v[6]==0x1f))) return -1;
+    return 0;
+}
+/* 1: a DXT1..5 header with a nonzero bit count or masks was repaired in place */
+int kh_dds_repair_header(unsigned char *b,size_t n){
+    if(kh_dds_game_format(b,n)!=0) return 0;
+    u32 size,flags; memcpy(&size,b+0x4c,4); memcpy(&flags,b+0x50,4);
+    if(size!=32 || flags!=4) return 0;
+    if(memcmp(b+0x54,"DXT",3) || b[0x57]<'1' || b[0x57]>'5') return 0;
+    memset(b+0x58,0,20);
+    return kh_dds_game_format(b,n)>0;
+}
+static _Atomic u64 st_dds_repaired;
+static void check_served_dds(KCtx *g,unsigned char *b,u32 size,const HdTable *t,int i,const HdEnt *e){
+    if(size<4 || memcmp(b,"DDS ",4)) return;
+    if(kh_dds_game_format(b,size)!=0) return;
+    static int repair=-1; if(repair<0){ const char *v=getenv("KHNMC_HD_DDS_REPAIR"); repair=!(v && !strcmp(v,"off")); }   /* off: proofs only */
+    if(!repair) return;
+    if(kh_dds_repair_header(b,size)){
+        if(atomic_fetch_add(&st_dds_repaired,1)<8)
+            kh_warn("hd-dds-header-repaired: %s entry %d (%s): DXT header with a nonzero RGBBitCount/masks, which the game's DDS reader "
+                    "(f_118a90) turns into DXGI_FORMAT_UNKNOWN; served with them zeroed (rebuild the pack: run-R6/fix_dds.py)",e->host,i,e->name);
+        return;
+    }
+    u32 v[8]; memcpy(v,b+0x4c,32);
+    kh_fatal(g,"hd-dds-unreadable: %s (entry %d \"%s\" of %s): pixel format size %u flags 0x%x FourCC %.4s bits %u masks %x/%x/%x/%x matches "
+             "no row of the game's DDS reader (f_118a90): the texture would be created with DXGI_FORMAT_UNKNOWN, which a GPU device refuses",
+             e->host,i,e->name,t->key,v[0],v[1],(const char *)b+0x54,v[3],v[4],v[5],v[6],v[7]);
+}
+
 /* GetRemasteredAsset thunk 0x106460 (CFileMan*, uint *outSize, int index): 16-aligned zero-padded block (rounded to 256) holding the asset, or NULL */
 void f_106460(KCtx *g){
     if(!cur_table){ st_orig_fallback++; orig_f_106460(g); return; }
@@ -725,6 +891,7 @@ void f_106460(KCtx *g){
     memset(hp(g,buf),0,alloc);
     if(fread(hp(g,buf),1,(size_t)e->size,f)!=(size_t)e->size){ fclose(f); ga_free(buf); kh_fatal(g,"hd assets: short read of %s",e->host); }
     fclose(f);
+    check_served_dds(g,hp(g,buf),(u32)e->size,t,i,e);
     wr32(g,sizeptr,(u32)e->size);
     st_assets++; st_asset_bytes+=(u64)e->size; note_asset(hp(g,buf),(u32)e->size);
     { extern void kh_file_live_note(u64,u64,const char *); char what[200]; snprintf(what,sizeof what,"%s#%d:%s",t->key,i,e->name); kh_file_live_note(buf,alloc,what); }   /* task 31: who holds the id zone */
@@ -745,6 +912,7 @@ void kh_hd_report(FILE *f){
     else fprintf(f,"kh: hd: package tables %s",pkg_state==1?"OFF (KHNMC_HD_PACKAGES=none)":pkg_state==3?"absent (tree without a remastered folder)":"not looked at (no load with HD assets)");
     if(prov_state==2) fprintf(f,"; provenance list %s (%d mod files, %d obsolete nohd lines ignored)\n",prov_file,prov_mods,prov_nohd_ignored);
     else fprintf(f,"; provenance list %s\n",!cfg_loaded?"not looked at":prov_none_explicit?"NONE (KHNMC_HD_MODLIST=none)":"NONE");
+    if(st_dds_repaired) fprintf(f,"kh: hd: DDS headers repaired while served (hd-dds-header-repaired): %llu\n",ULL(st_dds_repaired));
     fprintf(f,"kh: hd: served asset kinds:");
     for(int k=0;k<8;k++) fprintf(f," %s=%llu",kind_names[k],ULL(st_kind[k]));
     fprintf(f,"\nkh: hd: served DDS dimensions:");
@@ -904,6 +1072,24 @@ int kh_hd_selftest(KCtx *g){
     unsigned char bar[0x1000]; char err[1500]; HdTable *t;
     cfg_loaded=1; prov_clear(); pkg_clear();                                           /* the tests set both lists themselves */
 
+    /* Round 6: the game's DDS reader rows (f_118a90) and the served-header repair of Pillow's DXT5 header (bit count 32). */
+    { unsigned char d[128]; u32 v[8];
+#define DDSHDR(fl,cc,bits,r,gg,bb,a) do{ memset(d,0,sizeof d); memcpy(d,"DDS ",4); v[0]=32; v[1]=(fl); memcpy(&v[2],(cc),4); v[3]=(bits); \
+        v[4]=(r); v[5]=(gg); v[6]=(bb); v[7]=(a); memcpy(d+0x4c,v,32); }while(0)
+      DDSHDR(4,"DXT5",0,0,0,0,0);                         TEST(kh_dds_game_format(d,128)==77 && !kh_dds_repair_header(d,128));
+      DDSHDR(4,"DXT3",0,0,0,0,0);                         TEST(kh_dds_game_format(d,128)==74);
+      DDSHDR(4,"DXT1",0,0,0,0,0);                         TEST(kh_dds_game_format(d,128)==71);
+      DDSHDR(0x41,"\0\0\0\0",32,0xff0000,0xff00,0xff,0xff000000u); TEST(kh_dds_game_format(d,128)==87 && !kh_dds_repair_header(d,128));
+      DDSHDR(0x41,"\0\0\0\0",16,0xf00,0xf0,0xf,0xf000);   TEST(kh_dds_game_format(d,128)==-1);
+      DDSHDR(4,"DXT5",32,0,0,0,0);                        TEST(kh_dds_game_format(d,128)==0);            /* the KH3 packs before round 6 */
+      TEST(kh_dds_repair_header(d,128)==1 && kh_dds_game_format(d,128)==77);
+      DDSHDR(4,"DXT5",32,0,0,0,0); v[0]=124; memcpy(d+0x4c,v,4); TEST(kh_dds_game_format(d,128)==0 && !kh_dds_repair_header(d,128));
+      DDSHDR(4,"DX10",0,0,0,0,0);                         TEST(kh_dds_game_format(d,128)==0 && !kh_dds_repair_header(d,128));
+      DDSHDR(0x41,"\0\0\0\0",32,0xff,0xff00,0xff0000,0xff000000u); TEST(kh_dds_game_format(d,128)==0 && !kh_dds_repair_header(d,128));   /* RGBA order */
+      TEST(kh_dds_game_format((const unsigned char *)"PNG",3)==-2);
+#undef DDSHDR
+    }
+
     /* Exercise the real HD cache across a look change, including packs predating title art. */
     {
         const char *oldroot=getenv("KHNMC_LOOK_DIR");
@@ -911,6 +1097,15 @@ int kh_hd_selftest(KCtx *g){
         char *savedroot=oldroot?strdup(oldroot):NULL;
         char pack[KH_TMP_MAX+32]; snprintf(pack,sizeof pack,"%s/pack",dir); mkdir(pack,0700);
         setenv("KHNMC_LOOK_DIR",pack,1); kh_look_set(g,0);
+        /* lane TI: the title picture follows the title screen, not the look */
+        const char *oldhooded=getenv("KHNMC_LOOK_HOODED_DIR"),*oldaxel=getenv("KHNMC_LOOK_AXEL_DIR"),*oldscreen=getenv("KHNMC_TITLE_SCREEN");
+        char *savedhooded=oldhooded?strdup(oldhooded):NULL,*savedaxel=oldaxel?strdup(oldaxel):NULL,*savedscreen=oldscreen?strdup(oldscreen):NULL;
+        char axelpack[KH_TMP_MAX+32]; snprintf(axelpack,sizeof axelpack,"%s/axelpack",dir); mkdir(axelpack,0700);
+        setenv("KHNMC_LOOK_HOODED_DIR",pack,1); setenv("KHNMC_LOOK_AXEL_DIR",axelpack,1);
+        const char *logos=getenv("KHNMC_TITLE_LOGO_DIR");
+        char *savedlogos=logos?strdup(logos):NULL;
+        setenv("KHNMC_TITLE_LOGO_DIR",pack,1);
+        setenv("KHNMC_TITLE_SCREEN","roxas",1);
         make_bar(bar,8,0);
         TEST(prov_add(TITLE_LAYOUT));
         for(int i=0;i<8;i++){
@@ -920,7 +1115,11 @@ int kh_hd_selftest(KCtx *g){
         HdTable *prev=kh_hd_begin(g,dir,TITLE_LAYOUT,bar,sizeof bar), *stock=cur_table;
         TEST(stock && stock->n==8 && stock->look==0);
         kh_look_set(g,1);
-        TEST(!hd_look(TITLE_LAYOUT) && put_file(pack,TITLE_IMAGE,"variant",7));
+        TEST(!hd_look(TITLE_LAYOUT));                       /* the look alone: no title variant */
+        setenv("KHNMC_TITLE_SCREEN","xion",1);
+        TEST(!hd_look(TITLE_LAYOUT) && kh_title_screen()==KH_TITLE_ROXAS);   /* XION without its picture: ROXAS */
+        kh_look_set(g,0);
+        TEST(put_file(pack,TITLE_IMAGE,"variant",7) && hd_look(TITLE_LAYOUT)==KH_TITLE_PICTURE_SLOT && kh_title_screen()==KH_TITLE_XION);
         kh_hd_begin(g,dir,TITLE_LAYOUT,bar,sizeof bar);
         HdTable *variant=cur_table;
         TEST(variant!=stock && variant->n==8 && variant->e[4].size==7 && stock->e[4].size==5);
@@ -928,11 +1127,12 @@ int kh_hd_selftest(KCtx *g){
             TEST(variant->e[i].orig==stock->e[i].orig &&
                  ((strcmp(variant->e[i].host,stock->e[i].host)!=0)==(i==4)));
         }
-        kh_look_set(g,0);
+        setenv("KHNMC_TITLE_SCREEN","roxas",1); kh_look_set(g,1);
         kh_hd_begin(g,dir,TITLE_LAYOUT,bar,sizeof bar); TEST(cur_table==stock);
-        const char *logos=getenv("KHNMC_TITLE_LOGO_DIR");
-        char *savedlogos=logos?strdup(logos):NULL;
-        setenv("KHNMC_TITLE_LOGO_DIR",pack,1);
+        kh_look_set(g,0);
+        TEST(kh_title_screen_next(KH_TITLE_ROXAS)==KH_TITLE_XION && kh_title_screen_next(KH_TITLE_XION)==KH_TITLE_ROXAS);   /* no Axel pack: skipped */
+        TEST(put_file(axelpack,TITLE_IMAGE,"axel-pic!",9) && kh_title_screen_next(KH_TITLE_XION)==KH_TITLE_AXEL &&
+             kh_title_screen_next(KH_TITLE_AXEL)==KH_TITLE_ROXAS);
         TEST(put_file(pack,"xkb.png","logo-xkb",8));
         memcpy(bar+sizeof bar-6,"T80L",4); bar[sizeof bar-2]=3;
         kh_hd_begin(g,dir,TITLE_LAYOUT,bar,sizeof bar-1);
@@ -940,6 +1140,34 @@ int kh_hd_selftest(KCtx *g){
         if(cur_table->n==8) for(int i=0;i<8;i++)
             TEST(cur_table->e[i].orig==stock->e[i].orig &&
                  ((strcmp(cur_table->e[i].host,stock->e[i].host)!=0)==(i==7)));
+        /* the Axel logo (T80L id 4) with AXEL chosen: slot 7 = axel.png, slot 4 = the Axel pack's picture */
+        TEST(put_file(pack,"axel.png","logo-axel!",10));
+        setenv("KHNMC_TITLE_SCREEN","axel",1);
+        memcpy(bar+sizeof bar-7,"T80L",4); bar[sizeof bar-3]=4;
+        kh_hd_begin(g,dir,TITLE_LAYOUT,bar,sizeof bar-2);
+        TEST(cur_table!=stock && cur_table->n==8 && cur_table->e[7].size==10 && cur_table->e[4].size==9);
+        /* the screens layout (T90L): 17 slots, live switching; pictures from the packs, logos from the logo folder */
+        {
+            static unsigned char big[0x1000];
+            char key[128]; snprintf(key,sizeof key,"remastered/" TITLE_LAYOUT "/-8.png");
+            TEST(prov_add(key) && put_file(dir,key,"stock",5));
+            TEST(put_file(pack,"roxas.png","logo-r",6) && put_file(pack,"xion.png","logo-xi",7));
+            make_bar_at(big,17,0,0x200); memcpy(big+sizeof big-20,"T90L",4);   /* its own length: the cache key holds the byte count */
+            kh_hd_begin(g,dir,TITLE_LAYOUT,big,sizeof big-16);
+            HdTable *sc=cur_table;
+            TEST(sc && sc->n==17 && sc->look==0 && sc->hooded==0);
+            if(sc && sc->n==17){
+                TEST(sc->e[12].size==7 && sc->e[13].size==9 && sc->e[14].size==6 && sc->e[15].size==7 && sc->e[16].size==10);
+                for(int i=9;i<12;i++) TEST(!strcmp(sc->e[i].host,sc->e[8].host));
+                TEST(sc->e[4].size==5);
+            }
+            setenv("KHNMC_TITLE_SCREEN","roxas",1);
+            kh_hd_begin(g,dir,TITLE_LAYOUT,big,sizeof big-16); TEST(cur_table==sc);   /* one table for every screen */
+        }
+        if(savedscreen) setenv("KHNMC_TITLE_SCREEN",savedscreen,1); else unsetenv("KHNMC_TITLE_SCREEN");
+        if(savedhooded) setenv("KHNMC_LOOK_HOODED_DIR",savedhooded,1); else unsetenv("KHNMC_LOOK_HOODED_DIR");
+        if(savedaxel) setenv("KHNMC_LOOK_AXEL_DIR",savedaxel,1); else unsetenv("KHNMC_LOOK_AXEL_DIR");
+        free(savedscreen); free(savedhooded); free(savedaxel);
         if(savedlogos) setenv("KHNMC_TITLE_LOGO_DIR",savedlogos,1); else unsetenv("KHNMC_TITLE_LOGO_DIR");
         free(savedlogos);
         kh_hd_end(prev);

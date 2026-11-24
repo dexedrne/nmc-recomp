@@ -155,8 +155,11 @@ u64 kh_input_game_frames(void);
 enum { ACTOR_SORA = 571, NMC_ROXAS = 84, EVENT_OBJECT = 1u << 30,
        DONALD_WEAPON = 575, GOOFY_WEAPON = 576, MAGES_STAFF = 108, KNIGHTS_SHIELD = 109 };
 #include "xion_swap.h"
+/* The scene-roxas overlay (task 64): Roxas in Sora's close-ups and low Sora (571) bound to object 84.  Not look-driven: the
+ * modes take it by default, KHNMC_SCENE_ROXAS=1 elsewhere.  Round 9 item 0: in the modes, too, the look's H_EX500 replaces the
+ * overlay only with KHNMC_SCENE_LOOK=1 (kh_look_key, kh_scene_pack_begin); with 0 the high-Sora scenes get the overlay. */
 static int scene_roxas(KCtx *g){
-    if(kh_xion_enabled) return 1;
+    if(kh_xion_enabled || kh_axel_enabled) return 1;
     const char *v=getenv("KHNMC_SCENE_ROXAS");
     if(!v || !*v || !strcmp(v,"0")) return 0;
     if(!strcmp(v,"1")) return 1;
@@ -174,11 +177,15 @@ static u32 event_weapon(KCtx *g,u32 actor){
     return prop;
 }
 
-static int high_sora(u32 id){ return id==572 || id==264; } /* ACTOR_SORA_H or explicit H_EX500 */
+static int high_sora(u32 id){ return id==572 || id==264 || id==200; } /* ACTOR_SORA_H, explicit H_EX500, explicit H_EX500_BTLF (tt28/808) */
+/* lane CSI (gated by KHNMC_SCENE_LOOK, default 0): the high-Sora scene pack opens for the look (any campaign, the Theater) only
+ * with the setting; otherwise for the overlay in the Xion / Axel modes / with KHNMC_SCENE_ROXAS=1 (round 9 item 0: then the
+ * overlay, not the look, is what the modes get). */
+int kh_event_high_scene(KCtx *g){ return kh_scene_wear() || scene_roxas(g); }
 
 void orig_f_2d0350(KCtx *g);
 void f_2d0350(KCtx *g){
-    if(high_sora((u32)A1(g)) && scene_roxas(g)) kh_scene_pack_begin();
+    if(high_sora((u32)A1(g)) && kh_event_high_scene(g)) kh_scene_pack_begin();
     if((u32)A1(g)==ACTOR_SORA && scene_roxas(g)){
         A1(g)=NMC_ROXAS;
         fprintf(stderr,"kh: scene Roxas: frame=%llu preload P_EX100 slot=%u\n",
@@ -204,7 +211,7 @@ void f_3df930(KCtx *g){
                 (unsigned long long)kh_input_game_frames());
     }
     u32 id=(u32)A0(g);
-    if(high_sora(id ^ EVENT_OBJECT) && event_spawn_site(rd64(g,KH_RSP(g))) && scene_roxas(g)) kh_scene_pack_begin();
+    if(high_sora(id ^ EVENT_OBJECT) && event_spawn_site(rd64(g,KH_RSP(g))) && kh_event_high_scene(g)) kh_scene_pack_begin();
     if((id & EVENT_OBJECT) && weapon_actor(id ^ EVENT_OBJECT)){
         u64 ret=rd64(g,KH_RSP(g));
         if(event_spawn_site(ret))

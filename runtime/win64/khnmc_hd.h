@@ -17,3 +17,7 @@ int kh_hd_selftest(KCtx *g);
  * (files by rule, entries by source, the container walker against the package tables).  Host only: no guest image, nothing runs.
  * Returns the exit status: 0, 1 when a table could not be built, 2 on set-up errors. */
 int kh_hd_check(const char *report);
+/* Round 6: the format the game's DDS reader f_118a90 gives a header (87/77/74/71; -1 no HD texture; 0 DXGI_FORMAT_UNKNOWN; -2 not a
+ * DDS), and the repair of a DXT1..5 header with a nonzero RGBBitCount / masks (1 = repaired). */
+int kh_dds_game_format(const unsigned char *b,size_t n);
+int kh_dds_repair_header(unsigned char *b,size_t n);

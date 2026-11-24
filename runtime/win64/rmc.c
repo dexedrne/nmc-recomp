@@ -3,6 +3,7 @@
 #include "kh_look.h"
 #include <sys/stat.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <fts.h>
 #include <string.h>
 #include <strings.h>
@@ -104,17 +105,35 @@ void kh_rmc_init(const char *root){
     if(root && *root) fprintf(stderr,"kh: RMC overlay: %zu files in %s\n",count,root);
 }
 
-/* devicectl uploads this complete inventory last. Only paths discovered by
- * a physical walk of Documents/rmc are eligible for unlink. */
-int kh_rmc_sync(const char *docs,const char *selected){
-    char manifest[4096],root[4096];
-    if(snprintf(manifest,sizeof manifest,"%s/rmc-pack.pending",docs)>=(int)sizeof manifest ||
-       snprintf(root,sizeof root,"%s/rmc",docs)>=(int)sizeof root) kh_fatal(NULL,"rmc-sync-path-length");
-    FILE *in=fopen(manifest,"rb");
-    if(!in){
+static void check_pack_dir(const char *path){
+    struct stat st;
+    if(lstat(path,&st)==0){
+        if(!S_ISDIR(st.st_mode)) kh_fatal(NULL,"rmc-sync-directory: %s",path);
+    }else if(errno!=ENOENT) kh_fatal(NULL,"rmc-sync-directory: %s: %s",path,strerror(errno));
+}
+
+/* The uploader writes the complete NUL-delimited inventory last. Only the
+ * physical walk produces deletion targets. A look's index is temporary. */
+static int sync_inventory(const char *docs,const char *look,const char *selected){
+    char manifest[4096],root[4096],parent[4096];
+    if(look){
+        if(snprintf(parent,sizeof parent,"%s/looks",docs)>=(int)sizeof parent ||
+           snprintf(root,sizeof root,"%s/%s",parent,look)>=(int)sizeof root ||
+           snprintf(manifest,sizeof manifest,"%s/looks-%s.pending",docs,look)>=(int)sizeof manifest)
+            kh_fatal(NULL,"rmc-sync-path-length");
+    }else if(snprintf(manifest,sizeof manifest,"%s/rmc-pack.pending",docs)>=(int)sizeof manifest ||
+             snprintf(root,sizeof root,"%s/rmc",docs)>=(int)sizeof root) kh_fatal(NULL,"rmc-sync-path-length");
+    int fd=open(manifest,O_RDONLY|O_NOFOLLOW|O_NONBLOCK);
+    if(fd<0){
         if(errno==ENOENT) return 0;
-        kh_fatal(NULL,"rmc-manifest-open: %s",strerror(errno));
+        kh_fatal(NULL,"rmc-manifest-open: %s: %s",manifest,strerror(errno));
     }
+    struct stat st;
+    if(fstat(fd,&st) || !S_ISREG(st.st_mode)) kh_fatal(NULL,"rmc-manifest-type: %s",manifest);
+    FILE *in=fdopen(fd,"rb");
+    if(!in) kh_fatal(NULL,"rmc-manifest-open: %s: %s",manifest,strerror(errno));
+    if(look) check_pack_dir(parent);
+    check_pack_dir(root);
     index_files(root,FTS_PHYSICAL);
     char *line=NULL; size_t cap=0; ssize_t n;
     while((n=getdelim(&line,&cap,0,in))>0){
@@ -137,7 +156,8 @@ int kh_rmc_sync(const char *docs,const char *selected){
             free(files[i].host);
         }
     }
-    fprintf(stderr,"kh: RMC sync: removed %zu stale files\n",count-kept);
+    if(look) fprintf(stderr,"kh: look sync: %s: removed %zu stale files; kept %zu\n",look,count-kept,kept);
+    else fprintf(stderr,"kh: RMC sync: removed %zu stale files\n",count-kept);
     count=kept;
     if(unlink(manifest)) kh_fatal(NULL,"rmc-manifest-finish: %s",strerror(errno));
     if(selected && !strcmp(selected,root)){
@@ -146,4 +166,10 @@ int kh_rmc_sync(const char *docs,const char *selected){
     }
     kh_rmc_init(NULL);
     return 0;
+}
+
+int kh_rmc_sync(const char *docs,const char *selected){
+    static const char *const looks[]={"xion","xion-hooded","axel","roxas-hd"};
+    for(size_t i=0;i<sizeof looks/sizeof *looks;i++) sync_inventory(docs,looks[i],NULL);
+    return sync_inventory(docs,NULL,selected);
 }

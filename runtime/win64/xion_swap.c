@@ -5,7 +5,9 @@
 #include "rewind.h"
 #include "route_state.h"
 #include "rmc.h"
+#include "title_logo.h"
 
+extern u64 kh_game_frames(void);
 #define VA(rva) (GS_BASE+(rva))
 #define ACTIVE VA(0x2a105d0)
 #define PARKED VA(0x2a11268)
@@ -13,23 +15,20 @@
 #define MICKEY VA(0x7523b8)
 
 _Atomic int kh_xion_enabled;
+_Atomic int kh_axel_enabled;
 int kh_xkb_menu;
 static u64 messages[7];
+/* Keep seven message addresses in the rewind record for older snapshots. */
 static const char *const lines[]={
-    "Critical","Xion Knows Best","Xion Always Cries","Play as Xion on Critical.",
-    "Roxas steps in","Xion returns","Play as Xion on Less Than Nothing."
+    "Critical","Less Than Nothing","Potions restore HP. Ethers restore MP.",
+    "Potions drain HP. Ethers drain MP.","Roxas steps in","Xion returns",""
 };
-static const u16 refs[]={30000,20019,30001,30002,17206,20020,30003,30006};
-
 u64 kh_xkb_message(int id){
     unsigned index=(id&0x7fff)-30000u;
-    return kh_xkb_menu && (index<4 || index==6) ? messages[index] : 0;
+    return index<4 ? messages[index] : 0;
 }
 
-u64 kh_encode_menu_text(const char *src,int compact){
-    u64 addr=ga_alloc(strlen(src)+1+(compact?2:0),16);
-    if(!addr) kh_fatal(NULL,"kh-menu-text-allocation");
-    u8 *dst=(u8 *)(gs_bias+addr);
+static void encode_menu_text(u8 *dst,const char *src,int compact){
     if(compact){ *dst++=0x0b; *dst++=76; } /* KH TextWidth, keeps the font height. */
     while(*src){
         char c=*src++;
@@ -40,35 +39,84 @@ u64 kh_encode_menu_text(const char *src,int compact){
         else if(c==' ') *dst++=1;
         else if(c=='\n') *dst++=2;
         else if(c=='.') *dst++=0x4f;   /* 0x4f = '.'; 0x4e is the Japanese full stop (OpenKH InternationalSystemDecode) */
+        else if(c=='\'') *dst++=0x57;
+        else if(c==':') *dst++=0x52;
         else kh_fatal(NULL,"kh-menu-text-encoding");
     }
     *dst=0;
+}
+u64 kh_encode_menu_text(const char *src,int compact){
+    u64 addr=ga_alloc(strlen(src)+1+(compact?2:0),16);
+    if(!addr) kh_fatal(NULL,"kh-menu-text-allocation");
+    encode_menu_text((u8 *)(gs_bias+addr),src,compact);
     return addr;
 }
 
 static void prepare_menu(KCtx *g){
-    if(!messages[0]){
-        for(unsigned i=0;i<7;i++){
+    for(unsigned i=0;i<7;i++){
+        u8 expected[64];
+        encode_menu_text(expected,lines[i],0);
+        if(!messages[i] || strcmp(gstr(g,messages[i]),(const char*)expected))
             messages[i]=kh_encode_menu_text(lines[i],0);
-        }
     }
-    for(unsigned i=0;i<8;i++) wr32(g,VA(0x5b870c)+4*i,0x8000|refs[i]);
+    /* Page 0 has room for four titles and four descriptions. Page 1 starts at +0x2c. */
+    wr16(g,VA(0x5b8700),2);
+    for(unsigned i=0;i<2;i++){
+        wr32(g,VA(0x5b870c)+4*i,0x8000| (30000+i));
+        wr32(g,VA(0x5b871c)+4*i,0x8000| (30002+i));
+    }
 }
-#define MENU_INIT(r) void orig_f_##r(KCtx *); void f_##r(KCtx *g){ \
-    if(kh_xkb_menu) prepare_menu(g); orig_f_##r(g); if(kh_xkb_menu) wr32(g,VA(0xb1d810),0); }
-MENU_INIT(2b84f0)
-MENU_INIT(2b8520)
-
+void orig_f_2b84f0(KCtx *);
+void f_2b84f0(KCtx *g){
+    prepare_menu(g);
+    orig_f_2b84f0(g);
+    wr32(g,VA(0xb1d810),0);
+}
+void orig_f_2b8520(KCtx *);
+void f_2b8520(KCtx *g){
+    prepare_menu(g);
+    orig_f_2b8520(g);
+    wr32(g,VA(0xb1d810),0);
+}
+void orig_f_2b8910(KCtx *);
+void f_2b8910(KCtx *g){
+    u64 context=rd64(g,VA(0xb1d800));
+    int first=context && !rd32(g,context);
+    orig_f_2b8910(g);
+    if(first){
+        u64 list=rd64(g,VA(0xb1d7e0));
+        if(!list || rd16(g,list+4)!=2) kh_fatal(g,"newgame-rows: expected two difficulty choices");
+        kh_warn("newgame-rows: Critical / Less Than Nothing");
+    }
+}
 void orig_f_2b88c0(KCtx *);
 void f_2b88c0(KCtx *g){
-    if(!kh_xkb_menu){orig_f_2b88c0(g);return;}
     u32 index=rd32(g,VA(0xb1d810));
-    if(index>=4) kh_fatal(g,"xkb-menu-choice: %u",index);
-    kh_xkb_set_mode(g,index>=2);
-    wr32(g,VA(0xb1d810),2+(index&1));
+    if(index>1) kh_fatal(g,"newgame-choice: invalid row %u",index);
+    int screen=kh_title_screen(),look=KH_LOOK_ROXAS;
+    if(screen==KH_TITLE_AXEL && kh_look_switch_ready(KH_LOOK_AXEL)) look=KH_LOOK_AXEL;
+    if(screen==KH_TITLE_XION){
+        if(kh_look_switch_ready(KH_LOOK_XION)) look=KH_LOOK_XION;
+        else if(kh_look_switch_ready(KH_LOOK_HOODED)) look=KH_LOOK_HOODED;
+    }
+    if(screen!=KH_TITLE_ROXAS && !look) kh_warn("newgame-look: %s artwork has no complete playable pack, using Roxas",kh_title_screen_name(screen));
+    kh_xkb_set_mode(g,KH_MODE_NONE);
+    wr32(g,VA(0xb1d810),2+index);
     orig_f_2b88c0(g);
     wr32(g,VA(0xb1d810),index);
-    kh_warn("xkb-choice: row %u level %u XKB %d",index,rd32(g,VA(0x9abd48)),kh_xion_enabled);
+    kh_select_saved_look(g,look);
+    kh_warn("newgame-choice: row %u level %u title %s look %d",index,rd32(g,VA(0x9abd48)),kh_title_screen_name(screen),look);
+}
+
+int kh_newgame_axel_selftest(KCtx *g){
+    u8 before[0x40]; memcpy(before,hp(g,VA(0x5b8700)),sizeof before);
+    prepare_menu(g);
+    int fail=rd16(g,VA(0x5b8700))!=2 || !kh_xkb_message(30000) || !kh_xkb_message(30003) ||
+        kh_xkb_message(30004) || rd32(g,VA(0x5b871c))!=(0x8000u|30002) ||
+        memcmp(before+0x2c,hp(g,VA(0x5b872c)),sizeof before-0x2c);
+    memcpy(hp(g,VA(0x5b8700)),before,sizeof before);
+    fprintf(stderr,"kh: two native New Game difficulties with independent character: %d failures\n",!!fail);
+    return !!fail;
 }
 
 static int declined,save_interaction,death_pending;
@@ -83,10 +131,15 @@ void kh_rewind_xion(KhRecords *r){
     extern void kh_rewind_xkb_save(KhRecords *);
     kh_rewind_xkb_save(r);
     KH_RECORD(r,declined);
-    int enabled=kh_xion_enabled;
+    int enabled=kh_campaign_mode();   /* 0 / 1 as older snapshots stored it, 2 = Axel Won't Cry */
     KH_VALUE(r,enabled);
-    if(r->loading) kh_xion_enabled=enabled;
+    if(r->loading){
+        if(enabled<0 || enabled>KH_MODE_AXEL) kh_fatal(NULL,"savestate-campaign-mode: %d",enabled);
+        kh_xion_enabled=enabled==KH_MODE_XION; kh_axel_enabled=enabled==KH_MODE_AXEL;
+
+    }
     KH_RECORD(r,messages);
+
     KH_RECORD(r,save_interaction);
     KH_RECORD(r,death_pending);
     KH_RECORD(r,xion);
@@ -103,7 +156,7 @@ void kh_rewind_xion(KhRecords *r){
 void kh_xion_init(void){
     const char *e=getenv("KHNMC_XKB_MENU");
     if(e&&*e&&strcmp(e,"0")&&strcmp(e,"1")) kh_fatal(NULL,"xkb-menu-mode: expected 0 or 1");
-    kh_xkb_menu=e&&!strcmp(e,"1");
+    kh_xkb_menu=!e || strcmp(e,"0");
     kh_save_difficulty_init();
 }
 
@@ -308,7 +361,7 @@ void f_2ed110(KCtx *g){
     if(kh_xion_enabled){ KCtx ctx=*g; handback(&ctx,"save"); }
     u64 dst=A0(g)?A0(g):rd64(g,VA(0xbee360));
     orig_f_2ed110(g);
-    if(kh_look_enabled()) kh_xion_save_portrait(g,dst);
+    if(kh_look_is_xion(kh_look_enabled())) kh_xion_save_portrait(g,dst);   /* Axel's saves keep the stock portrait */
     kh_xkb_serialized();
 }
 void kh_xion_reset(KCtx *g){
@@ -316,13 +369,14 @@ void kh_xion_reset(KCtx *g){
 }
 void orig_f_2ed0e0(KCtx *);
 void f_2ed0e0(KCtx *g){
-    if(kh_xion_enabled) kh_xion_reset(g);
+    if(kh_xion_enabled || kh_axel_enabled) kh_xion_reset(g);
     int menu_load=rd64(g,KH_RSP(g))==VA(0x2e59b6);
     orig_f_2ed0e0(g);
     if(menu_load){
         if(kh_xkb_menu) kh_xkb_load(g);
         else kh_xkb_set_mode(g,0);
         kh_autosave_load(g);
+        kh_restore_saved_look(g);
         if(kh_xion_enabled) prepare_menu(g);
     }
     if(kh_xion_enabled) kh_warn("xion-swap: loaded Roxas, save EXP %u munny %u",rd32(g,VA(0x9acf90)),rd32(g,VA(0x9abcf0)));
@@ -448,6 +502,21 @@ int kh_xion_selftest(KCtx *g){
         kh_records_free(&cut);
     }
     kh_xion_enabled=prior;
+    {   /* The campaign word of the same record: 2 = Axel Won't Cry; 0 and 1 are what older snapshots hold. */
+        int prior_axel=kh_axel_enabled,bad=0;
+        for(int mode=0;mode<=KH_MODE_AXEL;mode++){
+            KhRecords cut={0};
+            kh_xion_enabled=mode==KH_MODE_XION; kh_axel_enabled=mode==KH_MODE_AXEL;
+            kh_records_begin(&cut,0); kh_rewind_xion(&cut); kh_records_end(&cut);
+            kh_xion_enabled=mode!=KH_MODE_XION; kh_axel_enabled=mode==KH_MODE_NONE;
+            kh_records_begin(&cut,1); kh_rewind_xion(&cut); kh_records_end(&cut);
+            bad+=kh_campaign_mode()!=mode || kh_xion_enabled!=(mode==KH_MODE_XION) || kh_axel_enabled!=(mode==KH_MODE_AXEL);
+            kh_records_free(&cut);
+        }
+        kh_xion_enabled=prior; kh_axel_enabled=prior_axel;
+        fprintf(stderr,"kh: axel campaign word in the rewind record: %d failures\n",bad);
+        failures+=bad;
+    }
     extern int kh_xkb_save_selftest(KCtx *);
     return failures+fields+kh_xkb_save_selftest(g);
 }
