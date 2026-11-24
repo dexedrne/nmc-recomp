@@ -907,18 +907,20 @@ void kh_aspect_title_config(const char *v){
 }
 #include "title_logo.h"
 #include "settings.h"
-static _Atomic int title_pad_slot=16;
-void kh_title_pad_family(int nintendo,int playstation){title_pad_slot=nintendo?18:playstation?17:16;}
+/* the old two-style title layout's L1 prompt (gone with lane TI's screens layout); kept so the pad code can still report its family */
+static _Atomic int title_pad_family;
+void kh_title_pad_family(int nintendo,int playstation){title_pad_family=nintendo?2:playstation?1:0;}
 
-/* f_194550 binds each property to one 0x1a0-byte sequence. Rebind just
- * its image before f_1948c0 draws it, retaining the current animation time. */
+/* The screens layout (tools/pack_title_screens.py, 17 textures): f_194550 binds each property to one 0x1a0-byte sequence.  Rebind
+ * the picture (slot 4 -> 4 / 12 / 13) and the logo (slot 7 -> 14 / 15 / 16) of the screen chosen now (KHNMC_TITLE_SCREEN, R3) before
+ * f_1948c0 draws it, retaining the current animation time, and copy that logo's sprite UV and part rectangles. */
 void orig_f_1948c0(KCtx *);
 void f_1948c0(KCtx *g){
     u64 layout=A0(g),obj=layout-0x50;
     if((obj==rd64(g,T_LAYOUT_PTR) || obj==rd64(g,T_MENU_PTR)) && kh_phase_title_alive() &&
-       rd32(g,obj+0x40)==19 && rd32(g,layout+0x38)==112){
-        u64 lay=rd64(g,layout+0x10),geometry=lay+79260;
-        if(rd32(g,geometry)!=0x47393854) kh_fatal(g,"title-style-geometry");
+       rd32(g,obj+0x40)==17 && rd32(g,layout+0x38)==105){   /* 17 textures, the native 105 properties */
+        u64 lay=rd64(g,layout+0x10),geometry=lay+KH_TITLE_SCREENS_GEOMETRY;
+        if(rd32(g,geometry)!=0x47303954) kh_fatal(g,"title-screens-geometry: no T90G at byte %d of the screens layout",KH_TITLE_SCREENS_GEOMETRY);
         int picture,logo=kh_title_variant(&picture);
         u64 seq=lay+rd32(g,rd64(g,layout+0x30)+6*4);
         u64 source=geometry+4+136*logo;
@@ -929,20 +931,21 @@ void f_1948c0(KCtx *g){
         if(group>=0 && group<20 && active && textures){
             u64 record=rd64(g,layout+0x28)+20*group;
             unsigned first=rd16(g,record),count=rd32(g,layout+0x60);
-            if(count>rd16(g,record+2) || first+count>112) kh_fatal(g,"title-style-properties");
+            if(count>rd16(g,record+2) || first+count>105) kh_fatal(g,"title-screens-properties");
             u64 prop=rd64(g,layout+0x20)+24*first;
             for(unsigned i=0;i<count;i++){
                 int slot=rd32(g,prop+24*i);
-                if(slot==4) slot=picture?12:4;
-                else if(slot==7) slot=logo?12+logo:7;
-                else if(slot==16) slot=title_pad_slot;
+                if(slot==4) slot=picture?11+picture:4;
+                else if(slot==7) slot=13+logo;
                 else continue;
                 wr64(g,active+i*0x1a0+0x60,textures+256*slot);
             }
             static int last=-1;
-            if(getenv("KHNMC_TEST_CHEAT_LOG") && last!=logo*2+picture){
-                last=logo*2+picture;
-                fprintf(stderr,"kh: title art frame=%llu picture=%s logo=%d\n",P(kh_game_frames()),picture?"Xion":"Roxas",logo);
+            if(getenv("KHNMC_TEST_CHEAT_LOG") && last!=logo*4+picture){
+                last=logo*4+picture;
+                static const char *const names[]={"ROXAS MAY CRY","XION ALWAYS CRIES","AXEL WON'T CRY"};
+                fprintf(stderr,"kh: title art frame=%llu screen=%s picture=%s logo=%d\n",P(kh_game_frames()),names[picture],
+                        picture==0?"slot 4":picture==1?"slot 12":"slot 13",logo);
             }
         }
     }

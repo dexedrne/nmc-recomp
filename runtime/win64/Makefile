@@ -178,7 +178,7 @@ BGLOAD_HOOKS = 3a0c60 15edd0 3f99e0 3f9850 3a64f0 3a0aa0 3a0b30 3a0bd0 19c470 4a
 # Task 27: 0x2b7420 = the New Game menu task (runtime/phase_log.c: alive between entry and return; the route's newgame-* conditions)
 INPUT_HOOKS = 3a0660 105e10 2b7420
 # Save-point Xion prototype, including the native pre-use boundaries and MICKEY lifecycle.
-INPUT_HOOKS += 2b84f0 2b8520 2b88c0 145170 100ef0 101590 1004d0 2ee350 2ee4a0 323250 321950
+INPUT_HOOKS += 2b84f0 2b8520 2b88c0 2b8910 145170 100ef0 101590 1004d0 2ee350 2ee4a0 323250 321950
 INPUT_HOOKS += 3dca50 3ed110 3d5c70 4151e0 414dd0 3e2eb0 414e30 414eb0 4150e0 415380 416030 416100 3ac350 3a24c0 152990 2ed0e0 2ed110 3ad540 2e4950
 # Task 30 (diagnostic, runtime/route_state.c, KHNMC_TRACE_PLACE=1): YS::OBJ::set_pos 0x3b64d0 / 0x3b6510 and the rotation setters 0x3b6420 / 0x3b6560, passed through
 PLACE_HOOKS = 3b64d0 3b6510 3b6420 3b6560 3b3200 3da940 419230
@@ -187,7 +187,7 @@ INPUT_HOOKS += $(PLACE_HOOKS)
 # and 0x3ad9a0 (message id -> text) is noted while a system menu runs: the camp menu's labels (`kh: menu text:`)
 INFO_HOOKS = 2f8e20 2f9440 2eb620 17b710 3ad9a0
 INPUT_HOOKS += $(INFO_HOOKS)
-FILE_HOOKS = 166640 19c3a0 3afd90 3e6120 3e61e0 3b43c0 3b4ec0 3b57b0 1f9a80 3a9cf0 131ef0 106000 1063d0 106700 106790 106870 $(HD_HOOKS) $(PHASE_HOOKS) $(DIFFICULTY_HOOKS) $(MOD_A_HOOKS) $(MOD_B_HOOKS) $(MOD_PARAMS_HOOKS) $(STREAM_HOOKS) $(BGLOAD_HOOKS) $(INPUT_HOOKS)
+FILE_HOOKS = 166640 19c3a0 3afd90 3e6120 3e61e0 3e6370 3e63d0 3b43c0 3b4ec0 3b57b0 1f9a80 3a9cf0 131ef0 106000 1063d0 106700 106790 106870 $(HD_HOOKS) $(PHASE_HOOKS) $(DIFFICULTY_HOOKS) $(MOD_A_HOOKS) $(MOD_B_HOOKS) $(MOD_PARAMS_HOOKS) $(STREAM_HOOKS) $(BGLOAD_HOOKS) $(INPUT_HOOKS)
 # object-id table guard (runtime/idtable.c): 0x4ad390 registers a 32 MiB window in the game's 64-slot id table and encodes the pointer
 IDTABLE_HOOKS = 4ad390
 FILE_HOOKS += $(IDTABLE_HOOKS)
@@ -225,6 +225,9 @@ FILE_HOOKS += $(ASPECT_HOOKS)
 # movie's picture is made once and handed out again).  13da10 (Movie::open) is in PHASE_HOOKS (phase_log.c tells the seam).
 MOVIE_HOOKS = 5375d0 2cbd80 13d690
 FILE_HOOKS += $(MOVIE_HOOKS)
+# lane R8-SCALE (runtime/look_scale.c): the three model-instance draws (rcx instance, r8 world matrix): the per-look render scale of the player
+SCALE_HOOKS = 1a5180 1a5580 1af000
+FILE_HOOKS += $(SCALE_HOOKS)
 # ---- Task 12: mod static edits ---------------------------------------------------------------------------------------------------
 # The mod DLL patches code bytes in 28 exe functions and attaches two INLINE detours (inside 3c3fe0 and 360920).  Those 30 functions
 # are re-lifted from the patched image into $(GEN)/mod_static_lifted.c and replace the vanilla lifted bodies through the alias list

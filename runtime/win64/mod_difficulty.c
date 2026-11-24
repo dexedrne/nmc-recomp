@@ -515,7 +515,7 @@ void f_1523a0(KCtx *g){
 }
 void f_152370(KCtx *g){
     orig_f_152370(g);
-    if(forced_difficulty>=0 && !kh_xion_enabled) wr32(g,GS_BASE+0x9abd48,forced_difficulty);
+    if(forced_difficulty>=0 && !kh_xion_enabled && !kh_axel_enabled) wr32(g,GS_BASE+0x9abd48,forced_difficulty);
 }
 static _Atomic u64 exp_hits[4];
 void kh_mod_add_exp(KCtx *g,u64 args){

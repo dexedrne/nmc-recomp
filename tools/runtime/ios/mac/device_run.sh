@@ -105,9 +105,11 @@ CUTSCENES=${CUTSCENES:-}; CUTSCENES_PACK=${CUTSCENES_PACK:-}                 # T
 # EXTRA_ENV="KHNMC_A=x KHNMC_B=y" (play and route modes; 11/19): extra switches written as `env` lines with the cutscene line
 #   (e.g. KHNMC_PLAYER_LOOK=xion KHNMC_XKB_MENU=1 KHNMC_SCENE_ROXAS=1); only KHNMC_* names, no spaces in values.
 # LOOK_PACK=DIR (11/19, task 56): every file under DIR on this Mac goes to the app's Documents/looks/xion/<same relative path>
-#   (the default KHNMC_LOOK_DIR on iOS), one devicectl copy per file; nothing on the phone is removed.
+#   (the default KHNMC_LOOK_DIR on iOS). HOODED_LOOK_PACK, AXEL_LOOK_PACK and ROXAS_HD_LOOK_PACK install
+#   xion-hooded, axel and roxas-hd. A complete inventory is uploaded last for each supplied pack.
 # SCENE_ROXAS_PACK is the directory containing obj/ and remastered/ (task 64).
-EXTRA_ENV=${EXTRA_ENV:-}; LOOK_PACK=${LOOK_PACK:-}; HOODED_LOOK_PACK=${HOODED_LOOK_PACK:-}; SCENE_ROXAS_PACK=${SCENE_ROXAS_PACK:-}
+EXTRA_ENV=${EXTRA_ENV:-}; LOOK_PACK=${LOOK_PACK:-}; HOODED_LOOK_PACK=${HOODED_LOOK_PACK:-}; AXEL_LOOK_PACK=${AXEL_LOOK_PACK:-}; SCENE_ROXAS_PACK=${SCENE_ROXAS_PACK:-}
+ROXAS_HD_LOOK_PACK=${ROXAS_HD_LOOK_PACK:-}
 # A copied private/ tree ships its logos alongside looks/. LOGO_PACK can point elsewhere.
 # RMC_PACK is a sparse pack. An explicitly empty directory clears the phone overlay.
 RMC_PACK=${RMC_PACK:-}
@@ -115,6 +117,11 @@ RMC_PACK=${RMC_PACK:-}
 LOGO_PACK=${LOGO_PACK:-}
 if [ -z "$LOGO_PACK" ] && [ -d "$SRC/private/logos" ]; then LOGO_PACK=$SRC/private/logos; fi
 if [ -n "$LOGO_PACK" ]; then
+  if [ -e "$LOGO_PACK/styles.2ld" ]; then
+    for file in styles.2ld painting.png prompt-{LB,L1,L}.png; do
+      [ -s "$LOGO_PACK/$file" ] || bad "LOGO_PACK: missing $file"
+    done
+  fi
   for file in {roxas,xion,xkb}.{2ld,png}; do
     [ -s "$LOGO_PACK/$file" ] || bad "LOGO_PACK: missing $file"
   done
@@ -126,7 +133,9 @@ if [ -n "$SCENE_ROXAS_PACK" ]; then
 fi
 for kv in $EXTRA_ENV; do case "$kv" in KHNMC_*=*) k=${kv%%=*}; case "$k" in *[!A-Z0-9_]*) bad "EXTRA_ENV: bad name '$k'";; esac;; *) bad "EXTRA_ENV: '$kv' is not KHNMC_NAME=value";; esac; done
 [ -z "$HOODED_LOOK_PACK" ] || [ -d "$HOODED_LOOK_PACK" ] || bad "HOODED_LOOK_PACK: missing directory"
+[ -z "$AXEL_LOOK_PACK" ] || [ -d "$AXEL_LOOK_PACK" ] || bad "AXEL_LOOK_PACK: missing directory"
 [ -z "$LOOK_PACK" ] || [ -d "$LOOK_PACK" ] || bad "LOOK_PACK: no directory '$LOOK_PACK' on this Mac"
+[ -z "$ROXAS_HD_LOOK_PACK" ] || [ -d "$ROXAS_HD_LOOK_PACK" ] || bad "ROXAS_HD_LOOK_PACK: missing directory"
 case "$CUTSCENES" in ''|nmc|story|theater) ;; *) bad "CUTSCENES is nmc, story or theater (got '$CUTSCENES')";; esac
 uses_pack(){ [ "$CUTSCENES" = story ] || [ "$CUTSCENES" = theater ]; }
 pack_name=story-events.khcs
@@ -196,37 +205,53 @@ if [ -n "$SCENE_ROXAS_PACK" ]; then
   say "scene Roxas model and three textures copied to Documents/scene-roxas"
 fi
 if [ -n "${LOGO_PACK:-}" ]; then
+  if [ -s "$LOGO_PACK/styles.2ld" ]; then
+    for file in painting.png prompt-{LB,L1,L}.png styles.2ld; do
+      cp_to "$LOGO_PACK/$file" "logos/$file" || { say "title style copy failed at $file"; exit 1; }
+    done
+  fi
   for logo in roxas xion xkb; do
     for ext in 2ld png; do
       file=$logo.$ext
       cp_to "$LOGO_PACK/$file" "logos/$file" || { say "title logo copy failed at $file"; exit 1; }
     done
   done
+  # 11/22: Axel's logo and the three-screen layout (live R3 switching) when the pack has them
+  for file in axel.2ld axel.png screens.2ld; do
+    [ -s "$LOGO_PACK/$file" ] || continue
+    cp_to "$LOGO_PACK/$file" "logos/$file" || { say "title logo copy failed at $file"; exit 1; }
+  done
 fi
-if [ -n "$RMC_PACK" ]; then
-  grep -a -q 'rmc-manifest-incomplete' "$APP/KHNMC" || { say "RMC_PACK needs an app built with RMC support"; exit 2; }
-  (cd "$RMC_PACK" && find . ! -type f ! -type d -print0) > "$OUT/rmc.unsupported" || { say "cannot enumerate RMC_PACK"; exit 1; }
-  [ ! -s "$OUT/rmc.unsupported" ] || { say "RMC_PACK must contain regular files and directories; use a sparse pack"; exit 2; }
-  (cd "$RMC_PACK" && find . -type f -print0) > "$OUT/rmc.list" || { say "cannot enumerate RMC_PACK"; exit 1; }
-  : > "$OUT/rmc-pack.pending" || exit 1
-  n=0
+upload_inventory(){
+  local pack=$1 dest=$2 marker=$3 rel n=0
+  (cd "$pack" && find . ! -type f ! -type d -print0) > "$OUT/$marker.unsupported" || { say "cannot enumerate $pack"; exit 1; }
+  [ ! -s "$OUT/$marker.unsupported" ] || { say "$pack must contain only regular files and directories"; exit 2; }
+  (cd "$pack" && find . -type f -print0) > "$OUT/$marker.list" || { say "cannot enumerate $pack"; exit 1; }
+  : > "$OUT/$marker" || exit 1
   while IFS= read -r -d '' rel; do
     rel=${rel#./}
-    cp_to "$RMC_PACK/$rel" "rmc/$rel" || { say "RMC copy failed at $rel"; exit 1; }
-    printf '%s\0' "$rel" >> "$OUT/rmc-pack.pending" || exit 1
+    cp_to "$pack/$rel" "$dest/$rel" || { say "copy failed at $dest/$rel"; exit 1; }
+    printf '%s\0' "$rel" >> "$OUT/$marker" || exit 1
     n=$((n+1))
-  done < "$OUT/rmc.list"
-  printf '/\0' >> "$OUT/rmc-pack.pending" || exit 1
-  cp_to "$OUT/rmc-pack.pending" rmc-pack.pending || { say "RMC inventory copy failed"; exit 1; }
-  say "RMC pack: $n files copied to Documents/rmc; launch applies the inventory"
+  done < "$OUT/$marker.list"
+  printf '/\0' >> "$OUT/$marker" || exit 1
+  cp_to "$OUT/$marker" "$marker" || { say "inventory copy failed for $dest"; exit 1; }
+  say "$n files copied to Documents/$dest; launch applies $marker"
+}
+if [ -n "$RMC_PACK" ]; then
+  grep -a -q 'rmc-manifest-incomplete' "$APP/KHNMC" || { say "RMC_PACK needs an app built with RMC support"; exit 2; }
+  upload_inventory "$RMC_PACK" rmc rmc-pack.pending
 fi
-for costume in xion xion-hooded; do
-  pack=$LOOK_PACK
-  [ "$costume" != xion-hooded ] || pack=$HOODED_LOOK_PACK
+for costume in xion xion-hooded axel roxas-hd; do
+  case "$costume" in
+    xion) pack=$LOOK_PACK ;;
+    xion-hooded) pack=$HOODED_LOOK_PACK ;;
+    axel) pack=$AXEL_LOOK_PACK ;;
+    roxas-hd) pack=$ROXAS_HD_LOOK_PACK ;;
+  esac
   [ -n "$pack" ] || continue
-  n=0; ( cd "$pack" && find . -type f | sed 's#^\./##' ) > "$OUT/$costume.list"
-  while IFS= read -r rel; do cp_to "$pack/$rel" "looks/$costume/$rel" || { say "copy of $costume FAILED at $rel"; exit 1; }; n=$((n+1)); done < "$OUT/$costume.list"
-  say "look pack: $n files copied to Documents/looks/$costume"
+  grep -a -q 'looks-%s.pending' "$APP/KHNMC" || bad "look upload needs an app with look inventory support"
+  upload_inventory "$pack" "looks/$costume" "looks-$costume.pending"
 done
 if uses_pack; then
   cp_to "$CUTSCENES_PACK" "data/$pack_name" || { say "copy of the cutscene pack FAILED"; exit 1; }

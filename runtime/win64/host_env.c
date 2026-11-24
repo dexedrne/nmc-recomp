@@ -269,6 +269,8 @@ void kh_host_env_init(int *argc,char ***argv){
     snprintf(p,sizeof p,"%s/looks/xion-hooded",he_docs); he_default("KHNMC_LOOK_HOODED_DIR",p,0);
     snprintf(p,sizeof p,"%s/rmc",he_docs); he_default("KHNMC_RMC_DIR",p,0);
     snprintf(p,sizeof p,"%s/looks/xion",he_docs); he_default("KHNMC_LOOK_DIR",p,0);
+    snprintf(p,sizeof p,"%s/looks/roxas-hd",he_docs); he_default("KHNMC_LOOK_ROXAS_HD_DIR",p,0);
+    snprintf(p,sizeof p,"%s/looks/axel",he_docs); he_default("KHNMC_LOOK_AXEL_DIR",p,0);
     snprintf(p,sizeof p,"%s/scene-roxas",he_docs); he_default("KHNMC_SCENE_ROXAS_DIR",p,0);
     snprintf(p,sizeof p,"%s/pkgdir",he_docs); he_default("KHNMC_PKGDIR",p,1);
     fprintf(stderr,"kh: host dirs: temporary files in %s\n",kh_tmpdir());

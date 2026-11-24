@@ -20,12 +20,12 @@
 
 extern int kh_run_is_selftest;
 extern u64 kh_game_frames(void);
-enum { LOOK, HP, MP, EXP, DROP, DRIVE, HUD_COMBO, COUNT, PAD=COUNT, SWAP_AB, STYLE, RAISE, ENEMY, SUB, LOWER, MENU_LAYOUT, LOGO, CREDIT, TITLE_STYLE, TUTORIAL, AUTO_SAVE, NAMES, DIFF_LABEL, FRAME_WORK, FRAME_LOG, TOUCH_MODE, TOUCH_SIZE, TOUCH_OPACITY, TOUCH_STYLE, TOUCH_LOOK, TOUCH_SLOTS, TOUCH_DPAD };
+enum { LOOK, HP, MP, EXP, DROP, DRIVE, HUD_COMBO, COUNT, PAD=COUNT, SWAP_AB, STYLE, RAISE, ENEMY, SUB, LOWER, MENU_LAYOUT, LOGO, CREDIT, TITLE_SCREEN, TUTORIAL, AUTO_SAVE, NAMES, DIFF_LABEL, FRAME_WORK, FRAME_LOG, TOUCH_MODE, TOUCH_SIZE, TOUCH_OPACITY, TOUCH_STYLE, TOUCH_LOOK, TOUCH_SLOTS, TOUCH_DPAD };
 #define BOOL_OPT(name,label,initial) {"KHNMC_" name,label,initial,"0|1",0,1,1}
 #define TWEAK_OPT(name,label,initial) {"KHNMC_TWEAK_" name,label,initial,"off|on",0,1,1}
 #define NUMBER(name,label,initial,min,max,step) {"KHNMC_" name,label,initial,NULL,min,max,step}
 const struct kh_option kh_options[]={
-    {"KHNMC_PLAYER_LOOK","Character","roxas","roxas|xion|xion-hooded",0,0,0},
+    {"KHNMC_PLAYER_LOOK","Character","roxas","roxas|xion|xion-hooded|axel|roxas-hd",0,0,0},
     BOOL_OPT("CHEAT_INF_HP","Infinite HP","0"), BOOL_OPT("CHEAT_INF_MP","Infinite MP","0"),
     NUMBER("EXP_MULT","EXP multiplier","1",0.5,10,0.5), NUMBER("DROP_MULT","Item drop multiplier","1",0.5,10,0.5),
     BOOL_OPT("CHEAT_INF_DRIVE","Infinite Drive","0"),
@@ -38,9 +38,10 @@ const struct kh_option kh_options[]={
     NUMBER("SUB_SCALE","Subtitle size","1.5",0.5,3,0.05),
     NUMBER("SUB_LOWER","Subtitle lower","0.06",0,0.5,0.01),
     {"KHNMC_MENU_LAYOUT","Portrait menu layout","portrait","portrait|band"},
+    /* lane TI: superseded by KHNMC_TITLE_SCREEN (each screen has its own logo); still read so older khnmc.conf files load, not shown */
     {"KHNMC_TITLE_LOGO","Title logo","auto","auto|cycle|mod|roxas|xion|xkb"},
     {"KHNMC_TITLE_CREDIT","Title credit","show","show|hide"},
-    {"KHNMC_TITLE_STYLE","Title style","auto","auto|roxas|xion"},
+    {"KHNMC_TITLE_SCREEN","Title screen","roxas","roxas|xion|axel"},   /* lane TI: R3 on the title screen cycles it */
     {"KHNMC_TUTORIAL_FIGHT","Tutorial fight","real","real|mod"},
     BOOL_OPT("AUTOSAVE","Autosave","0"),
     {"KHNMC_LOOK_NAMES","Names in text","all","all|menus"},
@@ -63,7 +64,7 @@ const struct kh_option kh_options[]={
 #define KH_GROUP(key,env,label) TWEAK_OPT(#env,label,"on"),
 #include "tweak_groups.h"
 #undef KH_GROUP
-    BOOL_OPT("XKB_MENU","Xion Knows Best difficulty menu","0"), BOOL_OPT("SCENE_ROXAS","Scene Roxas","0"),
+    BOOL_OPT("XKB_MENU","Legacy campaign saves","1"), BOOL_OPT("SCENE_ROXAS","Scene Roxas","0"),
     NUMBER("FOV_ZOOM","Portrait camera zoom","1.3",1,1.89,0.05),
     NUMBER("HUD_SCALE_CMD","Portrait command menu","1.25",0.5,3,0.05),
     NUMBER("HUD_SCALE_HP","Portrait player gauges","1.5",0.5,3,0.05),
@@ -120,6 +121,9 @@ const struct kh_option kh_options[]={
     TWEAK_OPT("COMBAT_MENU_MEMORY","Menu memory (unused by DLL)","off"),
     TWEAK_OPT("COMBAT_REPOINT_AND_EXTEND_BTLOBJ_SHEET","Extend battle objects (unused by DLL)","on"),
     TWEAK_OPT("COMBAT_CHANGE_CUSTOM_MAGIC_MPDRIVE_STATUS","Magic MP/Drive status (unused by DLL)","off"),
+    /* The Axel look's weapon (file_layer.c kh_axel_weapon_*): its row shows in Character only for the Axel look with the chakram
+     * set present.  Keep it right before the two state actions: WEAPON below counts from the end of the list. */
+    {"KHNMC_AXEL_WEAPON","Weapon","keyblade","keyblade|chakrams",0,0,0},
     NUMBER("SAVE_STATE","Save state","1",1,3,1), NUMBER("LOAD_STATE","Load state","1",1,3,1),
     BOOL_OPT("DEBUG_TURBO","Debug turbo","0"),
     BOOL_OPT("DEBUG_OHKO","Debug one-hit kills","0"),
@@ -138,6 +142,12 @@ static float turbo_speed=7.5f;
 static unsigned long long mp_probe;
 static int test_log;
 int kh_setting_action(int i){return i>=kh_option_count-DEBUG_COUNT-STATE_ACTIONS && i<kh_option_count;}
+#define WEAPON (kh_option_count-DEBUG_COUNT-STATE_ACTIONS-1)
+static _Atomic int axel_chakrams;     /* the Weapon setting: 0 keyblade (default), 1 chakrams */
+static _Atomic int weapon_dirty;      /* the player's weapons may show the other weapon: rebind them at the next quiet frame */
+int kh_axel_weapon_chakrams(void){ return atomic_load(&axel_chakrams); }
+/* The look shown in the Character panel is Axel and the set is there: the Weapon row is offered. */
+static int weapon_offered(int look){ return look==KH_LOOK_AXEL && kh_axel_weapon_ready(); }
 static const char *unavailable[sizeof kh_options/sizeof *kh_options];
 const char *kh_setting_unavailable(int i){
     if(i<0 || i>=kh_option_count) return "Unknown option";
@@ -153,6 +163,29 @@ void kh_settings_cheats_restore(const double saved[5]){ for(int i=HP;i<=DRIVE;i+
 double kh_live_setting_value(int i){ return atomic_load(&values[i]); }
 int kh_setting_live(int index){return index>=0 && index<COUNT;}
 
+static const char *const look_names[KH_LOOKS]={"roxas","xion","xion-hooded","axel","roxas-hd"};
+static int look_number(const char *value){
+    for(int i=1;i<KH_LOOKS;i++) if(!strcmp(value,look_names[i])) return i;
+    return 0;
+}
+/* The pickers' cycle: Roxas -> Xion -> Xion (hooded) -> Axel -> Roxas over the first `count` looks (kh_look_count():
+ * 3 without the Axel pack, exactly the cycle from before it; 4 with it). */
+static int look_step(int current,int forward,int count){
+    if(current<0 || current>=count) current=0;
+    return (current+(forward?1:count-1))%count;
+}
+static int next_available_look(int current,int forward){
+    for(int i=0;i<KH_LOOKS;i++){
+        current=look_step(current,forward,KH_LOOKS);
+        if(!current || kh_look_switch_ready(current)) return current;
+    }
+    return KH_LOOK_ROXAS;
+}
+/* A request word, as savestates from before the Axel look hold it: 0..2 a field request for Roxas / Xion / hooded Xion,
+ * 3..5 the same from the native save-point menu; Axel is 6 (field) and 7 (save point). */
+static int request_word(int target,int save){ return target>=KH_LOOK_AXEL?2*target+!!save:target+(save?3:0); }
+static int request_look(int request){ return request>=6?request/2:request%3; }
+static int request_save(int request){ return request>=6?(request&1):(request>=3); }
 static int validate(const char *name,const char *value,double *number){
     if(!name || !value || !*value || strlen(value)>1000) return -1;
     for(int i=0;i<kh_option_count;i++) if(!strcmp(name,kh_options[i].name)){
@@ -161,7 +194,7 @@ static int validate(const char *name,const char *value,double *number){
             const char *p=o->choices;
             while(*p){
                 size_t n=strcspn(p,"|");
-                if(strlen(value)==n && !strncmp(p,value,n)){*number=i==LOOK?(!strcmp(value,"xion-hooded")?2:!strcmp(value,"xion")):!strcmp(value,"1");return i;}
+                if(strlen(value)==n && !strncmp(p,value,n)){*number=i==LOOK?look_number(value):!strcmp(value,"1");return i;}
                 p+=n; if(*p) p++;
             }
             return -1;
@@ -254,7 +287,7 @@ static u64 deferred_resources;
 static u64 waiting_since;
 void kh_settings_reset_look(void){
     int request=atomic_exchange(&look_request,-1);
-    if(request>=0) kh_warn("player appearance: dropped %d place-changed",request%3);
+    if(request>=0) kh_warn("player appearance: dropped %d place-changed",request_look(request));
     waiting_since=0;
     finishing_look=-1;
 }
@@ -262,7 +295,7 @@ void kh_settings_reset_look(void){
 int kh_settings_hooded(void){return kh_look_pack_ready(2);}
 int kh_settings_look(void){
     int request=atomic_load(&look_request);
-    return request>=0?request%3:kh_look_enabled();
+    return request>=0?request_look(request):kh_look_enabled();
 }
 /* f_321e40 creates a four-row list. f_2eb490 builds two or three
  * stock rows, ending with Title Screen even when World Map is hidden. */
@@ -387,11 +420,14 @@ int kh_settings_selftest(KCtx *g){
     fail|=kh_stick_step(&state,&start,0xc0,1500000000)!=CHORD_HOLD;
     fail|=kh_stick_step(&state,&start,0,1500000001)!=CHORD_IDLE;
     fail|=LOOK!=0;
-    fail|=validate("KHNMC_TITLE_STYLE","auto",&v)!=TITLE_STYLE ||
-          validate("KHNMC_TITLE_STYLE","roxas",&v)!=TITLE_STYLE ||
-          validate("KHNMC_TITLE_STYLE","xion",&v)!=TITLE_STYLE ||
-          validate("KHNMC_TITLE_STYLE","cycle",&v)>=0;
+    fail|=validate("KHNMC_TITLE_SCREEN","roxas",&v)!=TITLE_SCREEN ||
+          validate("KHNMC_TITLE_SCREEN","xion",&v)!=TITLE_SCREEN ||
+          validate("KHNMC_TITLE_SCREEN","axel",&v)!=TITLE_SCREEN ||
+          validate("KHNMC_TITLE_SCREEN","auto",&v)>=0 || validate("KHNMC_TITLE_LOGO","cycle",&v)!=LOGO;
     fail|=validate("KHNMC_PLAYER_LOOK","xion",&v)!=LOOK || v!=1;
+    extern int kh_axel_settings_selftest(KCtx *),kh_axel_round2_selftest(KCtx *);
+    fail|=kh_axel_settings_selftest(g);
+    fail|=kh_axel_round2_selftest(g);
     const int presets[]={1,2,3,5,10};
     for(int i=0;i<5;i++)
         fail|=next_multiplier(presets[i],1)!=presets[(i+1)%5] ||
@@ -455,8 +491,17 @@ int kh_setting_set(const char *name,const char *value){
     }
     if(i==LOOK){
         int empty=-1;
-        if(finishing_look>=0 || !atomic_compare_exchange_strong(&look_request,&empty,(int)v)) return -2;
+        if(finishing_look>=0 || !atomic_compare_exchange_strong(&look_request,&empty,request_word((int)v,0))) return -2;
         return 0;
+    }
+    if(i==WEAPON){
+        if(!kh_axel_weapon_ready()) return -2;
+        int result=kh_save_live_option(name,value,i,v);
+        if(!result && atomic_exchange(&axel_chakrams,!strcmp(value,"chakrams"))!=!strcmp(value,"chakrams")){
+            atomic_store(&weapon_dirty,1);
+            kh_warn("axel-weapon: %s",value);
+        }
+        return result;
     }
     return kh_save_live_option(name,value,i,v);
 }
@@ -470,8 +515,8 @@ static int kh_save_live_option(const char *name,const char *value,int i,double v
     if(!result && kh_setting_live(i)) atomic_store(&values[i],v);
     if(!result && ((i>=PAD && i<=FRAME_LOG) || strstr(name,"HUD_SCALE_") || !strcmp(name,"KHNMC_FOV_ZOOM"))){
         /* The render and controller threads can keep reading these immutable strings. */
-        if(i==PAD || i==SWAP_AB || i==LOGO || i==TITLE_STYLE || i==NAMES || i==AUTO_SAVE){
-            static const char *const choices[]={"auto","positions","letters","0","1","cycle","mod","roxas","xion","xkb","all","menus"};
+        if(i==PAD || i==SWAP_AB || i==LOGO || i==TITLE_SCREEN || i==NAMES || i==AUTO_SAVE){
+            static const char *const choices[]={"auto","positions","letters","0","1","cycle","mod","roxas","xion","xkb","axel","all","menus"};
             for(size_t j=0;j<sizeof choices/sizeof *choices;j++) if(!strcmp(value,choices[j])) live_choices[i]=choices[j];
         }
         extern void kh_menu_display_apply(const char *,const char *),kh_menu_tutorial(int),kh_menu_difficulty_labels(int);
@@ -493,10 +538,7 @@ static void init_notice_text(void);
 void kh_settings_init(void){
     init_notice_text();
     test_log=getenv("KHNMC_TEST_CHEAT_LOG") && !strcmp(getenv("KHNMC_TEST_CHEAT_LOG"),"1");
-    load_saved_options();
-    char title_pack[4096];
-    kh_title_logo_path(4,"2ld",title_pack,sizeof title_pack);
-    if(access(title_pack,R_OK)) unavailable[TITLE_STYLE]="Title style pack missing";
+    if(!kh_run_is_selftest) load_saved_options();
     /* Older phone configs use the shorter spelling. */
     const char *present=getenv("KHNMC_PRESENT");
     if(present && *present && !getenv("KHNMC_GFX_PRESENT"))
@@ -562,6 +604,9 @@ void kh_settings_init(void){
         const char *name=kh_options[i].name,*v=getenv(name);
         if(v){double n; if(validate(name,v,&n)<0) kh_fatal(NULL,"setting-value: %s=%s",name,v); values[i]=n;}
     }
+    const char *weapon=getenv(kh_options[WEAPON].name);
+    axel_chakrams=weapon && !strcmp(weapon,"chakrams");
+    if(axel_chakrams && !kh_axel_weapon_ready()) kh_warn("axel-weapon: chakrams chosen, but %s/weapons/chakram is absent or the Axel pack incomplete: keyblade",getenv("KHNMC_LOOK_AXEL_DIR")?:"private/looks/axel");
     const char *spec=getenv("KHNMC_TEST_SETTINGS");
     if(!spec) return;
     schedule_storage=strdup(spec);
@@ -600,9 +645,11 @@ void kh_settings_init(void){
 _Atomic int kh_hide_hud;
 /* f_18deb0 replaces the active INFORMATION line. Keep transient feedback off
  * that widget so mission scripts retain their own message and timing. */
-enum { NOTICE_XION, NOTICE_ROXAS, NOTICE_FIELD, NOTICE_BUSY, NOTICE_ACTOR, NOTICE_PACK, NOTICE_HOODED, NOTICE_COUNT };
+enum { NOTICE_XION, NOTICE_ROXAS, NOTICE_FIELD, NOTICE_BUSY, NOTICE_ACTOR, NOTICE_PACK, NOTICE_HOODED, NOTICE_AXEL, NOTICE_ROXAS_HD, NOTICE_COUNT };
 static const char *const notice_lines[]={"Xion","Roxas","Can't switch now: outside field","Can't switch now: busy",
-    "Can't switch now: player unavailable","Can't switch now: missing art","Xion (hooded)"};
+    "Can't switch now: player unavailable","Can't switch now: missing art","Xion (hooded)","Axel","HD Roxas"};
+enum { NOTICE_MASK=15 };
+_Static_assert(NOTICE_COUNT<=NOTICE_MASK+1,"the notice word keeps its line in four bits");
 static u8 look_text[NOTICE_COUNT][40];
 static _Atomic u64 notice;
 u8 kh_look_font[65536];
@@ -746,17 +793,18 @@ static int section_rows(int section,int *ids){
     for(int i=0;i<kh_setting_menu_count();i++){
         int group=ADVANCED;
         if(i==LOOK) group=CHARACTER;
+        else if(i==WEAPON){ if(!weapon_offered(direct_character?preview_look:kh_settings_look())) continue; group=CHARACTER; }
         else if(i>=HP && i<=DRIVE) group=CHEATS;
 #if KH_IOS_PATHS
         else if(i>=TOUCH_MODE && i<=TOUCH_DPAD) group=CONTROLLER;
 #endif
         else if(i==PAD || i==SWAP_AB) group=CONTROLLER;
-        else if(i==HUD_COMBO || (i>=STYLE && i<=TITLE_STYLE) || (i==FRAME_WORK || i==FRAME_LOG) ||
+        else if(i==HUD_COMBO || (i>=STYLE && i<=TITLE_SCREEN) || (i==FRAME_WORK || i==FRAME_LOG) ||
                 strstr(kh_options[i].name,"HUD_SCALE_") || !strcmp(kh_options[i].name,"KHNMC_FOV_ZOOM")) group=DISPLAY;
         else if(i>=TUTORIAL && i<=DIFF_LABEL) group=GAMEPLAY;
-        if(group==section && i!=TITLE_STYLE) ids[n++]=i;
+        if(group==section && i!=TITLE_SCREEN && i!=LOGO) ids[n++]=i;
     }
-    if(section==DISPLAY) ids[n++]=TITLE_STYLE;
+    if(section==DISPLAY) ids[n++]=TITLE_SCREEN;
     if(section==CONTROLLER) ids[n++]=INPUT_ROW;
     if(section==GAMEPLAY) ids[n++]=ADVANCED_ROW;
     return n;
@@ -772,7 +820,7 @@ static int menu_catalog_test(void){
         u8 encoded[128];
         encode_system_text(encoded,kh_options[i].label);
         double value;
-        if(seen[i]!=1 || validate(kh_options[i].name,kh_options[i].initial,&value)!=i) return 1;
+        if((seen[i]!=1 && !((i==WEAPON || i==LOGO) && !seen[i])) || validate(kh_options[i].name,kh_options[i].initial,&value)!=i) return 1;
     }
 #if KH_IOS_PATHS
     int n=section_rows(CONTROLLER,ids);
@@ -804,9 +852,9 @@ static int menu_catalog_test(void){
 }
 static void option_text(int i,char *out,size_t cap){
     if(i==LOOK){
-        static const char *const names[]={"roxas","xion","xion-hooded"};
-        snprintf(out,cap,"%s",names[direct_character?preview_look:kh_settings_look()]);
-    }else if(i==TITLE_STYLE) snprintf(out,cap,"%s",kh_menu_choice(kh_options[i].name)?:"auto");
+        snprintf(out,cap,"%s",look_names[direct_character?preview_look:kh_settings_look()]);
+    }else if(i==TITLE_SCREEN) snprintf(out,cap,"%s",kh_title_screen_name(kh_title_screen()));
+    else if(i==WEAPON) snprintf(out,cap,"%s",atomic_load(&axel_chakrams)?"chakrams":"keyblade");
     else if(kh_setting_live(i)) snprintf(out,cap,"%g",kh_live_setting_value(i));
     else snprintf(out,cap,"%s",chosen[i][0]?chosen[i]:getenv(kh_options[i].name)?:kh_options[i].initial);
 }
@@ -872,19 +920,20 @@ static void select_look(KCtx *g,int target,int save){
         choice_place=rd16(g,GS_BASE+0x717008);
         choice_position.valid=kh_route_player_pos(g,&choice_position.x,&choice_position.y,&choice_position.z,&yaw);
     }
-    atomic_store(&look_request,target+(save?3:0));
+    atomic_store(&look_request,request_word(target,save));
     kh_warn("%s-character chose %d",save?"save":"field",target);
 }
 static const char *timing(int i,const char *blocked){
     if(i<0) return "A to open";
     if(i==LOOK) return blocked?:direct_character?"A to confirm   B to cancel":"Left / Right to switch";
+    if(i==WEAPON) return blocked?:"Axel only: Left / Right to switch";
     const char *reason=kh_setting_unavailable(i);
     if(reason) return reason;
     if(kh_setting_action(i)) return "A to queue on close";
 #if KH_IOS_PATHS
     if(i>=TOUCH_MODE && i<=TOUCH_DPAD) return "Applies immediately";
 #endif
-    if(i==TITLE_STYLE) return "Auto follows Character";
+    if(i==TITLE_SCREEN) return "R3 on the title screen cycles";
     if(i==LOGO) return "Next title load";
     if(i==NAMES) return "Next text lookup";
     if(i==TUTORIAL) return "Next tutorial fight";
@@ -894,9 +943,10 @@ static const char *timing(int i,const char *blocked){
 }
 static void edit_row(KCtx *g,int i,int direction,const char *blocked){
     const struct kh_option *o=&kh_options[i];
-    if(kh_setting_unavailable(i) || (i==LOOK && blocked)) return;
+    if(kh_setting_unavailable(i) || ((i==LOOK || i==WEAPON) && blocked)) return;
     char old[VALUE_CAP],value[VALUE_CAP];option_text(i,old,sizeof old);
-    if(o->choices){
+    if(i==LOOK) snprintf(value,sizeof value,"%s",look_names[next_available_look(look_number(old),direction>0)]);
+    else if(o->choices){
         char list[128];snprintf(list,sizeof list,"%s",o->choices);
         char *rest=list,*v,*choices[16];int count=0,index=0;
         while((v=strsep(&rest,"|"))){if(!strcmp(old,v)) index=count;choices[count++]=v;}
@@ -913,7 +963,7 @@ static void edit_row(KCtx *g,int i,int direction,const char *blocked){
         strcpy(tail,end);
     }
     if(i==LOOK){
-        int target=!strcmp(value,"roxas")?0:!strcmp(value,"xion")?1:2;
+        int target=look_number(value);
         if(target && !kh_look_pack_ready(target)){feedback="Missing character pack";return;}
         select_look(g,target,0);
     }else if(!strcmp(o->name,"KHNMC_SCENE_ROXAS") && !strcmp(value,"1") && !kh_scene_pack_ready()){
@@ -936,11 +986,15 @@ int kh_menu_pad(struct KCtx *g,unsigned buttons,int lt,int rt,int lx,int ly,int 
     if(releasing){releasing=buttons!=0;return releasing;}
     int chord=(buttons&0x50)==0x50 && (down&0x50);
     if(!menu_open){
-        if(title_screen==KH_TITLE_LIST && !unavailable[TITLE_STYLE] && (buttons&0x100) && !(buttons&~0x100)){
-            if(down&0x100){
-                const char *style=kh_menu_choice("KHNMC_TITLE_STYLE");
-                int xion=style && strcmp(style,"auto")?!strcmp(style,"xion"):kh_look_enabled()!=0;
-                if(kh_setting_set("KHNMC_TITLE_STYLE",xion?"roxas":"xion")) kh_fatal(g,"title-style-save");
+        /* lane TI: R3 alone on the title screen's list cycles ROXAS -> XION -> AXEL (screens whose pack is missing are skipped) and
+         * saves the choice (khnmc.conf).  The screens layout shows it at once, the logo layouts at the next title load. */
+        if(title_screen==KH_TITLE_LIST && (buttons&0x80) && !(buttons&~0x80)){
+            if(down&0x80){
+                int from=kh_title_screen(),to=kh_title_screen_next(from);
+                int rc=kh_setting_set("KHNMC_TITLE_SCREEN",kh_title_screen_name(to));
+                if(rc) kh_fatal(g,"title-screen-save: %d",rc);
+                fprintf(stderr,"kh: title screen R3: %s -> %s frame=%llu\n",kh_title_screen_name(from),kh_title_screen_name(to),
+                        (unsigned long long)kh_game_frames());
             }
             return 1;
         }
@@ -975,7 +1029,7 @@ int kh_menu_pad(struct KCtx *g,unsigned buttons,int lt,int rt,int lx,int ly,int 
         else {row=page-first_section;page=ROOT;}
         component=0;
     }else if(direct_character && (down&15) && !blocked){
-        preview_look=(preview_look+((down&5)?2:1))%3;
+        preview_look=next_available_look(preview_look,!(down&5));
     }else if(n && (down&3)){row=(row+n+((down&1)?-1:1))%n;component=0;}
     else if(down&0x1000){
         if(direct_character){
@@ -1017,9 +1071,9 @@ int kh_menu_pad(struct KCtx *g,unsigned buttons,int lt,int rt,int lx,int ly,int 
             const char *label=page==ROOT?pages[j+first_section]:opt==INPUT_ROW?"Input test":opt==ADVANCED_ROW?"Advanced":kh_options[opt].label;
             char value[VALUE_CAP]="";
             if(opt>=0) option_text(opt,value,sizeof value);
-            if(opt==TITLE_STYLE){
-                const char *style=!strcmp(value,"auto")?"Auto (follow Character)":!strcmp(value,"xion")?"Xion":"Roxas";
-                snprintf(value,sizeof value,"%s",style);
+            if(opt==TITLE_SCREEN){
+                const char *screen=!strcmp(value,"xion")?"Xion Always Cries":!strcmp(value,"axel")?"Axel Won't Cry":"Roxas May Cry";
+                snprintf(value,sizeof value,"%s",screen);
             }
             used+=snprintf(buf+used,sizeof buf-used,"%c %.42s%s%.32s\n",j==row?'>':' ',label,opt>=0?": ":"",value);
         }
@@ -1046,7 +1100,7 @@ int kh_menu_text(uint8_t text[KH_MENU_TEXT_SIZE]){
     return text[0]?2:0;
 }
 static const u8 *visible_notice(u64 state,u64 now){
-    return now<(state & ~7ull)?look_text[state & 7]:NULL;
+    return now<(state & ~(u64)NOTICE_MASK)?look_text[state & NOTICE_MASK]:NULL;
 }
 const u8 *kh_look_notice(void){
     u64 state=atomic_load(&notice);
@@ -1060,7 +1114,7 @@ const u8 *kh_look_notice(void){
     u64 now=kh_host_ns();
     /* Start the notice timer when the font is ready. */
     if(state<=NOTICE_COUNT){
-        u64 active=((now+2000000000ull) & ~7ull) | (state-1);
+        u64 active=((now+2000000000ull) & ~(u64)NOTICE_MASK) | (state-1);
         if(!atomic_compare_exchange_strong(&notice,&state,active)) return NULL;
         state=active;
     }
@@ -1098,6 +1152,13 @@ static u64 last_switch;
 /* A frame already submitted may still reference the old instance. Retire it
  * with the actor, at the same native teardown boundary as the active one. */
 static struct idle_render { u64 owner,instance[3]; } idle[80]; /* native sheet pool */
+/* Four looks and three spare instances: the actor's OWN first model has to be the one its first look comes back to, or a
+ * fifth model (a second copy of that look, from the art cache) would need a fourth spare.  The record's layout is fixed
+ * (savestates), so the look an actor was loaded with rides in the unused top byte of its owner word: 0 = not known (every
+ * actor of a session without the Axel pack, and every older savestate), else the look + 1. */
+static u64 extra_instances; /* guest array, pointer saved in the spare legacy root-label words */
+#define IDLE_OWNER(word) ((word)&0x00ffffffffffffffull)
+#define IDLE_LOOK(word) ((int)((word)>>56)-1)
 static void free_render(KCtx *g,u64 inst){
     u64 model=rd64(g,inst+0x20),allocator=kh_call(g,GS_BASE+0x152590,0,0,0,0);
     kh_call(g,rd64(g,rd64(g,model)+0x48),model,allocator,inst,0);
@@ -1105,15 +1166,21 @@ static void free_render(KCtx *g,u64 inst){
 static void end_look_actor(KCtx *g){
     if(!last_switch) return;
     if(A0(g)==face_actor) face_actor=face_instance=face_model=face_bar=0;
-    for(size_t i=0;i<80;i++) if(idle[i].owner==A0(g)){
+    for(size_t i=0;i<80;i++) if(idle[i].owner && IDLE_OWNER(idle[i].owner)==A0(g)){
         KCtx ctx=*g;
         for(int j=0;j<3;j++) if(idle[i].instance[j]) free_render(&ctx,idle[i].instance[j]);
+        if(extra_instances){
+            u64 extra=rd64(g,extra_instances+8*i);
+            if(extra) free_render(&ctx,extra);
+            wr64(g,extra_instances+8*i,0);
+        }
         idle[i]=(struct idle_render){0};
         break;
     }
 }
-void orig_f_3b43c0(KCtx *); void f_3b43c0(KCtx *g){ end_look_actor(g); orig_f_3b43c0(g); }
-void orig_f_3b4ec0(KCtx *); void f_3b4ec0(KCtx *g){ end_look_actor(g); orig_f_3b4ec0(g); }
+static void end_weapon_object(KCtx *g);
+void orig_f_3b43c0(KCtx *); void f_3b43c0(KCtx *g){ end_look_actor(g); end_weapon_object(g); orig_f_3b43c0(g); }
+void orig_f_3b4ec0(KCtx *); void f_3b4ec0(KCtx *g){ end_look_actor(g); end_weapon_object(g); orig_f_3b4ec0(g); }
 void orig_f_3b57b0(KCtx *);
 void f_3b57b0(KCtx *g){
     u64 actor=A0(g);
@@ -1130,7 +1197,8 @@ static u64 look_bar(KCtx *g,const char *stem,const char *ext,u64 native){
     int n=snprintf(name,sizeof name,"obj/%s.%s",stem,ext);
     if(n<0 || (size_t)n>=sizeof name) return 0;
     char host[4096];
-    if(kh_look_enabled() && !kh_look_available(name,host,sizeof host)) return 0;
+    if(kh_loading_weapon){ if(!kh_axel_weapon_asset(name,host,sizeof host)) return 0; }
+    else if(kh_look_enabled() && !kh_look_available(name,host,sizeof host)) return 0;
     u64 path=ga_strdup(name);
     int size=(s32)kh_call(g,GS_BASE+0x3a09b0,path,0,0,0);
     u64 bar=size>=16?ga_alloc(size,128):0;
@@ -1148,10 +1216,18 @@ static u64 look_bar(KCtx *g,const char *stem,const char *ext,u64 native){
     }
     return bar;
 }
+/* 16 player stems x 4 looks is more than the 48 recorded entries (3 looks fit).  The entries past them are not a savestate
+ * record: a load forgets them, and such a pair is then read again. */
+enum { EXTRA_ART=KH_LOOKS*20-48 };
+static struct look_art art_more[EXTRA_ART];
 static struct look_art *look_art(KCtx *g,const char *stem,int target,u64 body,u64 face){
     struct look_art *a=art;
     while(a<art+48 && a->stem[0] && (a->mode!=target || strcmp(a->stem,stem))) ++a;
-    if(a==art+48) kh_fatal(g,"look-art-cache-full: %s",stem);
+    if(a==art+48){
+        a=art_more;
+        while(a<art_more+EXTRA_ART && a->stem[0] && (a->mode!=target || strcmp(a->stem,stem))) ++a;
+        if(a==art_more+EXTRA_ART) kh_fatal(g,"look-art-cache-full: %s",stem);
+    }
     snprintf(a->stem,sizeof a->stem,"%s",stem); a->mode=target;
     if(!a->body) a->body=look_bar(g,stem,"mdlx",body);
     if(face && !a->face) a->face=look_bar(g,stem,"a.us",face);
@@ -1182,17 +1258,25 @@ static void publish_art(KCtx *g,u64 resource,u64 body,u64 face){
     }
     wr64(g,resource+16,body); wr64(g,resource+24,face);
 }
-void orig_f_3e61e0(KCtx *);
-void f_3e61e0(KCtx *g){
-    u64 prior=0,resource=A0(g);
+/* Every native release of a resource (f_3e61e0 close, f_3e6370 / f_3e63d0 release-and-reopen, which free +0x10/+0x18/+0x20
+ * through f_39da10's lookup in the resource heap) must see the native BARs again: a BAR read here is not in that heap and
+ * f_39da10 would write through a null record (found with the chakram set: a weapon resource is re-opened by the object
+ * constructor f_3a7a40 -> f_3d7c70 -> f_3ef750 -> f_3e6370 right after its first open). */
+static void unhold_resource(KCtx *g,u64 resource){
+    u64 prior=0;
     forget_deferred(g,resource);
     for(u64 e=held_resources;e;prior=e,e=rd64(g,e)) if(rd64(g,e+8)==resource){
         wr64(g,resource+16,rd64(g,e+16)); wr64(g,resource+24,rd64(g,e+24));
         if(prior) wr64(g,prior,rd64(g,e)); else held_resources=rd64(g,e);
         ga_free(e); break;
     }
-    orig_f_3e61e0(g);
 }
+void orig_f_3e61e0(KCtx *);
+void f_3e61e0(KCtx *g){ unhold_resource(g,A0(g)); orig_f_3e61e0(g); }
+void orig_f_3e6370(KCtx *);
+void f_3e6370(KCtx *g){ unhold_resource(g,A0(g)); orig_f_3e6370(g); }
+void orig_f_3e63d0(KCtx *);
+void f_3e63d0(KCtx *g){ unhold_resource(g,A0(g)); orig_f_3e63d0(g); }
 /* The camp model allocator needs room for Xion's extra mesh groups. */
 static u64 camp_preview_pool;
 void orig_f_19c3a0(KCtx *);
@@ -1206,17 +1290,73 @@ void f_19c3a0(KCtx *g){
     orig_f_19c3a0(g);
 }
 void orig_f_3e6120(KCtx *);
+/* ---- the Axel look's chakram set ------------------------------------------------------------------------------------------
+ * The game reads its weapon models itself, always the keyblades (kh_loading_weapon is 0 then).  Like a look body, a weapon
+ * resource (+8 its object entry, +0x10 the model BAR) opened while the Axel look wears the chakrams gets the chakram BAR read
+ * here; the native BAR is kept in the held list and comes back at release or when the chakrams are no longer wanted.
+ * The BARs read here are not a savestate record: a load forgets them (as art_more) and they are read again. */
+static struct weapon_art { char stem[40]; u64 body; } weapon_art[128];
+static u64 held_entry(KCtx *g,u64 resource);
+static int weapon_stem(KCtx *g,u64 resource,char stem[33]){
+    u64 row=rd64(g,resource+8);
+    if(!row) return 0;
+    memcpy(stem,hp(g,row+8),32); stem[32]=0;
+    return !strncasecmp(stem,"W_EX010",7);
+}
+static int weapon_wanted(const char *stem){
+    char rel[64],host[4096];
+    snprintf(rel,sizeof rel,"obj/%s.mdlx",stem);
+    return kh_look_enabled()==KH_LOOK_AXEL && atomic_load(&axel_chakrams) && kh_axel_weapon_asset(rel,host,sizeof host) &&
+           kh_axel_weapon_ready();
+}
+/* worn: the chakram BAR the resource already holds (0: none).  After a savestate load the cache is empty but the restored
+ * resources still hold the snapshot's chakram BARs: those are kept, not read again. */
+static u64 weapon_bar(KCtx *g,const char *stem,u64 native,u64 worn){
+    struct weapon_art *a=weapon_art;
+    while(a<weapon_art+128 && a->stem[0] && strcmp(a->stem,stem)) ++a;
+    if(a==weapon_art+128) kh_fatal(g,"axel-weapon-cache-full: %s",stem);
+    if(!a->body && worn){ snprintf(a->stem,sizeof a->stem,"%s",stem); a->body=worn; }
+    if(!a->body){
+        snprintf(a->stem,sizeof a->stem,"%s",stem);
+        kh_loading_weapon=1;
+        a->body=look_bar(g,stem,"mdlx",native);
+        kh_loading_weapon=0;
+        if(a->body) kh_warn("axel-weapon-bar: %s chakram model %llx",stem,(unsigned long long)a->body);
+    }
+    return a->body;
+}
+static int bind_weapon(KCtx *g,u64 resource,const char *stem){
+    u64 held=held_entry(g,resource);
+    if(!weapon_wanted(stem)){
+        if(held) publish_art(g,resource,rd64(g,held+16),rd64(g,held+24));
+        return 1;
+    }
+    /* a weapon resource holds a BAR other than its native one only when bind_weapon gave it the chakram BAR */
+    u64 worn=held && rd64(g,resource+16)!=rd64(g,held+16)?rd64(g,resource+16):0;
+    u64 body=weapon_bar(g,stem,held?rd64(g,held+16):rd64(g,resource+16),worn);
+    if(!body) return 0;
+    publish_art(g,resource,body,rd64(g,resource+24));
+    return 1;
+}
 static int bind_resource(KCtx *g,u64 resource){
+    char wstem[33];
+    if(rd64(g,resource+16) && weapon_stem(g,resource,wstem)){ KCtx ctx=*g; return bind_weapon(&ctx,resource,wstem); }
     if(!last_switch && !kh_scene_pack_active()) return 1;
     u64 row=rd64(g,resource+8),body=rd64(g,resource+16),face=rd64(g,resource+24);
     if(!row || !body) return 1;
     char stem[33],path[64];
     memcpy(stem,hp(g,row+8),32); stem[32]=0;
     snprintf(path,sizeof path,"obj/%s.mdlx",stem);
-    int high=kh_scene_pack_active() && !strcmp(path,KH_SCENE_MDLX);
+    /* Round 9 item 0: high Sora in an event wears the scene look (kh_scene_wear: the look only with KHNMC_SCENE_LOOK=1, else 0 =
+     * the scene-roxas overlay, in every campaign mode); its BAR is read under that look, so the file layer serves the same file
+     * the game's own read got. */
+    int high=kh_scene_pack_active() && (!strcmp(path,KH_SCENE_MDLX) || (kh_scene_wear() && kh_scene_form_alias(path,NULL,0)));
     if(!high && (!last_switch || kh_player_asset_key(path)!=-1)) return 1;
     KCtx ctx=*g;
-    struct look_art *a=look_art(&ctx,stem,kh_look_enabled(),body,high?0:face);
+    int target=high?kh_scene_wear():kh_look_enabled(),prior=kh_loading_look;
+    if(high) kh_loading_look=target;
+    struct look_art *a=look_art(&ctx,stem,target,body,high?0:face);
+    kh_loading_look=prior;
     if(!a) return 0;
     publish_art(g,resource,a->body,high?face:(face?a->face:0));
     return 1;
@@ -1232,11 +1372,24 @@ void f_3e6120(KCtx *g){
     deferred_resources=entry;
     kh_warn("look-resource-bind deferred");
 }
-static int bind_look(KCtx *g,KhPlayerSheet p,const char *stem,int target){
+static u64 held_entry(KCtx *g,u64 resource){
+    u64 entry=held_resources;
+    while(entry && rd64(g,entry+8)!=resource) entry=rd64(g,entry);
+    return entry;
+}
+/* current: the look in force (the caller has set kh_loading_look to the target). */
+static int bind_look(KCtx *g,KhPlayerSheet p,const char *stem,int target,int current){
     u64 obj=p.obj,inst=rd64(g,obj+0x7b0);
     if(!inst || !rd64(g,obj+0xa88) || !rd64(g,obj+0x920) || !rd64(g,obj+0x928) ||
         rd64(g,inst+0x20)!=rd64(g,obj+0xa88)) return 0;
-    struct look_art *a=look_art(g,stem,target,rd64(g,obj+0x920),rd64(g,obj+0x928));
+    size_t sheet_slot=(p.sheet-(GS_BASE+0x2a17290))/0x278;
+    u64 held=held_entry(g,obj+0x910);
+    int four=kh_look_count()>3;   /* without the Axel pack nothing below differs from the three-look code */
+    int own_look=sheet_slot<80 && idle[sheet_slot].owner && IDLE_OWNER(idle[sheet_slot].owner)==obj?IDLE_LOOK(idle[sheet_slot].owner):-1;
+    struct look_art own={{0},target,0,0},*a;
+    if(own_look==target && held){ own.body=rd64(g,held+16); own.face=rd64(g,held+24); a=&own; }   /* back to its first look: its own model */
+    else if(four && !held && target==current){ own.body=rd64(g,obj+0x920); own.face=rd64(g,obj+0x928); a=&own; }   /* it wears that look already */
+    else a=look_art(g,stem,target,rd64(g,obj+0x920),rd64(g,obj+0x928));
     if(!a) return 0;
     u64 native=rd64(g,obj+0x920),face=a->face;
     u64 original=kh_call(g,GS_BASE+0x3a6420,native,4,0,0);
@@ -1252,12 +1405,20 @@ static int bind_look(KCtx *g,KhPlayerSheet p,const char *stem,int target){
     if(!model || !tex || rd64(g,model)!=rd64(g,rd64(g,obj+0xa88))) return 0;
     int changed=rd64(g,obj+0xa88)!=model;
     if(changed){
-        size_t slot=(p.sheet-(GS_BASE+0x2a17290))/0x278;
-        if(slot>=80 || (idle[slot].owner && idle[slot].owner!=obj)) return 0;
+        size_t slot=sheet_slot;
+        if(slot>=80 || (idle[slot].owner && IDLE_OWNER(idle[slot].owner)!=obj)) return 0;
         u64 *spare=idle[slot].instance;
         int j=0;
         while(j<3 && spare[j] && rd64(g,spare[j]+0x20)!=model) j++;
-        if(j==3) return 0;
+        if(j==3){
+            if(!extra_instances){
+                extra_instances=ga_alloc(80*8,16);
+                if(!extra_instances) kh_fatal(g,"look-instance-allocation");
+                memset(hp(g,extra_instances),0,80*8);
+            }
+            spare=(u64*)hp(g,extra_instances+slot*8); j=0;
+            if(*spare && rd64(g,*spare+0x20)!=model) return 0;
+        }
         u64 other=spare[j];
         if(!other){
             u64 allocator=kh_call(g,GS_BASE+0x152590,0,0,0,0);
@@ -1267,7 +1428,9 @@ static int bind_look(KCtx *g,KhPlayerSheet p,const char *stem,int target){
             kh_call(g,GS_BASE+0x1a4e30,next,0,0,0);
             other=next;
         }
-        idle[slot].owner=obj; spare[j]=inst;
+        /* The first change of this actor: the instance it leaves is the one it was loaded with, under `current`. */
+        if(!idle[slot].owner) idle[slot].owner=obj | (four && !held && current>=0 && current<KH_LOOKS?(u64)(current+1)<<56:0);
+        spare[j]=inst;
         inst=other;
         wr64(g,obj+0xa88,model);
         wr64(g,obj+0x7b0,inst);
@@ -1277,6 +1440,63 @@ static int bind_look(KCtx *g,KhPlayerSheet p,const char *stem,int target){
     face_bar=face; face_actor=obj; face_instance=inst; face_model=model;
     gauge_pending=1;
     return 1;
+}
+/* The player's two weapon objects ([player+0xd60], [+0xd68]; route_state.c) after a look or Weapon change: their resource gets
+ * the wanted BAR (bind_weapon) and, when that makes another model, a render instance of it, exactly as bind_look does for the
+ * body.  The instance left behind is freed when that weapon object ends (f_3b43c0 / f_3b4ec0), as the player's spares are.
+ * weapon_idle is not a savestate record (the record layout is fixed): a load forgets it, the spare is then left to the game. */
+static struct idle_render weapon_idle[8];
+static int bind_weapon_object(KCtx *g,u64 w){
+    char stem[33];
+    u64 res=w+0x910,inst=rd64(g,w+0x7b0),old_model=rd64(g,w+0xa88);
+    if(!inst || !old_model || !rd64(g,res+16) || rd64(g,inst+0x20)!=old_model || !weapon_stem(g,res,stem)) return 0;
+    u64 before=rd64(g,res+16);
+    if(!bind_weapon(g,res,stem)) return 0;
+    if(rd64(g,res+16)==before) return 1;   /* its model was made from this BAR already */
+    u64 model=kh_call(g,GS_BASE+0x3e62e0,res,0,0,0),tex=kh_call(g,GS_BASE+0x3e6310,res,0,0,0);
+    if(getenv("KHNMC_TEST_LOOK_DIGEST"))
+        fprintf(stderr,"kh: axel-weapon-object %s obj=%llx body=%llx model %llx->%llx tex=%llx\n",stem,(unsigned long long)w,
+                (unsigned long long)rd64(g,res+16),(unsigned long long)old_model,(unsigned long long)model,(unsigned long long)tex);
+    if(!model || !tex || rd64(g,model)!=rd64(g,old_model)) return 0;
+    if(model==old_model) return 1;
+    struct idle_render *e=NULL;
+    for(int k=0;k<8;k++) if(weapon_idle[k].owner==w){ e=&weapon_idle[k]; break; }
+    for(int k=0;k<8 && !e;k++) if(!weapon_idle[k].owner) e=&weapon_idle[k];
+    if(!e) return 0;
+    int j=0;
+    while(j<3 && e->instance[j] && rd64(g,e->instance[j]+0x20)!=model) j++;
+    if(j==3) return 0;
+    u64 next=e->instance[j];
+    if(!next){
+        u64 allocator=kh_call(g,GS_BASE+0x152590,0,0,0,0);
+        next=kh_call(g,rd64(g,rd64(g,model)+0x40),model,allocator,0,0);
+        if(!next) return 0;
+        kh_call(g,GS_BASE+0x1a4bb0,next,tex,0,0);
+        kh_call(g,GS_BASE+0x1a4e30,next,0,0,0);
+    }
+    e->owner=w; e->instance[j]=inst;
+    wr64(g,w+0xa88,model); wr64(g,w+0x7b0,next); wr64(g,w+0x7e0,tex);
+    return 1;
+}
+/* 1 = done (or nothing to do), 0 = try again at a later quiet frame. */
+static int rebind_weapons(KCtx *g){
+    u64 player=rd64(g,GS_BASE+0x2a105d0);
+    if(!player) return 1;
+    int ok=1;
+    for(int j=0;j<2;j++){
+        u64 w=rd64(g,player+0xd60+8ull*(u64)j);
+        if(!w || !rd64(g,w+0x7b0)) continue;
+        KCtx ctx=*g;
+        if(!bind_weapon_object(&ctx,w)){ ok=0; kh_warn("axel-weapon: weapon %d of the player not rebound yet",j); }
+    }
+    return ok;
+}
+static void end_weapon_object(KCtx *g){
+    for(int k=0;k<8;k++) if(weapon_idle[k].owner && weapon_idle[k].owner==A0(g)){
+        KCtx ctx=*g;
+        for(int j=0;j<3;j++) if(weapon_idle[k].instance[j]) free_render(&ctx,weapon_idle[k].instance[j]);
+        weapon_idle[k]=(struct idle_render){0};
+    }
 }
 static void retry_gauge(KCtx *g){
     if(!gauge_pending) return;
@@ -1288,7 +1508,7 @@ static void retry_gauge(KCtx *g){
     gauge_pending=!rd8(g,gauge+0x50+0x304);
 }
 static void look_frame(KCtx *g,int request,u64 frame){
-    int target=request%3;
+    int target=request<0?request:request_look(request);
     int previous=kh_look_enabled();
     int refresh=target<0;
     if(refresh){
@@ -1307,31 +1527,31 @@ static void look_frame(KCtx *g,int request,u64 frame){
     snprintf(path,sizeof path,"obj/%s.mdlx",stem);
     if(kh_player_asset_key(path)!=-1) goto feedback;
     if(target){
-        static int validated[3];
+        static int validated[KH_LOOKS];
         if(!validated[target]){
             if(!kh_look_switch_ready(target)){notice_index=NOTICE_PACK;goto feedback;}
             validated[target]=1;
         }
-        char face[96],host[4096];
+        char host[4096];
         if(!kh_look_asset(target,path,host,sizeof host)) {notice_index=NOTICE_PACK; goto feedback;}
         snprintf(path,sizeof path,"obj/%s.a.us",stem);
-        snprintf(face,sizeof face,"remastered/%s/-%d.dds",path,kh_player_asset_key(path)-1);
-        if(!kh_look_asset(target,path,host,sizeof host) || !kh_look_asset(target,face,host,sizeof host)){
+        if(!kh_look_asset(target,path,host,sizeof host) || !kh_look_face_ready(target,stem)){
             notice_index=NOTICE_PACK; goto feedback;
         }
     }
     KCtx ctx=*g;
     kh_loading_look=target;
-    int bound=bind_look(&ctx,player,stem,target);
+    int bound=bind_look(&ctx,player,stem,target,previous);
     kh_loading_look=-1;
     if(!bound){
         notice_index=NOTICE_PACK;
         goto feedback;
     }
     if(refresh) return;
-    kh_look_set(&ctx,target);
+    kh_select_saved_look(&ctx,target);
+    if(atomic_load(&axel_chakrams) && (previous==KH_LOOK_AXEL || target==KH_LOOK_AXEL)) atomic_store(&weapon_dirty,1);
     retry_gauge(&ctx);
-    if((previous!=0)!=(target!=0)) kh_look_voice_bind(&ctx);
+
     finishing_look=target;
     last_switch=frame;
     if(getenv("KHNMC_TEST_LOOK_DIGEST")){
@@ -1340,6 +1560,13 @@ static void look_frame(KCtx *g,int request,u64 frame){
         fprintf(stderr,"kh: look-commit frame=%llu mode=%d stem=%s body=%llx face=%llx name=%08lx gauge=%d\n",
                 (unsigned long long)frame,target,stem,(unsigned long long)rd64(g,player.obj+0x920),
                 (unsigned long long)face_bar,(unsigned long)crc32(0,(const u8 *)text,strlen(text)),!gauge_pending);
+        /* the BARs the player's weapon objects show at this commit (chakram = not the resource's native BAR) */
+        u64 lead=rd64(g,GS_BASE+0x2a105d0);
+        for(int j=0;j<2 && lead;j++){
+            u64 w=rd64(g,lead+0xd60+8ull*(u64)j),held=w?held_entry(g,w+0x910):0;
+            if(w) fprintf(stderr,"kh: look-commit-weapon frame=%llu weapon=%d body=%llx %s\n",(unsigned long long)frame,j,
+                          (unsigned long long)rd64(g,w+0x910+16),held && rd64(g,w+0x910+16)!=rd64(g,held+16)?"chakram":"native");
+        }
     }
     return;
 feedback:
@@ -1366,6 +1593,9 @@ void kh_settings_frame(KCtx *g,uint64_t frame){
             refill_drive(g,kh_xion_progress_player());
         }
         retry_gauge(g);
+        /* the player's weapons follow a look or Weapon change at the next frame the look switch itself would accept */
+        if(atomic_load(&weapon_dirty) && finishing_look<0 && !gauge_pending && atomic_load(&look_request)<0 && !look_blocked(g,0) &&
+           rebind_weapons(g)) atomic_store(&weapon_dirty,0);
         for(u64 e=deferred_resources,next;e;e=next){
             next=rd64(g,e);
             u64 resource=rd64(g,e+8);
@@ -1375,7 +1605,8 @@ void kh_settings_frame(KCtx *g,uint64_t frame){
     if(finishing_look>=0 && !voice_busy && !gauge_pending && !deferred_resources){
         int target=finishing_look;
         finishing_look=-1;
-        int id=target==2?NOTICE_HOODED:target?NOTICE_XION:NOTICE_ROXAS;
+        static const int look_notice[KH_LOOKS]={NOTICE_ROXAS,NOTICE_XION,NOTICE_HOODED,NOTICE_AXEL,NOTICE_ROXAS_HD};
+        int id=look_notice[target];
         show_look_notice(id,frame);
     }
     while(pending && pending->frame<=frame){
@@ -1393,7 +1624,7 @@ void kh_settings_frame(KCtx *g,uint64_t frame){
     if(g && !voice_busy && !gauge_pending && !deferred_resources){
         int request=atomic_load(&look_request);
         if(request>=0){
-            int save=request>=3;
+            int save=request_save(request);
             const char *drop=NULL;
             if(save && rd16(g,GS_BASE+0x717008)!=choice_place) drop="place-changed";
             else if(save && (menu_open || rd8(g,GS_BASE+0x9006b0))) request=-1;
@@ -1406,7 +1637,7 @@ void kh_settings_frame(KCtx *g,uint64_t frame){
                     else drop=!strcmp(why,"Battle active")?"battle-timeout":why;
                 }else drop=why;
             }
-            if(drop){kh_warn("player appearance: dropped %d %s",request%3,drop);
+            if(drop){kh_warn("player appearance: dropped %d %s",request_look(request),drop);
                 atomic_store(&look_request,-1);request=-1;waiting_since=0;}
             if(request>=0) waiting_since=0;
         }
@@ -1512,12 +1743,19 @@ void kh_rewind_look(KhRecords *r){
     if(r->loading) camp_preview_pool=(legacy_notice>>63)?legacy_notice & ~(1ull<<63):0;
     if(r->loading){notice=0;menu_open=0;enter_character=0;}
     KH_RECORD(r,art);
+    if(r->loading){ memset(art_more,0,sizeof art_more); memset(weapon_art,0,sizeof weapon_art); memset(weapon_idle,0,sizeof weapon_idle); }   /* not records: see look_art, weapon_art */
+    /* The restored weapon resources hold the BARs of the snapshot, the Weapon setting and the look may differ now: the player's
+     * weapons are matched again at the next quiet frame (rebind_weapons leaves weapons that match alone).  Only with the
+     * chakram set: without it no chakram BAR is ever bound, and the default path stays as it was. */
+    if(r->loading && kh_axel_weapon_ready()) atomic_store(&weapon_dirty,1);
     KH_RECORD(r,held_resources);
     KH_RECORD(r,deferred_resources);
     KH_RECORD(r,character_labels);
     u64 legacy_root_labels[4]={0};
     if(!r->loading) memcpy(legacy_root_labels,&choice_position,sizeof choice_position);
+    if(!r->loading && extra_instances){legacy_root_labels[2]=0x524f5841534844ull; legacy_root_labels[3]=extra_instances;}
     KH_RECORD(r,legacy_root_labels);
+    if(r->loading) extra_instances=legacy_root_labels[2]==0x524f5841534844ull?legacy_root_labels[3]:0;
     if(r->loading){
         memcpy(&choice_position,legacy_root_labels,sizeof choice_position);
         choice_position.valid=choice_position.valid==1;
@@ -1538,4 +1776,319 @@ void kh_rewind_look(KhRecords *r){
     KH_RECORD(r,face_model);
     KH_RECORD(r,face_bar);
     KH_RECORD(r,last_switch);
+}
+/* Selftest: snapshot + load of this owner's records; returns 2 when taking the snapshot already set weapon_dirty, else
+ * weapon_dirty after the load.  Everything a load resets is put back. */
+static int load_marks_weapons(void){
+    static struct look_art saved_more[EXTRA_ART]; static struct weapon_art saved_art[128]; static struct idle_render saved_idle[8];
+    memcpy(saved_more,art_more,sizeof art_more); memcpy(saved_art,weapon_art,sizeof weapon_art); memcpy(saved_idle,weapon_idle,sizeof weapon_idle);
+    u64 saved_notice=atomic_load(&notice),saved_waiting=waiting_since;
+    int saved_menu=atomic_load(&menu_open),saved_enter=atomic_load(&enter_character),saved_dirty=atomic_load(&weapon_dirty),result;
+    KhRecords cut={0};
+    atomic_store(&weapon_dirty,0);
+    kh_records_begin(&cut,0); kh_rewind_look(&cut); kh_records_end(&cut);
+    if(atomic_load(&weapon_dirty)) result=2;
+    else{
+        kh_records_begin(&cut,1); kh_rewind_look(&cut); kh_records_end(&cut);
+        result=atomic_load(&weapon_dirty);
+    }
+    kh_records_free(&cut);
+    memcpy(art_more,saved_more,sizeof art_more); memcpy(weapon_art,saved_art,sizeof weapon_art); memcpy(weapon_idle,saved_idle,sizeof weapon_idle);
+    atomic_store(&notice,saved_notice); waiting_since=saved_waiting;
+    atomic_store(&menu_open,saved_menu); atomic_store(&enter_character,saved_enter); atomic_store(&weapon_dirty,saved_dirty);
+    return result;
+}
+
+/* ---- the Axel look and the "Axel Won't Cry" mode: the settings side, with a synthetic pack of one-byte files ---------- */
+#include <ftw.h>
+#include <sys/stat.h>
+static int axel_test_remove(const char *path,const struct stat *st,int type,struct FTW *walk){
+    (void)st; (void)type; (void)walk;
+    return remove(path);
+}
+static int axel_test_file(const char *root,const char *rel){
+    char path[KH_TMP_MAX+256];
+    if(snprintf(path,sizeof path,"%s/%s",root,rel)>=(int)sizeof path) return 0;
+    for(char *p=path+strlen(root)+1;(p=strchr(p,'/'));p++){
+        *p=0;
+        if(mkdir(path,0700) && errno!=EEXIST) return 0;
+        *p='/';
+    }
+    FILE *f=fopen(path,"wb");
+    return f && fputc('x',f)=='x' && !fclose(f);
+}
+int kh_axel_settings_selftest(KCtx *g){
+    int checks=0,fail=0;
+    double v;
+#define AX(c) do { checks++; if(!(c)){ fprintf(stderr,"axel settings selftest FAIL: %s\n",#c); fail++; } } while(0)
+    AX(validate("KHNMC_PLAYER_LOOK","axel",&v)==LOOK && v==KH_LOOK_AXEL);
+    AX(validate("KHNMC_PLAYER_LOOK","roxas-hd",&v)==LOOK && v==KH_LOOK_ROXAS_HD);
+    AX(validate("KHNMC_PLAYER_LOOK","xion-hooded",&v)==LOOK && v==2 && validate("KHNMC_PLAYER_LOOK","roxas",&v)==LOOK && v==0);
+    AX(validate("KHNMC_PLAYER_LOOK","Axel",&v)<0 && validate("KHNMC_PLAYER_LOOK","axel ",&v)<0);
+    /* Three looks: the cycle from before the Axel look, both ways. */
+    AX(look_step(0,1,3)==1 && look_step(1,1,3)==2 && look_step(2,1,3)==0);
+    AX(look_step(0,0,3)==2 && look_step(2,0,3)==1 && look_step(1,0,3)==0);
+    /* Four: Roxas -> Xion -> Xion (hooded) -> Axel -> Roxas. */
+    AX(look_step(0,1,4)==1 && look_step(1,1,4)==2 && look_step(2,1,4)==3 && look_step(3,1,4)==0);
+    AX(look_step(0,0,4)==3 && look_step(3,0,4)==2 && look_step(2,0,4)==1 && look_step(1,0,4)==0);
+    AX(look_step(3,1,3)==1 && look_step(3,0,3)==2);          /* the pack went away while Axel was shown */
+    for(int target=0;target<KH_LOOKS;target++) for(int save=0;save<2;save++){
+        int word=request_word(target,save);
+        AX(word>=0 && request_look(word)==target && request_save(word)==save);
+    }
+    for(int word=0;word<6;word++) AX(request_look(word)==word%3 && request_save(word)==(word>=3));   /* older savestates */
+    char decoded[40]; u64 p=ga_alloc(sizeof look_text[0],16);
+    AX(p!=0);
+    if(p){
+        memcpy(hp(g,p),look_text[NOTICE_AXEL],sizeof look_text[0]);
+        kh_route_message_text(g,p,decoded,sizeof decoded);
+        AX(!strcmp(decoded,"Axel"));
+        ga_free(p);
+    }
+    /* No pack, a partial pack, the whole pack. */
+    const char *env=getenv("KHNMC_LOOK_AXEL_DIR");
+    char *saved_env=env?strdup(env):NULL;
+    int saved_look=kh_look_enabled(),saved_mode=kh_campaign_mode();
+    char root[KH_TMP_MAX]; kh_tmp_path(root,sizeof root,"khnmc-axel-pack-XXXXXX");
+    if(!mkdtemp(root)){ fprintf(stderr,"axel settings selftest FAIL: temporary directory\n"); return fail+1; }
+    const char *hd=getenv("KHNMC_LOOK_ROXAS_HD_DIR");
+    char *saved_hd=hd?strdup(hd):NULL;
+    setenv("KHNMC_LOOK_ROXAS_HD_DIR","",1);
+    setenv("KHNMC_LOOK_AXEL_DIR",root,1);
+    AX(kh_look_count()==3 && !kh_look_pack_ready(KH_LOOK_AXEL) && !kh_look_switch_ready(KH_LOOK_AXEL));
+    kh_xkb_set_mode(g,KH_MODE_AXEL);                         /* a save of the mode loaded without its pack */
+    AX(kh_axel_enabled && !kh_xion_enabled && kh_campaign_mode()==KH_MODE_AXEL && kh_look_enabled()==KH_LOOK_ROXAS);
+    kh_xkb_set_mode(g,KH_MODE_NONE);
+    AX(!kh_axel_enabled && !kh_xion_enabled && !kh_look_enabled());
+    static const struct { const char *stem; int face; } forms[]={
+        {"P_EX100",36},{"P_EX100_BTLF",47},{"P_EX100_MAGF",38},{"P_EX100_KH1F",47},{"P_EX100_TRIF",5},{"P_EX100_ULTF",41},
+        {"P_EX100_HTLF",3},{"P_EX101",36},{"P_EX101_BTLF",47},{"P_EX110_BTLF",0},{"P_EX121",36},{"P_EX100_WI",36},
+        {"P_EX100_WI_MAGF",38},{"P_EX100_WI_KH1F",45},{"P_EX100_WI_ULTF",41}};
+    char rel[160]; int made=1;
+    for(size_t i=0;i<sizeof forms/sizeof *forms;i++){
+        snprintf(rel,sizeof rel,"obj/%s.mdlx",forms[i].stem); made&=axel_test_file(root,rel);
+        snprintf(rel,sizeof rel,"obj/%s.a.us",forms[i].stem); made&=axel_test_file(root,rel);
+        if(i+1==sizeof forms/sizeof *forms){ AX(kh_look_count()==3); }      /* one face picture short of a pack */
+        snprintf(rel,sizeof rel,"remastered/obj/%s.a.us/-%d.dds",forms[i].stem,forms[i].face); made&=axel_test_file(root,rel);
+    }
+    AX(made && kh_look_pack_ready(KH_LOOK_AXEL) && kh_look_count()==4);
+    AX(!kh_look_switch_ready(KH_LOOK_AXEL));                 /* the scene model and the 24 voice banks are part of the pack */
+    made&=axel_test_file(root,KH_SCENE_MDLX);
+    for(int id=1;id<=64 && made;id++){
+        /* kh_player_voice names every bank: probe both bank groups of look_voice.inc */
+        static const char *const worlds[]={"al0_sora","bb0_sora","ca0_sora","dc0_sora","eh0_sora","hb0_sora","he0_sora","lk0_sora",
+            "lm0_sora","mu0_sora","nm0_sora","po0_sora","tr0_sora","tt0_roxas","tt0_sora","wi0_sora"};
+        static const char *const formbanks[]={"P_EX100_BTLF.a.us/voice/battle/us/lnd","P_EX100_KH1F.a.us/voice/battle/us/lnd",
+            "P_EX100_MAGF.a.us/voice/battle/us/bladeless","P_EX100_ULTF.a.us/voice/battle/us/awakened",
+            "P_EX100_WI_KH1F.a.us/voice/battle/us/lnd","P_EX100_WI_MAGF.a.us/voice/battle/us/bladeless",
+            "P_EX100_WI_ULTF.a.us/voice/battle/us/awakened","P_EX101_BTLF.a.us/voice/battle/us/lnd"};
+        if(id<=16) snprintf(rel,sizeof rel,"voice/us/battle/%s.win32.scd",worlds[id-1]);
+        else if(id<=24) snprintf(rel,sizeof rel,"remastered/obj/%s",formbanks[id-17]);
+        else break;
+        AX(kh_player_voice(rel)>0);
+        made&=axel_test_file(root,rel);
+    }
+    AX(made && kh_look_switch_ready(KH_LOOK_AXEL));
+    kh_xkb_set_mode(g,KH_MODE_AXEL);
+    AX(kh_axel_enabled && !kh_xion_enabled && kh_look_enabled()==KH_LOOK_AXEL && kh_settings_look()==KH_LOOK_AXEL);
+    AX(!strcmp(kh_look_root(),root));
+    AX(kh_look_key("obj/P_EX100.mdlx")==-1 && kh_look_key("remastered/obj/P_EX100.a.us/-36.dds")==37);
+    AX(kh_look_key("voice/us/battle/tt0_roxas.win32.scd")==-1);
+    {   /* round 9 item 0: in Axel Won't Cry the story rigs follow the look only with KHNMC_SCENE_LOOK=1 (before: without it too) */
+        const char *sl=getenv("KHNMC_SCENE_LOOK"); char *prior_sl=sl?strdup(sl):NULL;
+        setenv("KHNMC_SCENE_LOOK","1",1);
+        AX(!kh_look_key("obj/H_EX510.mdlx"));                /* an optional story rig the pack does not have: the stock model */
+        made&=axel_test_file(root,"obj/H_EX510.mdlx");
+        AX(made && kh_look_key("obj/H_EX510.mdlx")==-1);
+        setenv("KHNMC_SCENE_LOOK","0",1);
+        AX(!kh_look_key("obj/H_EX510.mdlx") && kh_look_key("obj/P_EX100.mdlx")==-1);   /* the scene stays Roxas, the field look stays */
+        if(prior_sl){ setenv("KHNMC_SCENE_LOOK",prior_sl,1); free(prior_sl); } else unsetenv("KHNMC_SCENE_LOOK");
+    }
+    AX(!kh_look_key("obj/P_EX120.mdlx") && !kh_look_key("obj/P_EX120_NPC_RED.mdlx"));
+    made&=axel_test_file(root,"obj/P_EX120_NPC_RED.mdlx");
+    AX(made && kh_look_key("obj/P_EX120_NPC_RED.mdlx")==-1 &&
+       !kh_look_key("obj/P_EX120_NPC_GREEN.mdlx") && !kh_look_key("obj/P_EX120_NPC_RED.mset"));
+    AX(!kh_look_key("obj/P_EX220.mdlx") && !kh_look_key("obj/P_EX100.mset"));
+    u64 label=ga_strdup("\x3f\xa8\xb1\x9a\xac");             /* "Roxas", the party menu's name */
+    AX(label!=0);
+    if(label){
+        const char *policy=getenv("KHNMC_LOOK_NAMES");
+        char *saved_policy=policy?strdup(policy):NULL;
+        setenv("KHNMC_LOOK_NAMES","all",1);
+        u64 shown=kh_look_name(g,0x851f,label);
+        AX(shown!=label && !strcmp(gstr(g,shown),"\x2e\xb1\x9e\xa5"));      /* "Axel" */
+        kh_look_set(g,KH_LOOK_XION);  AX(!strcmp(gstr(g,shown),"\x45\xa2\xa8\xa7"));
+        kh_look_set(g,KH_LOOK_ROXAS); AX(!strcmp(gstr(g,shown),"\x3f\xa8\xb1\x9a\xac"));
+        kh_look_set(g,KH_LOOK_AXEL);  AX(!strcmp(gstr(g,shown),"\x2e\xb1\x9e\xa5"));
+        if(saved_policy){ setenv("KHNMC_LOOK_NAMES",saved_policy,1); free(saved_policy); } else unsetenv("KHNMC_LOOK_NAMES");
+    }
+    kh_look_set(g,KH_LOOK_ROXAS);                            /* the player changed character inside the mode */
+    AX(kh_axel_enabled && !kh_look_enabled());
+    kh_xkb_set_mode(g,KH_MODE_AXEL);                         /* a second load of the same mode resets its appearance */
+    AX(kh_look_enabled()==KH_LOOK_AXEL);
+    kh_xkb_set_mode(g,KH_MODE_XION);
+    AX(kh_xion_enabled && !kh_axel_enabled && kh_look_enabled()==KH_LOOK_XION);
+    kh_xkb_set_mode(g,KH_MODE_NONE);
+    AX(!kh_xion_enabled && !kh_axel_enabled && !kh_look_enabled() && !kh_look_key("obj/P_EX100.mdlx"));
+#undef AX
+    if(saved_mode) kh_xkb_set_mode(g,saved_mode);
+    kh_look_set(g,saved_look);
+    if(saved_hd){ setenv("KHNMC_LOOK_ROXAS_HD_DIR",saved_hd,1); free(saved_hd); } else unsetenv("KHNMC_LOOK_ROXAS_HD_DIR");
+    if(saved_env){ setenv("KHNMC_LOOK_AXEL_DIR",saved_env,1); free(saved_env); } else unsetenv("KHNMC_LOOK_AXEL_DIR");
+    nftw(root,axel_test_remove,16,FTW_DEPTH|FTW_PHYS);
+    fprintf(stderr,"kh: axel look selftest: cycle, request words, pack presence, mode default and names: %d checks, %d failures\n",checks,fail);
+    return fail;
+}
+
+/* ---- round 2: HD-body binding for every look, the face slot of P_EX100_WI_KH1F, the title lookup, the chakram set, the
+ * Weapon row, the New Game fifth row.  Synthetic packs of one-byte files in three temporary roots. ------------------------- */
+int kh_axel_round2_selftest(KCtx *g){
+    extern int kh_hd_look_probe(const char *,int *),kh_newgame_axel_selftest(KCtx *);
+    int checks=0,fail=0,costume=-1;
+    double v;
+#define R2(c) do { checks++; if(!(c)){ fprintf(stderr,"axel round2 selftest FAIL: %s\n",#c); fail++; } } while(0)
+    /* the face slot: the last texture of the form's folder; -39 of P_EX100_WI_KH1F is an effect texture */
+    R2(kh_player_asset_key("obj/P_EX100_WI_KH1F.a.us")==46 && kh_player_asset_key("remastered/obj/P_EX100_WI_KH1F.a.us/-45.dds")==46);
+    R2(kh_player_asset_key("remastered/obj/P_EX100_WI_KH1F.a.us/-39.dds")==0 && kh_player_asset_key("obj/P_EX100_KH1F.a.us")==48);
+    R2(validate("KHNMC_AXEL_WEAPON","keyblade",&v)==WEAPON && validate("KHNMC_AXEL_WEAPON","chakrams",&v)==WEAPON);
+    R2(validate("KHNMC_AXEL_WEAPON","Chakrams",&v)<0 && validate("KHNMC_AXEL_WEAPON","1",&v)<0);
+    R2(!strcmp(kh_options[WEAPON].name,"KHNMC_AXEL_WEAPON") && !strcmp(kh_options[WEAPON].initial,"keyblade") && !kh_setting_action(WEAPON));
+    static const char *const envs[3]={"KHNMC_LOOK_DIR","KHNMC_LOOK_HOODED_DIR","KHNMC_LOOK_AXEL_DIR"};
+    char *saved[3]; char roots[3][KH_TMP_MAX];
+    for(int i=0;i<3;i++){ const char *e=getenv(envs[i]); saved[i]=e?strdup(e):NULL; }
+    int saved_look=kh_look_enabled(),saved_mode=kh_campaign_mode(),saved_chakrams=atomic_load(&axel_chakrams);
+    int made=1;
+    for(int i=0;i<3;i++){
+        kh_tmp_path(roots[i],sizeof roots[i],"khnmc-r2-pack-XXXXXX");
+        if(!mkdtemp(roots[i])){ fprintf(stderr,"axel round2 selftest FAIL: temporary directory\n"); return fail+1; }
+        setenv(envs[i],roots[i],1);
+    }
+    static const struct { const char *stem; int face; } forms[]={
+        {"P_EX100",36},{"P_EX100_BTLF",47},{"P_EX100_MAGF",38},{"P_EX100_KH1F",47},{"P_EX100_TRIF",5},{"P_EX100_ULTF",41},
+        {"P_EX100_HTLF",3},{"P_EX101",36},{"P_EX101_BTLF",47},{"P_EX110_BTLF",0},{"P_EX121",36},{"P_EX100_WI",36},
+        {"P_EX100_WI_MAGF",38},{"P_EX100_WI_KH1F",39},{"P_EX100_WI_ULTF",41}};   /* -39: the slot packs made before round 2 use */
+    char rel[160];
+    for(int r=0;r<3;r++) for(size_t i=0;i<sizeof forms/sizeof *forms;i++){
+        snprintf(rel,sizeof rel,"obj/%s.mdlx",forms[i].stem); made&=axel_test_file(roots[r],rel);
+        snprintf(rel,sizeof rel,"obj/%s.a.us",forms[i].stem); made&=axel_test_file(roots[r],rel);
+        snprintf(rel,sizeof rel,"remastered/obj/%s.a.us/-%d.dds",forms[i].stem,forms[i].face); made&=axel_test_file(roots[r],rel);
+    }
+    R2(made);
+    /* a pack with the face sheet at -39 only is still complete for all three looks; its -39 is not served */
+    for(int look=1;look<=3;look++) R2(kh_look_pack_ready(look) && kh_look_face_ready(look,"P_EX100_WI_KH1F") && kh_look_face_ready(look,"P_EX100"));
+    /* HD Roxas uses native voices. All twenty rigs gate the fifth slot. */
+    {
+        const char *v=getenv("KHNMC_LOOK_ROXAS_HD_DIR"); char *previous=v?strdup(v):NULL;
+        setenv("KHNMC_LOOK_ROXAS_HD_DIR",roots[0],1);
+        R2(!kh_look_switch_ready(KH_LOOK_ROXAS_HD));
+        const char *const scenes[]={"H_EX500","H_EX510","H_EX510_PAJAMAS","P_EX110","P_EX110_NPC_PAJAMAS"};
+        for(unsigned i=0;i<sizeof scenes/sizeof *scenes;i++){
+            snprintf(rel,sizeof rel,"obj/%s.mdlx",scenes[i]); made&=axel_test_file(roots[0],rel);
+        }
+        R2(made && kh_look_switch_ready(KH_LOOK_ROXAS_HD) && !kh_look_voice_set(KH_LOOK_ROXAS_HD));
+        R2(next_available_look(KH_LOOK_ROXAS,0)==KH_LOOK_ROXAS_HD && next_available_look(KH_LOOK_ROXAS_HD,1)==KH_LOOK_ROXAS);
+        u64 word=GS_BASE+0x9a98b0+0x419c;
+        u32 before=rd32(g,word);
+        wr32(g,word,0x1ab);
+        kh_select_saved_look(g,KH_LOOK_ROXAS_HD);
+        R2(rd32(g,word)==(0x4c4b0000u | (KH_LOOK_ROXAS_HD<<9) | 0x1ab));
+        kh_look_set(g,KH_LOOK_ROXAS);
+        kh_restore_saved_look(g);
+        R2(kh_look_enabled()==KH_LOOK_ROXAS_HD && !kh_look_key("voice/us/battle/TT0_ROXAS.win32.scd"));
+        setenv("KHNMC_LOOK_ROXAS_HD_DIR","",1);
+        kh_restore_saved_look(g);
+        R2(kh_look_enabled()==KH_LOOK_ROXAS && ((rd32(g,word)>>9)&7)==KH_LOOK_ROXAS_HD);
+        wr32(g,word,before);
+        if(previous){setenv("KHNMC_LOOK_ROXAS_HD_DIR",previous,1); free(previous);}else unsetenv("KHNMC_LOOK_ROXAS_HD_DIR");
+    }
+    R2(!kh_look_face_ready(1,"P_EX220"));
+    for(int look=1;look<=3;look++){
+        kh_look_set(g,look);
+        R2(kh_look_key("obj/P_EX100_WI_KH1F.a.us")==KH_LOOK_STOCK_HD && kh_look_key("remastered/obj/P_EX100_WI_KH1F.a.us/-39.dds")==0);
+        R2(kh_look_key("remastered/obj/P_EX100_WI_KH1F.a.us/-45.dds")==0 && kh_hd_look_probe("obj/P_EX100_WI_KH1F.a.us",NULL)==0);
+        R2(kh_look_key("obj/P_EX100_KH1F.a.us")==48);
+    }
+    for(int r=0;r<3;r++) made&=axel_test_file(roots[r],"remastered/obj/P_EX100_WI_KH1F.a.us/-45.dds");
+    for(int look=1;look<=3;look++){
+        kh_look_set(g,look);
+        R2(made && kh_look_key("obj/P_EX100_WI_KH1F.a.us")==46 && kh_hd_look_probe("obj/P_EX100_WI_KH1F.a.us",&costume)==46);
+        R2(costume==(look==3?2:look==2?1:0));
+    }
+    /* HD-body binding: every look whose pack holds remastered/obj/<STEM>.mdlx/-0.dds, the hooded one too */
+    for(int look=1;look<=3;look++){
+        kh_look_set(g,look);
+        R2(kh_hd_look_probe("obj/P_EX100.mdlx",&costume)==-1);                     /* no sheets: embedded textures */
+    }
+    made&=axel_test_file(roots[1],"remastered/obj/P_EX100.mdlx/-0.dds");          /* only the hooded pack has sheets */
+    kh_look_set(g,KH_LOOK_HOODED); R2(made && kh_hd_look_probe("obj/P_EX100.mdlx",&costume)==-3 && costume==1);
+    kh_look_set(g,KH_LOOK_XION);   R2(kh_hd_look_probe("obj/P_EX100.mdlx",&costume)==-1);
+    made&=axel_test_file(roots[0],"remastered/obj/P_EX100.mdlx/-0.dds") && axel_test_file(roots[2],"remastered/obj/P_EX100.mdlx/-0.dds");
+    for(int look=1;look<=3;look++){ kh_look_set(g,look); R2(kh_hd_look_probe("obj/P_EX100.mdlx",&costume)==-3 && costume==(look==3?2:look==2?1:0)); }
+    kh_look_set(g,KH_LOOK_ROXAS); R2(kh_hd_look_probe("obj/P_EX100.mdlx",&costume)==0 && costume==0);
+    /* the title (lane TI): the picture follows KHNMC_TITLE_SCREEN, never the look; XION reads the Xion pack, else the hooded one */
+    made&=axel_test_file(roots[1],"remastered/" KH_TITLE_LAYOUT "/-4.png") && axel_test_file(roots[2],"remastered/" KH_TITLE_LAYOUT "/-4.png");
+    {
+        const char *old=getenv("KHNMC_TITLE_SCREEN"); char *saved=old?strdup(old):NULL;
+        setenv("KHNMC_TITLE_SCREEN","roxas",1);
+        for(int look=0;look<KH_LOOKS;look++){ kh_look_set(g,look); R2(made && kh_hd_look_probe(KH_TITLE_LAYOUT,NULL)==0); }
+        setenv("KHNMC_TITLE_SCREEN","xion",1);
+        for(int look=0;look<=3;look++){ kh_look_set(g,look); R2(kh_hd_look_probe(KH_TITLE_LAYOUT,&costume)==5 && costume==KH_TITLE_XION); }
+        setenv("KHNMC_TITLE_SCREEN","axel",1);
+        kh_look_set(g,KH_LOOK_ROXAS); R2(kh_hd_look_probe(KH_TITLE_LAYOUT,NULL)==5 && kh_title_screen()==KH_TITLE_AXEL);
+        R2(kh_title_screen_next(KH_TITLE_ROXAS)==KH_TITLE_XION && kh_title_screen_next(KH_TITLE_AXEL)==KH_TITLE_ROXAS);
+        if(saved) setenv("KHNMC_TITLE_SCREEN",saved,1); else unsetenv("KHNMC_TITLE_SCREEN");
+        free(saved);
+    }
+    /* the chakram set: offered with the Axel pack complete (scene model + banks are not needed for it) and its two files */
+    R2(!kh_axel_weapon_ready() && !weapon_offered(KH_LOOK_AXEL) && kh_setting_set("KHNMC_AXEL_WEAPON","chakrams")==-2);
+    R2(load_marks_weapons()==0);                                                 /* a load without the chakram set: nothing to rebind */
+    made&=axel_test_file(roots[2],"weapons/chakram/obj/W_EX010.mdlx") && axel_test_file(roots[2],"weapons/chakram/obj/W_EX010_10.mdlx");
+    R2(made && !kh_axel_weapon_ready());                                           /* no HD texture yet */
+    made&=axel_test_file(roots[2],"weapons/chakram/hd/-0.dds");
+    R2(made && kh_axel_weapon_ready() && weapon_offered(KH_LOOK_AXEL) && !weapon_offered(KH_LOOK_XION) && !weapon_offered(KH_LOOK_ROXAS));
+    char host[4096];
+    R2(kh_axel_weapon_asset("obj/W_EX010_10.mdlx",host,sizeof host) && !kh_axel_weapon_asset("obj/W_EX010_20.mdlx",host,sizeof host));
+    R2(!kh_axel_weapon_asset("obj/W_EX010_10.mset",host,sizeof host) && !kh_axel_weapon_asset("obj/P_EX100.mdlx",host,sizeof host));
+    kh_look_set(g,KH_LOOK_AXEL);
+    R2(kh_look_key("obj/W_EX010_10.mdlx")==0);                                     /* the game's own reads: the keyblade */
+    kh_loading_weapon=1;
+    R2(kh_look_key("obj/W_EX010_10.mdlx")==KH_LOOK_WEAPON && kh_hd_look_probe("obj/W_EX010_10.mdlx",&costume)==KH_LOOK_WEAPON);
+    R2(kh_look_key("obj/W_EX010_20.mdlx")==0 && kh_look_key("obj/W_EX010_ROXAS_LIGHT.mdlx")==0 && kh_look_key("remastered/obj/W_EX010_10.mdlx/-0.dds")==0);
+    kh_look_set(g,KH_LOOK_XION); R2(kh_look_key("obj/W_EX010_10.mdlx")==0);     /* another look never maps it */
+    kh_loading_weapon=0;
+    atomic_store(&axel_chakrams,0);
+    kh_look_set(g,KH_LOOK_AXEL);
+    R2(!weapon_wanted("W_EX010_10"));
+    atomic_store(&axel_chakrams,1);
+    R2(weapon_wanted("W_EX010_10") && !weapon_wanted("W_EX010_20"));
+    kh_look_set(g,KH_LOOK_ROXAS); R2(!weapon_wanted("W_EX010_10"));
+    R2(load_marks_weapons()==1);                                                 /* a load with the set: rebind at the next quiet frame */
+    {   /* after a load (empty cache) the chakram BAR a restored resource holds is kept, not read again */
+        static struct weapon_art kept[128];
+        memcpy(kept,weapon_art,sizeof weapon_art); memset(weapon_art,0,sizeof weapon_art);
+        R2(weapon_bar(g,"W_EX010_10",0x1110,0x2220)==0x2220 && weapon_bar(g,"W_EX010_10",0x1110,0)==0x2220 && weapon_bar(g,"W_EX010_10",0x1110,0x3330)==0x2220);
+        memcpy(weapon_art,kept,sizeof weapon_art);
+    }
+    /* the Weapon row: in Character only while the panel shows Axel */
+    int ids[sizeof kh_options/sizeof *kh_options+1],n,has;
+    int saved_direct=direct_character,saved_preview=preview_look;
+    direct_character=1;
+    preview_look=KH_LOOK_AXEL; n=section_rows(CHARACTER,ids); has=0; for(int j=0;j<n;j++) has|=ids[j]==WEAPON;
+    R2(n==2 && ids[0]==LOOK && has);
+    preview_look=KH_LOOK_HOODED; n=section_rows(CHARACTER,ids); R2(n==1 && ids[0]==LOOK);
+    n=section_rows(ADVANCED,ids); has=0; for(int j=0;j<n;j++) has|=ids[j]==WEAPON; R2(!has);
+    R2(!menu_catalog_test());
+    direct_character=saved_direct; preview_look=saved_preview;
+    /* the New Game fifth row (xion_swap.c) */
+    R2(!kh_newgame_axel_selftest(g));
+#undef R2
+    atomic_store(&axel_chakrams,saved_chakrams);
+    if(saved_mode) kh_xkb_set_mode(g,saved_mode);
+    kh_look_set(g,saved_look);
+    for(int i=0;i<3;i++){
+        if(saved[i]){ setenv(envs[i],saved[i],1); free(saved[i]); } else unsetenv(envs[i]);
+        nftw(roots[i],axel_test_remove,16,FTW_DEPTH|FTW_PHYS);
+    }
+    fprintf(stderr,"kh: axel round2 selftest: face slot 45 + legacy -39, HD body binding of every look, title lookup, chakram set, Weapon row, New Game row: %d checks, %d failures\n",checks,fail);
+    return fail;
 }

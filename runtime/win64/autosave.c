@@ -3,6 +3,8 @@
 #include "autosave.h"
 #include "xion_swap.h"
 #include "slot_disk.h"
+#include "slot_hash.h"
+#include "kh_look.h"
 #include "route_state.h"
 #include "warp.h"
 #include <errno.h>
@@ -108,8 +110,50 @@ static int newest(int dir){
 
 /* The optional trailer is committed by the same rename as the checkpoint. */
 static const u8 mode_trailer[]={'k','h','X','b',1};
+
+/* Axel Won't Cry.  Its checkpoint file is an ordinary one, without the trailer: a build from before this mode accepts a
+ * checkpoint of exactly SAVE_SIZE bytes (plain Critical) or one with the 5-byte khXb trailer (which it would load as Xion
+ * Knows Best) and calls every other size invalid.  The mode is the side file KH2autosave-<n>.axel, 38 bytes:
+ *     +0  "khXa", u8 1 (version)    +5  u8 saved difficulty (2)    +6  SHA-256 of the checkpoint's SAVE_SIZE bytes
+ * It is written (rename) before the checkpoint and counts only while its digest matches the checkpoint beside it, so a
+ * file left from an earlier checkpoint of that number, or by a failed write, is nothing.  The older build never opens it. */
+typedef struct { u8 magic[5],level,digest[32]; } AxelMark;
+static const u8 axel_magic[]={'k','h','X','a',1};
+static void axel_name(char name[40],int n){ snprintf(name,40,"KH2autosave-%d.axel",n); }
+static void axel_mark_make(AxelMark *m,const u8 *data){
+    memcpy(m->magic,axel_magic,sizeof m->magic); m->level=data[0x2498];
+    SlotHash h; slot_hash_init(&h); slot_hash_add(&h,data,SAVE_SIZE); slot_hash_end(m->digest,&h);
+}
+static int axel_mark_valid(const AxelMark *m,const u8 *data){
+    AxelMark expected; axel_mark_make(&expected,data);
+    return m->level==2 && !data[0x2499] && !data[0x249a] && !data[0x249b] && !memcmp(m,&expected,sizeof expected);
+}
+static int axel_mark_publish(int dir,int n,const u8 *data,int axel){
+    char name[40]; axel_name(name,n);
+    if(!axel) return !unlinkat(dir,name,0) || errno==ENOENT;
+    AxelMark m; axel_mark_make(&m,data);
+    int fd=openat(dir,".axel.tmp",O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW,0600);
+    if(fd<0) return 0;
+    int ok=write(fd,&m,sizeof m)==(ssize_t)sizeof m && !fsync(fd);
+    if(close(fd)) ok=0;
+    if(ok) ok=!renameat(dir,".axel.tmp",dir,name);
+    if(!ok) unlinkat(dir,".axel.tmp",0);
+    return ok;
+}
+static int axel_mark_read(int dir,int n,const u8 *data){
+    char name[40]; axel_name(name,n);
+    int fd=openat(dir,name,O_RDONLY|O_NOFOLLOW|O_NONBLOCK);
+    if(fd<0) return 0;
+    AxelMark m; u8 extra;
+    struct stat st;
+    int ok=!fstat(fd,&st) && S_ISREG(st.st_mode) && read(fd,&m,sizeof m)==(ssize_t)sizeof m && read(fd,&extra,1)==0 &&
+           axel_mark_valid(&m,data);
+    close(fd);
+    return ok;
+}
 static int publish(int dir,int n,const u8 *data){
     char name[40]; filename(name,n);
+    if(!axel_mark_publish(dir,n,data,kh_axel_enabled)) return 0;
     int fd=openat(dir,".slot.tmp",O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW,0600);
     if(fd<0) return 0;
     FILE *f=fdopen(fd,"wb");
@@ -175,12 +219,13 @@ static int read_checkpoint(KCtx *g,int previous,int load,u32 *level,int *tag){
             u8 trailer[sizeof mode_trailer];
             if(ok && tagged) ok=fread(trailer,sizeof trailer,1,f)==1 && !memcmp(trailer,mode_trailer,4) &&
                 trailer[4]>=1 && trailer[4]<=3 && rd32(g,candidate+0x2498)==trailer[4];
+            int axel=ok && !tagged && axel_mark_read(dir,n,data);
             if(ok){
                 *level=rd32(g,candidate+0x2498);
-                *tag=tagged ? trailer[4] : 0;
+                *tag=tagged ? trailer[4] : axel ? (KH_SAVE_TAG_AXEL|2) : 0;
             }
             if(ok && load){
-                kh_xkb_set_mode(g,kh_xkb_menu && tagged);
+                kh_xkb_set_mode(g,!kh_xkb_menu?KH_MODE_NONE:axel?KH_MODE_AXEL:tagged);
                 memcpy(GUEST_PTR(SAVE),data,SAVE_SIZE);
                 kh_warn("autosave-load: %s %.2s%02u",name,kh_warp_world_names[data[12]],data[13]);
             }
@@ -226,6 +271,29 @@ int kh_autosave_selftest(KCtx *g){
     fails+=native_valid(g,buf)!=0;
     fails+=allowed(1,1)||allowed(5,5)||allowed(18,21)||allowed(8,13)||allowed(16,26)||
            allowed(14,11)||allowed(9,0)||allowed(4,45)||!allowed(18,19);
+    {   /* The Axel Won't Cry side file: bound to its checkpoint's bytes, absent for every other campaign. */
+        int axel=0;
+        char dir[KH_TMP_MAX]; kh_tmp_path(dir,sizeof dir,"khnmc-axel-auto-XXXXXX");
+        int d=mkdtemp(dir)?open(dir,O_RDONLY|O_DIRECTORY):-1;
+        if(d<0) axel++;
+        else{
+            memset(p+0x2498,0,4); p[0x2498]=2;
+            AxelMark m; axel_mark_make(&m,p);
+            axel+=!axel_mark_valid(&m,p) || sizeof m!=38;
+            m.magic[3]='b'; axel+=axel_mark_valid(&m,p); m.magic[3]='a';
+            m.magic[4]=2; axel+=axel_mark_valid(&m,p); m.magic[4]=1;
+            m.digest[31]^=1; axel+=axel_mark_valid(&m,p); m.digest[31]^=1;
+            axel+=!axel_mark_publish(d,2,p,1) || !axel_mark_read(d,2,p) || axel_mark_read(d,1,p);
+            p[100]^=1; axel+=axel_mark_read(d,2,p); p[100]^=1;       /* the mark of an earlier checkpoint of this number */
+            p[0x2498]=3; axel_mark_make(&m,p); axel+=axel_mark_valid(&m,p);   /* Less Than Nothing is never this mode */
+            axel+=!axel_mark_publish(d,3,p,1) || axel_mark_read(d,3,p);
+            p[0x2498]=2;
+            axel+=!axel_mark_publish(d,2,p,0) || axel_mark_read(d,2,p) || !axel_mark_publish(d,2,p,0);   /* removed, twice */
+            unlinkat(d,"KH2autosave-3.axel",0); close(d); rmdir(dir);
+        }
+        fprintf(stderr,"kh: autosave axel mark: digest binding, stale mark, wrong level, removal: %d failures\n",axel);
+        fails+=axel;
+    }
     ga_free(buf);
     kh_call(&ctx,GS_BASE+0x325dd0,0,0,0,0);
     wr64(g,GS_BASE+0xbef890,old_manager); wr64(g,GS_BASE+0xbef898,old_table);
