@@ -1,15 +1,15 @@
 
-<h1 align="center">Nobody May Cry: Recompiled</h1>
+<h1 align="center">KH2 iOS Port (mod friendly)</h1>
 
-<p align="center"><b>Kingdom Hearts II Final Mix + Nobody May Cry, statically recompiled from the PC executable.</b><br>
+<p align="center"><b>Kingdom Hearts II Final Mix, statically recompiled from the PC executable, and mod friendly.</b><br>
 Native on iPhone, macOS and Linux. No emulator, no Windows, no game files in this repository.</p>
 
 ---
 
 The PC game's executable is statically lifted to C, function by function (38,242 of them), and runs on a hand-written runtime that
-stands in for Windows. The **Nobody May Cry** mod (Roxas in Sora's place, Devil-May-Cry-style combat, four difficulties up to "Less
-Than Nothing") is ported into it: its hooks, its patches and its script calls, behaving exactly as the PC mod, with the technical
-side improved (memory, stability, size). The target is a personal iPhone build, and it plays there.
+stands in for Windows. **Roxas May Cry** (Roxas in Sora's place, Devil-May-Cry-style combat, four difficulties up to "Less Than
+Nothing") is ported into it: the mod's hooks, its patches and its script calls, behaving exactly as the PC mod, with the technical
+side improved (memory, stability, size). **Xion Knows Best** and **Axel Won't Cry** come with it as playable looks and title screens. The target is a personal iPhone build, and it plays there.
 
 This is a **static recompilation**, in the family of the "Recompiled" ports: the C is machine-generated from the binary, not a
 hand-written, byte-matching decompilation. The project was called *KHNMC: Decomp Edition* until 2026-11-18; KHNMC stays as the code
@@ -23,6 +23,8 @@ name (the switches are `KHNMC_*`).
 | **macOS, Apple Silicon** | Renders on the GPU through MoltenVK and Metal at the game's own 60 fps cap; the story route plays there on the GPU. Guest memory accesses are ordered (acquire / release) on Apple CPUs, where the plain build was shown to reorder. |
 | **Linux x86-64** | Boots and plays headless, with a real picture through vkd3d on a CPU Vulkan driver and a software XAudio2 mixer. Self-check: 172,956 checks, 0 failures. |
 | **The mod** | All three of its DLLs ported: 40 function hooks, 87 static edits, 114 added script calls, the four difficulties. Mapped along the way: the 83 enemy AI files that act differently on Less Than Nothing ([docs/difficulty/LTN-ENEMY-AI.md](docs/difficulty/LTN-ENEMY-AI.md)). |
+| **Looks** | Pick who you play as: Roxas, Xion, Xion (hooded), Axel or Roxas HD, each from an optional look pack you make from your own files (a missing pack is never offered). Axel is drawn at his own size in the field and in the pause menu. |
+| **Title** | Three title screens, Roxas May Cry, Xion Knows Best and Axel Won't Cry, each with its own picture, logo and boot-intro sketches. **R3** on the title cycles them and the choice is saved. The title menu has a fourth row, **CHEATS**, that opens the Roxas May Cry menu (character, cheats, controller, display, gameplay). |
 | **Automatic play** | State-driven route scripts (wait for a game state, press, walk, fight, talk) and a debug warp into any of the 311 rooms. |
 
 ## Options
@@ -33,10 +35,24 @@ Everything below is presentation or an opt-in extra; with a switch unset the gam
 |---|---|---|
 | `KHNMC_ASPECT=fill` | Use the whole screen of any shape (foldable, portrait) instead of 16:9 with bars | done |
 | `KHNMC_FOV_ZOOM`, `KHNMC_HUD_SCALE_CMD` / `_HP`, `KHNMC_TITLE_LAYOUT` | Portrait tuning: camera zoom, command menu and HP gauge size, title layout | done |
-| `KHNMC_CUTSCENES=story` | The story scenes NMC removes, restored from your own data where they are provably presentation-only | in review |
+| `KHNMC_CUTSCENES=story` | The story scenes the mod removes, restored from your own data where they are provably presentation-only | in review |
 | `KHNMC_SCENE_ROXAS=1` | Roxas instead of Sora in story scenes | in progress |
-| Xion ([docs/xion/](docs/xion/)) | Swap to NMC's playable Xion at a save point, on any difficulty; and Xion's look on Roxas's moves | in progress |
+| `KHNMC_PLAYER_LOOK` | Roxas, Xion, Xion (hooded), Axel or Roxas HD (needs the look pack) | done |
+| `KHNMC_TITLE_SCREEN` | Roxas May Cry, Xion Knows Best or Axel Won't Cry title screen (R3 on the title cycles it) | done |
+| `KHNMC_PS2_FORM_REWARDS` | The PS2 version's growth rewards for Bladeless (Wisdom) and Light & Dark (Limit); on when the Roxas May Cry package is installed | done |
+| Xion Knows Best ([docs/xion/](docs/xion/)) | Swap to playable Xion at a save point, on any difficulty; and Xion's look on Roxas's moves | in progress |
 | Live rotation | Turn the phone between landscape and portrait while playing | in progress |
+
+## What changed since 2026-11-21
+
+- **Looks.** Roxas, Xion, Xion (hooded), Axel and Roxas HD bound to the HD pictures; Axel's size in the field and in the pause
+  (camp) menu; looks kept out of cutscenes where they do not belong; the Light & Dark keyblade fix; looks stay in sync on the phone.
+- **Title screens + R3.** Roxas May Cry, Xion Knows Best and Axel Won't Cry title screens with their own logos and boot-intro
+  sketches; R3 on the title switches between them live and the choice is saved.
+- **CHEATS row.** A fourth title-menu row opens the Roxas May Cry menu before a game is loaded.
+- **Fixes.** Three rounds of review fixes (settings, save slots, files, HD assets, the Xion save), the Mac / iPhone build scripts
+  (signing, device runs, data push, cleanup) with their own test script, the PS2 form growth rewards, portrait and touch layout
+  changes, and upside-down portrait turned by the app itself (an iPhone does not turn its interface upside down).
 
 ## How it works
 
@@ -63,6 +79,8 @@ Everything below is presentation or an opt-in extra; with a switch unset the gam
 
 First run `python3 tools/publish/prepare_sources.py OUTPUT --exe FILE --mod DIR --data DIR` in the checkout. Use the resulting private sources to build. The data directory is the baked English PC tree.
 
+First run `python3 tools/publish/prepare_sources.py OUTPUT --exe FILE --mod DIR --data DIR` in the checkout. Use the resulting private sources to build. The data directory is the baked English PC tree.
+
 You need your own copy of *Kingdom Hearts HD 1.5+2.5 ReMIX* for PC and of the Nobody May Cry mod. A work tree needs, next to these
 sources, the lifted C and the game's data tree, both made locally from those copies. In the build layout, generate runtime/xion_fields.inc with tools/runtime/xion_fields.py using your local data. On Linux:
 
@@ -77,9 +95,9 @@ The iPhone build runs on a Mac with Xcode (`tools/runtime/ios/`, see `docs/APPLE
 
 ## Related
 
-A separate project is planned: a full **decomposition of the Nobody May Cry mod for OpenKH**, documenting every change NMC makes as
-readable patches rebuilt from the vanilla game, with difficulty and other options on top. Assets will never be uploaded; the tools
-take them from your own copy of the mod.
+The mod is also available as a **decomposition for OpenKH** ([nmc-decomposed](https://github.com/dexedrne/nmc-decomposed)): every
+change it makes as readable patches rebuilt from the vanilla game. Assets are never uploaded; the tools take them from your own copy
+of the mod.
 
 ## Rules
 
